@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 #endif
 #include "ui_private.h"
+#include "ui_gpu.h"
 #include "line.h"
 #include "state.h"
 #include "media_io.h"
@@ -200,8 +201,19 @@ static void sample_scroll(gint64 now)
 		ui.stick_bottom = TRUE;
 }
 
+static gboolean window_visible(void)
+{
+	return !(SDL_GetWindowFlags(ui.window) &
+		 (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
+}
+
 static int frame_wait(gint64 now, gboolean visual_animation)
 {
+	/* Keep receiving worker and input events while the tray or window
+	 * manager hides the window. A show/restore event dirties the canvas.
+	 */
+	if (!window_visible())
+		return -1;
 	gint64 emoji = ui_reduce_motion() ? 0 : ui_emoji_deadline();
 
 	if (emoji && emoji <= now)
@@ -227,12 +239,17 @@ static void display_rate(void)
 					 0 ?
 			 mode.refresh_rate :
 			 0;
+	const char *limit = g_getenv("AVERNELLA_MAX_FPS");
+	guint64 fps;
+
+	if (limit && g_ascii_string_to_unsigned(limit, 10, 1, 2000, &fps, NULL))
+		hz = MIN(hz > 0 && hz <= 2000 ? hz : 60, (int)fps);
 	ui_frame_rate(&frame_clock, hz);
 }
 
 static struct {
 	pid_t pid;
-	int fd, wake, share;
+	int fd, wake, preview;
 	GThread *thread;
 	GAsyncQueue *writes;
 	GHashTable *requests;
@@ -242,17 +259,22 @@ static struct {
 	GHashTable *read_marks;
 	Json *selected_summary; /* borrowed from ui.chats; rebound when the list changes */
 	gint64 notification_baseline;
-	guint32 packet_event, refresh_event, share_event;
+	guint32 packet_event, refresh_event, preview_event;
 	SDL_TimerID login_timer;
 	guint login_failures;
 } wire;
 
-/* The pump and SDL thread share one pending presentation frame. */
-static struct {
-	GMutex lock;
+/* A pending event owns the latest frame for its stream. */
+static GMutex preview_lock;
+struct pending_preview {
 	int fd;
-	struct line_share_frame frame;
-} share_mailbox = { .fd = -1 };
+	struct line_preview_frame frame;
+};
+static struct pending_preview previews[LINE_PREVIEW_COUNT] = {
+	[LINE_PREVIEW_SCREEN] = { .fd = -1 },
+	[LINE_PREVIEW_REMOTE] = { .fd = -1 },
+	[LINE_PREVIEW_SELF] = { .fd = -1 },
+};
 
 extern char **environ;
 static void reset_login(const char *message);
@@ -304,31 +326,34 @@ struct wire_write {
 	char data[];
 };
 
-static void pump_share(guint generation)
+static void pump_preview(guint generation)
 {
-	struct line_share_frame frame;
-	int fd = line_media_recv_share(wire.share, &frame);
+	struct line_preview_frame frame;
+	int fd = line_media_recv_frame(wire.preview, &frame);
 
 	if (fd < 0)
 		return;
-	g_mutex_lock(&share_mailbox.lock);
-	gboolean notify = share_mailbox.fd < 0;
+	struct pending_preview *preview = &previews[frame.source];
+
+	g_mutex_lock(&preview_lock);
+	gboolean notify = preview->fd < 0;
 
 	if (!notify)
-		close(share_mailbox.fd);
-	share_mailbox.fd = fd;
-	share_mailbox.frame = frame;
+		close(preview->fd);
+	preview->fd = fd;
+	preview->frame = frame;
 	if (notify) {
 		SDL_Event e = { 0 };
 
-		e.type = wire.share_event;
+		e.type = wire.preview_event;
 		e.user.code = (Sint32)generation;
+		e.user.data1 = GUINT_TO_POINTER((guint)frame.source);
 		if (SDL_PushEvent(&e) != 1) {
-			close(share_mailbox.fd);
-			share_mailbox.fd = -1;
+			close(preview->fd);
+			preview->fd = -1;
 		}
 	}
-	g_mutex_unlock(&share_mailbox.lock);
+	g_mutex_unlock(&preview_lock);
 }
 
 static gpointer pump(gpointer data)
@@ -346,7 +371,7 @@ static gpointer pump(gpointer data)
 		struct pollfd fds[] = { { wire.fd,
 					  POLLIN | (writing ? POLLOUT : 0), 0 },
 					{ wire.wake, POLLIN, 0 },
-					{ wire.share, POLLIN, 0 } };
+					{ wire.preview, POLLIN, 0 } };
 		int rc = poll(fds, G_N_ELEMENTS(fds), -1);
 
 		if (rc < 0 && errno == EINTR)
@@ -394,7 +419,7 @@ static gpointer pump(gpointer data)
 				g_clear_pointer(&writing, g_free);
 		}
 		if (fds[2].revents & POLLIN)
-			pump_share(generation);
+			pump_preview(generation);
 		if (fds[2].revents & (POLLERR | POLLHUP | POLLNVAL))
 			break;
 	}
@@ -419,10 +444,11 @@ static void stop_worker(void)
 		g_thread_join(wire.thread);
 		close(wire.fd);
 		close(wire.wake);
-		close(wire.share);
-		if (share_mailbox.fd >= 0) {
-			close(share_mailbox.fd);
-			share_mailbox.fd = -1;
+		close(wire.preview);
+		for (size_t i = 0; i < G_N_ELEMENTS(previews); i++) {
+			if (previews[i].fd >= 0)
+				close(previews[i].fd);
+			previews[i].fd = -1;
 		}
 		g_async_queue_unref(wire.writes);
 		wire.pid = 0;
@@ -437,13 +463,13 @@ static void stop_worker(void)
 
 static gboolean start_worker(int credentials_fd)
 {
-	int pair[2], share[2];
+	int pair[2], preview[2];
 
 	if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
 		return FALSE;
 	wire.wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-	if (wire.wake < 0 ||
-	    socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, share) < 0) {
+	if (wire.wake < 0 || socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC,
+					0, preview) < 0) {
 		int failure = errno;
 
 		if (wire.wake >= 0)
@@ -456,7 +482,7 @@ static gboolean start_worker(int credentials_fd)
 	int output = LINE_CREDENTIAL_FD + (credentials_fd >= 0);
 	int buffer = 4096;
 
-	setsockopt(share[1], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
+	setsockopt(preview[1], SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
 	posix_spawn_file_actions_t actions;
 	int err = posix_spawn_file_actions_init(&actions);
 
@@ -471,10 +497,10 @@ static gboolean start_worker(int credentials_fd)
 				&actions, credentials_fd, LINE_CREDENTIAL_FD);
 		if (!err)
 			err = posix_spawn_file_actions_adddup2(
-				&actions, share[1], output);
+				&actions, preview[1], output);
 #if defined(__GLIBC__) && \
 	(__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 34))
-		/* Keep the control socket, share socket and optional password pipe. */
+		/* Keep the control socket, preview socket and optional password pipe. */
 		if (!err)
 			err = posix_spawn_file_actions_addclosefrom_np(
 				&actions, output + 1);
@@ -490,17 +516,17 @@ static gboolean start_worker(int credentials_fd)
 		posix_spawn_file_actions_destroy(&actions);
 	}
 	close(pair[1]);
-	close(share[1]);
+	close(preview[1]);
 	if (err) {
 		close(pair[0]);
-		close(share[0]);
+		close(preview[0]);
 		close(wire.wake);
 		wire.pid = 0;
 		errno = err;
 		return FALSE;
 	}
 	wire.fd = pair[0];
-	wire.share = share[0];
+	wire.preview = preview[0];
 	fcntl(wire.fd, F_SETFL, O_NONBLOCK);
 	wire.writes = g_async_queue_new_full(g_free);
 	wire.thread = g_thread_new("line-ipc", pump,
@@ -733,6 +759,8 @@ static gboolean set_json(Json **dest, Json *value)
 		return FALSE;
 	if (dest == &ui.history)
 		ui_forget_history();
+	if (dest == &ui.chats)
+		ui_forget_rail();
 	if (value)
 		json_object_get(value);
 	if (*dest)
@@ -1146,9 +1174,11 @@ static void show_chats(Json *list)
 				NULL;
 		guint64 last = ui_read_id(ui_string(row, "lastId", NULL));
 
-		if (cursor && last && last <= cursor->confirmed)
+		if (cursor && last && last <= cursor->confirmed) {
+			ui_forget_rail();
 			json_object_object_add(row, "unread",
 					       json_object_new_int(0));
+		}
 		json_object_array_add(merged, json_object_get(row));
 	}
 	gboolean changed = set_json(&ui.chats, merged);
@@ -1441,6 +1471,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				   ui_read_id(ui_string(row, "lastId", NULL)))) {
 			json_object_object_add(row, "unread",
 					       json_object_new_int(0));
+			ui_forget_rail();
 			json_object_object_add(
 				row, "lastSeenId",
 				json_object_new_string(saved->text));
@@ -2153,17 +2184,22 @@ static void event(SDL_Event *e)
 {
 	if (ui_tray_event(e, ui.window, &ui.quitting))
 		return;
-	if (e->type == wire.share_event) {
-		if ((guint)e->user.code != wire.generation || ui.quitting)
-			return;
-		g_mutex_lock(&share_mailbox.lock);
-		int fd = share_mailbox.fd;
-		struct line_share_frame frame = share_mailbox.frame;
+	if (e->type == wire.preview_event) {
+		guint source = GPOINTER_TO_UINT(e->user.data1);
 
-		share_mailbox.fd = -1;
-		g_mutex_unlock(&share_mailbox.lock);
+		if ((guint)e->user.code != wire.generation || ui.quitting ||
+		    source >= LINE_PREVIEW_COUNT)
+			return;
+		struct pending_preview *preview = &previews[source];
+
+		g_mutex_lock(&preview_lock);
+		int fd = preview->fd;
+		struct line_preview_frame frame = preview->frame;
+
+		preview->fd = -1;
+		g_mutex_unlock(&preview_lock);
 		if (fd >= 0) {
-			ui_media_share_frame(&frame, fd);
+			ui_media_preview_frame(&frame, fd);
 			close(fd);
 		}
 		return;
@@ -2204,6 +2240,17 @@ static void event(SDL_Event *e)
 		ui_draw_reset_renderer();
 		break;
 	case SDL_WINDOWEVENT:
+		if (e->window.windowID != SDL_GetWindowID(ui.window))
+			break;
+		switch (e->window.event) {
+		case SDL_WINDOWEVENT_SHOWN:
+		case SDL_WINDOWEVENT_HIDDEN:
+		case SDL_WINDOWEVENT_MINIMIZED:
+		case SDL_WINDOWEVENT_MAXIMIZED:
+		case SDL_WINDOWEVENT_RESTORED:
+			ui_media_window_visibility(window_visible());
+			break;
+		}
 		if (e->window.event == SDL_WINDOWEVENT_CLOSE) {
 			if (ui_tray_hide(ui.window))
 				SDL_FlushEvent(SDL_QUIT);
@@ -2372,9 +2419,9 @@ int line_ui(int argc, char **argv)
 	if (wayland)
 		SDL_SetHintWithPriority(SDL_HINT_RENDER_VSYNC, "1",
 					SDL_HINT_DEFAULT);
-	ui.window = SDL_CreateWindow(
-		"Avernella (" LINE_BUILD_COMMIT ")",
-		SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED, 920, 630,
+	ui.window = ui_gpu_window(
+		"Avernella (" LINE_BUILD_COMMIT ")", SDL_WINDOWPOS_CENTERED,
+		SDL_WINDOWPOS_CENTERED, 920, 630,
 		SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	if (!ui.window || !ui_draw_init()) {
 		g_printerr("Window: %s\n", SDL_GetError());
@@ -2401,7 +2448,7 @@ int line_ui(int argc, char **argv)
 		return 1;
 	}
 	wire.refresh_event = wire.packet_event + 1;
-	wire.share_event = wire.packet_event + 2;
+	wire.preview_event = wire.packet_event + 2;
 	ui_tray_start();
 	display_rate();
 	ui_motion_refresh_preferences();

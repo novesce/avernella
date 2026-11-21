@@ -2157,16 +2157,16 @@ static int worker(int credentials_fd)
 	if (prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != parent ||
 	    parent == 1)
 		return 1;
-	int share_fd = LINE_CREDENTIAL_FD + (credentials_fd >= 0);
+	int frame_fd = LINE_CREDENTIAL_FD + (credentials_fd >= 0);
 	int socket_type;
 	socklen_t size = sizeof(socket_type);
 
-	if (!getsockopt(share_fd, SOL_SOCKET, SO_TYPE, &socket_type, &size) &&
+	if (!getsockopt(frame_fd, SOL_SOCKET, SO_TYPE, &socket_type, &size) &&
 	    socket_type == SOCK_SEQPACKET) {
-		fcntl(share_fd, F_SETFD, FD_CLOEXEC);
-		line_call_share_socket(share_fd);
+		fcntl(frame_fd, F_SETFD, FD_CLOEXEC);
+		line_call_frame_socket(frame_fd);
 	} else {
-		share_fd = -1;
+		frame_fd = -1;
 	}
 	struct line_worker w = { .dir = -1,
 				 .credentials_fd = credentials_fd,
@@ -2235,8 +2235,8 @@ static int worker(int credentials_fd)
 	if (w.image_wake >= 0)
 		close(w.image_wake);
 	clear_view(&w);
-	if (share_fd >= 0)
-		close(share_fd);
+	if (frame_fd >= 0)
+		close(frame_fd);
 	g_hash_table_unref(w.leases);
 	if (w.dir >= 0)
 		close(w.dir);

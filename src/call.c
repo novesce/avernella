@@ -97,11 +97,11 @@ void line_voice_tick(void)
 }
 
 static struct call_task *active;
-static int share_socket = -1;
+static int frame_socket = -1;
 
-void line_call_share_socket(int fd)
+void line_call_frame_socket(int fd)
 {
-	share_socket = fd;
+	frame_socket = fd;
 }
 
 struct call_endpoint {
@@ -541,6 +541,26 @@ static void peer_share_state(struct voice_call *c, gboolean sharing)
 	emit_share_state(c, "peerSharing", sharing, NULL);
 }
 
+/* Return true when the preview is sent or dropped under backpressure. */
+static gboolean send_preview(struct voice_call *c,
+			     enum line_preview_source source,
+			     const struct line_camera_frame *image, gint64 now)
+{
+	if (frame_socket < 0)
+		return FALSE;
+	struct line_preview_frame report = {
+		.decoded_at = now,
+		.width = image->width,
+		.height = image->height,
+		.rotation = image->rotation,
+		.source = source,
+		.camera_enabled = g_atomic_int_get(&c->task->camera_enabled),
+	};
+
+	g_strlcpy(report.chat, c->info.target, sizeof(report.chat));
+	return line_media_send_frame(frame_socket, &report, image);
+}
+
 static void display_share(const struct line_camera_frame *image, gpointer user)
 {
 	struct voice_call *c = user;
@@ -551,18 +571,10 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
 		return;
 	gint64 now = g_get_monotonic_time();
 
-	if (share_socket >= 0) {
-		struct line_share_frame report = { .decoded_at = now,
-						   .width = image->width,
-						   .height = image->height,
-						   .rotation =
-							   image->rotation };
-
-		g_strlcpy(report.chat, c->info.target, sizeof(report.chat));
-		line_media_send_share(share_socket, &report, image);
+	if (send_preview(c, LINE_PREVIEW_SCREEN, image, now))
 		return;
-	}
 	GBytes *frame = pack_i420(image);
+
 	g_mutex_lock(&task->frame_lock);
 	gboolean notify = !task->share_frame ||
 			  now - task->share_notified >= G_USEC_PER_SEC;
@@ -989,8 +1001,11 @@ static void display_video(const struct line_camera_frame *image, gpointer user)
 		g_printerr("line-call video first frame decoded\n");
 	if (!g_atomic_int_get(&task->preview_visible))
 		return;
-	GBytes *frame = pack_i420(image);
 	gint64 now = g_get_monotonic_time();
+
+	if (send_preview(c, LINE_PREVIEW_REMOTE, image, now))
+		return;
+	GBytes *frame = pack_i420(image);
 
 	g_mutex_lock(&task->frame_lock);
 	gboolean notify = !task->frame ||
@@ -1024,15 +1039,16 @@ static gboolean capture_video(struct voice_call *c, gint64 now, GError **error)
 
 	gboolean preview = FALSE;
 
-	if (g_atomic_int_get(&task->preview_visible)) {
+	if (g_atomic_int_get(&task->preview_visible) &&
+	    line_camera_frame_size_valid(frame.width, frame.height) &&
+	    !send_preview(c, LINE_PREVIEW_SELF, &frame, now)) {
 		g_mutex_lock(&task->frame_lock);
 		/* Copy a preview only once the window took the last one. */
 		preview = !task->self_frame ||
 			  now - task->self_notified >= G_USEC_PER_SEC;
 		g_mutex_unlock(&task->frame_lock);
 	}
-	if (preview &&
-	    line_camera_frame_size_valid(frame.width, frame.height)) {
+	if (preview) {
 		/* The window shows the local camera beside the peer's picture. */
 		GBytes *self = pack_i420(&frame);
 

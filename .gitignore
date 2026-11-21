@@ -1,5 +1,6 @@
 /build/
 /avernella
+/avernella-vulkan.so
 /avernella-liff
 /avernella-liff-gtk
 *.apk

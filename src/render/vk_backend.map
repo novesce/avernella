@@ -1,0 +1,4 @@
+{
+	global: avernella_gpu_v1;
+	local: *;
+};

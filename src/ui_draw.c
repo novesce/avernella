@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_private.h"
+#include "ui_gpu.h"
 #include "line.h"
 #include "ui_chat_lists.h"
 #include "ui_emoji.h"
@@ -7,6 +8,7 @@
 #include "ui_flex.h"
 #include "ui_find.h"
 #include "ui_groups.h"
+#include "ui_gpu_scroll.h"
 #include "ui_motion.h"
 #include "ui_profile.h"
 #include "flex_asset.h"
@@ -38,8 +40,20 @@
 static cairo_t *cr;
 static PangoContext *context;
 static SDL_Texture *canvas_texture;
-static gboolean log_renderer;
+static Uint32 canvas_format;
+static gboolean log_renderer, native_repaint;
 static double video_offset;
+
+/* Circular history rows use the same texture as the rest of the canvas. */
+static struct {
+	SDL_Rect area;
+	int origin, offset, hover, scale;
+	gboolean reusable;
+} history_scroll;
+static struct {
+	SDL_Rect bands[4];
+	int count;
+} history_damage;
 
 static void color(guint rgb)
 {
@@ -50,6 +64,10 @@ static void color(guint rgb)
 static void path(double x, double y, double w, double h, double r)
 {
 	r = MIN(r, MIN(w, h) / 2);
+	if (r == 0.) {
+		cairo_rectangle(cr, x, y, w, h);
+		return;
+	}
 	cairo_new_sub_path(cr);
 	cairo_arc(cr, x + w - r, y + r, r, -G_PI_2, 0);
 	cairo_arc(cr, x + w - r, y + h - r, r, 0, G_PI_2);
@@ -398,8 +416,9 @@ enum {
 /* Unread chats are pinned to the rail like Discord's direct-message pills. */
 static struct {
 	Rect box[RAIL_ITEMS];
-	char *id[RAIL_ITEMS];
-	int count;
+	Json *row[RAIL_ITEMS]; /* Borrowed until the chat list changes. */
+	int count, available;
+	gboolean valid;
 } rail_items;
 
 const char *ui_rail_chat_at(int x, int y)
@@ -409,31 +428,40 @@ const char *ui_rail_chat_at(int x, int y)
 		    x < rail_items.box[i].x + rail_items.box[i].w &&
 		    y >= rail_items.box[i].y &&
 		    y < rail_items.box[i].y + rail_items.box[i].h)
-			return rail_items.id[i];
+			return ui_string(rail_items.row[i], "id", "");
 	return NULL;
+}
+
+void ui_forget_rail(void)
+{
+	rail_items.count = 0;
+	rail_items.available = 0;
+	rail_items.valid = FALSE;
 }
 
 static void collect_rail(void)
 {
-	for (int i = 0; i < rail_items.count; i++)
-		g_clear_pointer(&rail_items.id[i], g_free);
 	rail_items.count = 0;
 	if (ui_compact() || !ui.chats)
 		return;
-	size_t count = json_object_array_length(ui.chats);
+	if (!rail_items.valid) {
+		size_t n = json_object_array_length(ui.chats);
 
-	for (size_t i = 0; i < count && rail_items.count < RAIL_ITEMS; i++) {
-		Json *c = json_object_array_get_idx(ui.chats, i);
+		for (size_t i = 0; i < n && rail_items.available < RAIL_ITEMS;
+		     i++) {
+			Json *row = json_object_array_get_idx(ui.chats, i);
 
-		if (json_object_get_int64(ui_field(c, "unread")) <= 0)
-			continue;
-		int y = 76 + rail_items.count * 56;
+			if (json_object_get_int64(ui_field(row, "unread")) > 0)
+				rail_items.row[rail_items.available++] = row;
+		}
+		rail_items.valid = TRUE;
+	}
+	for (int i = 0; i < rail_items.available; i++) {
+		int y = 76 + i * 56;
 
 		if (y + 48 > ui.height - 70)
 			break;
-		rail_items.box[rail_items.count] = (Rect){ 12, y, 48, 48 };
-		rail_items.id[rail_items.count++] =
-			g_strdup(ui_string(c, "id", ""));
+		rail_items.box[rail_items.count++] = (Rect){ 12, y, 48, 48 };
 	}
 }
 
@@ -1078,18 +1106,9 @@ static void rail_button(Rect r, gboolean selected, gboolean unread, guint fill)
 		box(r.x, r.y, r.w, r.h, radius, fill);
 }
 
-static void rail_avatar(Rect r, const char *id)
+static void rail_avatar(Rect r, Json *c)
 {
-	Json *c = NULL;
-
-	for (size_t i = 0; ui.chats && i < json_object_array_length(ui.chats);
-	     i++)
-		if (!g_strcmp0(ui_string(json_object_array_get_idx(ui.chats, i),
-					 "id", ""),
-			       id))
-			c = json_object_array_get_idx(ui.chats, i);
-	if (!c)
-		return;
+	const char *id = ui_string(c, "id", "");
 	gboolean selected = !g_strcmp0(ui.selected, id);
 
 	rail_button(r, selected, TRUE, 0);
@@ -1121,7 +1140,7 @@ static void server_rail(void)
 	chat_mark(home.x + 8, home.y + 8, 32, ACCENT, WHITE);
 	box(24, 68, 24, 2, 1, LINE);
 	for (int i = 0; i < rail_items.count; i++)
-		rail_avatar(rail_items.box[i], rail_items.id[i]);
+		rail_avatar(rail_items.box[i], rail_items.row[i]);
 	if (ui.groups && ui.rail_add.w) {
 		Rect a = ui.rail_add;
 		double hover = strength(HOVER, a, hovered(a));
@@ -1395,6 +1414,7 @@ static void drop_bubble(gpointer data)
 
 void ui_forget_history(void)
 {
+	history_scroll.reusable = FALSE;
 	g_clear_pointer(&cache.rows, g_array_unref);
 	cache.source = NULL;
 	cache.height = 0;
@@ -1402,6 +1422,8 @@ void ui_forget_history(void)
 
 void ui_draw_shutdown(void)
 {
+	ui_gpu_close();
+	ui_forget_rail();
 	ui_forget_labels();
 	ui_forget_history();
 	g_clear_object(&context);
@@ -1595,6 +1617,24 @@ static void prepare_bubbles(Rect area)
 	cache.height += 16;
 }
 
+/* Row bottoms increase monotonically even when media make row heights vary. */
+static guint first_row_at(int pos)
+{
+	guint lo = 0, hi = cache.rows->len;
+
+	while (lo < hi) {
+		guint mid = lo + (hi - lo) / 2;
+		const struct message_layout *r =
+			&g_array_index(cache.rows, struct message_layout, mid);
+
+		if (r->y + r->h <= pos)
+			lo = mid + 1;
+		else
+			hi = mid;
+	}
+	return lo;
+}
+
 static struct message_layout *bubble_at(int x, int y)
 {
 	Rect area = ui.conversation;
@@ -1605,13 +1645,14 @@ static struct message_layout *bubble_at(int x, int y)
 		return NULL;
 	int pos = y - area.y + ui.history_offset;
 
-	for (guint i = 0; i < cache.rows->len; i++) {
-		struct message_layout *r =
-			&g_array_index(cache.rows, struct message_layout, i);
-		if (pos >= r->y && pos < r->y + r->h)
-			return r;
-	}
-	return NULL;
+	guint i = first_row_at(pos);
+
+	if (i == cache.rows->len)
+		return NULL;
+	struct message_layout *r =
+		&g_array_index(cache.rows, struct message_layout, i);
+
+	return pos >= r->y ? r : NULL;
 }
 
 Json *ui_sender_at(int x, int y, Rect *anchor)
@@ -1898,6 +1939,22 @@ Json *ui_rich_area_at(int x, int y, Json **message, int *key)
 	return NULL;
 }
 
+static gboolean history_row_damaged(int top, int height)
+{
+	if (!history_damage.count)
+		return TRUE;
+	int y = top * history_scroll.scale;
+	int end = (top + height) * history_scroll.scale;
+
+	for (int i = 0; i < history_damage.count; i++) {
+		SDL_Rect band = history_damage.bands[i];
+
+		if (y < band.y + band.h && end > band.y)
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static void message_rows(Rect area)
 {
 	prepare_bubbles(area);
@@ -1911,16 +1968,17 @@ static void message_rows(Rect area)
 			    ui_message_at(ui.hover_x, ui.hover_y) :
 			    -1;
 
-	for (guint i = 0; i < cache.rows->len; i++) {
+	for (guint i = first_row_at(ui.history_offset); i < cache.rows->len;
+	     i++) {
 		struct message_layout *r =
 			&g_array_index(cache.rows, struct message_layout, i);
 		int y = area.y + r->y - ui.history_offset,
 		    x = area.x + MESSAGE_LEFT;
 
-		if (y + r->h < area.y)
-			continue;
 		if (y > area.y + area.h)
 			break;
+		if (!history_row_damaged(y - 2, MAX(r->h, r->top + 48) + 4))
+			continue;
 		if (r->date) {
 			int tw;
 
@@ -2233,6 +2291,8 @@ static void chat_view(void)
 gboolean ui_draw_init(void)
 {
 	log_renderer = !g_strcmp0(g_getenv("LINE_RENDER_LOG"), "1");
+	if (ui_gpu_active())
+		return TRUE;
 	if (g_strcmp0(g_getenv("LINE_DISABLE_GPU"), "1")) {
 		int drivers = SDL_GetNumRenderDrivers();
 
@@ -2258,10 +2318,24 @@ gboolean ui_draw_init(void)
 		}
 	}
 	if (ui.renderer) {
-		if (log_renderer) {
-			SDL_RendererInfo info;
+		SDL_RendererInfo info;
 
-			if (!SDL_GetRendererInfo(ui.renderer, &info))
+		canvas_format = SDL_PIXELFORMAT_RGB888;
+		if (!SDL_GetRendererInfo(ui.renderer, &info)) {
+			/* Both formats match Cairo RGB24 in native byte order.
+			 * Vulkan exposes ARGB8888 directly on little-endian Linux.
+			 * Requesting an unsupported XRGB texture here makes SDL
+			 * convert the entire dirty rectangle on every upload.
+			 */
+			for (Uint32 i = 0; i < info.num_texture_formats; i++) {
+				if (info.texture_formats[i] ==
+				    SDL_PIXELFORMAT_ARGB8888) {
+					canvas_format =
+						SDL_PIXELFORMAT_ARGB8888;
+					break;
+				}
+			}
+			if (log_renderer)
 				g_printerr(
 					"LINE renderer: %s on %s, accelerated=%s, vsync=%s\n",
 					info.name, SDL_GetCurrentVideoDriver(),
@@ -2284,6 +2358,9 @@ gboolean ui_draw_init(void)
 
 void ui_draw_reset_renderer(void)
 {
+	history_scroll.reusable = FALSE;
+	history_scroll.origin = 0;
+	history_damage.count = 0;
 	if (ui.renderer) {
 		ui_media_reset_renderer();
 		g_clear_pointer(&canvas_texture, SDL_DestroyTexture);
@@ -2312,6 +2389,20 @@ static SDL_Surface *backing_buffer(int width, int height)
 	return ui.buffer;
 }
 
+static int copy_canvas(void)
+{
+	struct ui_scroll_copy copies[6];
+	SDL_Rect canvas = { 0, 0, ui.buffer->w, ui.buffer->h };
+	int count = ui_scroll_quads(canvas, history_scroll.area,
+				    history_scroll.origin, copies);
+
+	for (int i = 0; i < count; i++)
+		if (SDL_RenderCopy(ui.renderer, canvas_texture, &copies[i].src,
+				   &copies[i].dst))
+			return -1;
+	return 0;
+}
+
 static gboolean present_canvas(void)
 {
 	float sx = (float)ui.buffer->w / ui.width;
@@ -2321,8 +2412,7 @@ static gboolean present_canvas(void)
 	 * rectangles still use window coordinates.
 	 */
 	if (SDL_RenderSetScale(ui.renderer, 1, 1) ||
-	    SDL_RenderSetViewport(ui.renderer, NULL) ||
-	    SDL_RenderCopy(ui.renderer, canvas_texture, NULL, NULL) ||
+	    SDL_RenderSetViewport(ui.renderer, NULL) || copy_canvas() ||
 	    SDL_RenderSetScale(ui.renderer, sx, sy)) {
 		disable_renderer();
 		ui.dirty = TRUE;
@@ -2333,16 +2423,261 @@ static gboolean present_canvas(void)
 	return TRUE;
 }
 
+static int history_uploads(struct ui_scroll_copy spans[8])
+{
+	int count = 0;
+
+	for (int i = 0; i < history_damage.count; i++)
+		count += ui_scroll_slices(history_scroll.area,
+					  history_scroll.origin,
+					  history_damage.bands[i],
+					  spans + count);
+	return count;
+}
+
+static struct gpu_rect gpu_rect(SDL_Rect r)
+{
+	return (struct gpu_rect){ r.x, r.y, r.w, r.h };
+}
+
+static void native_scroll_scene(struct gpu_scene *scene)
+{
+	struct ui_scroll_copy spans[8];
+	SDL_Rect canvas = { 0, 0, scene->width, scene->height };
+
+	if (history_scroll.origin) {
+		scene->copy_count = ui_scroll_quads(canvas, history_scroll.area,
+						    history_scroll.origin,
+						    spans);
+		for (unsigned int i = 0; i < scene->copy_count; i++)
+			scene->copies[i] = (struct gpu_copy){
+				.src = gpu_rect(spans[i].src),
+				.dst = gpu_rect(spans[i].dst),
+			};
+	}
+	scene->upload_count = history_uploads(spans);
+	for (unsigned int i = 0; i < scene->upload_count; i++)
+		scene->uploads[i] = (struct gpu_copy){
+			.src = gpu_rect(spans[i].dst),
+			.dst = gpu_rect(spans[i].src),
+		};
+}
+
+static gboolean present_native(SDL_Rect dirty)
+{
+	struct gpu_scene scene = {
+		.pixels = ui.buffer->pixels,
+		.width = ui.buffer->w,
+		.height = ui.buffer->h,
+		.pitch = ui.buffer->pitch,
+		.damage = { dirty.x, dirty.y, dirty.w, dirty.h },
+	};
+
+	native_scroll_scene(&scene);
+	ui_media_gpu_video(&scene, video_offset);
+	int result = ui_gpu_draw(&scene);
+
+	native_repaint = result <= 0;
+	if (!native_repaint)
+		return TRUE;
+	/* A skipped acquire also skips this frame's texture updates. */
+	history_scroll.reusable = FALSE;
+	history_scroll.origin = 0;
+	history_damage.count = 0;
+	ui.dirty = TRUE;
+	if (!result)
+		return FALSE;
+	/* A Vulkan window cannot provide an SDL2 software window surface. */
+	int x, y, w, h, min_w, min_h;
+	SDL_Window *old = ui.window;
+	Uint32 flags = SDL_GetWindowFlags(old) &
+		       (SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI |
+			SDL_WINDOW_MAXIMIZED);
+
+	SDL_GetWindowPosition(old, &x, &y);
+	SDL_GetWindowSize(old, &w, &h);
+	SDL_GetWindowMinimumSize(old, &min_w, &min_h);
+	SDL_Window *next =
+		SDL_CreateWindow(SDL_GetWindowTitle(old), x, y, w, h, flags);
+
+	ui_gpu_close();
+	ui_draw_reset_renderer();
+	ui_media_reset_renderer();
+	if (next) {
+		ui.window = next;
+		SDL_DestroyWindow(old);
+		SDL_SetWindowMinimumSize(next, min_w, min_h);
+		if (ui_draw_init())
+			return FALSE;
+	}
+	g_printerr("Avernella: could not recover the display: %s\n",
+		   SDL_GetError());
+	ui.quitting = TRUE;
+	return FALSE;
+}
+
 void ui_draw_video(void)
 {
 	int width, height;
 
+	if (ui_gpu_active() && ui.buffer && !native_repaint) {
+		ui_gpu_size(&width, &height);
+		if (width == ui.buffer->w && height == ui.buffer->h) {
+			present_native((SDL_Rect){ 0 });
+			return;
+		}
+	}
 	if (ui.renderer && canvas_texture &&
 	    !SDL_GetRendererOutputSize(ui.renderer, &width, &height) &&
 	    width == ui.buffer->w && height == ui.buffer->h)
 		present_canvas();
 	else
 		ui_draw();
+}
+
+static gboolean reusable_history(SDL_Surface *target, SDL_Rect *pixels)
+{
+	Rect r = ui.conversation;
+
+	if ((!ui.renderer && !ui_gpu_active()) || !ui.connected ||
+	    !ui.selected || !ui.history || !ui_chat_visible() ||
+	    ui_friends_active() || ui_media_layer() ||
+	    ui_profile_toast_visible() || ui.stage_h || ui_emoji_deadline() ||
+	    ui_animation_deadline(g_get_monotonic_time()) || !cache.rows ||
+	    cache.source != ui.history || cache.width != r.w ||
+	    ui.stick_bottom || target->h % ui.height || target->w % ui.width ||
+	    r.h <= 0 || r.y < 0 || r.y + r.h > ui.height || r.x < 0 ||
+	    r.x + r.w > ui.width || (ui.hover_x >= 0 && !hovered(r)) ||
+	    ui.history_offset < 0 ||
+	    ui.history_offset > MAX(0, cache.height - r.h))
+		return FALSE;
+	for (guint i = first_row_at(ui.history_offset); i < cache.rows->len;
+	     i++) {
+		struct message_layout *row =
+			&g_array_index(cache.rows, struct message_layout, i);
+
+		if (row->y >= ui.history_offset + r.h)
+			break;
+		/* These can paint animated pixels, delayed media or tooltips. */
+		if (row->photo || row->video || row->rich || row->flex ||
+		    ui_field(row->message, "emojis"))
+			return FALSE;
+	}
+	int sx = target->w / ui.width, sy = target->h / ui.height;
+
+	*pixels = (SDL_Rect){ r.x * sx, r.y * sy, r.w * sx, r.h * sy };
+	return TRUE;
+}
+
+static void hover_damage(int index)
+{
+	if (index < 0 || (guint)index >= cache.rows->len)
+		return;
+	const struct message_layout *row =
+		&g_array_index(cache.rows, struct message_layout, index);
+	int scale = history_scroll.scale;
+	SDL_Rect band = history_scroll.area;
+
+	band.y += (row->y - ui.history_offset - 2) * scale;
+	band.h = (MAX(row->h, row->top + 48) + 4) * scale;
+	if (SDL_IntersectRect(&history_scroll.area, &band,
+			      &history_damage.bands[history_damage.count]))
+		history_damage.count++;
+}
+
+/* Union the full-width bands before emitting texture copy regions. */
+static void merge_history_bands(void)
+{
+	SDL_Rect *bands = history_damage.bands;
+	int count = history_damage.count;
+
+	for (int i = 1; i < count; i++) {
+		SDL_Rect band = bands[i];
+		int j = i;
+
+		while (j && bands[j - 1].y > band.y) {
+			bands[j] = bands[j - 1];
+			j--;
+		}
+		bands[j] = band;
+	}
+	int used = 1;
+
+	for (int i = 1; i < count; i++) {
+		SDL_Rect *prev = &bands[used - 1];
+
+		if (bands[i].y <= prev->y + prev->h)
+			prev->h =
+				MAX(prev->h, bands[i].y + bands[i].h - prev->y);
+		else
+			bands[used++] = bands[i];
+	}
+	history_damage.count = used;
+}
+
+/* Cairo repaints only the entering scanlines and any changed hover highlight. */
+static gboolean advance_history(SDL_Surface *target, SDL_Rect pixels)
+{
+	SDL_Rect area;
+
+	if (!history_scroll.reusable || !reusable_history(target, &area) ||
+	    !SDL_RectEquals(&pixels, &area) ||
+	    !SDL_RectEquals(&history_scroll.area, &area))
+		return FALSE;
+	int dy = (ui.history_offset - history_scroll.offset) *
+		 history_scroll.scale;
+
+	if (!dy || ABS(dy) >= area.h)
+		return FALSE;
+	history_scroll.origin = (history_scroll.origin + dy + area.h) % area.h;
+	/* The fixed header's antialiased edge touches the first chat row.
+	 * Repair both edges and any edge pixels shifted into the interior.
+	 */
+	int guard = MIN(2 * history_scroll.scale, area.h);
+	SDL_Rect exposed = area, edge = area;
+
+	exposed.h = MIN(area.h, ABS(dy) + guard);
+	edge.h = guard;
+	if (dy > 0)
+		exposed.y += area.h - exposed.h;
+	else
+		edge.y += area.h - guard;
+	history_damage.bands[0] = exposed;
+	history_damage.bands[1] = edge;
+	history_damage.count = 2;
+	int hover = ui_message_at(ui.hover_x, ui.hover_y);
+
+	if (hover != history_scroll.hover) {
+		hover_damage(history_scroll.hover);
+		hover_damage(hover);
+	}
+	merge_history_bands();
+	history_scroll.hover = hover;
+	history_scroll.offset = ui.history_offset;
+	return TRUE;
+}
+
+static int upload_canvas(SDL_Surface *target, SDL_Rect pixels)
+{
+	if (!history_damage.count) {
+		const guint8 *data = (const guint8 *)target->pixels +
+				     (size_t)pixels.y * target->pitch +
+				     pixels.x * 4;
+		return SDL_UpdateTexture(canvas_texture, &pixels, data,
+					 target->pitch);
+	}
+	struct ui_scroll_copy spans[8];
+	int count = history_uploads(spans);
+
+	for (int i = 0; i < count; i++) {
+		const guint8 *data = (const guint8 *)target->pixels +
+				     (size_t)spans[i].dst.y * target->pitch +
+				     spans[i].dst.x * 4;
+		if (SDL_UpdateTexture(canvas_texture, &spans[i].src, data,
+				      target->pitch))
+			return -1;
+	}
+	return 0;
 }
 
 static void draw_frame(const Rect *region)
@@ -2357,7 +2692,18 @@ static void draw_frame(const Rect *region)
 	SDL_Surface *surface = NULL, *target = NULL;
 	gboolean retained = FALSE;
 
-	if (ui.renderer) {
+	if (ui_gpu_active()) {
+		int width, height;
+
+		ui_gpu_size(&width, &height);
+		if (width < 1 || height < 1)
+			return;
+		retained = ui.buffer && ui.buffer->w == width &&
+			   ui.buffer->h == height;
+		target = backing_buffer(width, height);
+		if (!target)
+			return;
+	} else if (ui.renderer) {
 		int width, height;
 
 		if (SDL_GetRendererOutputSize(ui.renderer, &width, &height))
@@ -2372,9 +2718,15 @@ static void draw_frame(const Rect *region)
 				g_clear_pointer(&canvas_texture,
 						SDL_DestroyTexture);
 				canvas_texture = SDL_CreateTexture(
-					ui.renderer, SDL_PIXELFORMAT_RGB888,
-					SDL_TEXTUREACCESS_STREAMING, width,
+					ui.renderer, canvas_format,
+					SDL_TEXTUREACCESS_STATIC, width,
 					height);
+				/* Cairo RGB24's fourth byte is padding. */
+				if (canvas_texture &&
+				    SDL_SetTextureBlendMode(canvas_texture,
+							    SDL_BLENDMODE_NONE))
+					g_clear_pointer(&canvas_texture,
+							SDL_DestroyTexture);
 			}
 			if (canvas_texture)
 				target = backing_buffer(width, height);
@@ -2382,7 +2734,7 @@ static void draw_frame(const Rect *region)
 				disable_renderer();
 		}
 	}
-	if (!ui.renderer) {
+	if (!target && !ui.renderer) {
 		surface = SDL_GetWindowSurface(ui.window);
 		if (!surface)
 			return;
@@ -2410,7 +2762,9 @@ static void draw_frame(const Rect *region)
 	}
 	if (SDL_MUSTLOCK(target) && SDL_LockSurface(target) < 0)
 		return;
-	gboolean partial = region && ui.connected && retained;
+	gboolean gpu = ui.renderer || ui_gpu_active();
+	gboolean partial = region && ui.connected && retained &&
+			   !(ui_gpu_active() && native_repaint);
 	SDL_Rect pixels = { 0, 0, target->w, target->h };
 
 	if (partial) {
@@ -2430,6 +2784,18 @@ static void draw_frame(const Rect *region)
 				   pixels.y;
 		}
 	}
+	history_damage.count = 0;
+	gboolean sparse = partial && gpu && advance_history(target, pixels);
+
+	if (!sparse) {
+		/* An unrelated repaint needs canonical canvas coordinates. */
+		if (history_scroll.origin) {
+			partial = FALSE;
+			pixels = (SDL_Rect){ 0, 0, target->w, target->h };
+		}
+		history_scroll.origin = 0;
+		history_scroll.reusable = FALSE;
+	}
 	cairo_surface_t *image = cairo_image_surface_create_for_data(
 		target->pixels, CAIRO_FORMAT_RGB24, target->w, target->h,
 		target->pitch);
@@ -2437,7 +2803,16 @@ static void draw_frame(const Rect *region)
 	double sx = (double)target->w / ui.width,
 	       sy = (double)target->h / ui.height;
 	if (partial) {
-		cairo_rectangle(cr, pixels.x, pixels.y, pixels.w, pixels.h);
+		if (sparse)
+			for (int i = 0; i < history_damage.count; i++) {
+				SDL_Rect band = history_damage.bands[i];
+
+				cairo_rectangle(cr, band.x, band.y, band.w,
+						band.h);
+			}
+		else
+			cairo_rectangle(cr, pixels.x, pixels.y, pixels.w,
+					pixels.h);
 		cairo_clip(cr);
 	}
 	cairo_scale(cr, sx, sy);
@@ -2516,14 +2891,12 @@ static void draw_frame(const Rect *region)
 		SDL_UnlockSurface(target);
 	gboolean presented;
 
-	if (ui.renderer) {
-		const guint8 *data = (const guint8 *)target->pixels +
-				     (size_t)pixels.y * target->pitch +
-				     pixels.x * 4;
-
+	if (ui_gpu_active()) {
 		video_offset = dy;
-		if (SDL_UpdateTexture(canvas_texture, partial ? &pixels : NULL,
-				      data, target->pitch)) {
+		presented = present_native(pixels);
+	} else if (ui.renderer) {
+		video_offset = dy;
+		if (upload_canvas(target, pixels)) {
 			disable_renderer();
 			ui.dirty = TRUE;
 			return;
@@ -2541,6 +2914,14 @@ static void draw_frame(const Rect *region)
 		if (!presented)
 			presented = !SDL_UpdateWindowSurface(ui.window);
 	}
+	if (gpu && !sparse && presented && painted_chat &&
+	    reusable_history(target, &history_scroll.area)) {
+		history_scroll.scale = target->h / ui.height;
+		history_scroll.offset = ui.history_offset;
+		history_scroll.hover = ui_message_at(ui.hover_x, ui.hover_y);
+		history_scroll.reusable = TRUE;
+	}
+	history_damage.count = 0;
 	if (painted_chat && presented)
 		ui_conversation_presented(ui_friends_active() || layer ||
 					  scrim > 0. || p != 0.);

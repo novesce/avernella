@@ -1,16 +1,57 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 /* Repeatable offline render benchmark. All conversations and profiles are local fixtures. */
 #include "ui_private.h"
+#include "ui_gpu.h"
 #include "ui_motion.h"
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
+
+/* Capture the backbuffer before presentation makes its contents undefined. */
+static guint32 *capture;
+static int capture_pitch;
+
+void __real_SDL_RenderPresent(SDL_Renderer *renderer);
+
+void __wrap_SDL_RenderPresent(SDL_Renderer *renderer)
+{
+	if (capture) {
+		g_assert_cmpint(SDL_RenderReadPixels(renderer, NULL,
+						     SDL_PIXELFORMAT_ARGB8888,
+						     capture, capture_pitch),
+				==, 0);
+		capture = NULL;
+	}
+	__real_SDL_RenderPresent(renderer);
+}
 
 static int compare_us(const void *a, const void *b)
 {
 	gint64 x = *(const gint64 *)a, y = *(const gint64 *)b;
 
 	return (x > y) - (x < y);
+}
+
+static void check_unread_rail(void)
+{
+	Json *first = json_object_array_get_idx(ui.chats, 149);
+
+	g_assert_cmpstr(ui_rail_chat_at(36, 100), ==, "contact-0149");
+	g_assert_cmpstr(ui_rail_chat_at(36, 156), ==, "contact-0299");
+	g_assert_null(ui_rail_chat_at(36, 126));
+
+	json_object_object_add(first, "unread", json_object_new_int(0));
+	ui_forget_rail();
+	ui_layout();
+	g_assert_cmpstr(ui_rail_chat_at(36, 100), ==, "contact-0299");
+
+	SDL_SetWindowSize(ui.window, 920, 220);
+	ui_layout();
+	g_assert_cmpstr(ui_rail_chat_at(36, 100), ==, "contact-0299");
+	g_assert_null(ui_rail_chat_at(36, 156));
+	SDL_SetWindowSize(ui.window, 920, 630);
+	ui_layout();
+	g_assert_cmpstr(ui_rail_chat_at(36, 156), ==, "contact-0449");
 }
 
 int main(void)
@@ -22,8 +63,8 @@ int main(void)
 		    !g_strcmp0(driver, "wayland") ? "1" : "0");
 	if (SDL_Init(SDL_INIT_VIDEO))
 		return 1;
-	ui.window = SDL_CreateWindow("LINE render benchmark", 0, 0, 920, 630,
-				     SDL_WINDOW_SHOWN);
+	ui.window = ui_gpu_window("Avernella renderer benchmark", 0, 0, 920,
+				  630, SDL_WINDOW_SHOWN);
 	if (!ui.window || !ui_draw_init()) {
 		g_printerr("Benchmark display: %s\n", SDL_GetError());
 		return 1;
@@ -48,6 +89,9 @@ int main(void)
 		json_object_object_add(row, "id", json_object_new_string(id));
 		json_object_object_add(row, "name",
 				       json_object_new_string(name));
+		if (i % 150 == 149)
+			json_object_object_add(row, "unread",
+					       json_object_new_int(1 + i % 13));
 		json_object_array_add(ui.chats, row);
 		g_array_append_val(ui.visible, i);
 	}
@@ -92,26 +136,43 @@ int main(void)
 	qsort(durations, FRAMES, sizeof(*durations), compare_us);
 	SDL_RendererInfo renderer;
 	const char *backend =
+		ui_gpu_active() ? "native Vulkan" :
 		ui.renderer && !SDL_GetRendererInfo(ui.renderer, &renderer) ?
-			renderer.name :
-			"window surface";
+				  renderer.name :
+				  "window surface";
 
 	printf("%s (%s) 920x630, %d frames, render+submit p50/p95/p99 = %.3f / %.3f / %.3f ms\n",
 	       SDL_GetCurrentVideoDriver(), backend, FRAMES,
 	       durations[FRAMES / 2] / 1000.,
 	       durations[FRAMES * 95 / 100] / 1000.,
 	       durations[FRAMES * 99 / 100] / 1000.);
-	if (partial) {
-		SDL_Surface *surface = ui.renderer ?
-					       ui.buffer :
-					       SDL_GetWindowSurface(ui.window);
+	if (partial && ui.renderer) {
+		int width, height;
+
+		g_assert_cmpint(SDL_GetRendererOutputSize(ui.renderer, &width,
+							  &height),
+				==, 0);
+		gsize size = (gsize)width * height * sizeof(*capture);
+		g_autofree guint32 *retained = g_malloc(size);
+		g_autofree guint32 *fresh = g_malloc(size);
+
+		capture_pitch = width * sizeof(*capture);
+		ui.history_offset -= 3;
+		capture = retained;
+		ui_draw_region(ui.conversation);
+		g_assert_null(capture);
+		capture = fresh;
+		ui_draw();
+		g_assert_null(capture);
+		g_assert_cmpmem(retained, size, fresh, size);
+	} else if (partial && !ui_gpu_active()) {
+		SDL_Surface *surface = SDL_GetWindowSurface(ui.window);
 
 		g_assert_false(SDL_MUSTLOCK(surface));
 		g_autofree guint8 *snapshot = g_memdup2(
 			surface->pixels, (gsize)surface->pitch * surface->h);
 		ui_draw();
-		surface = ui.renderer ? ui.buffer :
-					SDL_GetWindowSurface(ui.window);
+		surface = SDL_GetWindowSurface(ui.window);
 		for (int y = 0; y < surface->h; y++) {
 			size_t off = (size_t)y * surface->pitch;
 
@@ -122,6 +183,7 @@ int main(void)
 				surface->w * surface->format->BytesPerPixel);
 		}
 	}
+	check_unread_rail();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
 	g_string_free(ui.message.value, TRUE);

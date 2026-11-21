@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vk_frame.h"
+#include "vk_desc_buffer.h"
 #include "line_ui_spirv.h"
 
-VkResult vk_ui_pipeline(const struct vk_ctx *ctx, VkFormat format,
-			VkPipeline *pipeline)
+VkResult vk_ui_pipeline_mode(const struct vk_ctx *ctx, VkFormat format,
+			     bool opaque, VkPipeline *pipeline)
 {
 	VkShaderModuleCreateInfo code[] = {
 		{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
@@ -48,15 +49,26 @@ VkResult vk_ui_pipeline(const struct vk_ctx *ctx, VkFormat format,
 		.mappingCount = 2,
 		.pMappings = mappings,
 	};
+	const VkBool32 mode = opaque;
+	const VkSpecializationMapEntry entry = { .constantID = 0,
+						 .size = sizeof(mode) };
+	const VkSpecializationInfo specialization = {
+		.mapEntryCount = 1,
+		.pMapEntries = &entry,
+		.dataSize = sizeof(mode),
+		.pData = &mode,
+	};
 	VkPipelineShaderStageCreateInfo stages[] = {
 		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
 		  .stage = VK_SHADER_STAGE_VERTEX_BIT,
 		  .module = modules[0],
+		  .pSpecializationInfo = &specialization,
 		  .pName = "main" },
 		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-		  .pNext = &mapping,
+		  .pNext = ctx->descriptor_heap ? &mapping : NULL,
 		  .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 		  .module = modules[1],
+		  .pSpecializationInfo = &specialization,
 		  .pName = "main" },
 	};
 	VkPipelineVertexInputStateCreateInfo vertex = {
@@ -66,7 +78,7 @@ VkResult vk_ui_pipeline(const struct vk_ctx *ctx, VkFormat format,
 	VkPipelineInputAssemblyStateCreateInfo assembly = {
 		.sType =
 			VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO,
-		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,
+		.topology = VK_PRIMITIVE_TOPOLOGY_TRIANGLE_STRIP,
 	};
 	VkPipelineViewportStateCreateInfo viewport = {
 		.sType = VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO,
@@ -84,7 +96,7 @@ VkResult vk_ui_pipeline(const struct vk_ctx *ctx, VkFormat format,
 		.rasterizationSamples = VK_SAMPLE_COUNT_1_BIT,
 	};
 	VkPipelineColorBlendAttachmentState attachment = {
-		.blendEnable = VK_TRUE,
+		.blendEnable = !opaque,
 		.srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
 		.dstColorBlendFactor = VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA,
 		.srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
@@ -118,7 +130,13 @@ VkResult vk_ui_pipeline(const struct vk_ctx *ctx, VkFormat format,
 	};
 	VkGraphicsPipelineCreateInfo info = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-		.pNext = &flags,
+		.pNext = ctx->descriptor_heap ? (void *)&flags :
+						(void *)&rendering,
+		.flags = ctx->descriptor_heap ?
+				 0 :
+				 VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,
+		.layout = ctx->descriptors ? ctx->descriptors->layout :
+					     VK_NULL_HANDLE,
 		.stageCount = 2,
 		.pStages = stages,
 		.pVertexInputState = &vertex,
@@ -138,16 +156,19 @@ finish:
 	return result;
 }
 
-void vk_ui_draw(const struct vk_ctx *ctx, VkCommandBuffer cmd,
-		VkPipeline pipeline, VkImageView target, VkExtent2D extent,
-		const struct ui_push *push, uint32_t count)
+void vk_ui_draw_mode(const struct vk_ctx *ctx, VkCommandBuffer cmd,
+		     VkPipeline pipeline, VkImageView target, VkExtent2D extent,
+		     const struct ui_push *push, uint32_t count,
+		     VkClearColorValue clear, bool discard)
 {
 	VkRenderingAttachmentInfo color = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
 		.imageView = target,
 		.imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-		.loadOp = VK_ATTACHMENT_LOAD_OP_CLEAR,
+		.loadOp = discard ? VK_ATTACHMENT_LOAD_OP_DONT_CARE :
+				    VK_ATTACHMENT_LOAD_OP_CLEAR,
 		.storeOp = VK_ATTACHMENT_STORE_OP_STORE,
+		.clearValue.color = clear,
 	};
 	VkRenderingInfo rendering = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
@@ -163,13 +184,17 @@ void vk_ui_draw(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 	};
 	VkViewport viewport = { 0, 0, extent.width, extent.height, 0, 1 };
 
-	vkCmdBindResourceHeapEXT(cmd, &ctx->resources.bind);
-	vkCmdBindSamplerHeapEXT(cmd, &ctx->samplers.bind);
-	vkCmdPushDataEXT(cmd, &data);
+	if (ctx->descriptor_heap) {
+		vkCmdBindResourceHeapEXT(cmd, &ctx->resources.bind);
+		vkCmdBindSamplerHeapEXT(cmd, &ctx->samplers.bind);
+		vkCmdPushDataEXT(cmd, &data);
+	} else {
+		vk_desc_buffer_bind(ctx, cmd, push);
+	}
 	vkCmdBeginRendering(cmd, &rendering);
 	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	vkCmdSetScissor(cmd, 0, 1, &rendering.renderArea);
-	vkCmdDraw(cmd, 6, count, 0, 0);
+	vkCmdDraw(cmd, 4, count, 0, 0);
 	vkCmdEndRendering(cmd);
 }

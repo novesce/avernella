@@ -16,7 +16,7 @@ J *line_call_share(gboolean enabled, GError **error);
 J *line_voice_hangup(GError **error);
 J *line_voice_mute(gboolean muted, GError **error);
 void line_voice_close(void);
-void line_call_share_socket(int fd);
+void line_call_frame_socket(int fd);
 
 /* Only feed operations from the authenticated account's Talk sync stream. */
 void line_voice_operation(Line *s, J *op);

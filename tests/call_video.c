@@ -678,6 +678,76 @@ static void screen_capture_conversion(void)
 	g_assert_cmpuint(h, ==, 720);
 }
 
+static void software_video_pixels(void)
+{
+	enum {
+		WIDTH = 33,
+		HEIGHT = 5,
+		Y_STRIDE = 41,
+		C_STRIDE = 23
+	};
+	guint8 y[HEIGHT * Y_STRIDE], u[3 * C_STRIDE], v[3 * C_STRIDE];
+	guint32 output[WIDTH * HEIGHT + 2];
+
+	for (size_t i = 0; i < sizeof(y); i++)
+		y[i] = i * 71;
+	for (size_t i = 0; i < sizeof(u); i++) {
+		u[i] = i * 37;
+		v[i] = 255 - i * 57;
+	}
+	for (unsigned int w = 2; w <= WIDTH; w++) {
+		for (int direction = -1; direction <= 1; direction += 2) {
+			struct line_camera_frame frame = {
+				.width = w,
+				.height = HEIGHT,
+				.stride = { direction * Y_STRIDE,
+					    direction * C_STRIDE,
+					    direction * C_STRIDE },
+				.plane = { y + 1, u + 1, v + 1 },
+			};
+
+			if (direction < 0) {
+				frame.plane[0] += (HEIGHT - 1) * Y_STRIDE;
+				frame.plane[1] += (HEIGHT / 2) * C_STRIDE;
+				frame.plane[2] += (HEIGHT / 2) * C_STRIDE;
+			}
+			memset(output, 0xff, sizeof(output));
+			line_camera_xrgb(&frame, output + 1);
+			g_assert_cmphex(output[0], ==, G_MAXUINT32);
+			g_assert_cmphex(output[1 + w * HEIGHT], ==,
+					G_MAXUINT32);
+			for (int row = 0; row < HEIGHT; row++) {
+				const guint8 *luma =
+					frame.plane[0] + row * frame.stride[0];
+				const guint8 *cb = frame.plane[1] +
+						   (row / 2) * frame.stride[1];
+				const guint8 *cr = frame.plane[2] +
+						   (row / 2) * frame.stride[2];
+
+				for (unsigned int x = 0; x < w; x++) {
+					int l = 298 * MAX(luma[x] - 16, 0) +
+						128;
+					int b = cb[x / 2] - 128,
+					    r = cr[x / 2] - 128;
+					guint32 expected =
+						(CLAMP((l + 409 * r) >> 8, 0,
+						       255)
+						 << 16) |
+						(CLAMP((l - 100 * b - 208 * r) >>
+							       8,
+						       0, 255)
+						 << 8) |
+						CLAMP((l + 516 * b) >> 8, 0,
+						      255);
+
+					g_assert_cmphex(output[1 + row * w + x],
+							==, expected);
+				}
+			}
+		}
+	}
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -690,10 +760,13 @@ int main(int argc, char **argv)
 			encrypted_feedback);
 	g_test_add_func("/video/profile-negotiation", negotiation);
 	g_test_add_func("/video/negotiated-stream-reports", negotiated_streams);
-	g_test_add_func("/video/screen-share-roundtrip", screen_share_roundtrip);
+	g_test_add_func("/video/screen-share-roundtrip",
+			screen_share_roundtrip);
 	g_test_add_func("/video/screen-share-official-layout",
 			screen_share_official_layout);
 	g_test_add_func("/video/screen-capture-conversion",
 			screen_capture_conversion);
+	g_test_add_func("/video/software-yuv-conversion",
+			software_video_pixels);
 	return g_test_run();
 }

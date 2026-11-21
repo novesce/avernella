@@ -48,7 +48,7 @@ SOURCES = main pair password_login state thrift transport messaging friends grou
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync tune http_tune
 SOURCES += chat_lists shared_content ui_chat_lists ui_chat_tools ui_shared_content ui_notifications screenshot
 SOURCES += ui_tray video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
-SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise
+SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu
 OBJECTS = $(SOURCES:%=build/%.o)
 GIT_COMMIT := $(if $(wildcard .git),$(shell git rev-parse HEAD 2>/dev/null | cut -c1-7))
 COMMIT_DEFINE := \#define LINE_BUILD_COMMIT "$(or $(GIT_COMMIT),unknown commit)"
@@ -75,7 +75,7 @@ TESTS += build/test-flex-asset build/test-ui-flex
 TESTS += build/test-qr-scan
 TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
-TESTS += build/test-liff build/test-chiptune build/test-denoise
+TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -147,12 +147,14 @@ DATADIR = $(PREFIX)/share
 install:
 	@test -x avernella || { echo "Run make before make install." >&2; exit 1; }
 	install -Dm755 avernella "$(DESTDIR)$(BINDIR)/avernella"
+	if [ -f avernella-vulkan.so ]; then install -Dm644 avernella-vulkan.so "$(DESTDIR)$(LIBEXECDIR)/avernella-vulkan.so"; fi
 	if [ -x avernella-liff ]; then install -Dm755 avernella-liff "$(DESTDIR)$(LIBEXECDIR)/avernella-liff"; fi
 	if [ -x avernella-liff-gtk ]; then install -Dm755 avernella-liff-gtk "$(DESTDIR)$(LIBEXECDIR)/avernella-liff-gtk"; fi
 	install -Dm644 data/avernella.desktop "$(DESTDIR)$(DATADIR)/applications/avernella.desktop"
 	install -Dm644 data/avernella.svg "$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/avernella.svg"
 
 uninstall:
+	rm -f "$(DESTDIR)$(LIBEXECDIR)/avernella-vulkan.so"
 	rm -f "$(DESTDIR)$(BINDIR)/avernella" "$(DESTDIR)$(LIBEXECDIR)/avernella-liff" "$(DESTDIR)$(LIBEXECDIR)/avernella-liff-gtk" \
 		"$(DESTDIR)$(DATADIR)/applications/avernella.desktop" \
 		"$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/avernella.svg"
@@ -192,7 +194,7 @@ build/camera_pixels.o build/screencast.o: CFLAGS += -O3
 # PipeWire's SPA headers use GNU statement expressions.
 build/screencast.o: CFLAGS += -Wno-pedantic
 build/qr_scan.o: CPPFLAGS += $(shell pkg-config --cflags zbar)
-build/test-ui-pixels: tests/ui_pixels.c build/ui_pixels.o
+build/test-ui-pixels: tests/ui_pixels.c build/ui_pixels.o build/ui_gpu_scroll.o
 build/test-ui-motion: tests/ui_motion.c build/ui_motion.o
 build/test-audio: LDFLAGS += -Wl,--wrap=SDL_QueueAudio
 build/test-audio: tests/call_audio.c build/call_audio.o build/call_srtp.o build/call_denoise.o
@@ -235,32 +237,48 @@ build/test-qr-scan: tests/qr_scan.c build/qr_scan.o
 $(TESTS):
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
-build/render-bench: tests/render_bench.c build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
-build/render-bench: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
-build/render-bench: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-build/render-bench: build/ui_sounds.o build/chiptune.o
+build/render-bench: private LDFLAGS += -Wl,--wrap=SDL_RenderPresent
+build/test-ui-scroll-scene: tests/ui_scroll_scene.c
+build/render-bench: tests/render_bench.c build/ui_gpu.o
+build/render-bench build/test-ui-scroll-scene: build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
+build/render-bench build/test-ui-scroll-scene: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
+build/render-bench build/test-ui-scroll-scene: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
+build/render-bench build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o
+build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
 bench: build/render-bench
 	./build/render-bench
 
-# This opt-in target needs the Vulkan 1.4 SDK and volk. Normal builds do
-# not compile shaders or link a Vulkan loader.
+# The main executable loads the native renderer only when opening a window.
 GLSLANG ?= glslangValidator
 SPIRV_VAL ?= spirv-val
-VOLK_DIR ?=
+VOLK_DIR ?= $(if $(wildcard /usr/include/volk.c),/usr/include)
+VK_HEADERS ?=
+VOLK_FLAGS = $(addprefix -I,$(VK_HEADERS) $(VOLK_DIR))
 ifneq ($(VOLK_DIR),)
-VOLK_FLAGS = -I$(VOLK_DIR)
 VOLK_LINK = build/volk.o
 build/volk.o: $(VOLK_DIR)/volk.c $(VOLK_DIR)/volk.h | build
-	$(CC) -O2 $(VOLK_FLAGS) -c $< -o $@
+	$(CC) -Os -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections $(VOLK_FLAGS) -c $< -o $@
 else
 VOLK_LINK = -lvolk
 endif
 
-build/ui_uber.%.spv: src/render/ui_uber.% | build
-	$(GLSLANG) -V -Os --target-env vulkan1.4 $< -o $@
-	$(SPIRV_VAL) --target-env vulkan1.4 $@
+NATIVE_VULKAN ?= auto
+ifeq ($(NATIVE_VULKAN),auto)
+HAVE_NATIVE_VK := $(shell command -v $(GLSLANG) >/dev/null && command -v $(SPIRV_VAL) >/dev/null && \
+	printf '\043include <volk.h>\n\043ifndef VK_EXT_descriptor_heap\n\043error older SDK\n\043endif\nint main(void){return 0;}\n' | \
+	$(CC) $(VOLK_FLAGS) -x c - $(filter -l%,$(VOLK_LINK)) -o /dev/null >/dev/null 2>&1 && echo 1)
+else
+HAVE_NATIVE_VK := $(NATIVE_VULKAN)
+endif
+ifeq ($(HAVE_NATIVE_VK),1)
+all: avernella-vulkan.so
+endif
+
+build/ui_uber.%.spv: src/render/ui_uber.% src/render/ui_limits.h Makefile | build
+	$(GLSLANG) -V -Os --target-env vulkan1.3 $< -o $@
+	$(SPIRV_VAL) --target-env vulkan1.3 $@
 
 build/line_ui_spirv.h: build/ui_uber.vert.spv build/ui_uber.frag.spv
 	@{ for stage in vert frag; do \
@@ -271,13 +289,21 @@ build/line_ui_spirv.h: build/ui_uber.vert.spv build/ui_uber.frag.spv
 	done; } > $@.tmp
 	mv -f $@.tmp $@
 
-VK_SOURCES = src/render/vk_ctx.c src/render/vk_frame.c
+VK_SOURCES = src/render/vk_ctx.c src/render/vk_frame.c src/render/vk_desc_buffer.c
 VK_PREREQS = $(VK_SOURCES) $(wildcard src/render/*.h) build/line_ui_spirv.h $(filter build/%,$(VOLK_LINK))
-build/vulkan-smoke: tests/vulkan_smoke.c src/render/vk_tex.c $(VK_PREREQS)
+build/vulkan-smoke: tests/vulkan_smoke.c src/render/vk_tex.c src/render/vk_canvas.c $(VK_PREREQS)
 	$(CC) $(CFLAGS) $(VOLK_FLAGS) -Isrc -Ibuild $(LDFLAGS) $(LINK_FLAGS) -o $@ $(filter %.c,$^) $(VOLK_LINK) -ldl
 
-build/vulkan-preview: tests/vulkan_preview.c $(VK_PREREQS)
+build/vulkan-preview: tests/vulkan_preview.c src/render/vk_present.c $(VK_PREREQS)
 	$(CC) $(CFLAGS) $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2) $(LDFLAGS) $(LINK_FLAGS) -o $@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2) -ldl
+
+avernella-vulkan.so: src/render/vk_backend.c src/render/vk_backend.map src/render/vk_canvas.c src/render/vk_tex.c src/render/vk_present.c $(VK_PREREQS)
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2) \
+		$(LDFLAGS) -shared -Wl,--exclude-libs,ALL,--gc-sections,-z,defs,-z,relro,-z,now $(STRIP_RELEASE) \
+		-Wl,--version-script=src/render/vk_backend.map \
+		-o build/$@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2) -ldl
+	cp build/$@ $@.tmp
+	mv -f $@.tmp $@
 
 .PHONY: vulkan-smoke vulkan-preview
 vulkan-smoke: build/vulkan-smoke
@@ -290,6 +316,7 @@ check: $(TESTS)
 	@set -e; for test in $(TESTS); do ./$$test; done
 
 clean:
+	$(RM) avernella-vulkan.so build/avernella-vulkan.so
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h avernella
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
 	$(RM) build/vulkan-smoke build/vulkan-preview build/volk.o build/line_ui_spirv.h build/ui_uber.vert.spv build/ui_uber.frag.spv

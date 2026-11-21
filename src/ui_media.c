@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_private.h"
+#include "ui_gpu.h"
 #include "ui_sounds.h"
 #include "ui_profile.h"
 #include "camera.h"
@@ -109,6 +110,7 @@ struct decode_job {
 
 struct call_picture {
 	void *pixels;
+	uint64_t generation;
 	size_t size;
 	struct line_camera_frame frame;
 	SDL_Texture *texture;
@@ -153,8 +155,8 @@ static struct {
 	/* Screen sharing: the peer's stream, ours, and the focused tile. */
 	gboolean peer_sharing, self_sharing, share_working;
 	gboolean share_in_video;
-	gboolean call_working;
-	gint64 share_ended_at;
+	gboolean call_working, preview_paused, window_hidden;
+	gint64 call_frames_since, share_ended_at;
 	int focus;
 	Rect share_button, tile_rect[4];
 	Rect call_minimize;
@@ -192,7 +194,8 @@ static void clear_call_frame(void)
 	clear_picture(&m.share_frame);
 	m.peer_sharing = m.self_sharing = m.share_working = FALSE;
 	m.share_in_video = FALSE;
-	m.share_ended_at = g_get_monotonic_time();
+	m.call_frames_since = m.share_ended_at = g_get_monotonic_time();
+	m.preview_paused = FALSE;
 	m.focus = 0;
 }
 
@@ -330,7 +333,9 @@ static void decoded_free(struct decode_job *job)
 	g_free(job);
 }
 
-static void clear_overlay(void)
+static void sync_call_preview(void);
+
+static void clear_overlay(enum media_mode next)
 {
 	if (m.mode == RECORDING)
 		line_record_cancel();
@@ -339,7 +344,8 @@ static void clear_overlay(void)
 	if (m.recorded)
 		line_record_discard(g_steal_pointer(&m.recorded));
 	m.serial++;
-	m.mode = CLOSED;
+	m.mode = next;
+	sync_call_preview();
 	m.friend_qr = m.avatar_pick = FALSE;
 	if (m.paste)
 		g_unlink(m.paste);
@@ -362,7 +368,7 @@ static void clear_overlay(void)
 
 static void close_overlay(void)
 {
-	clear_overlay();
+	clear_overlay(CLOSED);
 	ui_restore_input();
 }
 
@@ -371,8 +377,7 @@ static void begin(enum media_mode mode, const char *chat, const char *id,
 {
 	g_autofree char *ch = g_strdup(chat), *mid = g_strdup(id),
 			*name = g_strdup(title);
-	clear_overlay();
-	m.mode = mode;
+	clear_overlay(mode);
 	set(&m.chat, ch);
 	set(&m.id, mid);
 	set(&m.title, name);
@@ -1052,13 +1057,13 @@ void ui_media_select_chat(void)
 	if (m.thumbs)
 		g_hash_table_remove_all(m.thumbs);
 	if (m.mode != CALL && !m.friend_qr)
-		clear_overlay();
+		clear_overlay(CLOSED);
 }
 
 void ui_media_reset(void)
 {
 	ui_media_select_chat();
-	clear_overlay();
+	clear_overlay(CLOSED);
 	ui_profile_reset();
 	g_clear_pointer(&m.playback, line_video_play_free);
 	if (m.uploads)
@@ -1140,7 +1145,8 @@ static gboolean play_clip(int fd, gboolean review)
 	m.play_review = review;
 	g_autoptr(GError) error = NULL;
 
-	m.playback = line_video_play(fd, ui.renderer != NULL, clip_finished,
+	m.playback = line_video_play(fd, ui.renderer || ui_gpu_active(),
+				     clip_finished,
 				     GUINT_TO_POINTER(m.play_serial), &error);
 	if (!m.playback) {
 		set(&m.note, error ? error->message :
@@ -1876,7 +1882,7 @@ static void choose_path(void)
 	if (m.avatar_pick) {
 		g_autofree char *chosen = g_strdup(path);
 
-		clear_overlay();
+		clear_overlay(CLOSED);
 		ui_profile_picture_chosen(chosen);
 		return;
 	}
@@ -2085,12 +2091,27 @@ int ui_media_content_height(void)
 	return ui.height - (call_docked() ? CALL_DOCK_HEIGHT : 0);
 }
 
-static void call_preview(gboolean visible)
+static gboolean call_connected(void);
+
+static void sync_call_preview(void)
 {
+	gboolean paused = m.window_hidden || m.mode != CALL;
+
+	if (!m.call_chat || !call_connected() || m.preview_paused == paused)
+		return;
+	m.preview_paused = paused;
+	if (!paused)
+		m.call_frames_since = g_get_monotonic_time();
 	Json *p = args(m.call_chat, NULL);
 
-	json_object_object_add(p, "visible", json_object_new_boolean(visible));
+	json_object_object_add(p, "visible", json_object_new_boolean(!paused));
 	ui_rpc("callPreview", p, m.call_serial);
+}
+
+void ui_media_window_visibility(gboolean visible)
+{
+	m.window_hidden = !visible;
+	sync_call_preview();
 }
 
 static void request_self_frame(const char *chat);
@@ -2100,7 +2121,8 @@ static void show_call(void)
 	if (m.mode == CALL)
 		return;
 	begin(CALL, m.call_chat, NULL, m.call_name);
-	call_preview(TRUE);
+	if (m.window_hidden)
+		return;
 	ui_rpc("callFrame", args(m.call_chat, NULL), m.serial);
 	request_self_frame(m.call_chat);
 }
@@ -2109,7 +2131,6 @@ static void minimize_call(void)
 {
 	if (!call_active() || !g_strcmp0(m.call_state, "incoming"))
 		return;
-	call_preview(FALSE);
 	close_overlay();
 }
 
@@ -2400,9 +2421,12 @@ void ui_media_call_event(Json *p)
 		      json_object_get_boolean(ui_field(p, "canMute")));
 	if (new_call || m.mode == DIAL)
 		begin(CALL, chat, NULL, who);
+	if (newly_connected)
+		sync_call_preview();
 	if (newly_connected || video_changed)
 		set(&m.call_note, ui_string(p, "message", NULL));
-	if (m.mode == CALL && m.video_ready && (newly_connected || video_changed)) {
+	if (m.mode == CALL && !m.window_hidden && m.video_ready &&
+	    (newly_connected || video_changed)) {
 		ui_rpc("callFrame", args(chat, NULL), m.serial);
 		request_self_frame(chat);
 	}
@@ -2425,6 +2449,8 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 				gboolean self, gboolean share,
 				gboolean camera_enabled)
 {
+	if (m.window_hidden)
+		return;
 	if (rotation < 0 || rotation >= 360 || rotation % 90)
 		rotation = 0;
 
@@ -2454,6 +2480,9 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	if (picture->frame.rotation != (unsigned int)rotation)
 		picture->view.w = 0;
 	picture->pixels = pixels;
+	static uint64_t generation;
+
+	picture->generation = ++generation;
 	picture->size = size;
 	line_camera_i420_frame(&picture->frame, pixels, width, height);
 	picture->frame.rotation = rotation;
@@ -2462,7 +2491,8 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 		if (!m.peer_sharing)
 			m.focus = 4;
 		m.peer_sharing = TRUE;
-		if (ui.renderer && picture->view.w > 0 && !first)
+		if ((ui.renderer || ui_gpu_active()) && picture->view.w > 0 &&
+		    !first)
 			ui.video_dirty = TRUE;
 		else
 			ui.dirty = TRUE;
@@ -2478,18 +2508,24 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	}
 	if (first && !g_strcmp0(g_getenv("LINE_CALL_DEBUG"), "1"))
 		g_printerr("line-call video first frame reached window\n");
-	if (ui.renderer && picture->view.w > 0)
+	if ((ui.renderer || ui_gpu_active()) && picture->view.w > 0)
 		ui.video_dirty = TRUE;
 	else
 		ui.dirty = TRUE;
 }
 
-void ui_media_share_frame(const struct line_share_frame *frame, int fd)
+void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
 {
-	if (m.mode == CALL && !g_strcmp0(frame->chat, m.call_chat) &&
-	    frame->decoded_at >= m.share_ended_at)
-		update_call_picture(fd, frame->width, frame->height,
-				    frame->rotation, FALSE, TRUE, FALSE);
+	gboolean self = frame->source == LINE_PREVIEW_SELF;
+	gboolean share = frame->source == LINE_PREVIEW_SCREEN;
+
+	if (m.mode != CALL || g_strcmp0(frame->chat, m.call_chat) ||
+	    frame->decoded_at < m.call_frames_since ||
+	    (share && frame->decoded_at < m.share_ended_at) ||
+	    (self && (!m.camera_enabled || m.share_in_video)))
+		return;
+	update_call_picture(fd, frame->width, frame->height, frame->rotation,
+			    self, share, frame->camera_enabled);
 }
 
 static void video_frame(Json *result, gboolean self, gboolean share)
@@ -2549,7 +2585,7 @@ static gboolean draw_call_frame(struct call_picture *picture, Rect box)
 
 	if (!picture->pixels || box.w <= 0 || box.h <= 0)
 		return FALSE;
-	if (upload_call_frame(picture)) {
+	if (ui_gpu_active() || upload_call_frame(picture)) {
 		gboolean sideways = frame->rotation == 90 ||
 				    frame->rotation == 270;
 		float scale = MIN((float)box.w / (sideways ? frame->height :
@@ -2948,6 +2984,41 @@ void ui_media_present_video(double y_offset)
 	present_picture(&m.call_frame, y_offset);
 	present_picture(&m.self_frame, y_offset);
 	present_picture(&m.share_frame, y_offset);
+}
+
+void ui_media_gpu_video(struct gpu_scene *scene, double y_offset)
+{
+	if (m.mode != CALL ||
+	    !(m.video_call || m.peer_sharing || m.self_sharing))
+		return;
+	const struct call_picture *pics[] = { &m.call_frame, &m.self_frame,
+					      &m.share_frame };
+	float sx = (float)scene->width / ui.width,
+	      sy = (float)scene->height / ui.height;
+
+	for (size_t i = 0; i < G_N_ELEMENTS(pics); i++) {
+		const struct call_picture *pic = pics[i];
+		const struct line_camera_frame *f = &pic->frame;
+		SDL_FRect r = pic->view;
+
+		if (!pic->pixels || r.w <= 0 || r.h <= 0)
+			continue;
+		gboolean side = f->rotation == 90 || f->rotation == 270;
+		float w = side ? r.h : r.w, h = side ? r.w : r.h;
+
+		scene->video[i] = (struct gpu_video){
+			.width = f->width,
+			.height = f->height,
+			.rotation = f->rotation,
+			.generation = pic->generation,
+			.x = (r.x + (r.w - w) / 2) * sx,
+			.y = (r.y + (r.h - h) / 2 + y_offset) * sy,
+			.w = w * sx,
+			.h = h * sy,
+		};
+		memcpy(scene->video[i].plane, f->plane, sizeof(f->plane));
+		memcpy(scene->video[i].stride, f->stride, sizeof(f->stride));
+	}
 }
 
 void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
@@ -3833,7 +3904,7 @@ int ui_media_layer(void)
 
 void ui_media_overlay(void)
 {
-	m.call_frame.view.w = 0;
+	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
 	/* Settings stay behind the avatar picker. */
 	if (ui_profile_active()) {
 		ui_profile_draw();

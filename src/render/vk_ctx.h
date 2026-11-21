@@ -4,6 +4,7 @@
 
 #include "ui_batch.h"
 #include <volk.h>
+#include <stdbool.h>
 
 struct vk_buffer {
 	VkBuffer handle;
@@ -37,6 +38,8 @@ struct vk_ctx {
 	uint32_t family;
 	VkPhysicalDeviceMemoryProperties memory;
 	VkImageLayout texture_layout;
+	bool descriptor_heap, host_image_copy, incremental_present;
+	struct vk_desc_buffer *descriptors;
 	struct vk_heap resources, samplers;
 	uint32_t free_head, free_next[UI_TEXTURE_SLOTS];
 };

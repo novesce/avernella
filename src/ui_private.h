@@ -137,6 +137,7 @@ gboolean ui_header_peer_at(int x, int y, Rect *anchor);
 void ui_draw_icon(Rect r, enum ui_icon icon, guint ink);
 /* Draws a one-pixel focus ring outside r. */
 void ui_draw_focus(Rect r);
+void ui_forget_rail(void);
 /* Rail shortcut under the pointer (an unread chat), or NULL. */
 const char *ui_rail_chat_at(int x, int y);
 /* Index of the message row under the pointer, or -1. */
@@ -254,6 +255,7 @@ gboolean ui_media_event(SDL_Event *e);
 void ui_media_reply(const char *method, Json *params, guint tag, Json *result,
 		    const char *error);
 void ui_media_call_event(Json *packet);
+void ui_media_window_visibility(gboolean visible);
 int ui_media_content_height(void);
 /* Height of the call stage above the selected chat's messages, or 0. */
 int ui_media_stage_height(void);
@@ -261,10 +263,12 @@ int ui_media_stage_height(void);
 void ui_media_chat_shown(void);
 int ui_media_dock_hover(int x, int y);
 void ui_media_draw_call_dock(void);
-struct line_share_frame;
-void ui_media_share_frame(const struct line_share_frame *frame, int fd);
+struct line_preview_frame;
+void ui_media_preview_frame(const struct line_preview_frame *frame, int fd);
 void ui_media_overlay(void);
 void ui_media_present_video(double y_offset);
+struct gpu_scene;
+void ui_media_gpu_video(struct gpu_scene *scene, double y_offset);
 void ui_media_reset_renderer(void);
 void ui_media_thumb(Json *row, Rect area);
 void ui_media_select_chat(void);

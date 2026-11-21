@@ -3,10 +3,12 @@
 #include "camera.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <stdio.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <unistd.h>
 
 static void close_lease(gpointer value)
@@ -45,25 +47,76 @@ static gboolean seal(int fd)
 			     F_SEAL_SEAL) == 0;
 }
 
-gboolean line_media_send_share(int socket, const struct line_share_frame *frame,
+static gboolean write_rows(int fd, struct iovec *rows, guint count, gsize bytes,
+			   off_t offset)
+{
+	ssize_t n;
+
+	do {
+		n = pwritev(fd, rows, count, offset);
+	} while (n < 0 && errno == EINTR);
+	return n == (ssize_t)bytes;
+}
+
+/* Copy decoder rows straight to the memfd. One vector covers a packed plane. */
+static gboolean write_i420(int fd, const struct line_camera_frame *image)
+{
+	struct iovec rows[128];
+	guint count = 0;
+	gsize bytes = 0;
+	off_t offset = 0;
+
+	for (guint i = 0; i < 3; i++) {
+		guint w = i ? (image->width + 1) / 2 : image->width;
+		guint h = i ? (image->height + 1) / 2 : image->height;
+
+		if (image->stride[i] == (int)w) {
+			w *= h;
+			h = 1;
+		}
+		for (guint y = 0; y < h; y++) {
+			rows[count++] = (struct iovec){
+				.iov_base =
+					(void *)(image->plane[i] +
+						 (gssize)y * image->stride[i]),
+				.iov_len = w,
+			};
+			bytes += w;
+			if (count == G_N_ELEMENTS(rows)) {
+				if (!write_rows(fd, rows, count, bytes, offset))
+					return FALSE;
+				offset += bytes;
+				count = 0;
+				bytes = 0;
+			}
+		}
+	}
+	return !count || write_rows(fd, rows, count, bytes, offset);
+}
+
+gboolean line_media_send_frame(int socket,
+			       const struct line_preview_frame *frame,
 			       const struct line_camera_frame *image)
 {
-	gsize size = line_camera_i420_size(image->width, image->height);
-	int fd = memfd_create("line-share", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	struct pollfd pfd = { .fd = socket, .events = POLLOUT };
+	int ready;
+
+	/* The socket carries live previews. Drop early while the UI is behind. */
+	do {
+		ready = poll(&pfd, 1, 0);
+	} while (ready < 0 && errno == EINTR);
+	if (!ready)
+		return socket >= 0;
+	if (ready < 0 || !(pfd.revents & POLLOUT) ||
+	    pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
+		return FALSE;
+	int fd = memfd_create("line-preview", MFD_CLOEXEC | MFD_ALLOW_SEALING);
 
 	if (fd < 0)
 		return FALSE;
 	gboolean sent = FALSE;
 
-	void *map = ftruncate(fd, size) == 0 ?
-			    mmap(NULL, size, PROT_WRITE, MAP_SHARED, fd, 0) :
-			    MAP_FAILED;
-
-	if (map != MAP_FAILED) {
-		line_camera_pack_i420(map, image);
-		munmap(map, size);
-	}
-	if (map != MAP_FAILED && seal(fd)) {
+	if (write_i420(fd, image) && seal(fd)) {
 		union {
 			struct cmsghdr align;
 			char bytes[CMSG_SPACE(sizeof(fd))];
@@ -81,14 +134,21 @@ gboolean line_media_send_share(int socket, const struct line_share_frame *frame,
 		c->cmsg_type = SCM_RIGHTS;
 		c->cmsg_len = CMSG_LEN(sizeof(fd));
 		memcpy(CMSG_DATA(c), &fd, sizeof(fd));
-		sent = sendmsg(socket, &message, MSG_DONTWAIT | MSG_NOSIGNAL) ==
-		       (ssize_t)sizeof(*frame);
+		ssize_t n;
+
+		do {
+			n = sendmsg(socket, &message,
+				    MSG_DONTWAIT | MSG_NOSIGNAL);
+		} while (n < 0 && errno == EINTR);
+		/* A full preview queue can drop this picture. */
+		sent = n == (ssize_t)sizeof(*frame) ||
+		       (n < 0 && errno == EAGAIN);
 	}
 	close(fd);
 	return sent;
 }
 
-int line_media_recv_share(int socket, struct line_share_frame *frame)
+int line_media_recv_frame(int socket, struct line_preview_frame *frame)
 {
 	union {
 		struct cmsghdr align;
@@ -127,6 +187,7 @@ int line_media_recv_share(int socket, struct line_share_frame *frame)
 	}
 	if (n != (ssize_t)sizeof(*frame) || count != 1 ||
 	    (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
+	    frame->source >= LINE_PREVIEW_COUNT ||
 	    frame->chat[sizeof(frame->chat) - 1]) {
 		if (fd >= 0)
 			close(fd);

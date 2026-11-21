@@ -5,8 +5,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define UI_TEXTURE_SLOTS 256
-#define UI_SAMPLER_SLOTS 2
+#include "ui_limits.h"
 #define UI_NO_CLIP UINT32_MAX
 
 enum ui_prim_kind {
@@ -14,7 +13,14 @@ enum ui_prim_kind {
 	UI_PRIM_GLYPH,
 	UI_PRIM_IMAGE,
 	UI_PRIM_DMABUF,
+	UI_PRIM_CANVAS,
+	UI_PRIM_I420,
 };
+
+/* For planar video, color/border_color name the U/V descriptors and the
+ * upper bits of prim_type hold the clockwise display rotation in quarters.
+ */
+#define UI_ROTATION_SHIFT 8
 
 /* Matches the scalar layout in ui_uber.vert. Colors pack R in bits 0–7. */
 struct ui_prim {

@@ -19,6 +19,6 @@ void vk_image_destroy(const struct vk_ctx *ctx, struct vk_image *image);
  * On success its layout is ctx->texture_layout.
  */
 VkResult vk_image_upload(const struct vk_ctx *ctx, const struct vk_image *image,
-			 const void *pixels);
+			 const void *pixels, size_t bytes);
 
 #endif

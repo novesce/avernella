@@ -22,8 +22,8 @@ Avernella is one C program, `avernella`, that runs as two processes, plus an opt
 
 `main()` in [`src/main.c`](../src/main.c) starts the UI unless it was started with `--worker`. The UI ([`src/ui.c`](../src/ui.c) and the `ui_*.c` files) owns the SDL window and everything you see:
 
-- SDL2 (through sdl2-compat on SDL3) creates the window, reads input and presents frames, with Vulkan when it is available and the window surface otherwise.
-- Cairo draws every control into one surface, and Pango shapes and caches text, including Thai and emoji.
+- SDL creates the window and reads input. The native Vulkan module composites it on the GPU. SDL Vulkan and the SDL window surface provide the fallback paths.
+- Cairo and Pango rasterize changed UI content, including Thai and emoji. The native renderer retains the canvas in device memory and draws the UI and video tiles in one instanced batch.
 - Background threads decode JPEG, PNG, WebP and animated PNG, so scrolling never waits for a picture.
 - It talks to the desktop through D-Bus: the StatusNotifier tray ([`ui_tray.c`](../src/ui_tray.c)), notifications ([`ui_notifications.c`](../src/ui_notifications.c)), and the XDG portals for screenshots and screen sharing ([`screenshot.c`](../src/screenshot.c), [`screencast.c`](../src/screencast.c)).
 
@@ -56,7 +56,7 @@ The UI and worker share a `SOCK_STREAM` socketpair carrying one JSON object per 
 
 The UI side runs an I/O thread (`line-ipc`) that writes queued lines when an `eventfd` wakes it and reads replies into SDL user events, so the drawing thread never blocks on the socket.
 
-Pictures don't travel as JSON. The worker writes downloaded bytes into a sealed `memfd` and passes the descriptor over a second `SOCK_SEQPACKET` socket with `SCM_RIGHTS` ([`media_io.c`](../src/media_io.c)). Decode threads in the UI map those bytes directly, without a copy.
+The worker writes call previews directly from the decoder or camera planes into sealed `memfd` files with `pwritev`. It passes each descriptor over a dedicated `SOCK_SEQPACKET` socket with `SCM_RIGHTS`. The window keeps the newest pending frame separately for the peer’s camera, local camera and peer’s screen. Hiding the window or closing the call stage pauses preview transfers while the call continues. Downloaded media uses a separate lease that lets the UI open and map the sealed file. [Media IPC implementation](../src/media_io.c).
 
 ### UI ↔ in-app browser
 

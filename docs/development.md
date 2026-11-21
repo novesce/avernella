@@ -21,26 +21,22 @@ The release build uses `-Oz -flto -fno-plt -fvisibility=hidden`, `--gc-sections`
 
 `avernella` looks for the browser helpers beside its executable and then in `../lib/avernella`, where `make install` puts them. It prefers `avernella-liff` (WPE WebKit) on Wayland and falls back to `avernella-liff-gtk` (WebKitGTK 6.0). Any `PREFIX` works without rebuilding. `make install` also installs `data/avernella.desktop` and `data/avernella.svg`, and the window reports the app ID `avernella`, so desktops match it to that menu entry. The Arch Linux package, `avernella-git`, lives in its own repository, [avernella-pkgbuild](https://github.com/novesce/avernella-pkgbuild), and builds the latest commit of this one.
 
-### Vulkan descriptor-heap prototype
+### Native Vulkan renderer
 
-The opt-in offscreen test builds the C renderer in `src/render/` with GCC and volk. It requires Vulkan headers and volk with `VK_EXT_descriptor_heap` support, glslang and SPIR-V Tools. It embeds the validated shader binaries at build time. With a volk source checkout, pass `VOLK_DIR=/path/to/volk` to build against it.
+The application loads `avernella-vulkan.so` beside the executable or from the installed lib directory. Build it with GCC, recent volk and Vulkan headers that declare descriptor heaps, glslang and SPIR-V Tools. Set `NATIVE_VULKAN=1` to require the module or `NATIVE_VULKAN=0` for an SDL-only build. Set `VOLK_DIR` to build from a volk checkout and `VK_HEADERS` to select a Vulkan-Headers include directory.
 
-```sh
-make vulkan-smoke VK_VENDOR=0x10de
-VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation make vulkan-smoke VK_VENDOR=0x1002
-```
+The renderer chooses a presentation-capable device and probes its features. It tries descriptor heaps first, then descriptor buffers on Vulkan 1.3 or later. Both paths reuse image and sampler descriptors, baked SPIR-V and a single graphics pipeline. The shader uses four vertices per quad, clips before rasterization, and takes short paths for an opaque canvas, glyph masks and I420 video. Two frame slots reuse mapped upload memory. Synchronization2 barriers order texture transfers and fragment reads. [Khronos descriptor heaps](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_descriptor_heap.html) · [Descriptor buffers](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_descriptor_buffer.html) · [Synchronization2](https://docs.vulkan.org/guide/latest/synchronization2.html)
 
-The offscreen test exercises Vulkan 1.4 device selection, shader device addresses, mapped descriptor heaps, host image copy and a single instanced dynamic-rendering draw. It checks rounded fills, borders, glyph coverage, RGBA sampling and clipping by reading back pixels. The render code prefers device-local, host-coherent memory and handles noncoherent mapped memory.
-
-The standalone swapchain preview uses the same pipeline. It logs the GPU, SDL backend, logical and drawable sizes, and the time spent on the host preparing and submitting frames. Pass `--test` for a 60-frame test that resizes twice, hides briefly, and checks that no frames were submitted while hidden. Preview presentation requires `VK_KHR_swapchain_maintenance1`.
+During eligible chat scrolling the renderer keeps history in a circular region of its existing canvas texture. It samples the retained rows in their new positions and uploads the exposed rows and any changed hover highlight. On drivers supporting incremental presentation it can also tell the compositor which window region changed. The compositor chooses how to use that hint. [Khronos incremental presentation](https://docs.vulkan.org/refpages/latest/refpages/source/VK_KHR_incremental_present.html)
 
 ```sh
-VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 \
-    make vulkan-preview VK_VENDOR=0x10de VK_PREVIEW_ARGS=--test
 LINE_RENDER_LOG=1 ./avernella
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation make vulkan-smoke VK_VENDOR=0x10de
+AVERNELLA_VK_DESCRIPTORS=buffer make vulkan-smoke VK_VENDOR=0x1002
+make vulkan-preview VK_PREVIEW_ARGS=--test
 ```
 
-The second command reports production LINE's SDL renderer and any runtime fallback. The descriptor-heap renderer currently serves the standalone preview. Live chat layout, the glyph atlas and WPE DMA-BUF import remain separate integration work.
+The offscreen tests read back rendered pixels. The swapchain test uses the production presenter, resizes the window and checks hidden-window behavior. Use `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` to select a Linux render node on drivers exposing DRM device properties. [Khronos physical device DRM](https://docs.vulkan.org/refpages/latest/refpages/source/VK_EXT_physical_device_drm.html)
 
 ## Tests
 
@@ -96,6 +92,7 @@ make checkpatch CHECKPATCH=/usr/lib/modules/<version>/build/scripts/checkpatch.p
 | `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`, `LINE_SHARE_KBPS` | Cap screen-sharing capture and encoding |
 | `LINE_SHARE_TRANSPORT=presentation` | Send screen sharing as a separate native presentation |
 | `LINE_DISABLE_GPU=1` | Draw through the SDL window surface instead of Vulkan |
+| `AVERNELLA_MAX_FPS=30` | Cap window presentation at 30 frames per second on either renderer. The default follows the display refresh rate. |
 | `LINE_DISABLE_TRAY=1` | Quit when the window closes instead of hiding in the tray |
 | `LINE_REDUCE_MOTION=1` | Turn off animation |
 | `SDL_VIDEODRIVER=x11` | Use X11 instead of Wayland |

@@ -5,6 +5,7 @@
 #include "call_srtp.h"
 #include "call_schema.h"
 #include "call_video.h"
+#include "media_io.h"
 #include "screencast.h"
 #include <sys/timerfd.h>
 #include <arpa/inet.h>
@@ -29,7 +30,7 @@ static gboolean bad_route, video_fixture, voice_fallback, migrate_media;
 static gboolean start_with_camera_off;
 static gboolean share_fixture;
 static gint cameras_opened;
-static int test_camera_fd = -1;
+static int test_camera_fd = -1, preview_fd = -1;
 #define audio_active (g_atomic_int_get(&audio_devices) > 0)
 
 J *line_rpc(Line *s, const char *path, const char *method, J *args, GError **e)
@@ -571,6 +572,52 @@ static void peer_display(const struct line_camera_frame *frame, gpointer data)
 	endpoint->got_frame = TRUE;
 }
 
+static GBytes *direct_video(int *width, int *height, int *rotation,
+			    gboolean *camera_enabled)
+{
+	struct pollfd input = { .fd = preview_fd, .events = POLLIN };
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+	GBytes *remote = NULL;
+	gboolean saw_self = FALSE;
+
+	while (!(remote && saw_self) && g_get_monotonic_time() < end) {
+		struct line_preview_frame msg;
+
+		if (poll(&input, 1, 100) <= 0)
+			continue;
+		int fd = line_media_recv_frame(preview_fd, &msg);
+
+		g_assert_cmpint(fd, >=, 0);
+		g_assert_cmpstr(msg.chat, ==, peer);
+		g_assert_cmpint(msg.decoded_at, >, 0);
+		if (msg.source == LINE_PREVIEW_REMOTE) {
+			gsize size =
+				line_camera_i420_size(msg.width, msg.height);
+			guint8 *pixels = g_malloc(size);
+
+			g_assert_cmpint(read(fd, pixels, size), ==, size);
+			g_clear_pointer(&remote, g_bytes_unref);
+			remote = g_bytes_new_take(pixels, size);
+			*width = msg.width;
+			*height = msg.height;
+			*rotation = msg.rotation;
+			*camera_enabled = msg.camera_enabled;
+		} else {
+			guint8 y;
+
+			g_assert_cmpuint(msg.source, ==, LINE_PREVIEW_SELF);
+			g_assert_cmpuint(msg.width, ==, 160);
+			g_assert_cmpuint(msg.height, ==, 120);
+			g_assert_cmpint(read(fd, &y, 1), ==, 1);
+			g_assert_cmpuint(y, ==, 96);
+			saw_self = TRUE;
+		}
+		close(fd);
+	}
+	g_assert_true(saw_self);
+	return remote;
+}
+
 static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 			   Slice local_material, guint8 pt, gboolean incoming,
 			   gboolean local_camera)
@@ -613,12 +660,19 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	g_assert_true(call_video_encode(video, &frame, g_get_monotonic_time(),
 					send_peer_video, &endpoint, &error));
 	g_assert_no_error(error);
-	expect_event("call_frame u22222222222222222222222222222222");
 	int width = 0, height = 0, rotation = -1;
 	gboolean camera_enabled = FALSE;
 
-	g_autoptr(GBytes) picture = line_call_take_frame(
-		peer, &width, &height, &rotation, &camera_enabled);
+	g_autoptr(GBytes) picture = NULL;
+
+	if (preview_fd >= 0)
+		picture = direct_video(&width, &height, &rotation,
+				       &camera_enabled);
+	else {
+		expect_event("call_frame u22222222222222222222222222222222");
+		picture = line_call_take_frame(peer, &width, &height, &rotation,
+					       &camera_enabled);
+	}
 
 	g_assert_nonnull(picture);
 	g_assert_cmpint(camera_enabled, ==, local_camera);
@@ -668,13 +722,18 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	}
 	g_assert_true(endpoint.got_frame);
 	/* The same captured frames feed the window's local preview. */
-	g_assert_cmpint(g_atomic_int_get(&self_frames), >, 0);
 	g_autoptr(GBytes) self =
 		line_call_take_self_frame(peer, &width, &height);
 
-	g_assert_nonnull(self);
-	g_assert_cmpuint(g_bytes_get_size(self), ==,
-			 line_camera_i420_size(width, height));
+	if (preview_fd >= 0) {
+		g_assert_cmpint(g_atomic_int_get(&self_frames), ==, 0);
+		g_assert_null(self);
+	} else {
+		g_assert_cmpint(g_atomic_int_get(&self_frames), >, 0);
+		g_assert_nonnull(self);
+		g_assert_cmpuint(g_bytes_get_size(self), ==,
+				 line_camera_i420_size(width, height));
+	}
 	call_video_close(video);
 }
 
@@ -1059,9 +1118,21 @@ static void outgoing(void)
 static void video_outgoing(void)
 {
 	if (g_test_subprocess()) {
+		int pair[2];
+
+		g_assert_cmpint(socketpair(AF_UNIX,
+					   SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+					   pair),
+				==, 0);
+		line_call_frame_socket(pair[0]);
+		preview_fd = pair[1];
 		g_unsetenv("LINE_EXPERIMENTAL_VIDEO");
 		video_fixture = TRUE;
 		outgoing();
+		line_call_frame_socket(-1);
+		preview_fd = -1;
+		close(pair[0]);
+		close(pair[1]);
 		return;
 	}
 	g_test_trap_subprocess(NULL, 8000000, 0);

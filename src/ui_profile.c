@@ -1718,6 +1718,11 @@ gboolean ui_profile_panel_click(int x, int y)
 	return FALSE;
 }
 
+gboolean ui_profile_toast_visible(void)
+{
+	return p.toast != NULL;
+}
+
 void ui_profile_toast_draw(void)
 {
 	p.toast_rect = (Rect){ 0 };

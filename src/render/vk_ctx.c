@@ -1,19 +1,23 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vk_ctx.h"
+#include "vk_desc_buffer.h"
+#include "vk_drm.h"
 #include <stdbool.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Include only features used by the descriptor-heap renderer. */
+/* Only the chosen descriptor model enters the device feature chain. */
 struct vk_features {
 	VkPhysicalDeviceFeatures2 core;
 	VkPhysicalDeviceVulkan12Features v12;
 	VkPhysicalDeviceVulkan13Features v13;
 	VkPhysicalDeviceVulkan14Features v14;
 	VkPhysicalDeviceDescriptorHeapFeaturesEXT heap;
+	VkPhysicalDeviceDescriptorBufferFeaturesEXT buffer;
 };
 
-static void feature_chain(struct vk_features *f)
+static void feature_chain(struct vk_features *f, bool v14, bool heap,
+			  bool buffer, void *tail)
 {
 	*f = (struct vk_features){
 		.core = { .sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
@@ -22,17 +26,102 @@ static void feature_chain(struct vk_features *f)
 				 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
 			 .pNext = &f->v13 },
 		.v13 = { .sType =
-				 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-			 .pNext = &f->v14 },
+				 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES },
 		.v14 = { .sType =
-				 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES,
-			 .pNext = &f->heap },
+				 VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_4_FEATURES },
 		.heap = { .sType =
 				  VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_HEAP_FEATURES_EXT },
+		.buffer = { .sType =
+				    VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_DESCRIPTOR_BUFFER_FEATURES_EXT },
 	};
+	if (buffer) {
+		f->buffer.pNext = tail;
+		tail = &f->buffer;
+	}
+	if (heap) {
+		f->heap.pNext = tail;
+		tail = &f->heap;
+	}
+	if (v14) {
+		f->v14.pNext = tail;
+		tail = &f->v14;
+	}
+	f->v13.pNext = tail;
 }
 
-static bool has_extensions(VkPhysicalDevice gpu, bool present)
+struct device_caps {
+	bool heap, buffer, drm, swapchain, incremental;
+	unsigned maintenance;
+};
+
+enum maintenance {
+	MAINTENANCE_KHR = 1,
+	MAINTENANCE_EXT = 2,
+};
+
+/* Both instance extension names may be advertised on a hybrid system even
+ * when one of its physical devices only has the original EXT device name.
+ */
+static VkResult create_instance(struct vk_ctx *ctx,
+				const VkApplicationInfo *app,
+				const struct vk_surface_config *surface,
+				unsigned *maintenance)
+{
+	VkInstanceCreateInfo info = {
+		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
+		.pApplicationInfo = app
+	};
+	if (!surface)
+		return vkCreateInstance(&info, NULL, &ctx->instance);
+	uint32_t count = 0;
+	VkResult result =
+		vkEnumerateInstanceExtensionProperties(NULL, &count, NULL);
+	if (result != VK_SUCCESS)
+		return result;
+	VkExtensionProperties *available = calloc(count, sizeof(*available));
+	const char **names =
+		calloc((size_t)surface->extension_count + 3, sizeof(*names));
+	if (!available || !names) {
+		result = VK_ERROR_OUT_OF_HOST_MEMORY;
+		goto done;
+	}
+	result =
+		vkEnumerateInstanceExtensionProperties(NULL, &count, available);
+	if (result != VK_SUCCESS)
+		goto done;
+	memcpy(names, surface->extensions,
+	       (size_t)surface->extension_count * sizeof(*names));
+	uint32_t n = surface->extension_count;
+	for (uint32_t i = 0; i < count; i++) {
+		const char *name = available[i].extensionName;
+		if (!strcmp(name,
+			    VK_KHR_SURFACE_MAINTENANCE_1_EXTENSION_NAME)) {
+			names[n++] = name;
+			*maintenance |= MAINTENANCE_KHR;
+		} else if (!strcmp(name,
+				   VK_EXT_SURFACE_MAINTENANCE_1_EXTENSION_NAME)) {
+			names[n++] = name;
+			*maintenance |= MAINTENANCE_EXT;
+		} else if (
+			!strcmp(name,
+				VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME)) {
+			names[n++] = name;
+		}
+	}
+	if (!*maintenance) {
+		result = VK_ERROR_EXTENSION_NOT_PRESENT;
+		goto done;
+	}
+	info.enabledExtensionCount = n;
+	info.ppEnabledExtensionNames = names;
+	result = vkCreateInstance(&info, NULL, &ctx->instance);
+done:
+	free(names);
+	free(available);
+	return result;
+}
+
+static bool read_extensions(VkPhysicalDevice gpu, struct device_caps *caps)
 {
 	uint32_t count = 0;
 
@@ -41,7 +130,6 @@ static bool has_extensions(VkPhysicalDevice gpu, bool present)
 	    !count)
 		return false;
 	VkExtensionProperties *extensions = calloc(count, sizeof(*extensions));
-	bool heap = false, swapchain = false, maintenance = false;
 
 	if (extensions &&
 	    vkEnumerateDeviceExtensionProperties(gpu, NULL, &count,
@@ -49,17 +137,28 @@ static bool has_extensions(VkPhysicalDevice gpu, bool present)
 		for (uint32_t i = 0; i < count; i++) {
 			const char *name = extensions[i].extensionName;
 
-			heap |= !strcmp(name,
-					VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
-			swapchain |=
-				!strcmp(name, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
-			maintenance |= !strcmp(
+			caps->heap |= !strcmp(
+				name, VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME);
+			caps->buffer |= !strcmp(
+				name, VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME);
+			caps->drm |= !strcmp(
 				name,
-				VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME);
+				VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
+			caps->swapchain |=
+				!strcmp(name, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
+			caps->incremental |= !strcmp(
+				name,
+				VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME);
+			if (!strcmp(name,
+				    VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
+				caps->maintenance |= MAINTENANCE_KHR;
+			else if (!strcmp(name,
+					 VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
+				caps->maintenance |= MAINTENANCE_EXT;
 		}
 	}
 	free(extensions);
-	return heap && (!present || (swapchain && maintenance));
+	return caps->heap || caps->buffer;
 }
 
 static uint32_t graphics_family(VkPhysicalDevice gpu, VkSurfaceKHR surface)
@@ -90,7 +189,8 @@ static uint32_t graphics_family(VkPhysicalDevice gpu, VkSurfaceKHR surface)
 	return family;
 }
 
-static VkResult pick_gpu(struct vk_ctx *ctx, uint32_t vendor)
+static VkResult pick_gpu(struct vk_ctx *ctx, uint32_t vendor,
+			 unsigned maintenance, const char **swapchain_ext)
 {
 	uint32_t count = 0;
 	VkResult result =
@@ -106,48 +206,81 @@ static VkResult pick_gpu(struct vk_ctx *ctx, uint32_t vendor)
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
 	result = vkEnumeratePhysicalDevices(ctx->instance, &count, devices);
 	if (result == VK_SUCCESS) {
+		const char *mode = getenv("AVERNELLA_VK_DESCRIPTORS");
+		const char *render_node = getenv("AVERNELLA_RENDER_NODE");
+		bool force_buffer = mode && !strcmp(mode, "buffer");
+		bool force_heap = mode && !strcmp(mode, "heap");
+		int best = -1;
 		result = VK_ERROR_FEATURE_NOT_PRESENT;
 		for (uint32_t i = 0; i < count; i++) {
 			VkPhysicalDeviceProperties properties;
-			struct vk_features features;
+			struct device_caps caps = { 0 };
+			struct vk_features f;
 
 			vkGetPhysicalDeviceProperties(devices[i], &properties);
-			if (properties.apiVersion < VK_API_VERSION_1_4 ||
-			    (vendor && vendor != properties.vendorID) ||
-			    !has_extensions(devices[i],
-					    ctx->surface != VK_NULL_HANDLE))
+			bool v14 = properties.apiVersion >= VK_API_VERSION_1_4;
+			bool cpu = properties.deviceType ==
+				   VK_PHYSICAL_DEVICE_TYPE_CPU;
+			if (cpu && ctx->surface && !vendor && !force_heap &&
+			    !force_buffer && (!render_node || !*render_node))
 				continue;
-			VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance = {
+			if (properties.apiVersion < VK_API_VERSION_1_3 ||
+			    (vendor && vendor != properties.vendorID) ||
+			    !read_extensions(devices[i], &caps) ||
+			    !vk_drm_matches(devices[i], render_node,
+					    caps.drm) ||
+			    (ctx->surface &&
+			     (!caps.swapchain ||
+			      !(caps.maintenance & maintenance))))
+				continue;
+			VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR present = {
 				.sType =
 					VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
 			};
-			feature_chain(&features);
-			if (ctx->surface)
-				features.heap.pNext = &maintenance;
-			vkGetPhysicalDeviceFeatures2(devices[i],
-						     &features.core);
-			if (!features.heap.descriptorHeap ||
-			    !features.v12.bufferDeviceAddress ||
-			    !features.v12.scalarBlockLayout ||
-			    !features.v12
-				     .shaderSampledImageArrayNonUniformIndexing ||
-			    !features.v12.timelineSemaphore ||
-			    !features.v13.dynamicRendering ||
-			    !features.v13.synchronization2 ||
-			    !features.v13.shaderDemoteToHelperInvocation ||
-			    !features.v14.hostImageCopy ||
-			    (ctx->surface &&
-			     !maintenance.swapchainMaintenance1))
+			feature_chain(&f, v14, caps.heap, caps.buffer,
+				      ctx->surface ? &present : NULL);
+			vkGetPhysicalDeviceFeatures2(devices[i], &f.core);
+			bool heap = v14 && caps.heap && f.heap.descriptorHeap &&
+				    !force_buffer;
+			VkPhysicalDeviceLimits *limits = &properties.limits;
+			bool buffer =
+				caps.buffer && f.buffer.descriptorBuffer &&
+				!force_heap &&
+				limits->maxPerStageDescriptorSampledImages >=
+					UI_TEXTURE_SLOTS &&
+				limits->maxDescriptorSetSampledImages >=
+					UI_TEXTURE_SLOTS &&
+				limits->maxPerStageResources >=
+					UI_TEXTURE_SLOTS + 1;
+			if ((!heap && !buffer) || !f.v12.bufferDeviceAddress ||
+			    !f.v12.scalarBlockLayout ||
+			    !f.v12.shaderSampledImageArrayNonUniformIndexing ||
+			    !f.v12.timelineSemaphore ||
+			    !f.v13.dynamicRendering ||
+			    !f.v13.synchronization2 ||
+			    !f.v13.shaderDemoteToHelperInvocation ||
+			    (ctx->surface && !present.swapchainMaintenance1))
 				continue;
 			uint32_t family =
 				graphics_family(devices[i], ctx->surface);
-
-			if (family == UINT32_MAX)
+			int score = (cpu ? 0 : 2) + heap;
+			if (family == UINT32_MAX || score <= best)
 				continue;
+			best = score;
 			ctx->gpu = devices[i];
 			ctx->family = family;
+			ctx->descriptor_heap = heap;
+			*swapchain_ext =
+				(caps.maintenance & maintenance &
+				 MAINTENANCE_KHR) ?
+					VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME :
+					VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+			ctx->incremental_present = ctx->surface &&
+						   caps.incremental;
+			ctx->host_image_copy = v14 && f.v14.hostImageCopy;
 			result = VK_SUCCESS;
-			break;
+			if (best == 3)
+				break;
 		}
 	}
 	free(devices);
@@ -380,9 +513,6 @@ static VkResult init_heaps(struct vk_ctx *ctx)
 					      samplers, destinations);
 	if (result == VK_SUCCESS)
 		result = vk_buffer_flush(ctx, &ctx->samplers.buffer);
-	ctx->free_head = 1; /* zero is the persistent glyph atlas */
-	for (uint32_t i = 1; i < UI_TEXTURE_SLOTS; i++)
-		ctx->free_next[i] = i + 1;
 	return result;
 }
 
@@ -437,6 +567,11 @@ void vk_image_slot_free(struct vk_ctx *ctx, uint32_t slot)
 	if (!slot || slot >= UI_TEXTURE_SLOTS ||
 	    ctx->free_next[slot] != UINT32_MAX)
 		return;
+	if (ctx->descriptors) {
+		vkDestroyImageView(ctx->device, ctx->descriptors->view[slot],
+				   NULL);
+		ctx->descriptors->view[slot] = VK_NULL_HANDLE;
+	}
 	ctx->free_next[slot] = ctx->free_head;
 	ctx->free_head = slot;
 }
@@ -448,6 +583,8 @@ VkResult vk_image_slot_write(const struct vk_ctx *ctx, uint32_t slot,
 	if (slot >= UI_TEXTURE_SLOTS ||
 	    (slot && ctx->free_next[slot] != UINT32_MAX))
 		return VK_ERROR_INITIALIZATION_FAILED;
+	if (ctx->descriptors)
+		return vk_desc_buffer_write(ctx, slot, view, layout);
 	VkImageDescriptorInfoEXT image = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_DESCRIPTOR_INFO_EXT,
 		.pView = view,
@@ -478,23 +615,19 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		return result;
 	VkApplicationInfo app = {
 		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-		.pApplicationName = "LINE Vulkan renderer",
-		.apiVersion = VK_API_VERSION_1_4,
+		.pApplicationName = "Avernella",
+		.apiVersion = volkGetInstanceVersion() >= VK_API_VERSION_1_4 ?
+				      VK_API_VERSION_1_4 :
+				      VK_API_VERSION_1_3,
 	};
-	VkInstanceCreateInfo instance = {
-		.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO,
-		.pApplicationInfo = &app,
-	};
-	if (surface) {
-		instance.enabledExtensionCount = surface->extension_count;
-		instance.ppEnabledExtensionNames = surface->extensions;
-	}
+	unsigned instance_maintenance = 0;
+	const char *swapchain_ext = NULL;
 
-	if (volkGetInstanceVersion() < VK_API_VERSION_1_4) {
+	if (volkGetInstanceVersion() < VK_API_VERSION_1_3) {
 		result = VK_ERROR_INCOMPATIBLE_DRIVER;
 		goto fail;
 	}
-	result = vkCreateInstance(&instance, NULL, &ctx->instance);
+	result = create_instance(ctx, &app, surface, &instance_maintenance);
 	if (result != VK_SUCCESS)
 		goto fail;
 	volkLoadInstanceOnly(ctx->instance);
@@ -504,12 +637,19 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		if (result != VK_SUCCESS)
 			goto fail;
 	}
-	result = pick_gpu(ctx, vendor);
+	result = pick_gpu(ctx, vendor, instance_maintenance, &swapchain_ext);
 	if (result != VK_SUCCESS)
 		goto fail;
 	struct vk_features features;
 
-	feature_chain(&features);
+	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+		.swapchainMaintenance1 = VK_TRUE,
+	};
+	feature_chain(&features, ctx->host_image_copy || ctx->descriptor_heap,
+		      ctx->descriptor_heap, !ctx->descriptor_heap,
+		      surface ? &maintenance : NULL);
 	features.v12.bufferDeviceAddress = VK_TRUE;
 	features.v12.scalarBlockLayout = VK_TRUE;
 	features.v12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
@@ -517,15 +657,9 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 	features.v13.dynamicRendering = VK_TRUE;
 	features.v13.synchronization2 = VK_TRUE;
 	features.v13.shaderDemoteToHelperInvocation = VK_TRUE;
-	features.v14.hostImageCopy = VK_TRUE;
-	features.heap.descriptorHeap = VK_TRUE;
-	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance = {
-		.sType =
-			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
-		.swapchainMaintenance1 = VK_TRUE,
-	};
-	if (surface)
-		features.heap.pNext = &maintenance;
+	features.v14.hostImageCopy = ctx->host_image_copy;
+	features.heap.descriptorHeap = ctx->descriptor_heap;
+	features.buffer.descriptorBuffer = !ctx->descriptor_heap;
 	const float priority = 1.0f;
 	VkDeviceQueueCreateInfo queue = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO,
@@ -534,16 +668,20 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		.pQueuePriorities = &priority,
 	};
 	const char *extensions[] = {
-		VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME,
+		ctx->descriptor_heap ? VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME :
+				       VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-		VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
+		swapchain_ext,
+		VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME,
 	};
 	VkDeviceCreateInfo device = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.pNext = &features.core,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &queue,
-		.enabledExtensionCount = surface ? 3 : 1,
+		.enabledExtensionCount = ctx->incremental_present ? 4 :
+					 surface		  ? 3 :
+								    1,
 		.ppEnabledExtensionNames = extensions,
 	};
 
@@ -553,9 +691,20 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 	volkLoadDevice(ctx->device);
 	vkGetDeviceQueue(ctx->device, ctx->family, 0, &ctx->queue);
 	vkGetPhysicalDeviceMemoryProperties(ctx->gpu, &ctx->memory);
-	result = init_texture_layout(ctx);
-	if (result == VK_SUCCESS)
-		result = init_heaps(ctx);
+	if (ctx->host_image_copy) {
+		result = init_texture_layout(ctx);
+		if (result == VK_ERROR_FORMAT_NOT_SUPPORTED)
+			ctx->host_image_copy = false;
+		else if (result != VK_SUCCESS)
+			goto fail;
+	}
+	if (!ctx->host_image_copy)
+		ctx->texture_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+	ctx->free_head = 1; /* zero is the persistent glyph atlas */
+	for (uint32_t i = 1; i < UI_TEXTURE_SLOTS; i++)
+		ctx->free_next[i] = i + 1;
+	result = ctx->descriptor_heap ? init_heaps(ctx) :
+					vk_desc_buffer_open(ctx);
 	if (result == VK_SUCCESS)
 		return result;
 fail:
@@ -567,6 +716,7 @@ void vk_ctx_destroy(struct vk_ctx *ctx)
 {
 	if (ctx->device) {
 		vkDeviceWaitIdle(ctx->device);
+		vk_desc_buffer_close(ctx);
 		vk_buffer_destroy(ctx, &ctx->samplers.buffer);
 		vk_buffer_destroy(ctx, &ctx->resources.buffer);
 		vkDestroyDevice(ctx->device, NULL);

@@ -109,6 +109,16 @@ New messages arrive by long poll. A separate thread keeps one LINE sync request 
 
 The in-app browser is a separate process. It prefers WPE WebKit (`avernella-liff`) on Wayland and falls back to WebKitGTK (`avernella-liff-gtk`) when WPE is unavailable. The client never maps WebKit itself. The browser starts on the first link, with `pidfd_spawn` (clone3 with a pidfd), and exits when its window closes, so it costs no memory otherwise. The client and browser exchange messages over a `SOCK_SEQPACKET` socket, and a thread in the client sleeps in `recv` until the browser has something to say. LINE's tokens travel over that socket, never in arguments or the environment. The browser moves itself and WebKit's processes into a systemd transient scope, its own cgroup v2 leaf, with `MemoryHigh=768M`, `CPUWeight=50` and `IOWeight=50`, so pages can't take memory, CPU or disk time from the chat. WebKit's memory pressure monitor reads that cgroup limit. It raises its `oom_score_adj`, so the kernel reclaims the browser before the client. `PR_SET_PDEATHSIG` ends it with the client. It also sets a 1 ms timer slack, which WebKit's processes inherit, so page timers coalesce into fewer wakeups. Web processes are capped at 512 MB, after which WebKit releases memory or reloads the page, and the network process trims its caches beyond 128 MB. The browser keeps a small memory cache and no back-forward page cache. Its HTTP disk cache and cookies live in `~/.cache/kitatide/liff` and `~/.local/share/kitatide/liff`, so a LIFF app's scripts come from the kernel's page cache on the next visit. Videos wait for a click. WebKit's bubblewrap sandbox stays on.
 
+## Install on Arch Linux or CachyOS
+
+Install [avernella-bin](https://aur.archlinux.org/packages/avernella-bin) from the AUR with an AUR helper.
+
+```sh
+paru -S avernella-bin
+```
+
+On older machines, `AVERNELLA_MAX_FPS=30 avernella` caps window redraws at 30 fps. Chat input, audio and network events continue at their usual rate. The window also suspends rendering while minimized or hidden in the tray.
+
 ## Build and test
 
 Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, and pkg-config. Development libraries include SDL2, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Sharing your screen also needs a running `xdg-desktop-portal` with a ScreenCast backend. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. Video playback and clip review use the system `ffplay` executable. The recording and playback tests use generated audio and video.
@@ -119,6 +129,12 @@ Install the packages on CachyOS or Arch Linux. The first command is enough to bu
 sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat \
   cairo pango glib2 qrencode zbar json-c curl openssl \
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
+```
+
+To build the native Vulkan module too, install the shader tools, recent Vulkan headers and volk. Binary releases include the module. A Vulkan loader and the driver for your GPU are needed at runtime.
+
+```sh
+sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader
 ```
 
 Add WPE WebKit for the in-app browser on Wayland, and WebKitGTK for fallback or X11. WebKit uses bubblewrap and xdg-dbus-proxy for its sandbox.
@@ -165,7 +181,7 @@ GCC builds the stripped release with size optimization and link-time optimizatio
 
 The size-optimized build omits unwind tables. For an unstripped diagnostic build with stack unwinding and debug symbols, run `make clean` followed by `make DEBUG=1`. Clean again before switching back to the release build.
 
-SDL uses Vulkan to present the interface and call video when its Vulkan renderer is available. Cairo draws the interface, and Pango reuses shaped labels and message layouts. Eligible scrolling updates upload only the changed region. Live calls upload planar video to a reusable texture and can present a new picture without redrawing the interface. FFplay also prefers Vulkan when the app uses it. The app falls back to drawing through the SDL window surface when Vulkan is unavailable, including with classic SDL2. Set `LINE_DISABLE_GPU=1` to select that path explicitly.
+The native Vulkan renderer composites the window, scrolls cached chat content and converts planar call video on the GPU. It prefers descriptor heaps and uses descriptor buffers on compatible Vulkan 1.3 drivers. Cairo and Pango rasterize new controls, text and images. The renderer reuses those pixels and uploads changed regions. When the native backend is unavailable, Avernella tries SDL Vulkan and then the software window surface. Use `LINE_RENDER_LOG=1 avernella` to see which path your machine selected.
 
 The client prefers native Wayland in a Wayland session and falls back to X11 if Wayland is unavailable. It uses logical window coordinates for layout and input and draws at the drawable's pixel resolution. To select X11 explicitly, run `SDL_VIDEODRIVER=x11 ./avernella`. On a hybrid NVIDIA laptop with `prime-run` installed, use `SDL_VIDEODRIVER=x11 prime-run ./avernella` to select the NVIDIA GPU through X11 or XWayland.
 

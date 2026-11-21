@@ -32,4 +32,5 @@ gboolean ui_profile_panel_click(int x, int y);
 int ui_profile_panel_hover(int x, int y);
 /* Unseen friend requests and adds, for the Friends badge. */
 int ui_profile_badge(void);
+gboolean ui_profile_toast_visible(void);
 void ui_profile_toast_draw(void);
