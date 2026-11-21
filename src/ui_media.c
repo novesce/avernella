@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_private.h"
+#include "ui_theme.h"
 #include "ui_gpu.h"
 #include "ui_sounds.h"
 #include "ui_profile.h"
@@ -35,11 +36,6 @@
 #include <turbojpeg.h>
 #include <unistd.h>
 #include <webp/decode.h>
-
-enum {
-	WHITE = 0xfbfbfb,
-	MUTED = 0x96979e
-};
 
 enum {
 	THUMB_EDGE = 320,
@@ -1429,7 +1425,7 @@ void ui_media_thumb(Json *row, Rect r)
 					       "Loading image…",
 			      (Rect){ r.x + 8, r.y + r.h / 2 - 10, r.w - 16,
 				      24 },
-			      13, 500, MUTED, FALSE);
+			      13, 500, UI_SUBTLE, FALSE);
 }
 
 cairo_surface_t *ui_avatar(const char *chat, const char *id, const char *key)
@@ -2740,12 +2736,12 @@ void ui_media_draw_fullscreen(void)
 	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
 	ui_draw_box((Rect){ 0, 0, ui.width, ui.height }, 0);
 	if (!picture || !draw_call_frame(picture, area))
-		ui_draw_centered("Waiting for video…", area, 15, 500, 0xdbdee1);
-	ui_draw_box((Rect){ 0, 0, ui.width, FULLSCREEN_BAR_H }, 0x111214);
+		ui_draw_centered("Waiting for video…", area, 15, 500, UI_BODY);
+	ui_draw_box((Rect){ 0, 0, ui.width, FULLSCREEN_BAR_H }, UI_RAIL);
 	if (exit.x > 20)
 		ui_draw_label(name ? name : "Video call",
 			      (Rect){ 12, 10, exit.x - 18, 24 }, 15, 600,
-			      0xf2f3f5, FALSE);
+			      UI_HEADING, FALSE);
 	ui_draw_button(exit, "Exit full screen", FALSE);
 }
 
@@ -2795,23 +2791,25 @@ void ui_media_draw_call_dock(void)
 	Rect open = dock_open();
 	int x = open.x + 44, width = open.w - 52;
 
-	ui_draw_box(dock, 0x18191d);
-	ui_draw_box((Rect){ 0, dock.y, dock.w, 1 }, 0x383a43);
+	ui_draw_box(dock, UI_SIDEBAR);
+	ui_draw_box((Rect){ 0, dock.y, dock.w, 1 }, UI_LINE);
 	if (at(open, ui.hover_x, ui.hover_y))
-		ui_draw_rounded(open, 8, 0x24262d);
+		ui_draw_rounded(open, 8, UI_HOVER);
 	ui_draw_avatar(m.call_name, m.call_chat,
 		       (Rect){ open.x + 5, open.y + 2, 32, 32 });
-	ui_draw_label(m.call_name, (Rect){ x, open.y + 1, width, 16 },
-		      13, 700, 0xf2f3f5, FALSE);
+	ui_draw_label(m.call_name, (Rect){ x, open.y + 1, width, 16 }, 13, 700,
+		      UI_HEADING, FALSE);
 	ui_draw_label(m.self_sharing ? "Sharing screen · Return to call" :
 				       "Return to call",
 		      (Rect){ x, open.y + 18, width, 17 }, 12, 500,
-		      call_connected() ? 0x86d8b0 : 0xb3b5bd, FALSE);
+		      call_connected() ? 0x86d8b0 : UI_MUTED, FALSE);
 	if (m.can_mute && call_connected())
 		ui_draw_round_button(dock_button(2),
 				     m.muted ? UI_GLYPH_MIC_OFF : UI_GLYPH_MIC,
-				     0x2b2d34, 0xf2f3f5,
-				     m.muted ? "Unmute (Alt+M)" : "Mute (Alt+M)");
+				     m.muted ? UI_ACCENT : UI_RAISED,
+				     m.muted ? UI_ON_ACCENT : UI_HEADING,
+				     m.muted ? "Unmute (Alt+M)" :
+					       "Mute (Alt+M)");
 	ui_draw_round_button(dock_button(1), UI_GLYPH_HANG_UP, 0xa52c35,
 			     0xffffff, "Disconnect");
 }
@@ -2830,9 +2828,9 @@ static void live_badge(Rect tile)
 static void draw_expand_button(Rect r)
 {
 	gboolean hover = at(r, ui.hover_x, ui.hover_y);
-	ui_draw_rounded(r, 4, hover ? 0x41434a : 0x2b2d31);
+	ui_draw_rounded(r, 4, hover ? UI_SELECTED : UI_INPUT);
 	if (r.w >= 68) {
-		ui_draw_centered("Full screen", r, 11, 600, 0xf2f3f5);
+		ui_draw_centered("Full screen", r, 11, 600, UI_HEADING);
 	} else {
 		int x = r.x + r.w / 2 - 6, y = r.y + r.h / 2 - 5;
 
@@ -2841,10 +2839,10 @@ static void draw_expand_button(Rect r)
 
 			ui_draw_box((Rect){ x + (right ? 8 : 0), y + bottom * 9,
 					    5, 2 },
-				    0xf2f3f5);
+				    UI_HEADING);
 			ui_draw_box((Rect){ x + right * 11,
 					    y + (bottom ? 6 : 0), 2, 5 },
-				    0xf2f3f5);
+				    UI_HEADING);
 		}
 	}
 	if (hover)
@@ -2856,7 +2854,7 @@ static void call_tile(int index, struct call_picture *picture, const char *name,
 {
 	Rect tile = m.tile_rect[index];
 
-	ui_draw_rounded(tile, 8, 0x1a1a1e);
+	ui_draw_rounded(tile, 8, UI_SIDEBAR);
 	gboolean shown = live && draw_call_frame(picture, tile);
 
 	if (!shown) {
@@ -2884,7 +2882,7 @@ static void call_tile(int index, struct call_picture *picture, const char *name,
 		ui_draw_label(name,
 			      (Rect){ tile.x, tile.y + tile.h + 6, label_w,
 				      20 },
-			      13, 600, 0xdbdee1, FALSE);
+			      13, 600, UI_BODY, FALSE);
 }
 
 /* Incoming calls ring as a small card with green and red buttons. */
@@ -2895,16 +2893,16 @@ static void draw_incoming_card(Rect area)
 
 	ui_draw_rounded((Rect){ card.x - 1, card.y - 1, card.w + 2,
 				card.h + 2 },
-			13, 0x2a2a30);
-	ui_draw_rounded(card, 12, 0x111214);
+			13, UI_LINE);
+	ui_draw_rounded(card, 12, UI_RAIL);
 	ui_draw_avatar(m.call_name ? m.call_name : "", m.call_chat,
 		       (Rect){ card.x + 90, card.y + 32, 80, 80 });
 	ui_draw_centered(m.call_name,
 			 (Rect){ card.x + 16, card.y + 124, card.w - 32, 30 },
-			 20, 700, 0xf2f3f5);
+			 20, 700, UI_HEADING);
 	ui_draw_centered(call_state_label(),
 			 (Rect){ card.x + 16, card.y + 156, card.w - 32, 22 },
-			 14, 500, 0x96979e);
+			 14, 500, UI_SUBTLE);
 	m.secondary = (Rect){ card.x + 54, card.y + 212, 56, 56 };
 	m.primary = (Rect){ card.x + card.w - 110, card.y + 212, 56, 56 };
 	ui_draw_round_button(m.secondary, UI_GLYPH_HANG_UP, 0xda373c, 0xffffff,
@@ -2947,12 +2945,12 @@ static void draw_call_stage(void)
 		ui_draw_centered(m.call_note,
 				 (Rect){ stage.x + 16, stage.y + 10,
 					 stage.w - 104, 24 },
-				 13, 500, 0x96979e);
+				 13, 500, UI_SUBTLE);
 	if (call_active()) {
 		m.call_minimize = (Rect){ stage.x + stage.w - 48,
 					  stage.y + 10, 36, 36 };
 		ui_draw_round_button(m.call_minimize, UI_GLYPH_MINIMIZE,
-				     0x2b2d34, 0xf2f3f5,
+				     UI_RAISED, UI_HEADING,
 				     "Minimize call (Esc)");
 	}
 	int controls_y = stage.y + stage.h - 76;
@@ -3026,15 +3024,15 @@ static void draw_call_stage(void)
 			/* Your own stream: Discord shows a placeholder too. */
 			Rect t = m.tile_rect[2];
 
-			ui_draw_rounded(t, 8, 0x1a1a1e);
+			ui_draw_rounded(t, 8, UI_SIDEBAR);
 			ui_draw_centered("You are sharing your screen",
 					 (Rect){ t.x + 8, t.y + t.h / 2 - 11,
 						 t.w - 16, 22 },
-					 t.h > 80 ? 15 : 11, 600, 0xf2f3f5);
+					 t.h > 80 ? 15 : 11, 600, UI_HEADING);
 			live_badge(t);
 			ui_draw_label("Your screen",
 				      (Rect){ t.x, t.y + t.h + 6, t.w, 20 }, 13,
-				      600, 0xdbdee1, FALSE);
+				      600, UI_BODY, FALSE);
 		}
 		if (m.peer_sharing)
 			call_tile(3, &m.share_frame, peer_screen, m.call_chat,
@@ -3051,7 +3049,7 @@ static void draw_call_stage(void)
 		ui_draw_centered(call_state_label(),
 				 (Rect){ stage.x + 16, cy + 94, stage.w - 32,
 					 22 },
-				 14, 500, 0x96979e);
+				 14, 500, UI_SUBTLE);
 	}
 	/* Controls: camera, screen, microphone, then the disconnect button. */
 	Rect buttons[4];
@@ -3076,22 +3074,22 @@ static void draw_call_stage(void)
 
 	if (call_camera_available()) {
 		m.third = buttons[i++];
-		ui_draw_round_button(m.third,
-				     m.camera_enabled ? UI_GLYPH_CAMERA :
-							UI_GLYPH_CAMERA_OFF,
-				     m.camera_enabled ? 0xf2f3f5 : 0x2b2b30,
-				     m.camera_enabled ? 0x111214 : 0xf2f3f5,
-				     m.camera_enabled ?
-					     "Turn Off Camera (Alt+V)" :
-					     "Turn On Camera (Alt+V)");
+		ui_draw_round_button(
+			m.third,
+			m.camera_enabled ? UI_GLYPH_CAMERA :
+					   UI_GLYPH_CAMERA_OFF,
+			m.camera_enabled ? UI_ACCENT : UI_INPUT,
+			m.camera_enabled ? UI_ON_ACCENT : UI_HEADING,
+			m.camera_enabled ? "Turn Off Camera (Alt+V)" :
+					   "Turn On Camera (Alt+V)");
 	}
 	if (call_share_available()) {
 		m.share_button = buttons[i++];
 		ui_draw_round_button(
 			m.share_button,
 			m.self_sharing ? UI_GLYPH_SCREEN_STOP : UI_GLYPH_SCREEN,
-			m.self_sharing ? 0xf2f3f5 : 0x2b2b30,
-			m.self_sharing ? 0x111214 : 0xf2f3f5,
+			m.self_sharing ? UI_ACCENT : UI_INPUT,
+			m.self_sharing ? UI_ON_ACCENT : UI_HEADING,
 			m.self_sharing ? "Stop Streaming (Alt+S)" :
 					 "Share Your Screen (Alt+S)");
 	}
@@ -3101,14 +3099,14 @@ static void draw_call_stage(void)
 
 		ui_draw_round_button(
 			m.secondary, m.muted ? UI_GLYPH_MIC_OFF : UI_GLYPH_MIC,
-			m.muted ? 0xf2f3f5 : 0x2b2b30,
-			m.muted ? 0x111214 : 0xf2f3f5,
+			m.muted ? UI_ACCENT : UI_INPUT,
+			m.muted ? UI_ON_ACCENT : UI_HEADING,
 			m.muted ? "Unmute (Alt+M)" : "Mute (Alt+M)");
 		/* The label may be wider than its button. */
 		ui_draw_centered(action,
 				 (Rect){ m.secondary.x - 12, m.secondary.y + 58,
 					 m.secondary.w + 24, 18 },
-				 12, 600, 0xf2f3f5);
+				 12, 600, UI_HEADING);
 		m.secondary.h += 20;
 	}
 	if (m.mode == CALL) {
@@ -3118,8 +3116,8 @@ static void draw_call_stage(void)
 	} else if (!m.call_working) {
 		/* A failed dial can be retried or dismissed. */
 		m.secondary = buttons[i++];
-		ui_draw_round_button(m.secondary, UI_GLYPH_CLOSE, 0x2b2b30,
-				     0xf2f3f5, "Cancel");
+		ui_draw_round_button(m.secondary, UI_GLYPH_CLOSE, UI_INPUT,
+				     UI_HEADING, "Cancel");
 		m.primary = buttons[i++];
 		ui_draw_round_button(m.primary, UI_GLYPH_ACCEPT, 0x248046,
 				     0xffffff, "Call Again");
@@ -4250,17 +4248,17 @@ void ui_media_overlay(void)
 		m.primary = (Rect){ 0 };
 		m.secondary = (Rect){ 0 };
 		ui_draw_rounded((Rect){ x - 1, y - 1, width + 2, height + 2 },
-				9, 0x2a2a30);
-		ui_draw_rounded(m.dialog, 8, 0x111214);
+				9, UI_LINE);
+		ui_draw_rounded(m.dialog, 8, UI_RAIL);
 		for (int j = 0; j < count; j++) {
 			Rect r = { m.items.x, m.items.y + j * 34, m.items.w,
 				   32 };
 			if (m.cursor == j)
-				ui_draw_rounded(r, 4, 0x267d72);
+				ui_draw_rounded(r, 4, UI_SELECTED);
 			ui_draw_label(m.mode == MENU ? labels[arr[j]] :
 						       reaction_labels[j],
 				      (Rect){ r.x + 9, r.y + 5, r.w - 15, 25 },
-				      14, 500, WHITE, FALSE);
+				      14, 500, UI_HEADING, FALSE);
 		}
 		return;
 	}
@@ -4283,7 +4281,7 @@ void ui_media_overlay(void)
 	m.primary = (Rect){ 0 };
 	m.secondary = (Rect){ 0 };
 	ui_scrim();
-	ui_draw_box(m.dialog, 0x242429);
+	ui_draw_box(m.dialog, UI_DIALOG);
 	const char *heading =
 		m.mode == PICK ? (m.avatar_pick ? "Choose a profile picture" :
 				  m.friend_qr	? "Read QR image" :
@@ -4301,13 +4299,13 @@ void ui_media_overlay(void)
 					   160 :
 					   40),
 			      35 },
-		      21, 700, WHITE, FALSE);
+		      21, 700, UI_HEADING, FALSE);
 	int bottom = y + h - 55;
 
 	m.primary = (Rect){ x + w - 150, bottom, 130, 36 };
 	m.secondary = (Rect){ x + 20, bottom, 116, 36 };
 	const char *yes = NULL, *no = NULL;
-	guint muted = 0xabacb2;
+	guint muted = UI_MUTED;
 
 	if (m.mode == PICK) {
 		m.path_entry = (Rect){ x + 20, y + 65, w - 85, 38 };
@@ -4326,13 +4324,14 @@ void ui_media_overlay(void)
 			Rect r = { m.items.x, m.items.y + j * 34, m.items.w,
 				   33 };
 			if (m.cursor == m.offset + j)
-				ui_draw_box(r, 0x2c2d32);
+				ui_draw_box(r, UI_SELECTED);
 			ui_draw_label(f->dir ? "▸" : "·",
 				      (Rect){ r.x + 7, r.y + 5, 20, 26 }, 16,
 				      600, muted, FALSE);
 			ui_draw_label(f->name,
 				      (Rect){ r.x + 31, r.y + 5, r.w - 40, 26 },
-				      15, f->dir ? 650 : 400, WHITE, FALSE);
+				      15, f->dir ? 650 : 400, UI_HEADING,
+				      FALSE);
 		}
 		if (!m.save && !m.friend_qr && !m.avatar_pick && ui.files) {
 			m.third = (Rect){ x + w - 132, y + 16, 112, 34 };

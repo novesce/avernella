@@ -1,20 +1,19 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_friends.h"
+#include "ui_theme.h"
 #include <string.h>
 
 enum {
-	INK = 0xefeff1,
-	MUTED = 0xabacb2,
-	BASE = 0x202024,
-	PANEL = 0x242429,
-	DIVIDER = 0x34343b,
-	HEADING = 0xf2f3f5,
-	SUBTLE = 0x96979e,
-	TAB_INK = 0xb5bac1,
-	TAB_HOVER = 0x26262b,
-	TAB_SELECTED = 0x2f3036,
-	GREEN = 0x248046,
-	GREEN_TEXT = 0x2dc770,
+	INK = UI_HEADING,
+	MUTED = UI_MUTED,
+	BASE = UI_BG,
+	PANEL = UI_PANEL,
+	DIVIDER = UI_LINE,
+	HEADING = UI_HEADING,
+	SUBTLE = UI_SUBTLE,
+	TAB_INK = UI_MUTED,
+	TAB_HOVER = UI_HOVER,
+	TAB_SELECTED = UI_SELECTED,
 	/* Discord friend rows: 62 px with a divider between them. */
 	ROW_H = 62,
 	N_TABS = 7
@@ -695,7 +694,7 @@ static void button(Rect r, const char *label, gboolean primary,
 {
 	if (f.focus == id)
 		ui_draw_box((Rect){ r.x - 2, r.y - 2, r.w + 4, r.h + 4 },
-			    0x949cf7);
+			    UI_ACCENT);
 	ui_draw_button(r, label, primary);
 }
 
@@ -718,7 +717,7 @@ static enum friends_control current_tab(void)
 	}
 }
 
-/* Discord's Friends header: title, divider, text tabs and a green Add. */
+/* The Friends header keeps Add Friend visible beside the directory tabs. */
 static void header(int x0, int w)
 {
 	gboolean narrow = w - x0 < 760;
@@ -743,7 +742,7 @@ static void header(int x0, int w)
 		ui_draw_icon((Rect){ x, 12, 24, 24 }, UI_ICON_PEOPLE, SUBTLE);
 		ui_draw_label("Friends", (Rect){ x + 32, 13, 70, 24 }, 16, 600,
 			      HEADING, FALSE);
-		ui_draw_box((Rect){ x + 108, 14, 1, 20 }, 0x3f4147);
+		ui_draw_box((Rect){ x + 108, 14, 1, 20 }, UI_LINE);
 		x += 124;
 	}
 	enum friends_control on = current_tab();
@@ -766,7 +765,7 @@ static void header(int x0, int w)
 		guint ink = selected ? HEADING : hover ? INK : TAB_INK;
 
 		if (add)
-			ui_draw_rounded(r, 4, selected ? BASE : GREEN);
+			ui_draw_rounded(r, 4, selected ? BASE : UI_ACCENT);
 		else if (selected || hover)
 			ui_draw_rounded(r, 4,
 					selected ? TAB_SELECTED : TAB_HOVER);
@@ -774,14 +773,14 @@ static void header(int x0, int w)
 			ui_draw_focus(r);
 		ui_draw_centered(narrow ? tabs[i].short_label : tabs[i].label,
 				 r, narrow ? 14 : 15, 500,
-				 add ? (selected ? GREEN_TEXT : 0xffffff) :
+				 add ? (selected ? UI_ACCENT : UI_ON_ACCENT) :
 				       ink);
 		f.tab[f.tabs] = r;
 		f.tab_id[f.tabs++] = tabs[i].id;
 		x += tw + (narrow ? 6 : 8);
 	}
 	f.top = y == 12 ? 48 : 72;
-	ui_draw_box((Rect){ x0, f.top, w - x0, 1 }, 0x121214);
+	ui_draw_box((Rect){ x0, f.top, w - x0, 1 }, UI_RAIL);
 }
 
 void ui_friends_draw(void)
@@ -941,7 +940,7 @@ void ui_friends_draw(void)
 						      rw - 150, 20 },
 					      14, 500, SUBTLE, FALSE);
 			/* Round actions: message (opens the chat) and more. */
-			guint fill = lit ? 0x111214 : 0x18181b;
+			guint fill = lit ? UI_RAIL : UI_PANEL;
 			Rect more = { r.x + rw - 36, r.y + 13, 36, 36 };
 
 			ui_draw_rounded(more, 18, fill);
@@ -980,7 +979,7 @@ void ui_friends_draw(void)
 			"You can add friends with their LINE ID, phone number or personal link.",
 			(Rect){ rx, t + 50, rw, 22 }, 14, 450, TAB_INK, FALSE);
 		/* One dark strip holds both the field and its button. */
-		ui_draw_rounded((Rect){ rx, t + 86, rw, 50 }, 8, 0x121214);
+		ui_draw_rounded((Rect){ rx, t + 86, rw, 50 }, 8, UI_RAIL);
 		f.entry = (Rect){ rx, t + 86, rw - 136, 50 };
 		ui_draw_edit(&f.query, f.entry, f.focus == FIELD,
 			     "ID, +country code and number, or link");

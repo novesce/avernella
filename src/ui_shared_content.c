@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_shared_content.h"
+#include "ui_theme.h"
 #include "ui_find.h"
 #include "ui_friends.h"
 #include <string.h>
@@ -39,10 +40,10 @@ static struct {
 } view;
 
 enum {
-	PANEL = 0x242429,
-	INK = 0xefeff1,
-	MUTED = 0xabacb2,
-	FOCUS = 0x267d72
+	PANEL = UI_DIALOG,
+	INK = UI_HEADING,
+	MUTED = UI_MUTED,
+	FOCUS = UI_ACCENT
 };
 
 static void set(char **slot, const char *s)
@@ -404,7 +405,7 @@ void ui_shared_draw(void)
 		if (row.y + row.h > bottom)
 			break;
 		if (i == view.index)
-			ui_draw_box(row, 0x383a43);
+			ui_draw_box(row, UI_SELECTED);
 		ui_draw_label(ui_string(r, "title", ""),
 			      (Rect){ row.x + 9, row.y + 5, row.w - 18, 22 },
 			      15, 650, INK, FALSE);

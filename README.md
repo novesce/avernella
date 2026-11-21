@@ -1,5 +1,7 @@
 # Avernella
 
+<img src="data/avernella.png" width="96" height="96" alt="Avernella’s horned anime mascot with a chat bubble">
+
 Avernella is an independent Linux desktop client compatible with LINE personal accounts. It is written in C and runs directly on Linux. Avernella has no affiliation with LY Corporation. The LINE name identifies the service it connects to.
 
 Use of the service is subject to [LY Corporation’s terms](https://www.lycorp.co.jp/en/company/terms/). The client uses LINE’s companion protocol, and LINE controls whether a linked device can connect.
@@ -34,7 +36,7 @@ This installs `avernella` in `/usr/local/bin` and the in-app browser in `/usr/lo
 
 Open **Friends → Add friend** to enter a LINE ID, an international phone number with its country code (such as `+66812345678`), or a personal LINE link. **Read QR image** accepts a saved QR image. Check the returned name and photo, then choose **Add friend**. **My QR code** shows your existing personal link when LINE supplies it. Open a friend to chat even if you've never messaged them. Use the **…** beside a friend for favorites, display names, hiding or blocking. **Friends → Manage** lists hidden and blocked friends so you can restore them.
 
-Use the green **+** in the server rail, or **+** beside **Direct Messages**, to create a group. Name it, select any friends you want to invite, and review the list before creating it. The member list icon in a group's header opens the roster and invitation controls. Select a roster row for member removal or invitation revocation. **Member List → Settings** contains rename, invite link and QR controls, and leave. Available actions depend on group permissions. Choose **Invitations** from the new-group screen to join or decline a group you've been invited to.
+Use the **+** in the server rail, or **+** beside **Direct Messages**, to create a group. Name it, select any friends you want to invite, and review the list before creating it. The member list icon in a group's header opens the roster and invitation controls. Select a roster row for member removal or invitation revocation. **Member List → Settings** contains rename, invite link and QR controls, and leave. Available actions depend on group permissions. Choose **Invitations** from the new-group screen to join or decline a group you've been invited to.
 
 **Friends → Manage** also opens recommendations and your profile. You can edit your display name and status and choose which recommended accounts to add.
 
@@ -91,7 +93,7 @@ Incoming LINE presentations appear in the call stage with a **LIVE** badge and s
 
 Set `LINE_CALL_DEBUG=1` to report video negotiation, call control messages, packet counts every five seconds and first-frame milestones in the terminal.
 
-The main window groups chats in a sidebar and uses a separate rail for shortcuts and unread chats. The dark slate surfaces use a teal accent for primary actions.
+The main window groups chats in a sidebar and uses a separate rail for shortcuts and unread chats. The dark plum theme uses hot pink for primary actions, unread badges and keyboard focus.
 
 ## Sounds
 

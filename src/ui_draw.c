@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_private.h"
 #include "ui_gpu.h"
+#include "ui_logo.h"
 #include "line.h"
 #include "ui_chat_lists.h"
 #include "ui_emoji.h"
@@ -10,34 +11,16 @@
 #include "ui_groups.h"
 #include "ui_gpu_scroll.h"
 #include "ui_motion.h"
+#include "ui_theme.h"
 #include "ui_profile.h"
 #include "flex_asset.h"
 #include <math.h>
 #include <string.h>
 
-#define INK 0xefeff1
-#define MUTED 0x96979e
-#define FOREST 0x1d675e
-#define PAPER 0x1e2b30
-#define LINE 0x29393e
-#define ACCENT 0x267d72
 #define WHITE 0xffffff
-#define MINT 0x29393e
-/* Dark surfaces for the rail, sidebar, chat and raised inputs. */
-#define RAIL 0x10181c
-#define SIDEBAR 0x182429
-#define PANEL 0x162126
-#define INPUT 0x2a393e
-#define BODY 0xdbdee1
-#define HEADING 0xf2f3f5
-#define SUBTLE 0x80848e
-#define ROW_HOVER 0x243339
-#define ROW_SELECTED 0x2d4147
-#define MESSAGE_HOVER 0x1a282d
-#define DANGER 0xf23f43
-#define ONLINE 0x23a55a
 
 static cairo_t *cr;
+static cairo_surface_t *logo;
 static PangoContext *context;
 static gboolean composited_text;
 static SDL_Texture *canvas_texture;
@@ -376,24 +359,24 @@ gint64 ui_animation_deadline(gint64 now_us)
 
 static void active_ring(Rect r)
 {
-	outline((Rect){ r.x - 3, r.y - 3, r.w + 6, r.h + 6 }, 12, 0x949cf7,
-		1.5);
+	outline((Rect){ r.x - 3, r.y - 3, r.w + 6, r.h + 6 }, 12,
+		UI_ACCENT_HOVER, 1.5);
 }
 
 static void action(Rect r, const char *s, gboolean solid, gboolean focus)
 {
 	double h = strength(HOVER, r, hovered(r));
-	/* Discord buttons: brand-filled primary, flat gray secondary. */
-	guint bg =
-		blend(solid ? ACCENT : 0x3e3f46, solid ? FOREST : 0x4b4c54, h);
+	/* Dark lettering keeps the hot-pink primary button readable. */
+	guint bg = blend(solid ? UI_ACCENT : UI_RAISED,
+			 solid ? UI_ACCENT_HOVER : UI_SELECTED, h);
 
 	box(r.x, r.y, r.w, r.h, 8, bg);
-	centered(s, r, 14, 500, WHITE);
+	centered(s, r, 14, 600, solid ? UI_ON_ACCENT : UI_HEADING);
 	double f = strength(FOCUSED, r, focus && ui.active);
 
 	if (f > 0.)
 		outline((Rect){ r.x - 3, r.y - 3, r.w + 6, r.h + 6 }, 12,
-			blend(PAPER, 0x949cf7, f), 1.5);
+			blend(UI_BG, UI_ACCENT_HOVER, f), 1.5);
 }
 
 static int rail_w(void)
@@ -487,10 +470,17 @@ static int sign_in_body(void)
 	return ui.email_login && !ui.authenticating ? 136 : 0;
 }
 
+/* Reserve the portrait and its gap only on the sign-in welcome card. */
+static int sign_in_portrait_height(void)
+{
+	return !ui.email_login && !ui.authenticating && !ui.pin && !ui.qr ?
+		       UI_LOGO_EDGE + 12 : 0;
+}
+
 static Rect sign_card(void)
 {
 	int w = MIN(480, ui.width - 32), pad = ui_compact() ? 24 : 32;
-	int h = 2 * pad + 88 + sign_in_body() + 44;
+	int h = 2 * pad + sign_in_portrait_height() + 88 + sign_in_body() + 44;
 
 	if (!ui.authenticating)
 		h += 102;
@@ -508,7 +498,8 @@ void ui_layout(void)
 	Rect card = sign_card();
 	int pad = ui_compact() ? 24 : 32;
 
-	int form = card.y + pad + 88, inner = card.w - 2 * pad;
+	int form = card.y + pad + sign_in_portrait_height() + 88;
+	int inner = card.w - 2 * pad;
 
 	ui.login = (Rect){ card.x + pad, form + sign_in_body(), inner, 44 };
 	ui.login_mode = (Rect){ card.x + pad, ui.login.y + 54, inner, 34 };
@@ -629,27 +620,6 @@ void ui_layout(void)
 	}
 }
 
-static void chat_mark(double x, double y, double s, guint fill, guint ink)
-{
-	cairo_save(cr);
-	cairo_translate(cr, x, y);
-	cairo_scale(cr, s / 40., s / 40.);
-	box(0, 0, 40, 40, 10, fill);
-	color(ink);
-	cairo_set_line_width(cr, 2.5);
-	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
-	cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
-	cairo_move_to(cr, 10, 13);
-	cairo_line_to(cr, 21, 13);
-	cairo_line_to(cr, 30, 21);
-	cairo_line_to(cr, 21, 29);
-	cairo_line_to(cr, 10, 29);
-	cairo_line_to(cr, 19, 21);
-	cairo_close_path(cr);
-	cairo_stroke(cr);
-	cairo_restore(cr);
-}
-
 static void draw_editor(Editor *edit, Rect r, gboolean focus,
 			const char *placeholder);
 
@@ -688,22 +658,26 @@ static void sign_in(void)
 	Rect card = sign_card();
 	int pad = ui_compact() ? 24 : 32, inner = card.w - 2 * pad;
 
-	box(0, 0, w, h, 0, RAIL);
+	box(0, 0, w, h, 0, UI_RAIL);
 	/* Draw the background rings at the current window size. */
-	color(0x1b292f);
+	color(UI_PANEL);
 	cairo_set_line_width(cr, 1);
 	for (int i = 0; i < 6; i++) {
 		cairo_new_path(cr);
 		cairo_arc(cr, w / 2., h / 2., 260 + i * 90, 0, 2 * G_PI);
 		cairo_stroke(cr);
 	}
-	if (!ui_compact()) {
-		chat_mark(28, 24, 32, ACCENT, WHITE);
-		text("Avernella", 68, 26, 200, 22, 800, WHITE, FALSE);
-	}
-	box(card.x - 1, card.y - 1, card.w + 2, card.h + 2, 13, 0x2a393e);
-	box(card.x, card.y, card.w, card.h, 12, 0x213137);
+	box(card.x - 1, card.y - 1, card.w + 2, card.h + 2, 13, UI_LINE);
+	box(card.x, card.y, card.w, card.h, 12, UI_DIALOG);
 	int y = card.y + pad;
+	int portrait = sign_in_portrait_height();
+
+	if (portrait) {
+		ui_draw_image(logo, (Rect){ card.x + (card.w - UI_LOGO_EDGE) / 2,
+					    y, UI_LOGO_EDGE, UI_LOGO_EDGE });
+		y += portrait;
+	}
+
 	const char *heading = ui.qr	     ? "Log in with QR code" :
 			      ui.pin	     ? "Verify this device" :
 			      ui.email_login ? "Connect your LINE account" :
@@ -715,9 +689,9 @@ static void sign_in(void)
 				 "Independent desktop client for LINE.";
 
 	centered(heading, (Rect){ card.x + pad, y, inner, 34 }, 24, 700,
-		 HEADING);
+		 UI_HEADING);
 	y += 40;
-	centered(sub, (Rect){ card.x + pad, y, inner, 24 }, 16, 400, 0xb5bac1);
+	centered(sub, (Rect){ card.x + pad, y, inner, 24 }, 16, 400, UI_MUTED);
 	y += 48;
 	if (ui.qr) {
 		int step = qr_step(), side = qr_pixels();
@@ -737,15 +711,15 @@ static void sign_in(void)
 		if (ui.notice && *ui.notice)
 			centered(ui.notice,
 				 (Rect){ card.x + pad, y, inner, 40 }, 14, 450,
-				 MUTED);
+				 UI_MUTED);
 	} else if (ui.pin) {
 		centered(ui.pin, (Rect){ card.x + pad, y, inner, 56 }, 44, 800,
-			 HEADING);
+			 UI_HEADING);
 		y += 64;
 		if (ui.notice && *ui.notice)
 			centered(ui.notice,
 				 (Rect){ card.x + pad, y, inner, 40 }, 14, 450,
-				 MUTED);
+				 UI_MUTED);
 	} else if (ui.email_login && !ui.authenticating) {
 		char masked[3 * LINE_CREDENTIAL_LIMIT + 1];
 		GString buffer = { .str = masked,
@@ -753,11 +727,11 @@ static void sign_in(void)
 		Editor mask = password_mask(&buffer);
 
 		text("Email address", ui.email_box.x, ui.email_box.y - 20,
-		     inner, 13, 600, INK, FALSE);
+		     inner, 13, 600, UI_HEADING, FALSE);
 		draw_editor(&ui.login_email, ui.email_box,
 			    ui.focus == F_LOGIN_EMAIL, "");
 		text("Password", ui.password_box.x, ui.password_box.y - 20,
-		     inner, 13, 600, INK, FALSE);
+		     inner, 13, 600, UI_HEADING, FALSE);
 		draw_editor(&mask, ui.password_box,
 			    ui.focus == F_LOGIN_PASSWORD, "");
 		ui.login_password.scroll = mask.scroll;
@@ -777,11 +751,11 @@ static void sign_in(void)
 		bottom = ui.login_mode.y + ui.login_mode.h + 12;
 	}
 	if (!ui.qr && !ui.pin && ui.notice && *ui.notice)
-		text(ui.notice, card.x + pad, bottom, inner, 13, 550, INK,
-		     TRUE);
+		text(ui.notice, card.x + pad, bottom, inner, 13, 550,
+		     UI_HEADING, TRUE);
 	else if (!ui.authenticating)
 		text("Approving a new desktop session may sign you out on another desktop.",
-		     card.x + pad, bottom, inner, 12, 400, SUBTLE, TRUE);
+		     card.x + pad, bottom, inner, 12, 400, UI_SUBTLE, TRUE);
 }
 
 static int caret_x(PangoLayout *layout, int index)
@@ -829,12 +803,13 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 
 	/* The composer draws its own rounded bar around the message field. */
 	if (edit == &ui.search) {
-		box(r.x, r.y, r.w, r.h, 6, RAIL);
+		box(r.x, r.y, r.w, r.h, 6, UI_RAIL);
 		if (focus_amount > 0.)
-			outline(r, 6, blend(RAIL, ACCENT, focus_amount), 1.);
+			outline(r, 6, blend(UI_RAIL, UI_ACCENT, focus_amount),
+				1.);
 	} else if (edit != &ui.message) {
-		box(r.x, r.y, r.w, r.h, 8, RAIL);
-		outline(r, 8, blend(0x2a393e, ACCENT, focus_amount), 1.);
+		box(r.x, r.y, r.w, r.h, 8, UI_RAIL);
+		outline(r, 8, blend(UI_INPUT, UI_ACCENT, focus_amount), 1.);
 	}
 	int pad = edit_padding(edit);
 
@@ -879,22 +854,22 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 		text(placeholder, ox, top + (edit == &ui.search ? 1 : 0), width,
 		     edit == &ui.search ? 14 : 15,
 		     edit == &ui.search ? 500 : 400,
-		     edit == &ui.search ? SUBTLE : MUTED, FALSE);
+		     edit == &ui.search ? UI_SUBTLE : UI_MUTED, FALSE);
 	else {
 		if (focus && !composing && from != to) {
 			int a = caret_x(item, from), b = caret_x(item, to);
 
 			box(origin + MIN(a, b), top, ABS(b - a), height, 2,
-			    0x48518b);
+			    UI_TEXT_SELECTION);
 		}
-		paint(item, origin, top, INK);
+		paint(item, origin, top, UI_HEADING);
 		if (composing)
 			line(origin + caret_x(item, from), top + height - 1,
-			     origin + pos, top + height - 1, ACCENT, 1.5);
+			     origin + pos, top + height - 1, UI_ACCENT, 1.5);
 	}
 	if (focus && ui.active) {
-		line(origin + pos, top + 1, origin + pos, top + height - 1, INK,
-		     1);
+		line(origin + pos, top + 1, origin + pos, top + height - 1,
+		     UI_HEADING, 1);
 		/* Anchor the IME candidate popover to the caret, including horizontal scrolling. */
 		static SDL_Rect last_ime;
 		SDL_Rect caret = { CLAMP(origin + pos, ox, ox + width), top, 1,
@@ -1007,9 +982,9 @@ static void draw_tooltip(Rect anchor, const char *s, gboolean right)
 				   anchor.y + anchor.h + 6, tw + 24, 34 };
 
 	tip.x = CLAMP(tip.x, 4, MAX(4, ui.width - tip.w - 4));
-	box(tip.x, tip.y, tip.w, tip.h, 8, RAIL);
-	outline(tip, 8, 0x2a393e, 1);
-	paint(t, tip.x + 12, tip.y + (tip.h - th) / 2, HEADING);
+	box(tip.x, tip.y, tip.w, tip.h, 8, UI_RAIL);
+	outline(tip, 8, UI_INPUT, 1);
+	paint(t, tip.x + 12, tip.y + (tip.h - th) / 2, UI_HEADING);
 }
 
 /* Draws the tooltip requested in the layer just drawn, where it was asked. */
@@ -1102,7 +1077,8 @@ static void rail_button(Rect r, gboolean selected, gboolean unread, guint fill)
 				0;
 
 	if (pill)
-		box(-4, r.y + (r.h - pill) / 2, 8, pill, 4, WHITE);
+		box(-4, r.y + (r.h - pill) / 2, 8, pill, 4,
+		    selected ? UI_ACCENT : UI_BODY);
 	if (fill)
 		box(r.x, r.y, r.w, r.h, radius, fill);
 }
@@ -1123,9 +1099,9 @@ static void rail_avatar(Rect r, Json *c)
 	int bw = unread < 10 ? 16 : unread < 100 ? 22 : 28;
 	Rect b = { r.x + r.w - bw + 4, r.y + r.h - 16 + 4, bw, 16 };
 
-	box(b.x - 4, b.y - 4, b.w + 8, b.h + 8, 12, RAIL);
-	box(b.x, b.y, b.w, b.h, 8, DANGER);
-	centered(count, b, 12, 700, WHITE);
+	box(b.x - 4, b.y - 4, b.w + 8, b.h + 8, 12, UI_RAIL);
+	box(b.x, b.y, b.w, b.h, 8, UI_ACCENT);
+	centered(count, b, 12, 700, UI_ON_ACCENT);
 	if (hovered(r))
 		tooltip(r, ui_string(c, "name", id), TRUE);
 }
@@ -1134,21 +1110,22 @@ static void server_rail(void)
 {
 	int h = ui.height;
 
-	box(0, 0, rail_w(), h, 0, RAIL);
+	box(0, 0, rail_w(), h, 0, UI_RAIL);
 	Rect home = { 12, 12, 48, 48 };
 
-	rail_button(home, TRUE, FALSE, ACCENT);
-	chat_mark(home.x + 8, home.y + 8, 32, ACCENT, WHITE);
-	box(24, 68, 24, 2, 1, LINE);
+	rail_button(home, TRUE, FALSE, UI_SELECTED);
+	ui_draw_image(logo, (Rect){ home.x + 2, home.y + 2, 44, 44 });
+	box(24, 68, 24, 2, 1, UI_LINE);
 	for (int i = 0; i < rail_items.count; i++)
 		rail_avatar(rail_items.box[i], rail_items.row[i]);
 	if (ui.groups && ui.rail_add.w) {
 		Rect a = ui.rail_add;
 		double hover = strength(HOVER, a, hovered(a));
 
-		rail_button(a, FALSE, FALSE, blend(0x232327, ONLINE, hover));
-		icon_plus(a.x + 24, a.y + 24, 9, blend(ONLINE, WHITE, hover),
-			  2.2);
+		rail_button(a, FALSE, FALSE,
+			    blend(UI_PANEL, UI_SELECTED, hover));
+		icon_plus(a.x + 24, a.y + 24, 9,
+			  blend(UI_ACCENT, UI_ACCENT_HOVER, hover), 2.2);
 		if (hovered(a))
 			tooltip(a, "New group", TRUE);
 	}
@@ -1160,7 +1137,7 @@ static void sidebar_icon_button(Rect r, int kind, const char *tip,
 				gboolean focus)
 {
 	gboolean hover = hovered(r);
-	guint ink = hover || focus ? HEADING : MUTED;
+	guint ink = hover || focus ? UI_HEADING : UI_MUTED;
 
 	if (focus)
 		active_ring(r);
@@ -1177,33 +1154,33 @@ static void user_panel(void)
 	int s = sidebar_w(), h = ui_media_content_height(), rail = rail_w();
 	Rect p = { rail, h - USER_PANEL_H, s - rail, USER_PANEL_H };
 
-	box(p.x, p.y, p.w, p.h, 0, PANEL);
+	box(p.x, p.y, p.w, p.h, 0, UI_PANEL);
 	Rect me = ui_profile_self_area(p);
 	double mh = strength(HOVER, me, hovered(me));
 
 	if (mh > 0.)
-		box(me.x, me.y, me.w, me.h, 6, blend(PANEL, 0x2a393e, mh));
+		box(me.x, me.y, me.w, me.h, 6, blend(UI_PANEL, UI_INPUT, mh));
 	avatar(ui.name ? ui.name : "?", p.x + 8, p.y + 10, 32,
 	       ui.self_id ? ui.self_id : "self", ui.self_id,
 	       ui_profile_self_avatar());
 	box(p.x + 30, p.y + 32, 14, 14, 7,
-	    mh > 0. ? blend(PANEL, 0x2a393e, mh) : PANEL);
-	dot(p.x + 37, p.y + 39, 5, ONLINE);
+	    mh > 0. ? blend(UI_PANEL, UI_INPUT, mh) : UI_PANEL);
+	dot(p.x + 37, p.y + 39, 5, UI_ONLINE);
 	text(ui.name ? ui.name : "", p.x + 48, p.y + 8, MAX(20, me.w - 48), 14,
-	     600, HEADING, FALSE);
+	     600, UI_HEADING, FALSE);
 	const char *status = ui_profile_self_status();
 
 	text(status && *status ? status : "Online", p.x + 48, p.y + 27,
-	     MAX(20, me.w - 48), 12, 450, MUTED, FALSE);
+	     MAX(20, me.w - 48), 12, 450, UI_MUTED, FALSE);
 	ui_profile_panel_draw();
 	Rect r = ui.logout;
 	double hv = strength(HOVER, r, hovered(r));
 
 	if (hv > 0.)
-		box(r.x, r.y, r.w, r.h, 6, blend(PANEL, 0x2a393e, hv));
+		box(r.x, r.y, r.w, r.h, 6, blend(UI_PANEL, UI_INPUT, hv));
 	if (ui.focus == F_LOGOUT)
 		active_ring(r);
-	icon_exit(r.x + 4, r.y + 4, hovered(r) ? DANGER : MUTED);
+	icon_exit(r.x + 4, r.y + 4, hovered(r) ? UI_DANGER : UI_MUTED);
 	if (hovered(r))
 		tooltip((Rect){ r.x, r.y - 80, r.w, 34 }, "Sign out", FALSE);
 }
@@ -1212,13 +1189,13 @@ static void chats_panel(void)
 {
 	int s = sidebar_w(), h = ui.height, rail = rail_w();
 
-	box(0, 0, s, h, 0, SIDEBAR);
+	box(0, 0, s, h, 0, UI_SIDEBAR);
 	if (rail)
 		server_rail();
 	/* The search sits in a header the height of the chat header. */
 	draw_editor(&ui.search, ui.search_box, ui.focus == F_SEARCH,
 		    "Find or start a conversation");
-	line(rail, HEADER_H, s, HEADER_H, RAIL, 1);
+	line(rail, HEADER_H, s, HEADER_H, UI_RAIL, 1);
 	gboolean friends_open = ui_friends_active();
 
 	if (ui.friends) {
@@ -1227,14 +1204,18 @@ static void chats_panel(void)
 		gboolean focus = ui.focus == F_FRIENDS;
 		gboolean lit = hovered(f) || focus || friends_open;
 
-		if (friends_open)
-			box(f.x, f.y, f.w, f.h, 6, ROW_SELECTED);
-		else if (hv > 0. || focus)
+		if (friends_open) {
+			box(f.x, f.y, f.w, f.h, 6, UI_SELECTED);
+			box(f.x, f.y + 11, 3, f.h - 22, 1.5, UI_ACCENT);
+		} else if (hv > 0. || focus)
 			box(f.x, f.y, f.w, f.h, 6,
-			    blend(SIDEBAR, ROW_HOVER, focus ? 1. : hv));
-		icon_people(f.x + 10, f.y + 9, lit ? HEADING : MUTED);
+			    blend(UI_SIDEBAR, UI_HOVER, focus ? 1. : hv));
+		icon_people(f.x + 10, f.y + 9,
+			    friends_open ? UI_ACCENT :
+			    lit		 ? UI_HEADING :
+					   UI_MUTED);
 		text("Friends", f.x + 44, f.y + 11, f.w - 54, 16, 500,
-		     lit ? HEADING : MUTED, FALSE);
+		     lit ? UI_HEADING : UI_MUTED, FALSE);
 		int badge = ui_profile_badge();
 
 		if (badge > 0) {
@@ -1243,8 +1224,8 @@ static void chats_panel(void)
 			int bw = badge > 9 ? 22 : 16;
 			Rect pill = { f.x + f.w - bw - 10, f.y + 13, bw, 16 };
 
-			box(pill.x, pill.y, pill.w, pill.h, 8, DANGER);
-			centered(count, pill, 12, 700, WHITE);
+			box(pill.x, pill.y, pill.w, pill.h, 8, UI_ACCENT);
+			centered(count, pill, 12, 700, UI_ON_ACCENT);
 		}
 	}
 	int heading_y = ui.new_group.y + 2;
@@ -1256,9 +1237,9 @@ static void chats_panel(void)
 		g_autofree char *title = g_utf8_strup(ui_folder_title(), -1);
 
 		text(title, b.x + 8, heading_y, b.w - 26, 12, 650,
-		     hv ? HEADING : MUTED, FALSE);
+		     hv ? UI_HEADING : UI_MUTED, FALSE);
 		cairo_new_path(cr);
-		color(hv ? HEADING : MUTED);
+		color(hv ? UI_HEADING : UI_MUTED);
 		cairo_set_line_width(cr, 1.5);
 		cairo_move_to(cr, b.x + b.w - 14, heading_y + 5);
 		cairo_line_to(cr, b.x + b.w - 10, heading_y + 9);
@@ -1266,7 +1247,7 @@ static void chats_panel(void)
 		cairo_stroke(cr);
 	} else
 		text("DIRECT MESSAGES", rail + 16, heading_y,
-		     ui.reload.x - rail - 22, 12, 650, MUTED, FALSE);
+		     ui.reload.x - rail - 22, 12, 650, UI_MUTED, FALSE);
 	if (ui.groups)
 		sidebar_icon_button(ui.new_group, 0, "New group",
 				    ui.focus == F_GROUP_NEW);
@@ -1280,7 +1261,8 @@ static void chats_panel(void)
 		text(ui.chats ? (ui.search.value->len ? "No matches" :
 							"No chats available") :
 				"Loading chats…",
-		     rail + 18, r.y + 8, s - rail - 36, 14, 450, MUTED, FALSE);
+		     rail + 18, r.y + 8, s - rail - 36, 14, 450, UI_MUTED,
+		     FALSE);
 	guint first = MAX(0, ui.list_offset / UI_CHAT_ROW);
 
 	for (guint i = first; i < ui.visible->len; i++) {
@@ -1303,10 +1285,13 @@ static void chats_panel(void)
 		       row_hover = strength(HOVER, track_key, hovered(row));
 		if (sel > 0. || row_hover > 0.)
 			box(row.x, row.y, row.w, row.h, 6,
-			    blend(blend(SIDEBAR, ROW_HOVER, row_hover),
-				  ROW_SELECTED, sel));
+			    blend(blend(UI_SIDEBAR, UI_HOVER, row_hover),
+				  UI_SELECTED, sel));
+		if (sel > 0.)
+			box(row.x, row.y + 11, 3, row.h - 22, 1.5,
+			    blend(UI_SELECTED, UI_ACCENT, sel));
 		if (selected && ui.focus == F_LIST)
-			outline(row, 6, ACCENT, 1);
+			outline(row, 6, UI_ACCENT, 1);
 		avatar(name, row.x + 8, row.y + 5, 32, id, id,
 		       ui_string(c, "avatarKey", NULL));
 		gint64 unread = json_object_get_int64(ui_field(c, "unread"));
@@ -1322,8 +1307,8 @@ static void chats_panel(void)
 			Rect pill = { row.x + row.w - 10 - badge, row.y + 13,
 				      badge, 16 };
 
-			box(pill.x, pill.y, pill.w, pill.h, 8, DANGER);
-			centered(count, pill, 12, 700, WHITE);
+			box(pill.x, pill.y, pill.w, pill.h, 8, UI_ACCENT);
+			centered(count, pill, 12, 700, UI_ON_ACCENT);
 		}
 		gboolean pinned = ui_list_pinned(id);
 
@@ -1333,7 +1318,7 @@ static void chats_panel(void)
 			cairo_save(cr);
 			cairo_translate(cr, px, py);
 			cairo_rotate(cr, .6);
-			color(MUTED);
+			color(UI_MUTED);
 			cairo_set_line_width(cr, 1.4);
 			cairo_new_path(cr);
 			cairo_move_to(cr, -3, -5);
@@ -1349,16 +1334,16 @@ static void chats_panel(void)
 			cairo_stroke(cr);
 			cairo_restore(cr);
 		}
-		guint ink = selected || unread > 0 ? HEADING :
-			    row_hover > .5	   ? BODY :
-						     MUTED;
+		guint ink = selected || unread > 0 ? UI_HEADING :
+			    row_hover > .5	   ? UI_BODY :
+						     UI_MUTED;
 		text(name, row.x + 50, row.y + 11,
 		     row.w - 60 - (badge ? badge + 8 : 0) - (pinned ? 16 : 0),
 		     16, unread > 0 ? 600 : 500, ink, FALSE);
 	}
 	cairo_restore(cr);
 	if (ui_compact() && ui.notice && *ui.notice)
-		text(ui.notice, 20, h - 127, s - 40, 13, 500, MUTED, TRUE);
+		text(ui.notice, 20, h - 127, s - 40, 13, 500, UI_MUTED, TRUE);
 	user_panel();
 }
 
@@ -1367,8 +1352,9 @@ static void empty_chat(void)
 	Rect r = ui.conversation;
 	int x = r.x + r.w / 2, y = r.y + r.h / 2 - 40;
 
-	chat_mark(x - 25, y - 19, 50, MINT, FOREST);
-	centered("Select a chat", (Rect){ r.x, y + 43, r.w, 35 }, 24, 650, INK);
+	ui_draw_image(logo, (Rect){ x - 32, y - 28, 64, 64 });
+	centered("Select a chat", (Rect){ r.x, y + 43, r.w, 35 }, 24, 650,
+		 UI_HEADING);
 }
 
 /*
@@ -1424,6 +1410,7 @@ void ui_forget_history(void)
 void ui_draw_shutdown(void)
 {
 	ui_gpu_close();
+	g_clear_pointer(&logo, cairo_surface_destroy);
 	ui_forget_rail();
 	ui_forget_labels();
 	ui_forget_history();
@@ -1719,20 +1706,20 @@ static void video_card(Json *row, Rect card)
 	const int cx = card.x + card.w / 2, cy = card.y + card.h / 2;
 	const gboolean hover = hovered(card);
 
-	box(card.x, card.y, card.w, card.h, 6, 0x16171b);
+	box(card.x, card.y, card.w, card.h, 6, UI_RAIL);
 	cairo_save(cr);
 	path(card.x, card.y, card.w, card.h, 6);
 	cairo_clip(cr);
 	ui_media_video_poster(row, card);
 	cairo_restore(cr);
-	outline(card, 6, hover ? 0x267d72 : 0x34353c, 1);
-	dot(cx, cy, 21, hover ? 0x267d72 : 0x25262c);
+	outline(card, 6, hover ? UI_ACCENT : UI_LINE, 1);
+	dot(cx, cy, 21, hover ? UI_ACCENT : UI_RAISED);
 	cairo_new_path(cr);
 	cairo_move_to(cr, cx - 4, cy - 8);
 	cairo_line_to(cr, cx + 9, cy);
 	cairo_line_to(cr, cx - 4, cy + 8);
 	cairo_close_path(cr);
-	color(INK);
+	color(hover ? UI_ON_ACCENT : UI_HEADING);
 	cairo_fill(cr);
 
 	gint64 duration = json_object_get_int64(ui_field(row, "durationMs"));
@@ -1747,8 +1734,8 @@ static void video_card(Json *row, Rect card)
 	}
 	Rect badge = { card.x + card.w - 63, card.y + card.h - 25, 56, 19 };
 
-	box(badge.x, badge.y, badge.w, badge.h, 4, 0x16171b);
-	centered(label, badge, 11, 600, INK);
+	box(badge.x, badge.y, badge.w, badge.h, 4, UI_RAIL);
+	centered(label, badge, 11, 600, UI_HEADING);
 }
 
 /* Discord opens a conversation with a large avatar and a short preface. */
@@ -1761,14 +1748,14 @@ static void conversation_intro(Rect area, int y)
 
 	avatar(name, x, y + 16, 80, ui.selected, ui.selected,
 	       ui_string(chat, "avatarKey", NULL));
-	text(name, x, y + 108, area.w - 32, 30, 800, HEADING, FALSE);
+	text(name, x, y + 108, area.w - 32, 30, 800, UI_HEADING, FALSE);
 	g_autofree char *line =
 		group ? g_strdup_printf("Welcome to the beginning of %s.",
 					name) :
 			g_strdup_printf(
 				"This is the beginning of your direct message history with %s.",
 				name);
-	text(line, x, y + 150, area.w - 32, 16, 400, MUTED, FALSE);
+	text(line, x, y + 150, area.w - 32, 16, 400, UI_MUTED, FALSE);
 }
 
 /*
@@ -1828,7 +1815,7 @@ static void rich_draw(Json *message, Rect r)
 	cairo_new_path(cr);
 	path(r.x, r.y, r.w, r.h, 8);
 	cairo_clip(cr);
-	box(r.x, r.y, r.w, r.h, 0, 0x2b2d31);
+	box(r.x, r.y, r.w, r.h, 0, UI_PANEL);
 	for (size_t i = 0; draws && i < json_object_array_length(draws); i++) {
 		Json *d = json_object_array_get_idx(draws, i);
 		const char *url = ui_string(d, "url", NULL);
@@ -1871,7 +1858,7 @@ static void rich_draw(Json *message, Rect r)
 	if (!shown)
 		text(loadable ? "Loading…" :
 				ui_string(message, "text", "Rich message"),
-		     r.x + 16, r.y + r.h / 2 - 10, r.w - 32, 15, 500, MUTED,
+		     r.x + 16, r.y + r.h / 2 - 10, r.w - 32, 15, 500, UI_MUTED,
 		     FALSE);
 	for (size_t i = 0; areas && i < json_object_array_length(areas); i++) {
 		Json *a = json_object_array_get_idx(areas, i);
@@ -1885,7 +1872,7 @@ static void rich_draw(Json *message, Rect r)
 		break;
 	}
 	cairo_restore(cr);
-	outline(r, 8, 0x34353c, 1);
+	outline(r, 8, UI_LINE, 1);
 	for (size_t i = 0; areas && i < json_object_array_length(areas); i++) {
 		Json *a = json_object_array_get_idx(areas, i);
 		Rect at = rich_rect(a, r, k);
@@ -1987,16 +1974,16 @@ static void message_rows(Rect area)
 			int left = area.x + (area.w - tw) / 2,
 			    mid = y + r->top / 2 + 2;
 
-			line(area.x + 16, mid, area.x + area.w - 16, mid, LINE,
-			     1);
-			box(left - 6, mid - 9, tw + 12, 18, 0, PAPER);
-			paint(r->date, left, mid - 8, SUBTLE);
+			line(area.x + 16, mid, area.x + area.w - 16, mid,
+			     UI_LINE, 1);
+			box(left - 6, mid - 9, tw + 12, 18, 0, UI_BG);
+			paint(r->date, left, mid - 8, UI_SUBTLE);
 		}
 		y += r->top;
 		Rect bg = { area.x, y, area.w, r->h - r->top };
 
 		if ((int)i == hover)
-			box(bg.x, bg.y, bg.w, bg.h, 0, MESSAGE_HOVER);
+			box(bg.x, bg.y, bg.w, bg.h, 0, UI_PANEL);
 		y += 2;
 		if (!r->group) {
 			const char *name = pango_layout_get_text(r->byline);
@@ -2005,7 +1992,7 @@ static void message_rows(Rect area)
 			avatar(name, area.x + 16, y + 2, MESSAGE_AVATAR,
 			       sid ? sid : "", ui.selected,
 			       ui_string(r->message, "avatarKey", NULL));
-			paint(r->byline, x, y, HEADING);
+			paint(r->byline, x, y, UI_HEADING);
 			if (r->clock) {
 				int tw;
 
@@ -2013,11 +2000,11 @@ static void message_rows(Rect area)
 							    NULL);
 				if (x + tw + 120 < area.x + area.w)
 					paint(r->clock, x + tw + 8, y + 4,
-					      SUBTLE);
+					      UI_SUBTLE);
 			}
 			y += 22;
 		} else if ((int)i == hover && r->short_clock)
-			paint(r->short_clock, area.x + 22, y + 4, SUBTLE);
+			paint(r->short_clock, area.x + 22, y + 4, UI_SUBTLE);
 		if (r->flex)
 			ui_flex_draw(cr, r->flex, x, y, flex_image, NULL);
 		else if (r->rich)
@@ -2030,7 +2017,7 @@ static void message_rows(Rect area)
 			video_card(r->message,
 				   (Rect){ x, y + 2, r->w, r->body_h - 4 });
 		else
-			paint(r->body, x, y, BODY);
+			paint(r->body, x, y, UI_BODY);
 		if (r->reactions) {
 			int tw, th;
 
@@ -2038,14 +2025,14 @@ static void message_rows(Rect area)
 			int ry = y + r->body_h + 4;
 			Rect pill = { x, ry, tw + 16, 24 };
 
-			box(pill.x, pill.y, pill.w, pill.h, 8, INPUT);
-			outline(pill, 8, 0x34353c, 1);
-			paint(r->reactions, x + 8, ry + (24 - th) / 2, BODY);
+			box(pill.x, pill.y, pill.w, pill.h, 8, UI_INPUT);
+			outline(pill, 8, UI_LINE, 1);
+			paint(r->reactions, x + 8, ry + (24 - th) / 2, UI_BODY);
 		}
 	}
 	if (ui.history && !cache.rows->len && !cache.intro)
 		centered("No messages in this conversation.", area, 14, 400,
-			 MUTED);
+			 UI_MUTED);
 }
 
 enum header_icon {
@@ -2093,7 +2080,7 @@ static void glyph_video(double x, double y)
 static void header_icon(Rect r, enum header_icon kind, gboolean focus)
 {
 	gboolean hover = hovered(r);
-	guint ink = hover || focus ? HEADING : 0xb5bac1;
+	guint ink = hover || focus ? UI_ACCENT_HOVER : UI_MUTED;
 	double x = r.x + (r.w - 24) / 2., y = r.y + (r.h - 24) / 2.;
 	const char *tips[] = { "Start Voice Call", "Start Video Call", "Search",
 			       "Member List", "More" };
@@ -2133,19 +2120,19 @@ static void composer(int s, int w)
 	if (ui.reply_id && !g_strcmp0(ui.reply_chat, ui.selected)) {
 		Rect bar = { c.x, c.y - 34, c.w, 42 };
 
-		box(bar.x, bar.y, bar.w, bar.h, 8, PANEL);
+		box(bar.x, bar.y, bar.w, bar.h, 8, UI_PANEL);
 		text("Replying to message", bar.x + 16, bar.y + 8, bar.w - 140,
-		     14, 500, MUTED, FALSE);
+		     14, 500, UI_MUTED, FALSE);
 		text("Esc to cancel", bar.x + bar.w - 116, bar.y + 8, 104, 12,
-		     500, SUBTLE, FALSE);
+		     500, UI_SUBTLE, FALSE);
 	}
-	box(c.x, c.y, c.w, c.h, 8, INPUT);
+	box(c.x, c.y, c.w, c.h, 8, UI_INPUT);
 	if (ui.photos || ui.files) {
 		Rect a = ui.attach;
 		double cx = a.x + a.w / 2., cy = a.y + a.h / 2.;
 
-		dot(cx, cy, 12, hovered(a) ? HEADING : 0xb5bac1);
-		icon_plus(cx, cy, 5.5, INPUT, 2.4);
+		dot(cx, cy, 12, hovered(a) ? UI_ACCENT_HOVER : UI_MUTED);
+		icon_plus(cx, cy, 5.5, UI_INPUT, 2.4);
 		if (hovered(a))
 			tooltip((Rect){ a.x, a.y - 82, a.w, 34 },
 				"Upload a File", FALSE);
@@ -2157,17 +2144,17 @@ static void composer(int s, int w)
 	if (ui.emojis || ui.stickers) {
 		Rect e = ui.emoji;
 		double x = e.x + e.w / 2., y = e.y + e.h / 2.;
-		guint ink = hovered(e) ? 0xf0b232 : 0xb5bac1;
+		guint ink = hovered(e) ? UI_ACCENT_HOVER : UI_MUTED;
 
 		color(ink);
 		cairo_new_path(cr);
 		cairo_arc(cr, x, y, 10, 0, 2 * G_PI);
 		cairo_fill(cr);
-		dot(x - 3.5, y - 2.5, 1.6, INPUT);
-		dot(x + 3.5, y - 2.5, 1.6, INPUT);
+		dot(x - 3.5, y - 2.5, 1.6, UI_INPUT);
+		dot(x + 3.5, y - 2.5, 1.6, UI_INPUT);
 		cairo_new_path(cr);
 		cairo_set_line_width(cr, 1.8);
-		color(INPUT);
+		color(UI_INPUT);
 		cairo_arc(cr, x, y + .5, 5, .25, G_PI - .25);
 		cairo_stroke(cr);
 		if (hovered(e))
@@ -2182,7 +2169,9 @@ static void composer(int s, int w)
 	if (ui.message.value->len || sending || ui.focus == F_SEND) {
 		Rect r = ui.send;
 		double x = r.x + r.w / 2., y = r.y + r.h / 2.;
-		guint ink = sending ? SUBTLE : hovered(r) ? HEADING : 0xb5bac1;
+		guint ink = sending    ? UI_SUBTLE :
+			    hovered(r) ? UI_ACCENT_HOVER :
+					 UI_ACCENT;
 
 		if (ui.focus == F_SEND)
 			active_ring(r);
@@ -2221,7 +2210,7 @@ static void chat_view(void)
 {
 	int s = ui_compact() ? 0 : sidebar_w(), w = ui.width, h = ui.height;
 
-	box(s, 0, w - s, h, 0, PAPER);
+	box(s, 0, w - s, h, 0, UI_BG);
 	int left = s + 16;
 
 	if (ui_compact() && ui.selected) {
@@ -2239,7 +2228,7 @@ static void chat_view(void)
 		avatar(name, left, 12, 24, ui.selected, ui.selected,
 		       ui_string(chat, "avatarKey", NULL));
 		text(name, left + 32, 13, MAX(12, right - left - 48), 16, 600,
-		     HEADING, FALSE);
+		     UI_HEADING, FALSE);
 		header_peer =
 			*ui.selected == 'u' ?
 				(Rect){ left, 8,
@@ -2248,10 +2237,10 @@ static void chat_view(void)
 				(Rect){ 0 };
 		header_icon(ui.chat_tools, ICON_MORE, FALSE);
 	} else
-		text("Messages", left, 13, w - left - 16, 16, 600, HEADING,
+		text("Messages", left, 13, w - left - 16, 16, 600, UI_HEADING,
 		     FALSE);
-	line(s, HEADER_H, w, HEADER_H, RAIL, 1);
-	line(s, HEADER_H + 1, w, HEADER_H + 1, 0x1a282d, 1);
+	line(s, HEADER_H, w, HEADER_H, UI_RAIL, 1);
+	line(s, HEADER_H + 1, w, HEADER_H + 1, UI_PANEL, 1);
 	if (ui.find_messages && ui.selected && ui.find_button.w)
 		header_icon(ui.find_button, ICON_SEARCH,
 			    ui.focus == F_FIND_TEXT);
@@ -2285,12 +2274,14 @@ static void chat_view(void)
 	if (ui.notice && *ui.notice)
 		text(ui.notice, s + 24,
 		     ui.composer.y - (ui.reply_id ? 34 : 0) - 46, w - s - 46,
-		     13, 500, MUTED, TRUE);
+		     13, 500, UI_MUTED, TRUE);
 	(void)h;
 }
 
 gboolean ui_draw_init(void)
 {
+	g_clear_pointer(&logo, cairo_surface_destroy);
+	logo = ui_logo_load(ui.window);
 	log_renderer = !g_strcmp0(g_getenv("LINE_RENDER_LOG"), "1");
 	if (ui_gpu_active())
 		return TRUE;
@@ -2865,7 +2856,7 @@ static void draw_frame(const Rect *region)
 	p = slide(&pane_slide, pane_key,
 		  ui_compact() ? (pane_key == 2 ? -10. : 10.) : 0.);
 	if (p != 0.) {
-		color(PAPER);
+		color(UI_BG);
 		cairo_paint(cr);
 	}
 	cairo_save(cr);
@@ -2967,13 +2958,10 @@ void ui_draw_region(Rect logical)
 	draw_frame(&logical);
 }
 
-/* Dialog panels share one fill; give them Discord's rounded modal frame. */
-#define DIALOG_SURFACE 0x213137
-
 void ui_draw_box(Rect r, guint rgb)
 {
-	if (rgb == DIALOG_SURFACE && r.w >= 160 && r.h >= 100) {
-		box(r.x - 1, r.y - 1, r.w + 2, r.h + 2, 13, 0x303036);
+	if (rgb == UI_DIALOG && r.w >= 160 && r.h >= 100) {
+		box(r.x - 1, r.y - 1, r.w + 2, r.h + 2, 13, UI_LINE);
 		box(r.x, r.y, r.w, r.h, 12, rgb);
 		return;
 	}
@@ -3128,12 +3116,13 @@ guint ui_blend(guint a, guint b, double v)
 void ui_draw_switch(Rect r, gboolean on)
 {
 	double v = strength(SELECTED, r, on);
+	guint track = blend(UI_SUBTLE, UI_ACCENT, v);
 
-	box(r.x, r.y, r.w, r.h, r.h / 2., blend(0x72767d, 0x23a55a, v));
+	box(r.x, r.y, r.w, r.h, r.h / 2., track);
 	double knob = r.h - 6, left = r.x + 3 + v * (r.w - knob - 6);
 
-	box(left, r.y + 3, knob, knob, knob / 2, WHITE);
-	color(blend(0x72767d, 0x23a55a, v));
+	box(left, r.y + 3, knob, knob, knob / 2, UI_ON_ACCENT);
+	color(track);
 	cairo_new_path(cr);
 	cairo_set_line_width(cr, 1.8);
 	double cx = left + knob / 2, cy = r.y + r.h / 2.;
@@ -3240,7 +3229,8 @@ void ui_draw_round_button(Rect r, enum ui_call_glyph glyph, guint fill,
 	}
 	if (slash) {
 		line(x + 2, y + 2, x + 22, y + 22, fill, 5);
-		line(x + 2, y + 2, x + 22, y + 22, DANGER, 2.4);
+		line(x + 2, y + 2, x + 22, y + 22,
+		     fill == UI_ACCENT ? UI_ON_ACCENT : UI_DANGER, 2.4);
 	}
 	if (tip && hovered(r))
 		tooltip((Rect){ r.x, r.y - 92, r.w, 34 }, tip, FALSE);
@@ -3343,6 +3333,6 @@ void ui_result_paint(PangoLayout *body, int x, int y, Rect clip)
 	cairo_save(cr);
 	cairo_rectangle(cr, clip.x, clip.y, clip.w, clip.h);
 	cairo_clip(cr);
-	paint(body, x, y, INK);
+	paint(body, x, y, UI_HEADING);
 	cairo_restore(cr);
 }

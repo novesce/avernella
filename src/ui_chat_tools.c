@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_chat_tools.h"
+#include "ui_theme.h"
 #include "ui_find.h"
 #include "ui_friends.h"
 #include "ui_shared_content.h"
@@ -362,7 +363,7 @@ void ui_chat_tools_draw(void)
 	int foot = y + h - 54;
 
 	ui_scrim();
-	ui_draw_box((Rect){ x, y, w, h }, 0x242429);
+	ui_draw_box((Rect){ x, y, w, h }, UI_DIALOG);
 	const char *title = tools.page == MENU	  ? "Chat tools" :
 			    tools.page == FORWARD ? "Forward message" :
 			    tools.page == PUBLISH ? "Announce message" :
@@ -370,7 +371,7 @@ void ui_chat_tools_draw(void)
 						    "Announcements";
 
 	ui_draw_label(title, (Rect){ x + 18, y + 13, w - 36, 35 }, 22, 700,
-		      0xefeff1, FALSE);
+		      UI_HEADING, FALSE);
 	tools.field = tools.list = tools.accept = tools.announcements_button =
 		tools.shared_button = tools.search_button =
 			tools.screenshot_button = (Rect){ 0 };
@@ -399,11 +400,11 @@ void ui_chat_tools_draw(void)
 				"Remove this announcement for everyone in the chat?";
 
 		ui_draw_label(description, (Rect){ x + 18, y + 58, w - 36, 59 },
-			      15, 500, 0xefeff1, TRUE);
+			      15, 500, UI_HEADING, TRUE);
 		if (tools.page == PUBLISH)
 			ui_draw_label(ui_string(tools.row, "text", ""),
 				      (Rect){ x + 18, y + 115, w - 36, 25 }, 13,
-				      500, 0xabacb2, FALSE);
+				      500, UI_MUTED, FALSE);
 		tools.accept = (Rect){ x + w - 130, foot, 112, 36 };
 		ui_draw_button(tools.accept,
 			       tools.page == PUBLISH ? "Announce" : "Remove",
@@ -431,15 +432,16 @@ void ui_chat_tools_draw(void)
 			Rect area = { tools.list.x, tools.list.y + i * 48,
 				      tools.list.w, 44 };
 
-			ui_draw_box(area, index == tools.selected ? 0x1d675e :
-								    0x202024);
+			ui_draw_box(area, index == tools.selected ?
+						  UI_SELECTED :
+						  UI_RAISED);
 			ui_draw_label(ui_string(row,
 						tools.page == FORWARD ? "name" :
 									"text",
 						""),
 				      (Rect){ area.x + 10, area.y + 6,
 					      area.w - 20, 30 },
-				      15, 550, 0xefeff1, FALSE);
+				      15, 550, UI_HEADING, FALSE);
 		}
 		if (!row_count() && !tools.note)
 			ui_draw_label(tools.pending ? "Loading…" :
@@ -447,7 +449,7 @@ void ui_chat_tools_draw(void)
 						      "No matching chats." :
 						      "No announcements.",
 				      (Rect){ x + 18, top + 15, w - 36, 40 },
-				      14, 500, 0xabacb2, FALSE);
+				      14, 500, UI_MUTED, FALSE);
 		Json *selected = item(tools.selected);
 
 		if (selected && (tools.page == FORWARD ||
@@ -467,5 +469,5 @@ void ui_chat_tools_draw(void)
 	else if (tools.pending && tools.page != ANNOUNCEMENTS)
 		ui_draw_label("Working…",
 			      (Rect){ x + 18, foot - 37, w - 36, 26 }, 13, 500,
-			      0xabacb2, FALSE);
+			      UI_MUTED, FALSE);
 }

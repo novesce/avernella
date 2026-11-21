@@ -47,7 +47,7 @@ LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync tune http_tune
 SOURCES += chat_lists shared_content ui_chat_lists ui_chat_tools ui_shared_content ui_notifications screenshot
-SOURCES += ui_tray video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
+SOURCES += ui_tray ui_logo video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
 SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu
 OBJECTS = $(SOURCES:%=build/%.o)
 GIT_COMMIT := $(if $(wildcard .git),$(shell git rev-parse HEAD 2>/dev/null | cut -c1-7))
@@ -151,12 +151,16 @@ install:
 	if [ -x avernella-liff ]; then install -Dm755 avernella-liff "$(DESTDIR)$(LIBEXECDIR)/avernella-liff"; fi
 	if [ -x avernella-liff-gtk ]; then install -Dm755 avernella-liff-gtk "$(DESTDIR)$(LIBEXECDIR)/avernella-liff-gtk"; fi
 	install -Dm644 data/avernella.desktop "$(DESTDIR)$(DATADIR)/applications/avernella.desktop"
-	install -Dm644 data/avernella.svg "$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/avernella.svg"
+	install -Dm644 data/avernella.png "$(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps/avernella.png"
+	install -Dm644 data/avernella-mark.png "$(DESTDIR)$(DATADIR)/icons/hicolor/64x64/apps/avernella.png"
+	$(RM) "$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/avernella.svg"
 
 uninstall:
 	rm -f "$(DESTDIR)$(LIBEXECDIR)/avernella-vulkan.so"
 	rm -f "$(DESTDIR)$(BINDIR)/avernella" "$(DESTDIR)$(LIBEXECDIR)/avernella-liff" "$(DESTDIR)$(LIBEXECDIR)/avernella-liff-gtk" \
 		"$(DESTDIR)$(DATADIR)/applications/avernella.desktop" \
+		"$(DESTDIR)$(DATADIR)/icons/hicolor/256x256/apps/avernella.png" \
+		"$(DESTDIR)$(DATADIR)/icons/hicolor/64x64/apps/avernella.png" \
 		"$(DESTDIR)$(DATADIR)/icons/hicolor/scalable/apps/avernella.svg"
 	rmdir "$(DESTDIR)$(LIBEXECDIR)" 2>/dev/null || true
 
@@ -174,6 +178,13 @@ build/line_build_commit.h: | build
 
 build/ui.o: override CPPFLAGS += -Ibuild
 build/ui.o: build/line_build_commit.h
+
+build/avernella_mark.inc: data/avernella-mark.png | build
+	@od -An -v -t u1 $< | awk '{for (i = 1; i <= NF; i++) printf "%s,", $$i; print ""}' > $@.tmp
+	mv -f $@.tmp $@
+
+build/ui_logo.o: override CPPFLAGS += -Ibuild
+build/ui_logo.o: build/avernella_mark.inc
 
 build/%.o: src/%.c Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -218,7 +229,7 @@ build/test-groups: tests/groups.c build/groups.o build/thrift.o
 build/test-chat-lists: tests/chat_lists.c build/chat_lists.o
 build/test-shared-content: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
 build/test-shared-content: tests/shared_content.c build/shared_content.o build/http_tune.o
-build/test-ui-tray: tests/ui_tray.c build/ui_tray.o
+build/test-ui-tray: tests/ui_tray.c build/ui_tray.o build/ui_logo.o build/ui_pixels.o
 build/test-ui-friends: tests/ui_friends.c build/ui_friends.o
 build/test-ui-read: tests/ui_read.c
 build/test-stickers: tests/stickers.c build/stickers.o build/thrift.o
@@ -244,7 +255,7 @@ build/render-bench: tests/render_bench.c build/ui_gpu.o
 build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
 build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o
+build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
@@ -318,7 +329,7 @@ check: $(TESTS)
 
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
-	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h avernella
+	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h build/avernella_mark.inc avernella
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
 	$(RM) build/vulkan-smoke build/vulkan-preview build/volk.o build/line_ui_spirv.h build/ui_uber.vert.spv build/ui_uber.frag.spv
 

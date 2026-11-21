@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_tray.h"
+#include "ui_logo.h"
 #include <gio/gio.h>
 #include <string.h>
 
@@ -145,6 +146,31 @@ static void action(int id)
 						  g_variant_new_int32(0), 0u));
 }
 
+static void check_icon(GVariant *properties)
+{
+	const char *name;
+	int width, height;
+	gsize size;
+	guint32 expected[UI_LOGO_EDGE * UI_LOGO_EDGE];
+	g_autoptr(GVariant) pixmaps = g_variant_lookup_value(
+		properties, "IconPixmap", G_VARIANT_TYPE("a(iiay)"));
+	g_autoptr(GVariant) bytes = NULL;
+
+	g_assert_true(g_variant_lookup(properties, "IconName", "&s", &name));
+	g_assert_cmpstr(name, ==, "avernella");
+	g_assert_nonnull(pixmaps);
+	g_assert_cmpuint(g_variant_n_children(pixmaps), ==, 1);
+	g_variant_get_child(pixmaps, 0, "(ii@ay)", &width, &height, &bytes);
+	g_assert_cmpint(width, ==, UI_LOGO_EDGE);
+	g_assert_cmpint(height, ==, UI_LOGO_EDGE);
+	const void *data = g_variant_get_fixed_array(bytes, &size, 1);
+
+	g_assert_true(ui_logo_read((guint8 *)expected, FALSE));
+	for (guint i = 0; i < G_N_ELEMENTS(expected); i++)
+		expected[i] = GUINT32_TO_BE(expected[i]);
+	g_assert_cmpmem(data, size, expected, sizeof(expected));
+}
+
 static void tray(void)
 {
 	g_setenv("SDL_VIDEODRIVER", "dummy", TRUE);
@@ -191,9 +217,7 @@ static void tray(void)
 
 	g_assert_true(g_variant_lookup(dict, "Title", "&s", &title));
 	g_assert_cmpstr(title, ==, "Avernella");
-	g_autoptr(GVariant) pixels = g_variant_lookup_value(
-		dict, "IconPixmap", G_VARIANT_TYPE("a(iiay)"));
-	g_assert_cmpuint(g_variant_n_children(pixels), ==, 1);
+	check_icon(dict);
 	g_autoptr(GVariant) show =
 		rpc(item, IPATH, ITEM, "Activate", g_variant_new("(ii)", 0, 0));
 	wait_for(VISIBLE);

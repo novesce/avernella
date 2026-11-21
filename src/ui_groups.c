@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_groups.h"
+#include "ui_theme.h"
 #include "ui_friends.h"
 #include <string.h>
 
@@ -519,7 +520,7 @@ static void manage_button(Rect r, const char *name, enum manage_action action,
 	manager.buttons[n].action = action;
 	if (n == manager.focus)
 		ui_draw_box((Rect){ r.x - 2, r.y - 2, r.w + 4, r.h + 4 },
-			    0x949cf7);
+			    UI_ACCENT);
 	ui_draw_button(r, name, primary);
 }
 
@@ -532,7 +533,7 @@ static void manage_draw(void)
 
 	manager.count = 0;
 	ui_scrim();
-	ui_draw_box((Rect){ left, top, w, h }, 0x242429);
+	ui_draw_box((Rect){ left, top, w, h }, UI_DIALOG);
 	const char *title =
 		manager.page == MG_MENU	       ? "Group settings" :
 		manager.page == MG_EDIT	       ? "Rename group" :
@@ -545,10 +546,10 @@ static void manage_draw(void)
 		ui_string(manager.link, "url", NULL) ?
 						"Replace invitation link?" :
 						"Create invitation link?";
-	ui_draw_label(title, (Rect){ x, y, width, 34 }, 21, 650, 0xfbfbfb,
+	ui_draw_label(title, (Rect){ x, y, width, 34 }, 21, 650, UI_HEADING,
 		      FALSE);
 	y += 40;
-	ui_draw_label(group, (Rect){ x, y, width, 26 }, 15, 550, 0xbbbdca,
+	ui_draw_label(group, (Rect){ x, y, width, 26 }, 15, 550, UI_MUTED,
 		      FALSE);
 	y += 38;
 	manage_button((Rect){ x, top + h - 52, 96, 34 },
@@ -574,14 +575,14 @@ static void manage_draw(void)
 			if (g.pending)
 				ui_draw_label("Loading…",
 					      (Rect){ x, y, width, 30 }, 15,
-					      450, 0xbbbdca, FALSE);
+					      450, UI_MUTED, FALSE);
 			else
 				manage_button((Rect){ x, y, width, 36 },
 					      "Reload", M_REFRESH, FALSE);
 		} else if (!flag(manager.link, "allowed"))
 			ui_draw_label(
 				"LINE has disabled link invitations for this group.",
-				(Rect){ x, y, width, 52 }, 15, 450, 0xbbbdca,
+				(Rect){ x, y, width, 52 }, 15, 450, UI_MUTED,
 				TRUE);
 		else if (!flag(manager.link, "enabled"))
 			manage_button((Rect){ x, y, width, 36 },
@@ -598,7 +599,7 @@ static void manage_draw(void)
 					y += bound + 8;
 				}
 				ui_draw_label(url, (Rect){ x, y, width, 22 },
-					      13, 450, 0xbbbdca, FALSE);
+					      13, 450, UI_MUTED, FALSE);
 				y += 30;
 				manage_button((Rect){ x, y, width, 34 },
 					      "Copy link", M_COPY, FALSE);
@@ -645,7 +646,7 @@ static void manage_draw(void)
 			summary = g_strdup(
 				"Anyone with the invitation link or QR code can join this group.");
 		ui_draw_label(summary, (Rect){ x, y, width, 98 }, 16, 450,
-			      0xe1e1ec, TRUE);
+			      UI_BODY, TRUE);
 		manage_button((Rect){ x + width - 148, top + h - 52, 148, 34 },
 			      g.writing ? "Updating…" : verb, M_CONFIRM, TRUE);
 	}
@@ -1058,7 +1059,7 @@ static void button(Rect r, const char *label, enum group_control item,
 {
 	if (g.focus == item)
 		ui_draw_box((Rect){ r.x - 2, r.y - 2, r.w + 4, r.h + 4 },
-			    0x949cf7);
+			    UI_ACCENT);
 	ui_draw_button(r, label, filled);
 }
 
@@ -1075,7 +1076,7 @@ void ui_groups_overlay(void)
 	    y = top + 18, width = w - 36;
 	g.panel = (Rect){ left, top, w, h };
 	ui_scrim();
-	ui_draw_box(g.panel, 0x242429);
+	ui_draw_box(g.panel, UI_DIALOG);
 	const char *title = g.pane == MEMBERS	    ? "Group members" :
 			    g.pane == CREATE	    ? "New group" :
 			    g.pane == INVITE	    ? "Invite friends" :
@@ -1092,7 +1093,7 @@ void ui_groups_overlay(void)
 				width - 120 :
 				width,
 			32 },
-		22, 650, 0xfbfbfb, FALSE);
+		22, 650, UI_HEADING, FALSE);
 	if (g.pane == CREATE ||
 	    (g.pane == MEMBERS && flag(g.detail, "canManage"))) {
 		g.incoming = (Rect){ x + width - 106, y - 2, 106, 31 };
@@ -1134,7 +1135,7 @@ void ui_groups_overlay(void)
 					  chosen, chosen == 1 ? "" : "s");
 	else
 		heading = g_strdup_printf("%d selected", chosen);
-	ui_draw_label(heading, (Rect){ x, y, width, 24 }, 14, 550, 0xb9bac2,
+	ui_draw_label(heading, (Rect){ x, y, width, 24 }, 14, 550, UI_MUTED,
 		      FALSE);
 	y += 28;
 	g.back = (Rect){ x, top + h - 54, 92, 36 };
@@ -1154,12 +1155,12 @@ void ui_groups_overlay(void)
 			Rect r = { x, y + i * 40, width, 38 };
 
 			if (g.focus == ROWS && g.cursor == g.first + i)
-				ui_draw_box(r, 0x383a43);
+				ui_draw_box(r, UI_SELECTED);
 			if (form())
 				ui_draw_label(picked ? "☑" : "☐",
 					      (Rect){ x + 4, r.y + 6, 29, 26 },
 					      18, 550,
-					      picked ? 0x9fa9ff : 0xb9bac2,
+					      picked ? UI_ACCENT : UI_MUTED,
 					      FALSE);
 			int inset = form() ? 36 : 6;
 
@@ -1168,12 +1169,12 @@ void ui_groups_overlay(void)
 				(Rect){ x + inset, r.y + 7,
 					width - inset - (item.pending ? 70 : 3),
 					25 },
-				15, 500, 0xfbfbfb, FALSE);
+				15, 500, UI_HEADING, FALSE);
 			if (item.pending)
 				ui_draw_label("Pending",
 					      (Rect){ x + width - 68, r.y + 7,
 						      68, 25 },
-					      13, 450, 0xb9bac2, FALSE);
+					      13, 450, UI_MUTED, FALSE);
 		}
 	} else {
 		const char *empty =
@@ -1182,7 +1183,7 @@ void ui_groups_overlay(void)
 			g.pane == MEMBERS ? "No members listed" :
 			g.pane == INBOX	  ? "No pending group invitations" :
 					    "No matching friends";
-		ui_draw_label(empty, g.list, 15, 450, 0xb9bac2, FALSE);
+		ui_draw_label(empty, g.list, 15, 450, UI_MUTED, FALSE);
 	}
 	if (more)
 		button(g.more,

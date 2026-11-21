@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_profile.h"
+#include "ui_theme.h"
 #include "ui_sounds.h"
 #include "ui_chat_lists.h"
 #include "ui_friends.h"
@@ -9,22 +10,21 @@
 
 /* Dark surfaces matching ui_draw.c. */
 enum {
-	HEADING = 0xf2f3f5,
-	INK = 0xdbdee1,
-	MUTED = 0x949ba4,
-	FAINT = 0x6d6f78,
-	POPOUT = 0x162126,
-	POPOUT_EDGE = 0x2e2e34,
-	INNER = 0x111214,
-	FIELD = 0x1e1f22,
-	NAV = 0x182429,
-	CONTENT = 0x1e2b30,
-	NAV_HOVER = 0x29393e,
-	NAV_SELECTED = 0x3a3b42,
-	ACCENT = 0x267d72,
-	GREEN = 0x248046,
+	HEADING = UI_HEADING,
+	INK = UI_BODY,
+	MUTED = UI_MUTED,
+	FAINT = UI_SUBTLE,
+	POPOUT = UI_PANEL,
+	POPOUT_EDGE = UI_LINE,
+	INNER = UI_RAIL,
+	FIELD = UI_INPUT,
+	NAV = UI_SIDEBAR,
+	CONTENT = UI_BG,
+	NAV_HOVER = UI_HOVER,
+	NAV_SELECTED = UI_SELECTED,
+	ACCENT = UI_ACCENT,
 	DANGER = 0xda373c,
-	CHIP = 0x2b2d31,
+	CHIP = UI_INPUT,
 	CARD_W = 300,
 	INBOX_W = 380,
 	TOAST_W = 320,
@@ -364,7 +364,7 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 	ui_draw_profile(row, (Rect){ x + 16, y + 20, 80, 80 });
 	if (self) {
 		ui_draw_rounded((Rect){ x + 72, y + 76, 24, 24 }, 12, POPOUT);
-		ui_draw_rounded((Rect){ x + 76, y + 80, 16, 16 }, 8, 0x23a55a);
+		ui_draw_rounded((Rect){ x + 76, y + 80, 16, 16 }, 8, UI_ONLINE);
 	}
 	int ty = y + 108;
 
@@ -382,7 +382,7 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 	if (flag(row, "favorite"))
 		chip(&cx, cy, "Favorite", 0xf0b232);
 	if (flag(row, "official"))
-		chip(&cx, cy, "Official", 0x267d72);
+		chip(&cx, cy, "Official", UI_ACCENT);
 	if (flag(row, "blocked"))
 		chip(&cx, cy, "Blocked", DANGER);
 	Rect inner = { x + 12, y + info_y, w - 24, inner_h };
@@ -416,20 +416,21 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 
 	if (self) {
 		button((Rect){ bx, by, bw, 32 }, "Edit Profile", ACCENT,
-		       0xffffff, A_EDIT_PROFILE, 0);
+		       UI_ON_ACCENT, A_EDIT_PROFILE, 0);
 	} else if (flag(row, "loading")) {
-		button((Rect){ bx, by, bw, 32 }, "Message", ACCENT, 0xffffff,
-		       A_MESSAGE, 0);
+		button((Rect){ bx, by, bw, 32 }, "Message", ACCENT,
+		       UI_ON_ACCENT, A_MESSAGE, 0);
 	} else {
 		gboolean add = flag(row, "canAdd") && !flag(row, "official");
 		gboolean friend = flag(row, "friend");
 		int second_w = friend || add ? (bw - 8) / 2 : 0;
 
 		button((Rect){ bx, by, bw - second_w - (second_w ? 8 : 0), 32 },
-		       busy ? busy : "Message", ACCENT, 0xffffff, A_MESSAGE, 0);
+		       busy ? busy : "Message", ACCENT, UI_ON_ACCENT, A_MESSAGE,
+		       0);
 		if (add)
 			button((Rect){ bx + bw - second_w, by, second_w, 32 },
-			       "Add Friend", GREEN, 0xffffff, A_ADD, 0);
+			       "Add Friend", ACCENT, UI_ON_ACCENT, A_ADD, 0);
 		else if (friend)
 			button((Rect){ bx + bw - second_w, by, second_w, 32 },
 			       flag(row, "blocked") ? "Unblock" : "Block", CHIP,
@@ -612,7 +613,7 @@ static int setting_row(int x, int y, int w, const char *title,
 		button((Rect){ x + w - bw, y + 2, bw, 32 }, label, CHIP, INK,
 		       action, arg);
 	}
-	ui_draw_box((Rect){ x, y + h + 16, w, 1 }, 0x2e2f35);
+	ui_draw_box((Rect){ x, y + h + 16, w, 1 }, UI_LINE);
 	return h + 33;
 }
 
@@ -649,7 +650,7 @@ static int account_section(int x, int y, int w)
 		      (Rect){ x + 112, y + 110, w - 270, 28 }, 20, 700, HEADING,
 		      FALSE);
 	button((Rect){ x + w - 150, y + 112, 134, 32 }, "Edit User Profile",
-	       ACCENT, 0xffffff, A_NAV, PROFILES);
+	       ACCENT, UI_ON_ACCENT, A_NAV, PROFILES);
 	Rect info = { x + 16, y + 172, w - 32, 76 };
 
 	ui_draw_rounded(info, 8, FIELD);
@@ -686,8 +687,8 @@ static int profiles_section(int x, int y, int w)
 	heading("Profiles", x, y, w);
 	y += 44;
 	caption("Avatar", x, y, form_w);
-	button((Rect){ x, y + 24, 150, 32 }, "Change Avatar", ACCENT, 0xffffff,
-	       A_PICTURE, 0);
+	button((Rect){ x, y + 24, 150, 32 }, "Change Avatar", ACCENT,
+	       UI_ON_ACCENT, A_PICTURE, 0);
 	ui_draw_label("JPEG, PNG or WebP. LINE shows a centered square.",
 		      (Rect){ x, y + 64, form_w, 20 }, 13, 400, MUTED, FALSE);
 	y += 104;
@@ -800,7 +801,7 @@ static int keybinds_section(int x, int y, int w)
 		Rect k = { x + w - kw, y + 2, kw, 28 };
 
 		ui_draw_rounded(k, 4, FIELD);
-		ui_draw_outline(k, 4, 0x3a3b42);
+		ui_draw_outline(k, 4, UI_LINE);
 		ui_draw_centered(shortcuts[i][1], k, 13, 600, HEADING);
 		y += 40;
 	}
@@ -818,13 +819,13 @@ static int appearance_section(int x, int y, int w)
 
 	ui_draw_rounded((Rect){ swatch.x - 3, swatch.y - 3, 66, 66 }, 33,
 			ACCENT);
-	ui_draw_rounded(swatch, 30, 0x313338);
+	ui_draw_rounded(swatch, 30, UI_BG);
 	ui_draw_rounded((Rect){ swatch.x + 18, swatch.y + 18, 24, 24 }, 12,
 			ACCENT);
 	ui_draw_icon((Rect){ swatch.x + 18, swatch.y + 18, 24, 24 },
-		     UI_ICON_CHECK, 0xffffff);
-	ui_draw_label("Dark", (Rect){ x + 76, y + 46, 200, 22 }, 15, 500, INK,
-		      FALSE);
+		     UI_ICON_CHECK, UI_ON_ACCENT);
+	ui_draw_label("Dark pink", (Rect){ x + 76, y + 46, 200, 22 }, 15, 500,
+		      INK, FALSE);
 	y += 116;
 	caption("Accessibility", x, y, w);
 	y += 28;
@@ -859,7 +860,7 @@ static void draw_settings(void)
 			if (s)
 				ui_draw_box((Rect){ nav_x + 10, y + 4,
 						    nav_w - 20, 1 },
-					    0x2e2f35);
+					    UI_LINE);
 			caption(s ? "App Settings" : "User Settings",
 				nav_x + 10, y + (s ? 14 : 0), nav_w - 20);
 			y += s ? 36 : 24;
@@ -879,7 +880,7 @@ static void draw_settings(void)
 		control(r, A_NAV, s);
 		y += 34;
 	}
-	ui_draw_box((Rect){ nav_x + 10, y + 6, nav_w - 20, 1 }, 0x2e2f35);
+	ui_draw_box((Rect){ nav_x + 10, y + 6, nav_w - 20, 1 }, UI_LINE);
 	y += 14;
 	Rect out = { nav_x, y, nav_w, 32 };
 	double oh = ui_draw_hover(out);
@@ -927,9 +928,9 @@ static void draw_settings(void)
 	Rect esc = { MIN(cx + cw + 24, W - 52), 60, 36, 36 };
 	double eh = ui_draw_hover(esc);
 
-	ui_draw_rounded(esc, 18, ui_blend(0x72767d, 0xb5bac1, eh));
+	ui_draw_rounded(esc, 18, ui_blend(UI_SUBTLE, UI_MUTED, eh));
 	ui_draw_rounded((Rect){ esc.x + 2, esc.y + 2, 32, 32 }, 16, CONTENT);
-	ui_draw_icon(esc, UI_ICON_CLOSE, ui_blend(0xb5bac1, HEADING, eh));
+	ui_draw_icon(esc, UI_ICON_CLOSE, ui_blend(UI_MUTED, HEADING, eh));
 	ui_draw_centered("ESC", (Rect){ esc.x - 4, esc.y + 40, 44, 16 }, 13,
 			 600, MUTED);
 	control(esc, A_CLOSE, 0);
@@ -944,8 +945,8 @@ static void draw_settings(void)
 		button((Rect){ bar.x + bar.w - 220, bar.y + 10, 80, 32 },
 		       "Reset", INNER, INK, A_RESET, 0);
 		button((Rect){ bar.x + bar.w - 132, bar.y + 10, 120, 32 },
-		       p.save_tag ? "Saving…" : "Save Changes", GREEN, 0xffffff,
-		       A_SAVE, 0);
+		       p.save_tag ? "Saving…" : "Save Changes", ACCENT,
+		       UI_ON_ACCENT, A_SAVE, 0);
 	}
 	if (p.settings_note && *p.settings_note) {
 		Rect n = { cx,
@@ -985,7 +986,7 @@ static int inbox_row(Json *row, int x, int y, int w, int index,
 	double h = ui_draw_hover(r);
 
 	if (h > 0.)
-		ui_draw_rounded(r, 6, ui_blend(POPOUT, 0x232428, h));
+		ui_draw_rounded(r, 6, ui_blend(POPOUT, UI_HOVER, h));
 	Rect face = { x + 8, y + 10, 36, 36 };
 
 	ui_draw_profile(row, face);
@@ -1005,16 +1006,16 @@ static int inbox_row(Json *row, int x, int y, int w, int index,
 		     no = { x + w - 44, y + 12, 32, 32 };
 
 		ui_draw_rounded(yes, 16,
-				ui_blend(CHIP, 0x35373c, ui_draw_hover(yes)));
-		ui_draw_icon(yes, UI_ICON_CHECK, busy ? MUTED : 0x23a55a);
+				ui_blend(CHIP, UI_RAISED, ui_draw_hover(yes)));
+		ui_draw_icon(yes, UI_ICON_CHECK, busy ? MUTED : UI_ONLINE);
 		ui_draw_rounded(no, 16,
-				ui_blend(CHIP, 0x35373c, ui_draw_hover(no)));
-		ui_draw_icon(no, UI_ICON_CLOSE, busy ? MUTED : 0xf23f43);
+				ui_blend(CHIP, UI_RAISED, ui_draw_hover(no)));
+		ui_draw_icon(no, UI_ICON_CLOSE, busy ? MUTED : UI_DANGER);
 		control(yes, A_ACCEPT, index);
 		control(no, A_DECLINE, index);
 	} else if (flag(row, "canAdd") && !flag(row, "friend")) {
 		button((Rect){ x + w - 84, y + 12, 72, 32 }, busy ? "…" : "Add",
-		       GREEN, 0xffffff, A_ADD_BACK, index);
+		       ACCENT, UI_ON_ACCENT, A_ADD_BACK, index);
 	} else {
 		ui_draw_label("Friends", (Rect){ x + w - 80, y + 19, 68, 18 },
 			      13, 500, MUTED, FALSE);
@@ -1651,8 +1652,8 @@ static void panel_button(Rect r, enum ui_icon icon, gboolean lit,
 
 	if (h > 0. || lit)
 		ui_draw_rounded(r, 6,
-				ui_blend(0x232428, 0x2e2f35, lit ? 1. : h));
-	ui_draw_icon(r, icon, h > .5 || lit ? HEADING : 0xb5bac1);
+				ui_blend(UI_PANEL, UI_LINE, lit ? 1. : h));
+	ui_draw_icon(r, icon, h > .5 || lit ? HEADING : UI_MUTED);
 	if (h > .5)
 		ui_draw_tooltip((Rect){ r.x, r.y - 80, r.w, 34 }, tip);
 }
@@ -1664,8 +1665,8 @@ void ui_profile_panel_draw(void)
 		Rect dot = { p.inbox_button.x + 18, p.inbox_button.y + 4, 12,
 			     12 };
 		ui_draw_rounded((Rect){ dot.x - 2, dot.y - 2, 16, 16 }, 8,
-				0x232428);
-		ui_draw_rounded(dot, 6, 0xf23f43);
+				UI_PANEL);
+		ui_draw_rounded(dot, 6, UI_DANGER);
 	}
 	panel_button(p.gear_button, UI_ICON_GEAR, p.view == SETTINGS,
 		     "User Settings");

@@ -19,7 +19,7 @@ make bench      # render benchmark
 
 The release build uses `-Oz -flto -fno-plt -fvisibility=hidden`, `--gc-sections`, `-z separate-code`, `--rosegment` and packed relative relocations when the toolchain supports them, and strips the result. Pixel loops in `ui_pixels.c`, `camera_pixels.c` and `screencast.c` are built with `-O3`.
 
-`avernella` looks for the browser helpers beside its executable and then in `../lib/avernella`, where `make install` puts them. It prefers `avernella-liff` (WPE WebKit) on Wayland and falls back to `avernella-liff-gtk` (WebKitGTK 6.0). Any `PREFIX` works without rebuilding. `make install` also installs `data/avernella.desktop` and `data/avernella.svg`, and the window reports the app ID `avernella`, so desktops match it to that menu entry. The Arch Linux package, `avernella-git`, lives in its own repository, [avernella-pkgbuild](https://github.com/novesce/avernella-pkgbuild), and builds the latest commit of this one.
+`avernella` looks for the browser helpers beside its executable and then in `../lib/avernella`, where `make install` puts them. It prefers `avernella-liff` (WPE WebKit) on Wayland and falls back to `avernella-liff-gtk` (WebKitGTK 6.0). Any `PREFIX` works without rebuilding. `make install` also installs `data/avernella.desktop` and the 64 px and 256 px Avernella PNG icons in the hicolor icon theme. The window uses the app ID `avernella` so desktops match it to that menu entry. The Arch package installs these icons from the verified Ubuntu release. [avernella-bin on the AUR](https://aur.archlinux.org/packages/avernella-bin)
 
 ### Native Vulkan renderer
 

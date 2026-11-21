@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_chat_lists.h"
+#include "ui_theme.h"
 #include "ui_sounds.h"
 #include "ui_motion.h"
 #include <string.h>
@@ -645,14 +646,14 @@ gboolean ui_lists_event(SDL_Event *e)
 
 void ui_lists_draw(void)
 {
-	const guint ink = 0xf1f1f3, muted = 0xadadb6;
+	const guint ink = UI_HEADING, muted = UI_MUTED;
 	int w = MIN(425, ui.width - 24), h = MIN(460, ui.height - 24),
 	    x = (ui.width - w) / 2, y = (ui.height - h) / 2;
 	panel.box = (Rect){ x, y, w, h };
 	panel.rows_box = (Rect){ 0 };
 	panel.submit = (Rect){ 0 };
 	ui_scrim();
-	ui_draw_box(panel.box, 0x242429);
+	ui_draw_box(panel.box, UI_DIALOG);
 	const char *title = panel.pane == ORGANIZE ? panel.name :
 			    panel.pane == PREFS	   ? "Preferences" :
 			    panel.pane == CAPTURE  ? "Keyboard shortcut" :
@@ -716,7 +717,7 @@ void ui_lists_draw(void)
 					  g_str_has_prefix(view, "folder:") &&
 						  !strcmp(view + 7, c->key)));
 			if (i + panel.first == panel.cursor)
-				ui_draw_box(r, 0x3d3e49);
+				ui_draw_box(r, UI_SELECTED);
 			ui_draw_label(c->label,
 				      (Rect){ r.x + 8, r.y + 7, r.w - 43,
 					      r.h - 5 },
@@ -725,7 +726,7 @@ void ui_lists_draw(void)
 				ui_draw_label("✓",
 					      (Rect){ r.x + r.w - 30, r.y + 7,
 						      25, 24 },
-					      15, 650, 0x70d39e, FALSE);
+					      15, 650, UI_ACCENT, FALSE);
 		}
 	}
 	if (!panel.note && panel.pane == VIEWS)

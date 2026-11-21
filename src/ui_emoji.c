@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_emoji.h"
+#include "ui_theme.h"
 #include "ui_apng.h"
 #include <math.h>
 #include <string.h>
@@ -7,8 +8,8 @@
 #define OBJECT "\xef\xbf\xbc"
 
 enum {
-	INK = 0xefeff1,
-	MUTED = 0xabacb2,
+	INK = UI_HEADING,
+	MUTED = UI_MUTED,
 	MAX_SPANS = 1024
 };
 
@@ -281,7 +282,9 @@ static void render_shape(cairo_t *cr, PangoAttrShape *shape, gboolean path,
 		cairo_paint(cr);
 	} else {
 		cairo_new_path(cr);
-		cairo_set_source_rgb(cr, .64, .65, .69);
+		cairo_set_source_rgb(cr, (UI_SUBTLE >> 16) / 255.,
+				     ((UI_SUBTLE >> 8) & 255) / 255.,
+				     (UI_SUBTLE & 255) / 255.);
 		cairo_set_line_width(cr, 1.2);
 		cairo_arc(cr, x + size / 2, y + size / 2, size * .36, 0,
 			  2 * G_PI);
@@ -640,7 +643,7 @@ void ui_emoji_draw(void)
 	int w = MIN(450, ui.width - 24), h = MIN(406, ui.height - 24),
 	    x = (ui.width - w) / 2, y = (ui.height - h) / 2;
 	palette.panel = (Rect){ x, y, w, h };
-	ui_draw_box(palette.panel, 0x242429);
+	ui_draw_box(palette.panel, UI_DIALOG);
 	if (palette.preview) {
 		draw_preview(palette.panel);
 		return;
@@ -658,7 +661,7 @@ void ui_emoji_draw(void)
 	palette.close = (Rect){ x + w - 69, y + 12, 54, 31 };
 	ui_draw_button(palette.close, "Close", FALSE);
 	palette.search = (Rect){ x + 16, y + 55, w - 32, 35 };
-	ui_draw_box(palette.search, 0x383a43);
+	ui_draw_box(palette.search, UI_INPUT);
 	g_autofree char *query =
 		g_strconcat(palette.query ? palette.query : "",
 			    palette.preedit ? palette.preedit : "", NULL);
@@ -683,7 +686,7 @@ void ui_emoji_draw(void)
 			      palette.grid.y + (i / palette.cols) * dy,
 			      cell - 3, dy - 3 };
 		if (start + i == palette.selected)
-			ui_draw_box(tile, 0x414450);
+			ui_draw_box(tile, UI_SELECTED);
 		cairo_surface_t *image = ui_emoji_image(r, TRUE, NULL);
 
 		int edge = palette.stickers ? MIN(64, tile.w - 5) : 36;

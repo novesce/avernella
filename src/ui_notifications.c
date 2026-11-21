@@ -24,6 +24,8 @@ static gpointer notify(gpointer data)
 		GVariantBuilder hints;
 
 		g_variant_builder_init(&hints, G_VARIANT_TYPE_VARDICT);
+		g_variant_builder_add(&hints, "{sv}", "desktop-entry",
+				      g_variant_new_string("avernella"));
 		g_variant_builder_add(
 			&hints, "{sv}", "category",
 			g_variant_new_string(notice->call ? "im.received" :
@@ -35,7 +37,7 @@ static gpointer notify(gpointer data)
 			"/org/freedesktop/Notifications",
 			"org.freedesktop.Notifications", "Notify",
 			g_variant_new("(susss^asa{sv}i)", "Avernella", 0u,
-				      "mail-message-new", summary, body,
+				      "avernella", summary, body,
 				      (const char *[]){ NULL }, &hints, -1),
 			G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NO_AUTO_START,
 			1200, NULL, NULL);

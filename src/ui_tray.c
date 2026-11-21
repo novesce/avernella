@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_tray.h"
+#include "ui_logo.h"
 #include <gio/gio.h>
 #include <string.h>
 #include <unistd.h>
@@ -80,6 +81,7 @@ static struct {
 	GMainLoop *loop;
 	GThread *thread;
 	GCancellable *cancel;
+	GVariant *icon;
 	char *address, *name;
 	Uint32 event;
 	gint available;
@@ -87,8 +89,8 @@ static struct {
 	struct host hosts[2];
 } tray;
 
-static const char *const labels[] = { "", "Open LINE", "Hide window",
-				      "Quit LINE" };
+static const char *const labels[] = { "", "Open Avernella", "Hide window",
+				      "Quit Avernella" };
 
 static void queue_action(enum tray_action which)
 {
@@ -113,34 +115,20 @@ static GVariant *pixmaps(gboolean with_icon)
 	GVariantBuilder items;
 
 	g_variant_builder_init(&items, G_VARIANT_TYPE("a(iiay)"));
-	if (with_icon) {
-		enum {
-			EDGE = 24
-		};
+	if (with_icon && !tray.icon) {
+		gsize size = UI_LOGO_EDGE * UI_LOGO_EDGE * 4;
+		guint8 *pixels = g_malloc(size);
 
-		guint8 p[EDGE * EDGE * 4];
-
-		for (int y = 0; y < EDGE; y++) {
-			for (int x = 0; x < EDGE; x++) {
-				int i = (y * EDGE + x) * 4;
-				int dx = 2 * x - 23, dy = 2 * y - 23;
-				gboolean bubble =
-					((x - 12) * (x - 12) * 4 +
-						 (y - 10) * (y - 10) * 9 <
-					 173) ||
-					(x >= 7 && x <= 10 && y >= 14 &&
-					 y <= 18 && x + y < 27);
-				p[i] = dx * dx + dy * dy < 560 ? 255 : 0;
-				p[i + 1] = bubble ? 255 : 13;
-				p[i + 2] = bubble ? 255 : 169;
-				p[i + 3] = bubble ? 255 : 90;
-			}
-		}
-		g_variant_builder_add(
-			&items, "(ii@ay)", EDGE, EDGE,
-			g_variant_new_fixed_array(G_VARIANT_TYPE_BYTE, p,
-						  sizeof(p), 1));
+		if (ui_logo_read(pixels, TRUE))
+			tray.icon = g_variant_ref_sink(g_variant_new_from_data(
+				G_VARIANT_TYPE_BYTESTRING, pixels, size, TRUE,
+				g_free, pixels));
+		else
+			g_free(pixels);
 	}
+	if (with_icon && tray.icon)
+		g_variant_builder_add(&items, "(ii@ay)", UI_LOGO_EDGE,
+				      UI_LOGO_EDGE, tray.icon);
 	return g_variant_builder_end(&items);
 }
 
@@ -164,7 +152,7 @@ static GVariant *property(GDBusConnection *bus, const char *sender,
 	}
 	if (!strcmp(name, "Category"))
 		return g_variant_new_string("Communications");
-	if (!strcmp(name, "Id"))
+	if (!strcmp(name, "Id") || !strcmp(name, "IconName"))
 		return g_variant_new_string("avernella");
 	if (!strcmp(name, "Title"))
 		return g_variant_new_string("Avernella");
@@ -177,7 +165,7 @@ static GVariant *property(GDBusConnection *bus, const char *sender,
 	if (!strcmp(name, "Menu"))
 		return g_variant_new_object_path(MENU_PATH);
 	if (!strcmp(name, "ToolTip"))
-		return g_variant_new("(s@a(iiay)ss)", "", pixmaps(FALSE),
+		return g_variant_new("(s@a(iiay)ss)", "avernella", pixmaps(FALSE),
 				     "Avernella", "");
 	if (g_str_has_suffix(name, "Pixmap"))
 		return pixmaps(!strcmp(name, "IconPixmap"));
@@ -601,6 +589,7 @@ void ui_tray_stop(void)
 		tray.thread = NULL;
 	}
 	g_clear_object(&tray.cancel);
+	g_clear_pointer(&tray.icon, g_variant_unref);
 	g_clear_pointer(&tray.loop, g_main_loop_unref);
 	g_clear_pointer(&tray.context, g_main_context_unref);
 	g_clear_pointer(&tray.address, g_free);

@@ -1,12 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_find.h"
+#include "ui_theme.h"
 #include "ui_friends.h"
 #include <string.h>
 
 enum {
-	INK = 0xefeff1,
-	MUTED = 0xabacb2,
-	PANEL = 0x242429
+	INK = UI_HEADING,
+	MUTED = UI_MUTED,
+	PANEL = UI_DIALOG
 };
 
 enum search_control {
@@ -334,7 +335,7 @@ static void button(Rect r, const char *label, gboolean primary,
 {
 	if (f.focus == item)
 		ui_draw_box((Rect){ r.x - 2, r.y - 2, r.w + 4, r.h + 4 },
-			    0x949cf7);
+			    UI_ACCENT);
 	ui_draw_button(r, label, primary);
 }
 
@@ -432,7 +433,7 @@ void ui_find_draw(void)
 		if (ry + r->height - 9 >= top && ry + r->height - 9 < footer)
 			ui_draw_box((Rect){ x + 18, ry + r->height - 9, w - 36,
 					    1 },
-				    0x34343b);
+				    UI_LINE);
 	}
 }
 

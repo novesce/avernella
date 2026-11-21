@@ -1,0 +1,30 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#ifndef UI_THEME_H
+#define UI_THEME_H
+
+/* Window surfaces, ordered from the rail through raised controls. */
+#define UI_RAIL 0x100c13
+#define UI_SIDEBAR 0x181019
+#define UI_BG 0x19121c
+#define UI_PANEL 0x231725
+#define UI_DIALOG 0x2b1b2b
+#define UI_INPUT 0x2d1e30
+#define UI_RAISED 0x362238
+#define UI_LINE 0x412e40
+
+#define UI_HOVER 0x322031
+#define UI_SELECTED 0x492338
+#define UI_TEXT_SELECTION 0x783951
+#define UI_ACCENT 0xff5ba9
+#define UI_ACCENT_HOVER 0xff8fc2
+#define UI_ON_ACCENT 0x210d1a
+
+#define UI_HEADING 0xfff5fa
+#define UI_BODY 0xeadce6
+#define UI_MUTED 0xc3a7b9
+#define UI_SUBTLE 0xaf90a5
+
+#define UI_DANGER 0xf23f43
+#define UI_ONLINE 0x23a55a
+
+#endif
