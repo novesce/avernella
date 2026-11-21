@@ -1,0 +1,48 @@
+name: Queue Avernella packages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+concurrency:
+  group: avernella-packaging-trigger-${{ github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  queue:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Trigger the packaging repository
+        shell: bash
+        env:
+          PACKAGE_QUEUE_KEY: ${{ secrets.PACKAGE_QUEUE_KEY }}
+        run: |
+          if [[ -z "$PACKAGE_QUEUE_KEY" ]]; then
+            echo "::error::The packaging repository's deploy key is missing."
+            exit 1
+          fi
+          scratch=$(mktemp -d)
+          trap 'rm -rf -- "$scratch"' EXIT
+          umask 077
+          printf '%s\n' "$PACKAGE_QUEUE_KEY" > "$scratch/key"
+          unset PACKAGE_QUEUE_KEY
+          printf '%s\n' 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > "$scratch/hosts"
+          export GIT_SSH_COMMAND="ssh -i $scratch/key -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$scratch/hosts"
+          repo=git@github.com:novesce/avernella-packaging.git
+          ref="refs/tags/avernella-source-$GITHUB_SHA"
+          if git ls-remote --exit-code "$repo" "$ref" >/dev/null; then
+            echo "Packaging was already queued for $GITHUB_SHA."
+            exit 0
+          else
+            status=$?
+            [[ "$status" == 2 ]] || exit "$status"
+          fi
+
+          git init --quiet "$scratch/repo"
+          git -C "$scratch/repo" fetch --quiet --depth=1 "$repo" refs/heads/main
+          git -C "$scratch/repo" push "$repo" "FETCH_HEAD:$ref"
