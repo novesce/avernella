@@ -256,6 +256,9 @@ void ui_media_reply(const char *method, Json *params, guint tag, Json *result,
 		    const char *error);
 void ui_media_call_event(Json *packet);
 void ui_media_window_visibility(gboolean visible);
+gboolean ui_media_fullscreen(void);
+void ui_media_leave_fullscreen(void);
+void ui_media_draw_fullscreen(void);
 int ui_media_content_height(void);
 /* Height of the call stage above the selected chat's messages, or 0. */
 int ui_media_stage_height(void);

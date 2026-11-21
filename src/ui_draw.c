@@ -39,6 +39,7 @@
 
 static cairo_t *cr;
 static PangoContext *context;
+static gboolean composited_text;
 static SDL_Texture *canvas_texture;
 static Uint32 canvas_format;
 static gboolean log_renderer, native_repaint;
@@ -2488,6 +2489,7 @@ static gboolean present_native(SDL_Rect dirty)
 	if (!result)
 		return FALSE;
 	/* A Vulkan window cannot provide an SDL2 software window surface. */
+	ui_media_leave_fullscreen();
 	int x, y, w, h, min_w, min_h;
 	SDL_Window *old = ui.window;
 	Uint32 flags = SDL_GetWindowFlags(old) &
@@ -2685,8 +2687,15 @@ static void draw_frame(const Rect *region)
 	static SDL_Surface *previous_surface;
 	static void *previous_pixels;
 	static int previous_width, previous_height;
+	gboolean fullscreen = ui_media_fullscreen();
+	gboolean painted_chat = FALSE;
+	double p = 0., dy = 0.;
+	int layer = 0;
 
-	ui_layout();
+	if (fullscreen)
+		SDL_GetWindowSize(ui.window, &ui.width, &ui.height);
+	else
+		ui_layout();
 	if (ui.width < 1 || ui.height < 1)
 		return;
 	SDL_Surface *surface = NULL, *target = NULL;
@@ -2763,7 +2772,7 @@ static void draw_frame(const Rect *region)
 	if (SDL_MUSTLOCK(target) && SDL_LockSurface(target) < 0)
 		return;
 	gboolean gpu = ui.renderer || ui_gpu_active();
-	gboolean partial = region && ui.connected && retained &&
+	gboolean partial = region && !fullscreen && ui.connected && retained &&
 			   !(ui_gpu_active() && native_repaint);
 	SDL_Rect pixels = { 0, 0, target->w, target->h };
 
@@ -2816,31 +2825,51 @@ static void draw_frame(const Rect *region)
 		cairo_clip(cr);
 	}
 	cairo_scale(cr, sx, sy);
+	if (context && composited_text != gpu) {
+		ui_forget_history();
+		g_clear_object(&context);
+	}
 	if (!context || sx != text_scale_x || sy != text_scale_y) {
 		ui_forget_labels();
-		if (!context)
+		if (!context) {
 			context = pango_cairo_create_context(cr);
-		else
+			composited_text = gpu;
+			if (gpu) {
+				/* A scrolled or scaled texture has no physical LCD
+				 * subpixel order. Use coverage stable across clips.
+				 */
+				cairo_font_options_t *opts =
+					cairo_font_options_create();
+
+				cairo_font_options_set_antialias(
+					opts, CAIRO_ANTIALIAS_GRAY);
+				pango_cairo_context_set_font_options(context,
+								     opts);
+				cairo_font_options_destroy(opts);
+			}
+		} else
 			pango_cairo_update_context(cr, context);
 		text_scale_x = sx;
 		text_scale_y = sy;
 	}
 	frame_us = g_get_monotonic_time();
 	ui_emoji_frame_start(frame_us);
+	if (fullscreen) {
+		ui_media_draw_fullscreen();
+		goto finish_canvas;
+	}
 	int pane_key = !ui.connected	 ? 0 :
 		       !ui_compact()	 ? 1 :
 		       ui_chat_visible() ? 3 :
 					   2;
-	double p = slide(&pane_slide, pane_key,
-			 ui_compact() ? (pane_key == 2 ? -10. : 10.) : 0.);
+	p = slide(&pane_slide, pane_key,
+		  ui_compact() ? (pane_key == 2 ? -10. : 10.) : 0.);
 	if (p != 0.) {
 		color(PAPER);
 		cairo_paint(cr);
 	}
 	cairo_save(cr);
 	cairo_translate(cr, p, 0);
-	gboolean painted_chat = FALSE;
-
 	if (ui.connected && ui_friends_active()) {
 		/* Like Discord, Friends opens in the main pane beside the list. */
 		if (!ui_compact() && (!partial || region->x < sidebar_w()))
@@ -2867,12 +2896,12 @@ static void draw_frame(const Rect *region)
 		ui_media_draw_call_dock();
 	/* Above the chat list and call dock, below any dialog. */
 	flush_tooltip();
-	int layer = ui.connected ? ui_media_layer() : 0;
+	layer = ui.connected ? ui_media_layer() : 0;
 
 	scrim = strength(SCRIM, (Rect){ 0, 0, 1, 1 },
 			 layer > 1 && layer != UI_LAYER_POPOUT &&
 				 layer != UI_LAYER_INBOX);
-	double dy = slide(&dialog_slide, layer, layer ? 8. : 0.);
+	dy = slide(&dialog_slide, layer, layer ? 8. : 0.);
 
 	if (layer) {
 		cairo_save(cr);
@@ -2884,6 +2913,7 @@ static void draw_frame(const Rect *region)
 	flush_tooltip();
 	if (ui.connected)
 		ui_profile_toast_draw();
+finish_canvas:
 	cairo_destroy(cr);
 	cairo_surface_flush(image);
 	cairo_surface_destroy(image);

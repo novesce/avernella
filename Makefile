@@ -75,7 +75,7 @@ TESTS += build/test-flex-asset build/test-ui-flex
 TESTS += build/test-qr-scan
 TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
-TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene
+TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -237,13 +237,14 @@ build/test-qr-scan: tests/qr_scan.c build/qr_scan.o
 $(TESTS):
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
-build/render-bench: private LDFLAGS += -Wl,--wrap=SDL_RenderPresent
+build/render-bench build/test-ui-call-fullscreen: private LDFLAGS += -Wl,--wrap=SDL_RenderPresent
+build/test-ui-call-fullscreen: tests/ui_call_fullscreen.c build/ui_gpu.o
 build/test-ui-scroll-scene: tests/ui_scroll_scene.c
 build/render-bench: tests/render_bench.c build/ui_gpu.o
-build/render-bench build/test-ui-scroll-scene: build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
-build/render-bench build/test-ui-scroll-scene: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
-build/render-bench build/test-ui-scroll-scene: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-build/render-bench build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o
+build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
+build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
+build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
+build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 

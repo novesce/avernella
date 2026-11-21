@@ -119,6 +119,14 @@ struct call_picture {
 	gboolean upload, convert, texture_failed;
 };
 
+enum stage_tile {
+	TILE_NONE,
+	TILE_PEER,
+	TILE_SELF,
+	TILE_OWN_SCREEN,
+	TILE_PEER_SCREEN,
+};
+
 static struct {
 	enum media_mode mode;
 	guint epoch, serial, call_serial, decode_event, record_event;
@@ -157,8 +165,10 @@ static struct {
 	gboolean share_in_video;
 	gboolean call_working, preview_paused, window_hidden;
 	gint64 call_frames_since, share_ended_at;
-	int focus;
-	Rect share_button, tile_rect[4];
+	int focus, first_click_focus;
+	Rect share_button, tile_rect[4], fullscreen_button[4];
+	enum stage_tile fullscreen_tile, first_click_tile;
+	gboolean window_expanded, saw_fullscreen, ignore_multiclick;
 	Rect call_minimize;
 	Json *row;
 } m;
@@ -187,8 +197,28 @@ static void clear_picture(struct call_picture *picture)
 	*picture = (struct call_picture){ 0 };
 }
 
+gboolean ui_media_fullscreen(void)
+{
+	return m.fullscreen_tile != 0;
+}
+
+void ui_media_leave_fullscreen(void)
+{
+	if (!ui_media_fullscreen())
+		return;
+	m.fullscreen_tile = m.first_click_tile = 0;
+	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
+	if (m.window_expanded && SDL_SetWindowFullscreen(ui.window, 0) < 0)
+		ui_status("Could not restore the window size.");
+	m.window_expanded = m.saw_fullscreen = FALSE;
+	ui_restore_input();
+	ui.dirty = TRUE;
+}
+
 static void clear_call_frame(void)
 {
+	ui_media_leave_fullscreen();
+	m.first_click_tile = 0;
 	clear_picture(&m.call_frame);
 	clear_picture(&m.self_frame);
 	clear_picture(&m.share_frame);
@@ -337,6 +367,8 @@ static void sync_call_preview(void);
 
 static void clear_overlay(enum media_mode next)
 {
+	if (next != CALL)
+		ui_media_leave_fullscreen();
 	if (m.mode == RECORDING)
 		line_record_cancel();
 	if (m.mode == EMOJI_PICKER)
@@ -2111,6 +2143,8 @@ static void sync_call_preview(void)
 void ui_media_window_visibility(gboolean visible)
 {
 	m.window_hidden = !visible;
+	if (!visible)
+		ui_media_leave_fullscreen();
 	sync_call_preview();
 }
 
@@ -2232,11 +2266,18 @@ static void request_share_frame(const char *chat)
 	ui_rpc("callFrame", share, m.serial);
 }
 
+static void stop_picture(struct call_picture *picture, enum stage_tile tile)
+{
+	if (m.fullscreen_tile == tile)
+		ui_media_leave_fullscreen();
+	clear_picture(picture);
+}
+
 static void request_self_frame(const char *chat)
 {
 	if (!m.camera_enabled || m.share_in_video) {
 		if (m.self_frame.pixels) {
-			clear_picture(&m.self_frame);
+			stop_picture(&m.self_frame, TILE_SELF);
 			ui.dirty = TRUE;
 		}
 		return;
@@ -2289,7 +2330,7 @@ void ui_media_call_event(Json *p)
 				if (!m.share_ended_at)
 					m.share_ended_at =
 						g_get_monotonic_time();
-				clear_picture(&m.share_frame);
+				stop_picture(&m.share_frame, TILE_PEER_SCREEN);
 				if (m.focus == 4)
 					m.focus = 0;
 			}
@@ -2306,7 +2347,7 @@ void ui_media_call_event(Json *p)
 				ui_field(p, "shareInVideo"));
 			m.share_working = FALSE;
 			if (m.share_in_video)
-				clear_picture(&m.self_frame);
+				stop_picture(&m.self_frame, TILE_SELF);
 			if ((!m.self_sharing && m.focus == 3) ||
 			    (m.share_in_video && m.focus == 2))
 				m.focus = 0;
@@ -2321,7 +2362,7 @@ void ui_media_call_event(Json *p)
 		    !m.video_ready)
 			return;
 		m.camera_enabled = FALSE;
-		clear_picture(&m.self_frame);
+		stop_picture(&m.self_frame, TILE_SELF);
 		set(&m.call_note, ui_string(p, "message", "The camera stopped."));
 		ui.dirty = TRUE;
 		return;
@@ -2392,11 +2433,16 @@ void ui_media_call_event(Json *p)
 
 		video_changed = m.video_ready != video_ready;
 		m.video_ready = video_ready;
+		if (!video_ready && (m.fullscreen_tile == TILE_PEER ||
+				     m.fullscreen_tile == TILE_SELF))
+			ui_media_leave_fullscreen();
 		m.video_call = show_video || m.call_frame.pixels;
 		if (camera)
 			m.camera_enabled = json_object_get_boolean(camera);
 		else if (video_changed)
 			m.camera_enabled = video_ready;
+		if (!m.camera_enabled && m.self_frame.pixels)
+			stop_picture(&m.self_frame, TILE_SELF);
 	}
 	if (!ui_field(p, "name")) {
 		for (size_t i = 0;
@@ -2487,10 +2533,17 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	line_camera_i420_frame(&picture->frame, pixels, width, height);
 	picture->frame.rotation = rotation;
 	picture->upload = picture->convert = TRUE;
+	enum stage_tile tile = share ? TILE_PEER_SCREEN :
+			       self  ? TILE_SELF :
+				       TILE_PEER;
+	gboolean visible = !m.fullscreen_tile || m.fullscreen_tile == tile;
+
 	if (share) {
 		if (!m.peer_sharing)
 			m.focus = 4;
 		m.peer_sharing = TRUE;
+		if (!visible)
+			return;
 		if ((ui.renderer || ui_gpu_active()) && picture->view.w > 0 &&
 		    !first)
 			ui.video_dirty = TRUE;
@@ -2506,6 +2559,8 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 		m.camera_enabled = camera_enabled;
 		set(&m.call_note, NULL);
 	}
+	if (!visible)
+		return;
 	if (first && !g_strcmp0(g_getenv("LINE_CALL_DEBUG"), "1"))
 		g_printerr("line-call video first frame reached window\n");
 	if ((ui.renderer || ui_gpu_active()) && picture->view.w > 0)
@@ -2619,6 +2674,81 @@ static gboolean draw_call_frame(struct call_picture *picture, Rect box)
 	return TRUE;
 }
 
+enum {
+	FULLSCREEN_BAR_H = 40
+};
+
+/* Stage tile numbers match the existing focus selection. */
+static struct call_picture *tile_picture(enum stage_tile tile)
+{
+	switch (tile) {
+	case TILE_PEER:
+		return &m.call_frame;
+	case TILE_SELF:
+		return m.camera_enabled && !m.share_in_video ? &m.self_frame :
+							       NULL;
+	case TILE_PEER_SCREEN:
+		return m.peer_sharing ? &m.share_frame : NULL;
+	default:
+		return NULL;
+	}
+}
+
+static gboolean enter_fullscreen(enum stage_tile tile)
+{
+	struct call_picture *picture = tile_picture(tile);
+
+	if (m.mode != CALL || !call_connected() || !picture || !picture->pixels)
+		return FALSE;
+	if (!(SDL_GetWindowFlags(ui.window) & SDL_WINDOW_FULLSCREEN)) {
+		if (SDL_SetWindowFullscreen(
+			    ui.window, SDL_WINDOW_FULLSCREEN_DESKTOP) < 0) {
+			ui_status(
+				"Full screen is unavailable on this display.");
+			return FALSE;
+		}
+		m.window_expanded = TRUE;
+	}
+	m.saw_fullscreen =
+		(SDL_GetWindowFlags(ui.window) & SDL_WINDOW_FULLSCREEN) != 0;
+	m.fullscreen_tile = tile;
+	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
+	memset(m.fullscreen_button, 0, sizeof(m.fullscreen_button));
+	SDL_StopTextInput();
+	ui.dirty = TRUE;
+	return TRUE;
+}
+
+static Rect fullscreen_exit(void)
+{
+	int w = MIN(144, MAX(1, ui.width - 12));
+
+	return (Rect){ ui.width - w - 6, 4, w, FULLSCREEN_BAR_H - 8 };
+}
+
+void ui_media_draw_fullscreen(void)
+{
+	struct call_picture *picture = tile_picture(m.fullscreen_tile);
+	Rect exit = fullscreen_exit();
+	Rect area = { 0, FULLSCREEN_BAR_H, ui.width,
+		      MAX(0, ui.height - FULLSCREEN_BAR_H) };
+	const char *name =
+		m.fullscreen_tile == TILE_SELF ? (ui.name ? ui.name : "You") :
+		m.fullscreen_tile == TILE_PEER_SCREEN ? "Shared screen" :
+							m.call_name;
+
+	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
+	ui_draw_box((Rect){ 0, 0, ui.width, ui.height }, 0);
+	if (!picture || !draw_call_frame(picture, area))
+		ui_draw_centered("Waiting for video…", area, 15, 500, 0xdbdee1);
+	ui_draw_box((Rect){ 0, 0, ui.width, FULLSCREEN_BAR_H }, 0x111214);
+	if (exit.x > 20)
+		ui_draw_label(name ? name : "Video call",
+			      (Rect){ 12, 10, exit.x - 18, 24 }, 15, 600,
+			      0xf2f3f5, FALSE);
+	ui_draw_button(exit, "Exit full screen", FALSE);
+}
+
 static const char *call_state_label(void)
 {
 	if (m.mode == DIAL)
@@ -2697,9 +2827,35 @@ static void live_badge(Rect tile)
 }
 
 /* One participant: live video when present, otherwise their avatar. */
-static void call_tile(Rect tile, struct call_picture *picture, const char *name,
+static void draw_expand_button(Rect r)
+{
+	gboolean hover = at(r, ui.hover_x, ui.hover_y);
+	ui_draw_rounded(r, 4, hover ? 0x41434a : 0x2b2d31);
+	if (r.w >= 68) {
+		ui_draw_centered("Full screen", r, 11, 600, 0xf2f3f5);
+	} else {
+		int x = r.x + r.w / 2 - 6, y = r.y + r.h / 2 - 5;
+
+		for (int n = 0; n < 4; n++) {
+			int right = n & 1, bottom = n >> 1;
+
+			ui_draw_box((Rect){ x + (right ? 8 : 0), y + bottom * 9,
+					    5, 2 },
+				    0xf2f3f5);
+			ui_draw_box((Rect){ x + right * 11,
+					    y + (bottom ? 6 : 0), 2, 5 },
+				    0xf2f3f5);
+		}
+	}
+	if (hover)
+		ui_draw_tooltip(r, "Full screen (F11)");
+}
+
+static void call_tile(int index, struct call_picture *picture, const char *name,
 		      const char *seed, gboolean live, gboolean streaming)
 {
+	Rect tile = m.tile_rect[index];
+
 	ui_draw_rounded(tile, 8, 0x1a1a1e);
 	gboolean shown = live && draw_call_frame(picture, tile);
 
@@ -2715,8 +2871,20 @@ static void call_tile(Rect tile, struct call_picture *picture, const char *name,
 	}
 	if (streaming)
 		live_badge(tile);
-	ui_draw_label(name, (Rect){ tile.x, tile.y + tile.h + 6, tile.w, 20 },
-		      13, 600, 0xdbdee1, FALSE);
+	int label_w = tile.w;
+	if (shown && tile.w >= 24) {
+		int w = tile.w >= 128 ? 72 : 24;
+		Rect r = { tile.x + tile.w - w, tile.y + tile.h + 2, w, 22 };
+
+		m.fullscreen_button[index] = r;
+		draw_expand_button(r);
+		label_w -= w + 4;
+	}
+	if (label_w > 0)
+		ui_draw_label(name,
+			      (Rect){ tile.x, tile.y + tile.h + 6, label_w,
+				      20 },
+			      13, 600, 0xdbdee1, FALSE);
 }
 
 /* Incoming calls ring as a small card with green and red buttons. */
@@ -2791,6 +2959,7 @@ static void draw_call_stage(void)
 	const char *self = ui.name ? ui.name : "You";
 
 	memset(m.tile_rect, 0, sizeof(m.tile_rect));
+	memset(m.fullscreen_button, 0, sizeof(m.fullscreen_button));
 	if (video) {
 		/*
 		 * Tiles: 0 the peer, 1 you, 2 your screen, 3 the peer's screen.
@@ -2848,12 +3017,11 @@ static void draw_call_stage(void)
 						y0 + (i / cols) * (th + 26 + 8),
 						tw, th };
 		}
-		call_tile(m.tile_rect[0], &m.call_frame, m.call_name,
-			  m.call_chat, m.call_frame.pixels != NULL, FALSE);
+		call_tile(0, &m.call_frame, m.call_name, m.call_chat,
+			  m.call_frame.pixels != NULL, FALSE);
 		if (!m.share_in_video)
-			call_tile(m.tile_rect[1], &m.self_frame, self,
-				  ui.self_id, m.self_frame.pixels != NULL,
-				  FALSE);
+			call_tile(1, &m.self_frame, self, ui.self_id,
+				  m.self_frame.pixels != NULL, FALSE);
 		if (m.self_sharing) {
 			/* Your own stream: Discord shows a placeholder too. */
 			Rect t = m.tile_rect[2];
@@ -2869,9 +3037,8 @@ static void draw_call_stage(void)
 				      600, 0xdbdee1, FALSE);
 		}
 		if (m.peer_sharing)
-			call_tile(m.tile_rect[3], &m.share_frame, peer_screen,
-				  m.call_chat, m.share_frame.pixels != NULL,
-				  TRUE);
+			call_tile(3, &m.share_frame, peer_screen, m.call_chat,
+				  m.share_frame.pixels != NULL, TRUE);
 		else
 			m.share_frame.view = (SDL_FRect){ 0 };
 	} else {
@@ -3278,7 +3445,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 						      CHIP_CAMERA_OFF);
 			m.video_call |= m.camera_enabled;
 			if (!m.camera_enabled)
-				clear_picture(&m.self_frame);
+				stop_picture(&m.self_frame, TILE_SELF);
 		}
 		/* Sharing reports back through call_share once capture starts. */
 		if (!strcmp(method, "callShare") &&
@@ -3472,6 +3639,25 @@ static void menu_select(int pos)
 static gboolean handle_key(SDL_KeyboardEvent k)
 {
 	SDL_Keycode code = k.keysym.sym;
+
+	if (m.mode == CALL && code == SDLK_F11) {
+		const enum stage_tile tiles[] = {
+			m.focus,
+			TILE_PEER,
+			TILE_PEER_SCREEN,
+			TILE_SELF,
+		};
+		for (guint i = 0; !k.repeat && i < G_N_ELEMENTS(tiles); i++) {
+			const struct call_picture *picture =
+				tile_picture(tiles[i]);
+
+			if (picture && picture->pixels) {
+				enter_fullscreen(tiles[i]);
+				break;
+			}
+		}
+		return TRUE;
+	}
 	gboolean ctrl = (k.keysym.mod & KMOD_CTRL) != 0;
 
 	if (call_docked() && !k.repeat && (k.keysym.mod & KMOD_ALT)) {
@@ -3518,6 +3704,8 @@ static gboolean handle_key(SDL_KeyboardEvent k)
 		return FALSE;
 	}
 	if (code == SDLK_ESCAPE) {
+		if (k.repeat)
+			return TRUE;
 		if (m.mode == CALL && call_active()) {
 			minimize_call();
 			return TRUE;
@@ -3589,6 +3777,22 @@ static gboolean handle_key(SDL_KeyboardEvent k)
 
 static void click_overlay(int x, int y, int clicks)
 {
+	if (m.mode == CALL) {
+		if (clicks == 2 && m.first_click_tile &&
+		    enter_fullscreen(m.first_click_tile)) {
+			/* The first click may already have rearranged the tiles. */
+			m.focus = m.first_click_focus;
+			return;
+		}
+		m.first_click_tile = 0;
+		for (int i = 0; i < 4; i++) {
+			if (at(m.fullscreen_button[i], x, y) &&
+			    enter_fullscreen(i + 1)) {
+				m.ignore_multiclick = TRUE;
+				return;
+			}
+		}
+	}
 	if ((m.mode == MENU || m.mode == REACT) && !at(m.dialog, x, y)) {
 		close_overlay();
 		return;
@@ -3625,6 +3829,10 @@ static void click_overlay(int x, int y, int clicks)
 	/* Clicking a tile focuses it; clicking the focused tile unfocuses. */
 	for (int i = 0; m.mode == CALL && i < 4; i++)
 		if (m.tile_rect[i].w && at(m.tile_rect[i], x, y)) {
+			if (clicks == 2 && enter_fullscreen(i + 1))
+				return;
+			m.first_click_tile = i + 1;
+			m.first_click_focus = m.focus;
 			m.focus = m.focus == i + 1 ? 0 : i + 1;
 			ui.dirty = TRUE;
 			return;
@@ -3644,6 +3852,74 @@ static void click_overlay(int x, int y, int clicks)
 			choose_item(pos, clicks >= 2);
 		else
 			menu_select((y - m.items.y) / 34);
+	}
+}
+
+static gboolean fullscreen_event(SDL_Event *e)
+{
+	switch (e->type) {
+	case SDL_WINDOWEVENT:
+		if (e->window.windowID != SDL_GetWindowID(ui.window))
+			return FALSE;
+		if (e->window.event == SDL_WINDOWEVENT_SIZE_CHANGED ||
+		    e->window.event == SDL_WINDOWEVENT_RESTORED) {
+			gboolean full = (SDL_GetWindowFlags(ui.window) &
+					 SDL_WINDOW_FULLSCREEN) != 0;
+
+			/* Wayland acknowledges a fullscreen request asynchronously. */
+			if (m.saw_fullscreen && !full) {
+				m.window_expanded = FALSE;
+				ui_media_leave_fullscreen();
+			} else if (full)
+				m.saw_fullscreen = TRUE;
+			return FALSE;
+		}
+		if (e->window.event != SDL_WINDOWEVENT_CLOSE)
+			return FALSE;
+		ui_media_leave_fullscreen();
+		SDL_FlushEvent(SDL_QUIT);
+		return TRUE;
+	case SDL_KEYDOWN:
+		if (!e->key.repeat && (e->key.keysym.sym == SDLK_ESCAPE ||
+				       e->key.keysym.sym == SDLK_F11))
+			ui_media_leave_fullscreen();
+		else if (e->key.keysym.mod & KMOD_ALT)
+			handle_key(e->key);
+		return TRUE;
+	case SDL_MOUSEBUTTONDOWN:
+		if (e->button.button != SDL_BUTTON_LEFT)
+			return TRUE;
+		if (e->button.clicks <= 1)
+			m.ignore_multiclick = FALSE;
+		else if (m.ignore_multiclick)
+			return TRUE;
+		if (at(fullscreen_exit(), e->button.x, e->button.y) ||
+		    (e->button.clicks == 2 &&
+		     e->button.y >= FULLSCREEN_BAR_H)) {
+			ui_media_leave_fullscreen();
+			m.ignore_multiclick = TRUE;
+		}
+		return TRUE;
+	case SDL_MOUSEMOTION: {
+		Rect r = fullscreen_exit();
+		if (at(r, ui.hover_x, ui.hover_y) !=
+		    at(r, e->motion.x, e->motion.y))
+			ui.dirty = TRUE;
+		ui.hover_x = e->motion.x;
+		ui.hover_y = e->motion.y;
+		return TRUE;
+	}
+	case SDL_DROPFILE:
+		SDL_free(e->drop.file);
+		return TRUE;
+	case SDL_TEXTINPUT:
+	case SDL_TEXTEDITING:
+	case SDL_KEYUP:
+	case SDL_MOUSEBUTTONUP:
+	case SDL_MOUSEWHEEL:
+		return TRUE;
+	default:
+		return FALSE;
 	}
 }
 
@@ -3720,6 +3996,16 @@ gboolean ui_media_event(SDL_Event *e)
 		}
 		return FALSE;
 	}
+	if (ui_media_fullscreen() && fullscreen_event(e))
+		return TRUE;
+	if (e->type == SDL_MOUSEBUTTONDOWN &&
+	    e->button.button == SDL_BUTTON_LEFT) {
+		if (e->button.clicks <= 1) {
+			m.first_click_tile = TILE_NONE;
+			m.ignore_multiclick = FALSE;
+		} else if (m.ignore_multiclick)
+			return TRUE;
+	}
 	if (e->type == SDL_MOUSEBUTTONDOWN &&
 	    e->button.button == SDL_BUTTON_LEFT) {
 		int target = ui_media_dock_hover(e->button.x, e->button.y);
@@ -3789,8 +4075,16 @@ gboolean ui_media_event(SDL_Event *e)
 			return TRUE;
 		case SDL_MOUSEMOTION:
 			if (m.mode == CALL || m.mode == DIAL) {
-				const Rect controls[] = { m.primary, m.secondary,
-					m.third, m.share_button, m.call_minimize };
+				const Rect controls[] = {
+					m.primary,
+					m.secondary,
+					m.third,
+					m.share_button,
+					m.call_minimize,
+					m.fullscreen_button[0],
+					m.fullscreen_button[1],
+					m.fullscreen_button[3]
+				};
 				int x = e->motion.x, y = e->motion.y;
 
 				for (guint i = 0; i < G_N_ELEMENTS(controls); i++)

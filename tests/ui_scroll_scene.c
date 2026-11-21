@@ -71,7 +71,30 @@ int ui_gpu_draw(const struct gpu_scene *s)
 	else
 		copy((const guint8 *)texture, sizeof(texture[0]), presented,
 		     (struct gpu_copy){ screen, screen });
+	/* The compositor samples RGB. Cairo leaves the high XRGB byte undefined. */
+	for (int y = 0; y < H; y++)
+		for (int x = 0; x < W; x++)
+			presented[y][x] &= 0x00ffffff;
 	return 1;
+}
+
+static void report_difference(int offset)
+{
+	g_autofree uint32_t (*actual)[W] =
+		g_memdup2(presented, sizeof(presented));
+
+	ui_draw();
+	for (int y = 0; y < H; y++) {
+		for (int x = 0; x < W; x++)
+			if (actual[y][x] != presented[y][x]) {
+				g_test_message(
+					"offset %d, pixel (%d,%d): %06x, full repaint %06x",
+					offset, x, y, actual[y][x],
+					presented[y][x]);
+				return;
+			}
+	}
+	g_test_message("offset %d also changed between full repaints", offset);
 }
 
 static void history(void)
@@ -136,6 +159,8 @@ static void history(void)
 		g_autofree char *actual = g_compute_checksum_for_data(
 			G_CHECKSUM_SHA256, (const guint8 *)presented,
 			sizeof(presented));
+		if (strcmp(actual, reference[i]))
+			report_difference(ui.history_offset);
 		g_assert_cmpstr(actual, ==, reference[i]);
 		if (i == 1) {
 			g_test_message(
