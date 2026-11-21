@@ -301,9 +301,9 @@ J *line_chats(Line *s, GError **error)
 			gint64 last = json_object_get_int64(field(latest, "2"));
 			gint64 hidden = json_object_get_int64(field(box, "10"));
 			gint64 removed = json_object_get_int64(field(box, "8"));
+			gint64 cleared = MAX(hidden, removed);
 
-			if (!talk_id(id) || (MAX(hidden, removed) > 0 &&
-					     last <= MAX(hidden, removed)))
+			if (!talk_id(id) || (cleared > 0 && last <= cleared))
 				continue;
 			gint64 time = json_object_get_int64(field(latest, "1"));
 			J *prior = field(summaries, id);
@@ -319,6 +319,8 @@ J *line_chats(Line *s, GError **error)
 
 				put(row, "id", string(id));
 				number(row, "time", time);
+				if (cleared > 0)
+					number(row, "clearThrough", cleared);
 				number(row, "unread",
 				       MAX((gint64)0,
 					   json_object_get_int64(
@@ -809,21 +811,6 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 	return rows;
 }
 
-J *line_history_raw(Line *s, const char *chat, J **messages, GError **error)
-{
-	if (!talk_id(chat)) {
-		g_set_error_literal(error, LINE_ERROR, 1,
-				    "Select a LINE conversation.");
-		return NULL;
-	}
-	g_autoptr(J) args = obj();
-	put(args, "2:str", string(chat));
-	number(args, "3:i32", HISTORY_LIMIT);
-	g_autoptr(J) reply =
-		line_rpc(s, "/S4", "getRecentMessagesV2", args, error);
-	return reply ? history_rows(s, reply, messages, error) : NULL;
-}
-
 static gboolean delivery_position(J *message, gint64 *time, guint64 *id)
 {
 	const char *digits = strfield(message, "4");
@@ -861,28 +848,25 @@ J *line_history_cursor(J *previous)
 	return cursor;
 }
 
-J *line_history_older(Line *s, const char *chat, J *boundary, J **messages,
-		      gboolean *more, GError **error)
-{
-	gint64 boundary_time;
-	guint64 boundary_id;
+struct page_boundary {
+	gint64 time;
+	guint64 id, cleared_through;
+	gboolean inclusive;
+};
 
-	if (!talk_id(chat) ||
-	    !delivery_position(boundary, &boundary_time, &boundary_id)) {
-		g_set_error_literal(
-			error, LINE_ERROR, 1,
-			"LINE did not supply a cursor for earlier messages.");
-		return NULL;
-	}
+static J *previous_page(Line *s, const char *chat, struct page_boundary end,
+			J **messages, gboolean *more, GError **error)
+{
 	g_autoptr(J) args = obj(), page = array();
 	J *req = obj(), *cursor = obj();
+	gboolean reached_floor = FALSE;
 
 	put(args, "2:obj", req);
 	number(args, "3:i32", 7);
 	put(req, "1:str", string(chat));
 	put(req, "2:obj", cursor);
-	number(cursor, "1:i64", boundary_time);
-	number(cursor, "2:i64", (gint64)boundary_id);
+	number(cursor, "1:i64", end.time);
+	number(cursor, "2:i64", (gint64)end.id);
 	number(req, "3:i32", HISTORY_LIMIT);
 	g_autoptr(J) reply = line_rpc(
 		s, "/S4", "getPreviousMessagesV2WithRequest", args, error);
@@ -894,18 +878,92 @@ J *line_history_older(Line *s, const char *chat, J *boundary, J **messages,
 			"LINE returned an unreadable history page.");
 		return NULL;
 	}
-	for (size_t i = 0; i < length(reply); i++) {
+	for (size_t i = 0; i < MIN(length(reply), HISTORY_LIMIT); i++) {
 		J *message = at(reply, i);
 		gint64 t;
 		guint64 id;
 
-		if (delivery_position(message, &t, &id) &&
-		    (t < boundary_time ||
-		     (t == boundary_time && id < boundary_id)))
-			json_object_array_add(page, json_object_get(message));
+		if (!delivery_position(message, &t, &id))
+			continue;
+		if (id <= end.cleared_through) {
+			reached_floor = TRUE;
+			continue;
+		}
+		if (t > end.time || (t == end.time && id > end.id) ||
+		    (!end.inclusive && id == end.id))
+			continue;
+		json_object_array_add(page, json_object_get(message));
 	}
-	*more = length(reply) >= HISTORY_LIMIT && length(page) > 0;
+	if (more)
+		*more = !reached_floor && length(reply) >= HISTORY_LIMIT &&
+			length(page) > 0;
 	return history_rows(s, page, messages, error);
+}
+
+J *line_history_with_summary(Line *s, const char *chat, J *summary,
+			     J **messages, GError **error)
+{
+	if (!talk_id(chat)) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Select a LINE conversation.");
+		return NULL;
+	}
+	g_autoptr(J) args = obj();
+
+	put(args, "2:str", string(chat));
+	number(args, "3:i32", HISTORY_LIMIT);
+	g_autoptr(J) reply =
+		line_rpc(s, "/S4", "getRecentMessagesV2", args, error);
+
+	if (!reply)
+		return NULL;
+	/* An empty recent page can coexist with a message-box delivery head. */
+	if (json_object_is_type(reply, json_type_array) && !length(reply) &&
+	    !g_strcmp0(strfield(summary, "id"), chat)) {
+		const char *digits = strfield(summary, "lastId");
+		struct page_boundary end = {
+			.time = json_object_get_int64(field(summary, "time")),
+			.cleared_through = json_object_get_uint64(
+				field(summary, "clearThrough")),
+			.inclusive = TRUE,
+		};
+
+		if (end.time > 0 && digits &&
+		    g_ascii_string_to_unsigned(digits, 10, 1, G_MAXINT64,
+					       &end.id, NULL) &&
+		    end.id > end.cleared_through)
+			return previous_page(s, chat, end, messages, NULL,
+					     error);
+	}
+	return history_rows(s, reply, messages, error);
+}
+
+J *line_history_raw(Line *s, const char *chat, J **messages, GError **error)
+{
+	return line_history_with_summary(s, chat, NULL, messages, error);
+}
+
+J *line_history_older_since(Line *s, const char *chat, J *boundary,
+			    guint64 cleared_through, J **messages,
+			    gboolean *more, GError **error)
+{
+	struct page_boundary end = { .cleared_through = cleared_through };
+
+	if (!talk_id(chat) ||
+	    !delivery_position(boundary, &end.time, &end.id)) {
+		g_set_error_literal(
+			error, LINE_ERROR, 1,
+			"LINE did not supply a cursor for earlier messages.");
+		return NULL;
+	}
+	return previous_page(s, chat, end, messages, more, error);
+}
+
+J *line_history_older(Line *s, const char *chat, J *boundary, J **messages,
+		      gboolean *more, GError **error)
+{
+	return line_history_older_since(s, chat, boundary, 0, messages, more,
+					error);
 }
 
 static J *mention_metadata(const char *text, J *mentions)

@@ -55,7 +55,9 @@ struct line_worker {
 	/* Scheduled token renewal: monotonic retry time and failure count. */
 	gint64 refresh_retry;
 	guint refresh_failures;
-	GHashTable *chats, *leases, *left_groups;
+	/* Chat IDs map to borrowed chat_snapshot rows, or NULL before first sync. */
+	GHashTable *chats;
+	GHashTable *leases, *left_groups;
 	J *messages, *friends, *opened_chats, *lookup_result, *invited_groups;
 	J *recommendations;
 	/* Profiles the window opened, and incoming friend requests. */
@@ -395,10 +397,11 @@ static J *open_conversation(struct line_worker *w, J *row)
 	json_object_object_add(chat, "avatarKey",
 			       json_object_new_string(avatar ? avatar : ""));
 	json_object_object_add(chat, "time", json_object_new_int(0));
-	if (!g_hash_table_contains(w->chats, id))
+	if (!g_hash_table_contains(w->chats, id)) {
 		json_object_object_add(w->opened_chats, id,
 				       json_object_get(chat));
-	g_hash_table_add(w->chats, g_strdup(id));
+		g_hash_table_insert(w->chats, g_strdup(id), NULL);
+	}
 	return chat;
 }
 
@@ -512,6 +515,29 @@ static void append_matches(J *matches, J *rows, const char *needle, J *chat)
 	}
 }
 
+static guint64 history_clear_id(struct line_worker *w, const char *chat)
+{
+	J *summary = g_hash_table_lookup(w->chats, chat);
+
+	return json_object_get_uint64(field(summary, "clearThrough"));
+}
+
+static J *recent_history(struct line_worker *w, const char *chat, J **raw,
+			 GError **error)
+{
+	return line_history_with_summary(&w->session, chat,
+					 g_hash_table_lookup(w->chats, chat),
+					 raw, error);
+}
+
+static J *previous_history(struct line_worker *w, const char *chat, J *boundary,
+			   J **raw, gboolean *more, GError **error)
+{
+	return line_history_older_since(&w->session, chat, boundary,
+					history_clear_id(w, chat), raw, more,
+					error);
+}
+
 static J *find_messages(struct line_worker *w, const char *chat, J *params,
 			GError **error)
 {
@@ -534,9 +560,9 @@ static J *find_messages(struct line_worker *w, const char *chat, J *params,
 	gboolean more = FALSE;
 
 	g_autoptr(J) rows =
-		token ? line_history_older(&w->session, chat, w->find_boundary,
-					   &raw, &more, error) :
-			line_history_raw(&w->session, chat, &raw, error);
+		token ? previous_history(w, chat, w->find_boundary, &raw, &more,
+					 error) :
+			recent_history(w, chat, &raw, error);
 	if (!rows)
 		return NULL;
 	size_t count = json_object_array_length(rows);
@@ -599,8 +625,7 @@ static J *find_all_messages(struct line_worker *w, J *params, GError **error)
 		if (!id || !g_hash_table_contains(w->chats, id))
 			continue;
 		g_autoptr(GError) failure = NULL;
-		g_autoptr(J) rows =
-			line_history_raw(&w->session, id, NULL, &failure);
+		g_autoptr(J) rows = recent_history(w, id, NULL, &failure);
 
 		if (rows)
 			append_matches(matches, rows, w->global_query, chat);
@@ -699,7 +724,7 @@ static J *chat_directory(struct line_worker *w, GError **error)
 		}
 		i++;
 		if (id) {
-			g_hash_table_add(w->chats, g_strdup(id));
+			g_hash_table_insert(w->chats, g_strdup(id), row);
 			json_object_object_del(w->opened_chats, id);
 			if (json_object_get_int64(field(row, "unread")) > 0 &&
 			    strfield(row, "lastId"))
@@ -709,7 +734,7 @@ static J *chat_directory(struct line_worker *w, GError **error)
 		}
 	}
 	json_object_object_foreach(w->opened_chats, id, row) {
-		g_hash_table_add(w->chats, g_strdup(id));
+		g_hash_table_insert(w->chats, g_strdup(id), row);
 		json_object_array_add(rows, json_object_get(row));
 	}
 	json_object_put(w->chat_snapshot);
@@ -817,6 +842,7 @@ enum { HISTORY_CACHE_CHATS = 24 };
 
 struct cached_history {
 	J *rows, *raw;
+	guint64 cleared_through;
 	gboolean stale;
 };
 
@@ -855,6 +881,7 @@ static void cache_store(struct line_worker *w, const char *chat, J *rows,
 
 	c->rows = json_object_get(rows);
 	c->raw = json_object_get(raw);
+	c->cleared_through = history_clear_id(w, chat);
 	g_hash_table_replace(w->history_cache, g_strdup(chat), c);
 	cache_touch(w, chat);
 }
@@ -870,8 +897,7 @@ static void cache_clear(struct line_worker *w)
 static J *fetch_history(struct line_worker *w, const char *chat, J **raw,
 			GError **error)
 {
-	Line *s = &w->session;
-	J *history = line_history_raw(s, chat, raw, error);
+	J *history = recent_history(w, chat, raw, error);
 
 	for (size_t i = 0; history && i < json_object_array_length(history);
 	     i++) {
@@ -882,7 +908,7 @@ static J *fetch_history(struct line_worker *w, const char *chat, J **raw,
 			continue;
 		g_autoptr(GError) ignored = NULL;
 		g_autofree char *name = line_attachment_filename(
-			s, field(*raw, strfield(row, "id")), &ignored);
+			&w->session, field(*raw, strfield(row, "id")), &ignored);
 		if (name)
 			json_object_object_add(row, "filename",
 					       json_object_new_string(name));
@@ -904,8 +930,6 @@ static void show_history(struct line_worker *w, const char *chat, J *raw)
 static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 		       GError **error)
 {
-	Line *s = &w->session;
-
 	if (older && g_strcmp0(chat, w->history_chat))
 		return problem(
 			error,
@@ -914,7 +938,7 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 		struct cached_history *c =
 			g_hash_table_lookup(w->history_cache, chat);
 
-		if (c) {
+		if (c && c->cleared_through == history_clear_id(w, chat)) {
 			/* Answer from memory now; check LINE after replying. */
 			show_history(w, chat, c->raw);
 			cache_touch(w, chat);
@@ -936,7 +960,7 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 	gboolean more = FALSE;
 
 	g_autoptr(J) boundary = line_history_cursor(w->messages);
-	J *history = line_history_older(s, chat, boundary, &raw, &more, error);
+	J *history = previous_history(w, chat, boundary, &raw, &more, error);
 	if (!history)
 		return NULL;
 	if (json_object_array_length(history)) {
@@ -1944,7 +1968,8 @@ static gboolean message_operation(struct line_worker *w, J *op,
 	if (!mine && w->unread_heads)
 		json_object_object_add(w->unread_heads, chat,
 				       json_object_new_string(id));
-	g_hash_table_add(w->chats, g_strdup(chat));
+	if (!g_hash_table_contains(w->chats, chat))
+		g_hash_table_insert(w->chats, g_strdup(chat), NULL);
 	struct cached_history *c = g_hash_table_lookup(w->history_cache, chat);
 
 	if (c)

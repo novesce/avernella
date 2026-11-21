@@ -12,7 +12,8 @@ static unsigned int sends, pages, profiles, group_profiles;
 static gboolean reject_read;
 static unsigned int read_requests;
 static const char *expected_body, *expected_chat, *expected_mention;
-static J *recent_fixture;
+static J *recent_fixture, *previous_fixture;
+static guint previous_requests;
 
 /* All endpoints are fixtures. Only ciphertext preparation is substituted. */
 J *line_seal_text(Line *s, const char *chat, const char *text, GError **error)
@@ -64,7 +65,7 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":\"" GROUP
 			"\",\"4\":{\"1\":22,\"2\":9007199254740993},"
-			"\"5\":9007199254740991,\"6\":2},"
+			"\"5\":9007199254740991,\"6\":2,\"8\":9,\"10\":11},"
 			"{\"1\":\"" SELF
 			"\",\"4\":{\"1\":23,\"2\":61},\"10\":61}],\"2\":false}");
 	}
@@ -122,6 +123,7 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	if (!strcmp(method, "getPreviousMessagesV2WithRequest")) {
 		J *req = field(args, "2:obj"), *end = field(req, "2:obj");
 
+		previous_requests++;
 		g_assert_cmpstr(path, ==, "/S4");
 		g_assert_cmpstr(strfield(req, "1:str"), ==, ALICE);
 		g_assert_cmpint(json_object_get_int64(field(end, "1:i64")), ==,
@@ -130,6 +132,8 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 				G_GINT64_CONSTANT(9007199254740993));
 		g_assert_cmpint(json_object_get_int(field(req, "3:i32")), ==,
 				50);
+		if (previous_fixture)
+			return json_object_get(previous_fixture);
 		return json_tokener_parse(
 			"[{\"4\":\"9007199254740993\",\"6\":133000},"
 			"{\"4\":\"9007199254740992\",\"6\":133000,\"10\":\"Older message\"}]");
@@ -207,6 +211,8 @@ static void chat_list(void)
 
 	g_assert_cmpstr(strfield(group, "lastId"), ==, "9007199254740993");
 	g_assert_cmpstr(strfield(group, "lastSeenId"), ==, "9007199254740991");
+	g_assert_cmpint(json_object_get_int64(field(group, "clearThrough")), ==,
+			11);
 	g_assert_cmpint(json_object_get_int64(field(group, "unread")), ==, 2);
 	g_assert_cmpstr(strfield(json_object_array_get_idx(chats, 1), "name"),
 			==, "Alice");
@@ -314,6 +320,84 @@ static void previous_messages(void)
 	g_assert_null(
 		line_history_older(&s, ALICE, invalid, NULL, &more, &error));
 	g_assert_error(error, LINE_ERROR, 1);
+}
+
+static void recover_empty_recent(void)
+{
+	Line s = { .mid = SELF };
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) empty = json_object_new_array();
+	g_autoptr(J) summary = json_tokener_parse(
+		"{\"id\":\"" ALICE "\",\"lastId\":\"9007199254740993\","
+		"\"time\":133000,\"clearThrough\":9007199254740990}");
+	g_autoptr(J) page = json_tokener_parse(
+		"[{\"4\":\"9007199254740993\",\"6\":133000,\"10\":\"Head\"},"
+		"{\"4\":\"9007199254740992\",\"6\":132999,\"10\":\"Previous\"},"
+		"{\"4\":\"9007199254740990\",\"6\":132998,\"10\":\"Cleared\"},"
+		"{\"4\":\"9007199254740994\",\"6\":133000,\"10\":\"Newer\"}]");
+	g_autoptr(J) raw = NULL;
+
+	recent_fixture = empty;
+	previous_fixture = page;
+	previous_requests = 0;
+	g_autoptr(J) rows =
+		line_history_with_summary(&s, ALICE, summary, &raw, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpuint(json_object_array_length(rows), ==, 2);
+	g_assert_cmpuint(json_object_object_length(raw), ==, 2);
+	g_assert_cmpstr(strfield(field(raw, "9007199254740993"), "10"), ==,
+			"Head");
+	g_assert_cmpstr(strfield(field(raw, "9007199254740992"), "10"), ==,
+			"Previous");
+	g_assert_cmpuint(previous_requests, ==, 1);
+
+	gboolean more = TRUE;
+	g_autoptr(J) boundary =
+		json_tokener_parse("{\"4\":\"9007199254740993\",\"6\":133000}");
+	g_autoptr(J) older = line_history_older_since(
+		&s, ALICE, boundary, 9007199254740990, NULL, &more, &error);
+
+	g_assert_no_error(error);
+	g_assert_false(more);
+	g_assert_cmpuint(json_object_array_length(older), ==, 1);
+	g_assert_cmpstr(strfield(json_object_array_get_idx(older, 0), "text"),
+			==, "Previous");
+
+	previous_fixture = empty;
+	g_clear_pointer(&rows, json_object_put);
+	rows = line_history_with_summary(&s, ALICE, summary, NULL, &error);
+	g_assert_no_error(error);
+	g_assert_cmpuint(json_object_array_length(rows), ==, 0);
+	g_assert_cmpuint(previous_requests, ==, 3);
+
+	recent_fixture = page;
+	g_clear_pointer(&rows, json_object_put);
+	rows = line_history_with_summary(&s, ALICE, summary, NULL, &error);
+	g_assert_no_error(error);
+	g_assert_cmpuint(previous_requests, ==, 3);
+
+	recent_fixture = empty;
+	previous_fixture = summary; /* malformed page */
+	g_assert_null(
+		line_history_with_summary(&s, ALICE, summary, NULL, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+
+	recent_fixture =
+		summary; /* malformed recent must not trigger recovery */
+	g_assert_null(
+		line_history_with_summary(&s, ALICE, summary, NULL, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	recent_fixture = empty;
+	json_object_object_del(summary, "lastId");
+	g_clear_pointer(&rows, json_object_put);
+	rows = line_history_with_summary(&s, ALICE, summary, NULL, &error);
+	g_assert_no_error(error);
+	g_assert_cmpuint(json_object_array_length(rows), ==, 0);
+	g_assert_cmpuint(previous_requests, ==, 4);
+	recent_fixture = previous_fixture = NULL;
 }
 
 static void profile_reuse(void)
@@ -555,6 +639,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/messaging/flex-history", flex_messages);
 	g_test_add_func("/messaging/rich-messages", rich_messages);
 	g_test_add_func("/messaging/previous-messages", previous_messages);
+	g_test_add_func("/messaging/recover-empty-recent",
+			recover_empty_recent);
 	g_test_add_func("/messaging/send", encrypted_send);
 	g_test_add_func("/messaging/profile-reuse", profile_reuse);
 	g_test_add_func("/messaging/mentions-and-forwarding",

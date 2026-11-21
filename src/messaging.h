@@ -27,9 +27,14 @@ J *line_send_reply(Line *s, const char *chat, const char *text,
 		   const char *reply_to, GError **error);
 
 J *line_history_raw(Line *s, const char *chat, J **messages, GError **error);
+J *line_history_with_summary(Line *s, const char *chat, J *summary,
+			     J **messages, GError **error);
 J *line_history_cursor(J *index);
 J *line_history_older(Line *s, const char *chat, J *boundary, J **messages,
 		      gboolean *more, GError **error);
+J *line_history_older_since(Line *s, const char *chat, J *boundary,
+			    guint64 cleared_through, J **messages,
+			    gboolean *more, GError **error);
 J *line_message_action(Line *s, const char *id, const char *reaction,
 		       GError **error);
 

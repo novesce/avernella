@@ -1473,7 +1473,12 @@ static char *message_stamp(GDateTime *dt)
 
 static gboolean show_intro(void)
 {
-	return !ui.has_older && !ui.older_page;
+	if (!ui.history || ui.has_older || ui.older_page)
+		return FALSE;
+	if (json_object_array_length(ui.history))
+		return TRUE;
+	/* An empty latest page can coexist with a known message in the chat list. */
+	return !ui_read_id(ui_string(ui_selected_chat(), "lastId", NULL));
 }
 
 /* Whether a rich message's first scene draws anything from LINE's CDN. */
@@ -1493,11 +1498,12 @@ static gboolean rich_loadable(Json *rich)
 static void prepare_bubbles(Rect area)
 {
 	cairo_matrix_t matrix;
+	gboolean intro = show_intro();
 
 	cairo_get_matrix(cr, &matrix);
 	if (cache.rows && cache.source == ui.history && cache.width == area.w &&
 	    cache.scale_x == matrix.xx && cache.scale_y == matrix.yy &&
-	    cache.intro == show_intro())
+	    cache.intro == intro)
 		return;
 	ui_forget_history();
 	size_t count = ui.history ? json_object_array_length(ui.history) : 0;
@@ -1507,7 +1513,7 @@ static void prepare_bubbles(Rect area)
 	g_array_set_clear_func(cache.rows, drop_bubble);
 	cache.source = ui.history;
 	cache.width = area.w;
-	cache.intro = show_intro();
+	cache.intro = intro;
 	cache.height = cache.intro ? INTRO_H : 8;
 	cache.scale_x = matrix.xx;
 	cache.scale_y = matrix.yy;
@@ -2068,8 +2074,9 @@ static void message_rows(Rect area)
 		}
 	}
 	if (ui.history && !cache.rows->len && !cache.intro)
-		centered("No messages in this conversation.", area, 14, 400,
-			 UI_MUTED);
+		centered(ui.older_page ? "No messages on this page." :
+					"LINE returned no messages on this device.",
+			 area, 14, 400, UI_MUTED);
 }
 
 enum header_icon {
