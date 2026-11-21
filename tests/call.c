@@ -9,6 +9,7 @@
 #include "screencast.h"
 #include <sys/timerfd.h>
 #include <arpa/inet.h>
+#include <errno.h>
 #include <SDL.h>
 #include <srtp2/srtp.h>
 #include <opus/opus.h>
@@ -30,6 +31,7 @@ static gboolean bad_route, video_fixture, voice_fallback, migrate_media;
 static gboolean start_with_camera_off;
 static gboolean share_fixture;
 static gint cameras_opened;
+static gint peer_video_ready;
 static int test_camera_fd = -1, preview_fd = -1;
 #define audio_active (g_atomic_int_get(&audio_devices) > 0)
 
@@ -173,7 +175,8 @@ int line_camera_read(struct line_camera *camera,
 	g_assert_nonnull(camera);
 	guint64 n;
 
-	if (read(test_camera_fd, &n, sizeof(n)) != sizeof(n))
+	if (read(test_camera_fd, &n, sizeof(n)) != sizeof(n) ||
+	    !g_atomic_int_get(&peer_video_ready))
 		return 0;
 	synthetic_frame(frame);
 	return 1;
@@ -441,15 +444,33 @@ static srtp_t peer_context(guint8 key[30], gboolean sending)
 	return ctx;
 }
 
+static gboolean readable_until(int fd, gint64 deadline)
+{
+	struct pollfd input = { .fd = fd, .events = POLLIN };
+
+	for (;;) {
+		gint64 left = deadline - g_get_monotonic_time();
+		int rc;
+
+		if (left <= 0)
+			return FALSE;
+		rc = poll(&input, 1, (left + 999) / 1000);
+		if (rc < 0 && errno == EINTR)
+			continue;
+		g_assert_cmpint(rc, >=, 0);
+		if (rc)
+			g_assert_true(input.revents & POLLIN);
+		return rc != 0;
+	}
+}
+
 static void expect_audio(int fd, srtp_t ctx, guint8 pt, guint32 ssrc)
 {
 	guint8 packet[2048];
-	struct pollfd pfd = { .fd = fd, .events = POLLIN };
-
 	int n = 0;
 	gint64 expires = g_get_monotonic_time() + 2000000;
 
-	while (g_get_monotonic_time() < expires && poll(&pfd, 1, 200) == 1) {
+	while (readable_until(fd, expires)) {
 		n = recv(fd, packet, sizeof(packet), 0);
 		if (n > 22 && (packet[0] >> 6) == 2 && (packet[1] & 127) == pt)
 			break;
@@ -643,6 +664,11 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 
 	g_assert_no_error(error);
 	g_assert_nonnull(video);
+	/*
+	 * Signaling and audio read from the same socket during setup. Keep the
+	 * first synthetic camera frame until the peer has its video decoder.
+	 */
+	g_atomic_int_set(&peer_video_ready, TRUE);
 	struct video_peer endpoint = { .fd = fd, .client = &r->remote };
 	g_autofree guint8 *y = g_malloc(WIDTH * HEIGHT);
 	g_autofree guint8 *u = g_malloc(CHROMA * CHROMA_ROWS);
@@ -703,22 +729,34 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 		call_video_close(video);
 		return;
 	}
-	struct pollfd f = { .fd = fd, .events = POLLIN };
+	gint64 deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+	gint64 next_feedback = 0;
 
-	gint64 deadline = g_get_monotonic_time() + 2000000;
-
-	while (!endpoint.got_frame && g_get_monotonic_time() < deadline &&
-	       poll(&f, 1, 200) == 1) {
+	while (!endpoint.got_frame) {
 		guint8 message[2048];
+		gint64 now = g_get_monotonic_time();
+
+		if (now >= deadline)
+			break;
+		if (now >= next_feedback) {
+			if (call_video_needs_keyframe(video))
+				g_assert_true(call_video_send_feedback(
+					video, send_peer_video, &endpoint));
+			next_feedback = now + G_USEC_PER_SEC;
+		}
+		if (!readable_until(fd, MIN(next_feedback, deadline)))
+			continue;
 		ssize_t n = recv(fd, message, sizeof(message), 0);
 
-		if (n >= 12 && (message[1] & 127) == pt)
+		if (n >= 12 && (message[0] >> 6) == 2 &&
+		    (message[1] & 127) == pt)
 			call_video_receive(video, message, n, peer_display,
 					   &endpoint);
-		/* Like the official app, ask again after missing a keyframe. */
-		if (call_video_needs_keyframe(video))
-			call_video_send_feedback(video, send_peer_video,
-						 &endpoint);
+	}
+	if (!endpoint.got_frame) {
+		g_test_message("Authenticated camera packets: %u",
+			       call_video_authenticated_packets(video));
+		call_video_report(video);
 	}
 	g_assert_true(endpoint.got_frame);
 	/* The same captured frames feed the window's local preview. */
@@ -759,15 +797,9 @@ static void receive_share_pictures(int fd, struct call_video *video,
 				   gint64 timeout)
 {
 	gint64 deadline = g_get_monotonic_time() + timeout;
-	struct pollfd fds = { .fd = fd, .events = POLLIN };
 
-	while (expected->received < count) {
-		gint64 remaining = deadline - g_get_monotonic_time();
+	while (expected->received < count && readable_until(fd, deadline)) {
 		guint8 packet[2048];
-
-		if (remaining <= 0 ||
-		    poll(&fds, 1, (remaining + 999) / 1000) != 1)
-			break;
 		ssize_t n = recv(fd, packet, sizeof(packet), 0);
 
 		if (n >= 12 && (packet[0] & 0xc0) == 0x80 &&
