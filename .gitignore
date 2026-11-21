@@ -1,0 +1,17 @@
+/build/
+/avernella
+/avernella-liff
+/avernella-liff-gtk
+*.apk
+*.apkm
+*.xapk
+\#*\#
+*~
+/.env
+/state/
+session.json
+session.new
+/analysis/apkm-evidence.json
+/analysis/chat-preview.png
+/analysis/emoji-picker.png
+/src/emoji_defaults.inc

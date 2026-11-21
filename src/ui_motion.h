@@ -1,0 +1,32 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#pragma once
+#include <glib.h>
+
+typedef struct {
+	int hz;
+	gint64 origin_us, next_us;
+} UiFrameClock;
+
+void ui_frame_rate(UiFrameClock *clock, int hz);
+void ui_frame_started(UiFrameClock *clock, gint64 now_us);
+/* -1 means wait for input indefinitely, 0 means a frame is due. */
+int ui_frame_wait_ms(const UiFrameClock *clock, gint64 now_us,
+		     gboolean requested);
+
+typedef struct {
+	double from, to, position;
+	int displayed;
+	gint64 start_us, end_us;
+} UiScroll;
+
+void ui_scroll_reset(UiScroll *scroll, int offset);
+void ui_scroll_by(UiScroll *scroll, int *offset, double distance, int maximum,
+		  gint64 now_us, gboolean reduced);
+gboolean ui_scroll_sample(UiScroll *scroll, int *offset, int maximum,
+			  gint64 now_us, gboolean reduced);
+gboolean ui_reduce_motion(void);
+void ui_motion_refresh_preferences(void);
+/* The app's own choice: 1 reduce, 0 animate, -1 follow the desktop. */
+void ui_motion_choose(int reduce);
+int ui_motion_choice(void);
+void ui_motion_shutdown(void);

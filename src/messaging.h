@@ -1,0 +1,45 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#pragma once
+#include "line.h"
+
+/*
+ * Results are owned by the caller. History is the newest 50 messages, in
+ * chronological order. The caller selects a chat from this session's list.
+ */
+J *line_chats(Line *s, GError **error);
+J *line_mark_read(Line *s, const char *chat, const char *id,
+		  gint32 reserved_seq, GError **error);
+J *line_history(Line *s, const char *chat, GError **error);
+J *line_send(Line *s, const char *chat, const char *text, GError **error);
+J *line_forward_text(Line *s, const char *chat, J *message, GError **error);
+char *line_message_preview(Line *s, J *message, GError **error);
+
+/* Encoded metadata and chunks are borrowed. Increments seq exactly once. */
+J *line_send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
+		    const char *reply_to, GError **error);
+/* Emoji ranges start at a UTF-16 offset and span a positive UTF-16 length. */
+J *line_send_emoji(Line *s, const char *chat, const char *text,
+		   const char *reply_to, J *emojis, GError **error);
+J *line_send_decorated(Line *s, const char *chat, const char *text,
+		       const char *reply_to, J *emojis, J *mentions,
+		       GError **error);
+J *line_send_reply(Line *s, const char *chat, const char *text,
+		   const char *reply_to, GError **error);
+
+J *line_history_raw(Line *s, const char *chat, J **messages, GError **error);
+J *line_history_cursor(J *index);
+J *line_history_older(Line *s, const char *chat, J *boundary, J **messages,
+		      gboolean *more, GError **error);
+J *line_message_action(Line *s, const char *id, const char *reaction,
+		       GError **error);
+
+void line_profile_operation(Line *s, J *op);
+
+/* Resolve MID keys with empty string values in-place, using the session profile cache. */
+void line_resolve_names(Line *s, J *names, char type);
+
+J *line_announcements(Line *s, const char *chat, GError **error);
+J *line_announce_message(Line *s, const char *chat, const char *id,
+			 const char *text, gint32 seq, GError **error);
+J *line_remove_announcement(Line *s, const char *chat, const char *id,
+			    gint32 seq, GError **error);

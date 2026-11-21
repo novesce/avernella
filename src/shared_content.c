@@ -1,0 +1,544 @@
+// SPDX-License-Identifier: GPL-3.0-or-later
+#include "shared_content.h"
+#include <curl/curl.h>
+#include <string.h>
+
+enum channel {
+	NOTE,
+	ALBUM
+};
+
+struct line_shared {
+	char *tokens[2], *chat, *album;
+	GHashTable *albums, *photos;
+};
+
+struct response {
+	GByteArray *data;
+	gsize limit;
+};
+
+static const char origin[] = "https://legy.line-apps.com";
+
+static gpointer fail(GError **error, const char *reason)
+{
+	g_set_error_literal(error, LINE_ERROR, 1, reason);
+	return NULL;
+}
+
+static gboolean plain(const char *s, size_t max)
+{
+	if (!s || !*s || strlen(s) > max)
+		return FALSE;
+	for (; *s; s++)
+		if ((guint8)*s < 33 || (guint8)*s > 126)
+			return FALSE;
+	return TRUE;
+}
+
+static const char *value(J *o, const char *name)
+{
+	J *v = field(o, name);
+
+	if (json_object_is_type(v, json_type_int))
+		return json_object_get_string(v);
+	const char *s = strfield(o, name);
+
+	return s && strlen(s) == (size_t)json_object_get_string_len(v) &&
+			       g_utf8_validate(s, -1, NULL) ?
+		       s :
+		       NULL;
+}
+
+static gboolean chat_id(const char *id)
+{
+	if (!id || !strchr("ucr", *id) || strlen(id) != 33)
+		return FALSE;
+	for (id++; *id; id++)
+		if (!g_ascii_isxdigit(*id))
+			return FALSE;
+	return TRUE;
+}
+
+static gboolean segment(const char *s)
+{
+	if (!plain(s, 256) || !strcmp(s, ".") || !strcmp(s, ".."))
+		return FALSE;
+	for (; *s; s++)
+		if (!g_ascii_isalnum(*s) && !strchr("-_.", *s))
+			return FALSE;
+	return TRUE;
+}
+
+void line_shared_clear(Line *s)
+{
+	struct line_shared *c = g_steal_pointer(&s->shared);
+
+	if (!c)
+		return;
+	g_free(c->tokens[NOTE]);
+	g_free(c->tokens[ALBUM]);
+	g_free(c->chat);
+	g_free(c->album);
+	g_hash_table_unref(c->albums);
+	g_hash_table_unref(c->photos);
+	g_free(c);
+}
+
+static struct line_shared *scope(Line *s, const char *chat)
+{
+	if (!s->shared) {
+		s->shared = g_new0(struct line_shared, 1);
+		s->shared->albums = g_hash_table_new_full(
+			g_str_hash, g_str_equal, g_free, NULL);
+		s->shared->photos = g_hash_table_new_full(
+			g_str_hash, g_str_equal, g_free, NULL);
+	}
+	struct line_shared *c = s->shared;
+
+	if (g_strcmp0(chat, c->chat)) {
+		g_free(c->chat);
+		c->chat = g_strdup(chat);
+		g_clear_pointer(&c->album, g_free);
+		g_hash_table_remove_all(c->albums);
+		g_hash_table_remove_all(c->photos);
+	}
+	return c;
+}
+
+static const char *channel_token(Line *s, enum channel index, GError **e)
+{
+	char **cached = &s->shared->tokens[index];
+
+	if (*cached)
+		return *cached;
+	g_autoptr(J) args = obj();
+	const char *id = index == NOTE ? "1341209850" : "1375220249";
+
+	json_object_object_add(args, "1:str", json_object_new_string(id));
+	g_autoptr(J) r = line_rpc(
+		s, "/CH4", "approveChannelAndIssueChannelToken", args, e);
+	if (!r)
+		return NULL;
+	const char *token = value(r, "5");
+
+	if (!plain(token, 16384))
+		return fail(
+			e,
+			"LINE did not return a shared-content channel token.");
+	*cached = g_strdup(token);
+	return *cached;
+}
+
+static size_t receive(char *data, size_t size, size_t count, void *user)
+{
+	struct response *r = user;
+
+	if (size && count > (r->limit - r->data->len) / size)
+		return 0;
+	g_byte_array_append(r->data, (guint8 *)data, size * count);
+	return size * count;
+}
+
+static GBytes *transfer(Line *s, enum channel channel, const char *path,
+			const char *logical_method, J *body,
+			const char *chat_header, const char *album, GError **e)
+{
+	const char *token = channel_token(s, channel, e);
+
+	if (!token)
+		return NULL;
+	if (!plain(s->access, 16384) || !chat_id(s->mid))
+		return fail(e, "The LINE session is unavailable.");
+	g_autofree char *url = g_strconcat(origin, path, NULL);
+	g_autofree char *auth = g_strconcat("x-line-access: ", s->access, NULL);
+	g_autofree char *ch = g_strconcat("x-line-channeltoken: ", token, NULL);
+	g_autofree char *mid =
+		g_strconcat("x-line-mid: ", album ? chat_header : s->mid, NULL);
+	g_autofree char *room =
+		chat_header && !album ?
+			g_strconcat("x-line-chat-id: ", chat_header, NULL) :
+			NULL;
+	g_autofree char *album_header =
+		album ? g_strconcat("x-line-album: ", album, NULL) : NULL;
+	g_autofree char *method_header =
+		g_strconcat("x-lhm: ", logical_method, NULL);
+	const char *const headers[] = {
+		auth,
+		ch,
+		mid,
+		method_header,
+		"x-line-application: DESKTOPWIN\t9.7.0.3556\tWINDOWS\t10.0.0-NT-x64",
+		"accept: application/json",
+		"content-type: application/json; charset=UTF-8",
+		"x-lpv: 1",
+		"x-lal: en_US",
+		room,
+		album_header
+	};
+	struct curl_slist *list = NULL;
+	CURL *curl = curl_easy_init();
+	struct response r = { .data = g_byte_array_new(),
+			      .limit = album ? 32u << 20 : 4u << 20 };
+	CURLcode rc = CURLE_FAILED_INIT;
+	long status = 0;
+
+	if (!curl)
+		goto out;
+	for (size_t i = 0; i < G_N_ELEMENTS(headers); i++)
+		if (headers[i]) {
+			struct curl_slist *next =
+				curl_slist_append(list, headers[i]);
+			if (!next) {
+				rc = CURLE_OUT_OF_MEMORY;
+				goto out;
+			}
+			list = next;
+		}
+#define SET(opt, v)                                  \
+	do {                                         \
+		rc = curl_easy_setopt(curl, opt, v); \
+		if (rc)                              \
+			goto out;                    \
+	} while (0)
+	if (!line_curl_tune(curl, TRUE))
+		goto out;
+	SET(CURLOPT_URL, url);
+	SET(CURLOPT_HTTPHEADER, list);
+	SET(CURLOPT_FOLLOWLOCATION, 0L);
+	SET(CURLOPT_PROTOCOLS_STR, "https");
+	SET(CURLOPT_CONNECTTIMEOUT, 8L);
+	SET(CURLOPT_TIMEOUT, 30L);
+	SET(CURLOPT_NOSIGNAL, 1L);
+	SET(CURLOPT_ACCEPT_ENCODING, "");
+	SET(CURLOPT_USERAGENT, "Line/9.7.0.3556");
+	SET(CURLOPT_POSTFIELDS, body ? json_object_to_json_string_ext(
+					       body, JSON_C_TO_STRING_PLAIN) :
+				       "");
+	SET(CURLOPT_WRITEFUNCTION, receive);
+	SET(CURLOPT_WRITEDATA, &r);
+#undef SET
+	rc = curl_easy_perform(curl);
+	if (!rc)
+		rc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+out:
+	curl_easy_cleanup(curl);
+	curl_slist_free_all(list);
+	if (!rc && status >= 200 && status < 300)
+		return g_byte_array_free_to_bytes(r.data);
+	g_byte_array_unref(r.data);
+	if (status == 401 || status == 403)
+		g_clear_pointer(&s->shared->tokens[channel], g_free);
+	if (rc)
+		g_set_error(e, LINE_ERROR, 1,
+			    "Shared-content transfer failed: %s.",
+			    curl_easy_strerror(rc));
+	else
+		g_set_error(e, LINE_ERROR, 1,
+			    "LINE shared content returned HTTP %ld.", status);
+	return NULL;
+}
+
+static J *request(Line *s, enum channel channel, const char *path,
+		  const char *logical_method, J *body, const char *chat,
+		  GError **e)
+{
+	g_autoptr(GBytes) bytes =
+		transfer(s, channel, path, logical_method, body, chat, NULL, e);
+	if (!bytes)
+		return NULL;
+	gsize n;
+	const char *p = g_bytes_get_data(bytes, &n);
+	struct json_tokener *parser = json_tokener_new();
+
+	json_tokener_set_flags(parser, JSON_TOKENER_STRICT |
+					       JSON_TOKENER_VALIDATE_UTF8);
+	g_autoptr(J) raw = json_tokener_parse_ex(parser, p, (int)n);
+	gboolean ok = json_tokener_get_error(parser) == json_tokener_success;
+
+	json_tokener_free(parser);
+	if (!ok || !json_object_is_type(raw, json_type_object) ||
+	    !json_object_is_type(field(raw, "code"), json_type_int))
+		return fail(
+			e,
+			"LINE returned an unreadable shared-content response.");
+	if (json_object_get_int64(field(raw, "code")) != 0) {
+		const char *msg = value(raw, "message");
+
+		g_set_error(e, LINE_ERROR, 1, "LINE shared content: %.250s",
+			    msg ? msg : "Request declined.");
+		return NULL;
+	}
+	J *result = field(raw, "result");
+
+	if (!json_object_is_type(result, json_type_object))
+		return fail(e,
+			    "LINE did not confirm the shared-content request.");
+	return json_object_get(result);
+}
+
+static J *item(J *items, const char *id, const char *title, const char *text)
+{
+	J *o = obj();
+
+	json_object_object_add(o, "id", json_object_new_string(id));
+	json_object_object_add(o, "title",
+			       json_object_new_string(title ? title : ""));
+	json_object_object_add(o, "text",
+			       json_object_new_string(text ? text : ""));
+	json_object_array_add(items, o);
+	return o;
+}
+
+static J *page(J *items, const char *next)
+{
+	J *out = obj();
+
+	json_object_object_add(out, "items", items);
+	if (plain(next, 2048))
+		json_object_object_add(out, "next",
+				       json_object_new_string(next));
+	return out;
+}
+
+static J *albums(Line *s, const char *chat, const char *cursor, GError **e)
+{
+	g_autofree char *esc =
+		g_uri_escape_string(cursor ? cursor : "", NULL, FALSE);
+	g_autofree char *path = g_strdup_printf(
+		"/ext/album/moa/v2/albums?cursor=%s&orderBy=createTimeDesc&include=",
+		esc);
+	g_autoptr(J) reply = request(s, ALBUM, path, "GET", NULL, NULL, e);
+	if (!reply)
+		return NULL;
+	J *rows = field(reply, "albums");
+
+	if (!json_object_is_type(rows, json_type_array))
+		return fail(e, "LINE did not return an album list.");
+	struct line_shared *c = s->shared;
+
+	if (!cursor)
+		g_hash_table_remove_all(c->albums);
+	J *items = json_object_new_array();
+
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		J *r = json_object_array_get_idx(rows, i);
+		const char *id = value(r, "albumId"),
+			   *count = value(r, "photoCount");
+		if (!segment(id) || g_strcmp0(chat, value(r, "chatId")) ||
+		    g_hash_table_size(c->albums) >= 4096)
+			continue;
+		g_hash_table_add(c->albums, g_strdup(id));
+		g_autofree char *text =
+			count ? g_strdup_printf("%s photos", count) : NULL;
+		item(items, id, value(r, "title"), text);
+	}
+	const char *next = value(reply, "nextCursor");
+
+	if (!next && json_object_get_boolean(field(reply, "hasMore")))
+		next = value(reply, "cursor");
+	return page(items, g_strcmp0(next, cursor) ? next : NULL);
+}
+
+static J *photos(Line *s, const char *chat, const char *album,
+		 const char *cursor, GError **e)
+{
+	struct line_shared *c = s->shared;
+
+	if (!segment(album) || !g_hash_table_contains(c->albums, album))
+		return fail(e, "Choose an album from this chat.");
+	g_autofree char *esc =
+		g_uri_escape_string(cursor ? cursor : "", NULL, FALSE);
+	g_autofree char *path = g_strdup_printf(
+		"/ext/album/api/v6/albums/%s/photos?cursor=%s&pageSize=50&orderBy=createTimeDesc&include=all&filterType=",
+		album, esc);
+	g_autoptr(J) reply = request(s, ALBUM, path, "GET", NULL, chat, e);
+	if (!reply)
+		return NULL;
+	J *rows = field(reply, "photos");
+
+	if (!json_object_is_type(rows, json_type_array))
+		return fail(e, "LINE did not return photos for this album.");
+	if (!cursor || g_strcmp0(c->album, album)) {
+		g_hash_table_remove_all(c->photos);
+		g_free(c->album);
+		c->album = g_strdup(album);
+	}
+	J *items = json_object_new_array();
+
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		J *r = json_object_array_get_idx(rows, i),
+		  *resource = field(r, "obsResourceId");
+		const char *id = value(resource, "oid");
+
+		if (!id)
+			id = value(r, "oid");
+		if (!segment(id) || g_hash_table_size(c->photos) >= 8192)
+			continue;
+		gboolean video =
+			!g_strcmp0(value(resource, "sid"), "v") ||
+			!g_ascii_strcasecmp(value(r, "resourceType") ?
+						    value(r, "resourceType") :
+						    "",
+					    "video");
+		if (!video)
+			g_hash_table_add(c->photos, g_strdup(id));
+		const char *number = value(r, "photoId");
+
+		if (!number)
+			number = value(r, "id");
+		g_autofree char *name = g_strdup_printf(
+			"%s%s%s", video ? "Video" : "Photo", number ? " " : "",
+			number ? number : "");
+		int width = json_object_get_int(field(r, "width")),
+		    height = json_object_get_int(field(r, "height"));
+		g_autofree char *desc =
+			width > 0 && height > 0 ?
+				g_strdup_printf("%d × %d", width, height) :
+				NULL;
+		J *it = item(items, id, name, desc);
+
+		json_object_object_add(it, "viewable",
+				       json_object_new_boolean(!video));
+	}
+	const char *next = value(reply, "nextCursor");
+
+	return page(items, g_strcmp0(next, cursor) ? next : NULL);
+}
+
+GBytes *line_shared_photo(Line *s, J *params, GError **e)
+{
+	const char *chat = value(params, "chat"),
+		   *album = value(params, "album"), *id = value(params, "id");
+	struct line_shared *c = s->shared;
+
+	if (!c || !chat_id(chat) || g_strcmp0(chat, c->chat) ||
+	    !segment(album) || g_strcmp0(c->album, album) || !segment(id) ||
+	    !g_hash_table_contains(c->photos, id))
+		return fail(e, "Choose a displayed photo from this chat.");
+	g_autofree char *path = g_strdup_printf("/oa/r/album/a/%s", id);
+
+	return transfer(s, ALBUM, path, "GET", NULL, chat, album, e);
+}
+
+static J *create_note(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *text = value(p, "text");
+
+	if (!strfield(p, "text") || !text || !*text || strlen(text) > 10000)
+		return fail(e, "Enter a note of up to 10,000 UTF-8 bytes.");
+	g_autoptr(J) body = json_tokener_parse(
+		"{\"postInfo\":{\"readPermission\":{\"type\":\"GROUP\",\"gids\":[]}},\"contents\":{\"contentsStyle\":{\"textStyle\":{\"textSizeMode\":\"NORMAL\",\"backgroundColor\":\"#FFFFFF\",\"textAnimation\":\"NONE\"},\"mediaStyle\":{\"displayType\":\"GRID_1_A\"}},\"media\":[],\"stickers\":[],\"locations\":[]}}");
+	json_object_array_add(
+		field(field(field(body, "postInfo"), "readPermission"), "gids"),
+		json_object_new_string(chat));
+	json_object_object_add(field(body, "contents"), "text",
+			       json_object_new_string(text));
+	g_autofree char *path = g_strdup_printf(
+		"/ext/note/nt/api/v57/post/create.json?homeId=%s&sourceType=TALKROOM",
+		chat);
+	g_autoptr(J) reply = request(s, NOTE, path, "POST", body, NULL, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "saved", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *notes(Line *s, const char *chat, const char *cursor, gboolean polls,
+		GError **e)
+{
+	g_autofree char *path = NULL;
+
+	g_autoptr(J) query = NULL;
+	if (polls) {
+		path = g_strdup("/mh/api/v46/search/note.json");
+		query = json_tokener_parse(
+			"{\"query\":\"poll\",\"queryType\":\"TEXT\",\"postLimit\":20,\"commandId\":16,\"channelId\":\"1341209850\",\"commandType\":188259}");
+		json_object_object_add(query, "homeId",
+				       json_object_new_string(chat));
+	} else {
+		g_autofree char *tail = NULL;
+
+		if (cursor) {
+			g_auto(GStrv) bits = g_strsplit(cursor, ":", 2);
+			guint64 time;
+
+			if (!segment(bits[0]) || !bits[1] ||
+			    !g_ascii_string_to_unsigned(
+				    bits[1], 10, 1, G_MAXINT64, &time, NULL))
+				return fail(e, "The note page has expired.");
+			tail = g_strdup_printf(
+				"&postId=%s&updatedTime=%" G_GUINT64_FORMAT,
+				bits[0], time);
+		}
+		path = g_strdup_printf(
+			"/ext/note/nt/api/v57/post/list.json?homeId=%s&sourceType=TALKROOM%s",
+			chat, tail ? tail : "");
+	}
+	g_autoptr(J) reply =
+		request(s, NOTE, path, polls ? "POST" : "GET", query, NULL, e);
+	if (!reply)
+		return NULL;
+	J *rows = field(reply, "posts");
+
+	if (!rows)
+		rows = field(reply, "feeds");
+	if (!json_object_is_type(rows, json_type_array))
+		return fail(e, "LINE did not return notes for this group.");
+	J *items = json_object_new_array();
+	g_autofree char *next = NULL;
+
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		J *r = json_object_array_get_idx(rows, i);
+
+		if (field(r, "post"))
+			r = field(r, "post");
+		J *info = field(r, "postInfo"), *user = field(r, "userInfo");
+		const char *id = value(info, "postId"),
+			   *text = value(field(r, "contents"), "text"),
+			   *from = value(user, "displayName");
+		if (!id)
+			id = value(r, "postId");
+		if (!id)
+			id = value(r, "id");
+		if (!text)
+			text = value(r, "text");
+		if (!segment(id))
+			continue;
+		item(items, id,
+		     from ? from : (polls ? "Poll note" : "Group note"),
+		     text && *text ? text : "Media or shared content");
+		if (i + 1 == json_object_array_length(rows) && !polls) {
+			gint64 time = json_object_get_int64(
+				field(info, "updatedTime"));
+			if (time > 0)
+				next = g_strdup_printf("%s:%" G_GINT64_FORMAT,
+						       id, time);
+		}
+	}
+	return page(items, g_strcmp0(next, cursor) ? next : NULL);
+}
+
+J *line_shared_content(Line *s, const char *method, J *p, GError **e)
+{
+	const char *chat = value(p, "chat"), *kind = value(p, "kind"),
+		   *cursor = value(p, "cursor");
+	if (!chat_id(chat) || (field(p, "cursor") && (!strfield(p, "cursor") ||
+						      !plain(cursor, 2048))))
+		return fail(e, "Choose an available conversation and page.");
+	scope(s, chat);
+	if (!strcmp(method, "sharedPhotos"))
+		return photos(s, chat, value(p, "album"), cursor, e);
+	if (!strcmp(method, "sharedList") && !g_strcmp0(kind, "albums"))
+		return albums(s, chat, cursor, e);
+	if (*chat != 'c')
+		return fail(e, "Open a group conversation to use group notes.");
+	if (!strcmp(method, "sharedPost"))
+		return create_note(s, chat, p, e);
+	if (!strcmp(method, "sharedList") &&
+	    (!g_strcmp0(kind, "notes") || !g_strcmp0(kind, "polls")))
+		return notes(s, chat, cursor, !strcmp(kind, "polls"), e);
+	return fail(e, "Unknown shared-content operation.");
+}

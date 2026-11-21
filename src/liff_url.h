@@ -1,0 +1,41 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#pragma once
+#include <glib.h>
+
+/*
+ * LINE Front-end Framework (LIFF) apps: web pages that run inside LINE with
+ * the user's LINE identity. LINE recognizes them by URL, asks LiffService
+ * for a view and hands the page its tokens in the URL fragment.
+ */
+
+/*
+ * Whether url names a LIFF app: https://liff.line.me/<liffId>...,
+ * https://miniapp.line.me/<liffId>..., https://line.me/R/app/<liffId>...
+ * or line://app/<liffId>.... When it does, *liff_id and *rest (the path,
+ * query and fragment after the ID, possibly "") are newly allocated.
+ * Either output may be NULL.
+ */
+gboolean line_liff_url(const char *url, char **liff_id, char **rest);
+
+/* LINE's own URL schemes, which only LINE can open. */
+gboolean line_liff_line_scheme(const char *url);
+
+/* The in-app browser's user agent marks; liff.isInClient() matches them. */
+#define LINE_LIFF_UA_VERSION "9.7.0"
+#define LINE_LIFF_USER_AGENT                                    \
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 " \
+	"(KHTML, like Gecko) Line/" LINE_LIFF_UA_VERSION " LIFF"
+#define LINE_WEB_USER_AGENT                                     \
+	"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 " \
+	"(KHTML, like Gecko) Line/" LINE_LIFF_UA_VERSION
+
+/*
+ * The in-app browser speaks to the UI over a SOCK_SEQPACKET socket, one
+ * datagram per message, fields separated by tabs:
+ *   UI -> browser: "L\t<size>\t<url>" LIFF page, "W\tweb\t<url>" web page,
+ *                  "R\t<dialog>\t<1|0>" answer to a script dialog.
+ *   browser -> UI: "O\t<url>" a LINE or LIFF link the page followed,
+ *                  "D\t<dialog>\t<a|c>\t<text>" alert or confirm.
+ */
+#define LINE_LIFF_FD 3
+#define LINE_LIFF_PACKET 16384
