@@ -11,3 +11,5 @@ enum {
 /* Straight-alpha ARGB pixels for SDL, Cairo preparation, or a tray host. */
 gboolean ui_logo_read(guint8 *pixels, gboolean network_order);
 cairo_surface_t *ui_logo_load(SDL_Window *window);
+/* Returns a caller-owned surface for the welcome screen. */
+cairo_surface_t *ui_logo_portrait(void);

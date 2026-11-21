@@ -179,12 +179,12 @@ build/line_build_commit.h: | build
 build/ui.o: override CPPFLAGS += -Ibuild
 build/ui.o: build/line_build_commit.h
 
-build/avernella_mark.inc: data/avernella-mark.png | build
+build/avernella_%.inc: data/avernella-%.png | build
 	@od -An -v -t u1 $< | awk '{for (i = 1; i <= NF; i++) printf "%s,", $$i; print ""}' > $@.tmp
 	mv -f $@.tmp $@
 
 build/ui_logo.o: override CPPFLAGS += -Ibuild
-build/ui_logo.o: build/avernella_mark.inc
+build/ui_logo.o: build/avernella_mark.inc build/avernella_welcome.inc
 
 build/%.o: src/%.c Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -329,7 +329,7 @@ check: $(TESTS)
 
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
-	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h build/avernella_mark.inc avernella
+	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
 	$(RM) build/vulkan-smoke build/vulkan-preview build/volk.o build/line_ui_spirv.h build/ui_uber.vert.spv build/ui_uber.frag.spv
 

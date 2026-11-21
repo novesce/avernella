@@ -21,6 +21,8 @@
 
 static cairo_t *cr;
 static cairo_surface_t *logo;
+static cairo_surface_t *welcome_art;
+static Rect sign_card, sign_heading, sign_portrait;
 static PangoContext *context;
 static gboolean composited_text;
 static SDL_Texture *canvas_texture;
@@ -470,23 +472,57 @@ static int sign_in_body(void)
 	return ui.email_login && !ui.authenticating ? 136 : 0;
 }
 
-/* Reserve the portrait and its gap only on the sign-in welcome card. */
-static int sign_in_portrait_height(void)
+static void layout_sign_in(void)
 {
-	return !ui.email_login && !ui.authenticating && !ui.pin && !ui.qr ?
-		       UI_LOGO_EDGE + 12 : 0;
-}
-
-static Rect sign_card(void)
-{
-	int w = MIN(480, ui.width - 32), pad = ui_compact() ? 24 : 32;
-	int h = 2 * pad + sign_in_portrait_height() + 88 + sign_in_body() + 44;
+	gboolean welcome = !ui.email_login && !ui.authenticating && !ui.pin &&
+			   !ui.qr;
+	gboolean wide = welcome && ui.width >= 760 && ui.height >= 360;
+	int pad = ui_compact() ? 24 : 32;
+	int w = MIN(wide ? 832 : 480, ui.width - 32);
+	int body = sign_in_body(), form_h = 88 + body + 44;
+	int side = 0, x, y, inner;
 
 	if (!ui.authenticating)
-		h += 102;
+		form_h += 102;
 	else if (!ui.qr && !ui.pin && ui.notice && *ui.notice)
-		h += 56;
-	return (Rect){ (ui.width - w) / 2, MAX(16, (ui.height - h) / 2), w, h };
+		form_h += 56;
+	int h = 2 * pad + form_h;
+
+	if (wide) {
+		side = MIN(320,
+			   MIN(w - 3 * pad - 340, ui.height - 2 * pad - 32));
+		h = MAX(h, side + 2 * pad);
+	} else if (welcome) {
+		/* Give the buttons and the session notice first claim on space. */
+		side = MIN(208, MIN(w - 2 * pad, ui.height - h - 44));
+		if (side >= 64)
+			h += side + 12;
+		else
+			side = 0;
+	}
+	sign_card = (Rect){ (ui.width - w) / 2, MAX(16, (ui.height - h) / 2), w,
+			    h };
+	x = sign_card.x + pad;
+	y = sign_card.y + pad;
+	inner = w - 2 * pad;
+	sign_portrait = (Rect){ 0 };
+	if (wide) {
+		sign_portrait =
+			(Rect){ x, sign_card.y + (h - side) / 2, side, side };
+		x += side + pad;
+		inner -= side + pad;
+		y = sign_card.y + (h - form_h) / 2;
+	} else if (side) {
+		sign_portrait =
+			(Rect){ sign_card.x + (w - side) / 2, y, side, side };
+		y += side + 12;
+	}
+	sign_heading = (Rect){ x, y, inner, 34 };
+	y += 88;
+	ui.login = (Rect){ x, y + body, inner, 44 };
+	ui.login_mode = (Rect){ x, ui.login.y + 54, inner, 34 };
+	ui.email_box = (Rect){ x, y + 19, inner, 38 };
+	ui.password_box = (Rect){ x, y + 83, inner, 38 };
 }
 
 void ui_layout(void)
@@ -495,16 +531,11 @@ void ui_layout(void)
 	int s = sidebar_w(), h = ui_media_content_height(), w = ui.width;
 	int chat_x = ui_compact() ? 0 : s;
 	int rail = rail_w(), list_w = s - rail;
-	Rect card = sign_card();
-	int pad = ui_compact() ? 24 : 32;
 
-	int form = card.y + pad + sign_in_portrait_height() + 88;
-	int inner = card.w - 2 * pad;
-
-	ui.login = (Rect){ card.x + pad, form + sign_in_body(), inner, 44 };
-	ui.login_mode = (Rect){ card.x + pad, ui.login.y + 54, inner, 34 };
-	ui.email_box = (Rect){ card.x + pad, form + 19, inner, 38 };
-	ui.password_box = (Rect){ card.x + pad, form + 83, inner, 38 };
+	if (!ui.connected)
+		layout_sign_in();
+	if (welcome_art && (ui.connected || !sign_portrait.w))
+		g_clear_pointer(&welcome_art, cairo_surface_destroy);
 	ui.back = (Rect){ 8, 8, 58, 32 };
 	/* Sidebar: search header, Friends, section heading, rows, user panel. */
 	ui.search_box = (Rect){ rail + 10, 10, list_w - 20, 28 };
@@ -622,6 +653,8 @@ void ui_layout(void)
 
 static void draw_editor(Editor *edit, Rect r, gboolean focus,
 			const char *placeholder);
+static void draw_image(cairo_surface_t *image, Rect r, unsigned int angle,
+		       cairo_filter_t filter);
 
 static Editor password_mask(GString *mask)
 {
@@ -655,8 +688,8 @@ int ui_password_index(int x)
 static void sign_in(void)
 {
 	int w = ui.width, h = ui.height;
-	Rect card = sign_card();
-	int pad = ui_compact() ? 24 : 32, inner = card.w - 2 * pad;
+	Rect card = sign_card;
+	int x = sign_heading.x, y = sign_heading.y, inner = sign_heading.w;
 
 	box(0, 0, w, h, 0, UI_RAIL);
 	/* Draw the background rings at the current window size. */
@@ -669,13 +702,20 @@ static void sign_in(void)
 	}
 	box(card.x - 1, card.y - 1, card.w + 2, card.h + 2, 13, UI_LINE);
 	box(card.x, card.y, card.w, card.h, 12, UI_DIALOG);
-	int y = card.y + pad;
-	int portrait = sign_in_portrait_height();
+	if (sign_portrait.w) {
+		Rect art = sign_portrait;
+		int cx = art.x + art.w / 2, cy = art.y + art.h / 2;
 
-	if (portrait) {
-		ui_draw_image(logo, (Rect){ card.x + (card.w - UI_LOGO_EDGE) / 2,
-					    y, UI_LOGO_EDGE, UI_LOGO_EDGE });
-		y += portrait;
+		dot(cx, cy, art.w * .44, UI_SELECTED);
+		if (!welcome_art)
+			welcome_art = ui_logo_portrait();
+		if (!welcome_art && logo)
+			welcome_art = cairo_surface_reference(logo);
+		if (welcome_art == logo)
+			art = (Rect){ cx - UI_LOGO_EDGE / 2,
+				      cy - UI_LOGO_EDGE / 2, UI_LOGO_EDGE,
+				      UI_LOGO_EDGE };
+		draw_image(welcome_art, art, 0, CAIRO_FILTER_BEST);
 	}
 
 	const char *heading = ui.qr	     ? "Log in with QR code" :
@@ -686,16 +726,15 @@ static void sign_in(void)
 		ui.qr	       ? "Scan this with the LINE app on your phone." :
 		ui.pin	       ? "Enter this code in LINE on your phone." :
 		ui.email_login ? "LINE may ask you to verify on your phone." :
-				 "Independent desktop client for LINE.";
+				 "Independent LINE desktop client.";
 
-	centered(heading, (Rect){ card.x + pad, y, inner, 34 }, 24, 700,
-		 UI_HEADING);
+	centered(heading, sign_heading, 24, 700, UI_HEADING);
 	y += 40;
-	centered(sub, (Rect){ card.x + pad, y, inner, 24 }, 16, 400, UI_MUTED);
+	centered(sub, (Rect){ x, y, inner, 24 }, 16, 400, UI_MUTED);
 	y += 48;
 	if (ui.qr) {
 		int step = qr_step(), side = qr_pixels();
-		int qr_x = card.x + (card.w - side) / 2;
+		int qr_x = x + (inner - side) / 2;
 
 		box(qr_x - 8, y - 8, side + 16, side + 16, 8, WHITE);
 		color(0x09110d);
@@ -709,16 +748,14 @@ static void sign_in(void)
 		cairo_fill(cr);
 		y += side + 16;
 		if (ui.notice && *ui.notice)
-			centered(ui.notice,
-				 (Rect){ card.x + pad, y, inner, 40 }, 14, 450,
+			centered(ui.notice, (Rect){ x, y, inner, 40 }, 14, 450,
 				 UI_MUTED);
 	} else if (ui.pin) {
-		centered(ui.pin, (Rect){ card.x + pad, y, inner, 56 }, 44, 800,
+		centered(ui.pin, (Rect){ x, y, inner, 56 }, 44, 800,
 			 UI_HEADING);
 		y += 64;
 		if (ui.notice && *ui.notice)
-			centered(ui.notice,
-				 (Rect){ card.x + pad, y, inner, 40 }, 14, 450,
+			centered(ui.notice, (Rect){ x, y, inner, 40 }, 14, 450,
 				 UI_MUTED);
 	} else if (ui.email_login && !ui.authenticating) {
 		char masked[3 * LINE_CREDENTIAL_LIMIT + 1];
@@ -751,11 +788,10 @@ static void sign_in(void)
 		bottom = ui.login_mode.y + ui.login_mode.h + 12;
 	}
 	if (!ui.qr && !ui.pin && ui.notice && *ui.notice)
-		text(ui.notice, card.x + pad, bottom, inner, 13, 550,
-		     UI_HEADING, TRUE);
+		text(ui.notice, x, bottom, inner, 13, 550, UI_HEADING, TRUE);
 	else if (!ui.authenticating)
 		text("Approving a new desktop session may sign you out on another desktop.",
-		     card.x + pad, bottom, inner, 12, 400, UI_SUBTLE, TRUE);
+		     x, bottom, inner, 12, 400, UI_SUBTLE, TRUE);
 }
 
 static int caret_x(PangoLayout *layout, int index)
@@ -1410,6 +1446,7 @@ void ui_forget_history(void)
 void ui_draw_shutdown(void)
 {
 	ui_gpu_close();
+	g_clear_pointer(&welcome_art, cairo_surface_destroy);
 	g_clear_pointer(&logo, cairo_surface_destroy);
 	ui_forget_rail();
 	ui_forget_labels();
@@ -3251,7 +3288,8 @@ void ui_draw_label(const char *s, Rect r, int size, int weight, guint rgb,
 	cairo_restore(cr);
 }
 
-void ui_draw_rotated_image(cairo_surface_t *image, Rect r, unsigned int angle)
+static void draw_image(cairo_surface_t *image, Rect r, unsigned int angle,
+		       cairo_filter_t filter)
 {
 	if (!image || r.w <= 0 || r.h <= 0)
 		return;
@@ -3271,14 +3309,19 @@ void ui_draw_rotated_image(cairo_surface_t *image, Rect r, unsigned int angle)
 		cairo_rotate(cr, angle * (G_PI / 180.));
 	cairo_scale(cr, z, z);
 	cairo_set_source_surface(cr, image, -w / 2., -h / 2.);
-	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+	cairo_pattern_set_filter(cairo_get_source(cr), filter);
 	cairo_paint(cr);
 	cairo_restore(cr);
 }
 
+void ui_draw_rotated_image(cairo_surface_t *image, Rect r, unsigned int angle)
+{
+	draw_image(image, r, angle, CAIRO_FILTER_BILINEAR);
+}
+
 void ui_draw_image(cairo_surface_t *image, Rect r)
 {
-	ui_draw_rotated_image(image, r, 0);
+	draw_image(image, r, 0, CAIRO_FILTER_BILINEAR);
 }
 
 void ui_draw_path_entry(Editor *editor, Rect r)
