@@ -1,6 +1,8 @@
-# Avernella
+<p align="center">
+  <img src="data/avernella.png" width="160" height="160" alt="Avernella’s pink-horned anime mascot with a chat bubble">
+</p>
 
-<img src="data/avernella.png" width="96" height="96" alt="Avernella’s horned anime mascot with a chat bubble">
+<h1 align="center">Avernella</h1>
 
 Avernella is an independent Linux desktop client compatible with LINE personal accounts. It is written in C and runs directly on Linux. Avernella has no affiliation with LY Corporation. The LINE name identifies the service it connects to.
 
