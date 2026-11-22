@@ -153,7 +153,22 @@ static gboolean same_draft(const char *chat, const char *text, Json *sent)
 
 static int max_list_scroll(void)
 {
-	return MAX(0, (int)ui.visible->len * UI_CHAT_ROW - ui.list_box.h);
+	return MAX(0,
+		   (int)ui.visible->len * ui_chat_row_height() - ui.list_box.h);
+}
+
+void ui_theme_changed(int old_row_height)
+{
+	/* Keep the same chat at the top when row heights change. */
+	ui_forget_history();
+	ui_forget_rail();
+	ui_layout();
+	ui.list_offset = MIN(max_list_scroll(), (gint64)ui.list_offset *
+							ui_chat_row_height() /
+							old_row_height);
+	ui_scroll_reset(&list_scroll, ui.list_offset);
+	ui_scroll_reset(&history_scroll, ui.history_offset);
+	ui.dirty = TRUE;
 }
 
 static void scroll_by(UiScroll *scroll, int *offset, double distance,
@@ -656,8 +671,9 @@ static void notify_unread(Json *rows)
 				NULL;
 		Json *previous = chat_summary(id);
 		guint64 prior = ui_read_id(ui_string(previous, "lastId", NULL));
+		guint64 seen = ui_read_id(ui_string(row, "lastSeenId", NULL));
 
-		if ((cursor && last <= cursor->confirmed) ||
+		if (ui_read_covers(cursor, last, seen) ||
 		    (prior ? last <= prior : time < wire.notification_baseline))
 			continue;
 		newest = row;
@@ -677,9 +693,19 @@ void ui_conversation_presented(gboolean covered)
 {
 	Json *summary = wire.selected_summary;
 
-	if (!wire.pid || !summary ||
-	    json_object_get_int64(ui_field(summary, "unread")) <= 0 ||
-	    !ui.history || !ui.selected || !g_strcmp0(ui.selected, ui.self_id))
+	if (!wire.pid || !summary || !ui.history || !ui.selected ||
+	    !g_strcmp0(ui.selected, ui.self_id))
+		return;
+	UiReadCursor *cursor =
+		wire.read_marks ?
+			g_hash_table_lookup(wire.read_marks, ui.selected) :
+			NULL;
+	gboolean unread = json_object_get_int64(ui_field(summary, "unread")) >
+			  0;
+
+	if (!unread &&
+	    (!cursor || cursor->pending ||
+	     cursor->viewed <= MAX(cursor->attempted, cursor->confirmed)))
 		return;
 	gboolean latest = wire.rendered_history &&
 			  wire.rendered_history == wire.newest_history;
@@ -695,19 +721,25 @@ void ui_conversation_presented(gboolean covered)
 		return;
 	guint64 target = ui_read_id(id),
 		seen = ui_read_id(ui_string(summary, "lastSeenId", NULL));
-	if (!target || target <= seen)
+	if (!target)
 		return;
 	if (!wire.read_marks)
 		wire.read_marks = g_hash_table_new_full(g_str_hash, g_str_equal,
 							g_free, g_free);
-	UiReadCursor *cursor =
-		g_hash_table_lookup(wire.read_marks, ui.selected);
 	if (!cursor) {
 		cursor = g_new0(UiReadCursor, 1);
 		g_hash_table_insert(wire.read_marks, g_strdup(ui.selected),
 				    cursor);
 	}
-	if (!ui_read_begin(cursor, target, seen))
+	gboolean send_receipt = ui_read_present(cursor, target, seen);
+
+	if (unread) {
+		json_object_object_add(summary, "unread",
+				       json_object_new_int(0));
+		ui_forget_rail();
+		ui_refilter_chats();
+	}
+	if (!send_receipt)
 		return;
 	struct ui_request *saved = g_new0(struct ui_request, 1);
 
@@ -1011,6 +1043,12 @@ static void chat_message(Json *packet)
 
 		if (g_strcmp0(ui_string(row, "id", NULL), chat))
 			continue;
+		guint64 incoming = ui_read_id(id);
+
+		/* Sync can replay a delivery already included in the list. */
+		if (incoming &&
+		    incoming <= ui_read_id(ui_string(row, "lastId", NULL)))
+			return;
 		if (json_object_deep_copy(row, &moved, NULL))
 			moved = NULL;
 		break;
@@ -1057,7 +1095,7 @@ static void pushed_history(Json *packet)
 	set_string(&ui.notice, "");
 }
 
-static void manual_refresh(void)
+static void retry_read_receipt(void)
 {
 	UiReadCursor *cursor =
 		wire.read_marks && ui.selected ?
@@ -1065,6 +1103,11 @@ static void manual_refresh(void)
 			NULL;
 	if (cursor && !cursor->pending)
 		cursor->attempted = cursor->confirmed;
+}
+
+static void manual_refresh(void)
+{
+	retry_read_receipt();
 	refresh();
 }
 
@@ -1104,12 +1147,15 @@ static void remember_draft(void)
 
 static void highlight(int pos)
 {
+	int row_height = ui_chat_row_height();
+	int top = pos * row_height;
+
 	ui.list_cursor = pos;
 	ui_scroll_reset(&list_scroll, ui.list_offset);
-	if (pos * UI_CHAT_ROW < ui.list_offset)
-		ui.list_offset = pos * UI_CHAT_ROW;
-	else if ((pos + 1) * UI_CHAT_ROW > ui.list_offset + ui.list_box.h)
-		ui.list_offset = (pos + 1) * UI_CHAT_ROW - ui.list_box.h;
+	if (top < ui.list_offset)
+		ui.list_offset = top;
+	else if (top + row_height > ui.list_offset + ui.list_box.h)
+		ui.list_offset = top + row_height - ui.list_box.h;
 	ui.dirty = TRUE;
 }
 
@@ -1119,6 +1165,7 @@ static void select_id(const char *id)
 		remember_draft();
 		ui_media_select_chat();
 		set_string(&ui.selected, id);
+		retry_read_receipt();
 		ui_media_chat_shown();
 		wire.selected_summary = chat_summary(id);
 		set_text(&ui.message, g_hash_table_lookup(ui.drafts, id));
@@ -1173,12 +1220,14 @@ static void show_chats(Json *list)
 				g_hash_table_lookup(wire.read_marks, id) :
 				NULL;
 		guint64 last = ui_read_id(ui_string(row, "lastId", NULL));
+		guint64 seen = ui_read_id(ui_string(row, "lastSeenId", NULL));
 
-		if (cursor && last && last <= cursor->confirmed) {
-			ui_forget_rail();
+		if (cursor)
+			cursor->confirmed = MAX(cursor->confirmed, seen);
+		if (json_object_get_int64(ui_field(row, "unread")) > 0 &&
+		    ui_read_covers(cursor, last, seen))
 			json_object_object_add(row, "unread",
 					       json_object_new_int(0));
-		}
 		json_object_array_add(merged, json_object_get(row));
 	}
 	gboolean changed = set_json(&ui.chats, merged);
@@ -1466,8 +1515,9 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				   saved->chat) &&
 			!g_strcmp0(ui_string(result, "id", NULL), saved->text);
 		Json *row = chat_summary(saved->chat);
+		guint64 target = ui_read_id(saved->text);
 
-		if (ui_read_finish(cursor, ui_read_id(saved->text), confirmed,
+		if (ui_read_finish(cursor, target, confirmed,
 				   ui_read_id(ui_string(row, "lastId", NULL)))) {
 			json_object_object_add(row, "unread",
 					       json_object_new_int(0));
@@ -1476,7 +1526,8 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				row, "lastSeenId",
 				json_object_new_string(saved->text));
 		}
-		if (!confirmed && !g_strcmp0(ui.selected, saved->chat) &&
+		if (!confirmed && cursor->confirmed < target &&
+		    !g_strcmp0(ui.selected, saved->chat) &&
 		    !g_strcmp0(ui_string(row, "lastId", NULL), saved->text))
 			set_string(
 				&ui.notice,
@@ -2077,8 +2128,10 @@ static void click(int x, int y)
 
 			edit->cursor = edit->anchor = editor_hit(edit, x);
 		}
-	} else if (ui_list_visible() && ui.friends &&
-		   inside(ui.friends_button, x, y))
+	} else if (ui_list_visible() && inside(ui.rail_chats, x, y))
+		focus_on(F_LIST);
+	else if (ui_list_visible() && ui.friends &&
+		 inside(ui.friends_button, x, y))
 		ui_friends_show();
 	else if (ui_list_visible() && ui.groups &&
 		 (inside(ui.new_group, x, y) || inside(ui.rail_add, x, y)))
@@ -2108,7 +2161,8 @@ static void click(int x, int y)
 	} else if (ui_chat_visible() && inside(ui.send, x, y))
 		send_message();
 	else if (ui_list_visible() && inside(ui.list_box, x, y))
-		select_chat((y - ui.list_box.y + ui.list_offset) / UI_CHAT_ROW);
+		select_chat((y - ui.list_box.y + ui.list_offset) /
+			    ui_chat_row_height());
 	ui.dirty = TRUE;
 }
 
@@ -2134,6 +2188,8 @@ static int hover_target(int x, int y)
 		return -6;
 	if (ui_list_visible() && ui.groups && inside(ui.new_group, x, y))
 		return -7;
+	if (ui_list_visible() && inside(ui.rail_chats, x, y))
+		return -2001;
 	if (ui_list_visible() && ui.groups && inside(ui.rail_add, x, y))
 		return -11;
 	if (ui_list_visible() && ui_rail_chat_at(x, y))
@@ -2164,7 +2220,8 @@ static int hover_target(int x, int y)
 	if (ui_chat_visible() && ui.selected && inside(ui.send, x, y))
 		return 3;
 	if (ui_list_visible() && inside(ui.list_box, x, y)) {
-		int row = (y - ui.list_box.y + ui.list_offset) / UI_CHAT_ROW;
+		int row = (y - ui.list_box.y + ui.list_offset) /
+			  ui_chat_row_height();
 
 		if ((guint)row < ui.visible->len)
 			return 4 + row;
@@ -2419,6 +2476,7 @@ int line_ui(int argc, char **argv)
 	if (wayland)
 		SDL_SetHintWithPriority(SDL_HINT_RENDER_VSYNC, "1",
 					SDL_HINT_DEFAULT);
+	ui_theme_init();
 	ui.window = ui_gpu_window(
 		"Avernella (" LINE_BUILD_COMMIT ")", SDL_WINDOWPOS_CENTERED,
 		SDL_WINDOWPOS_CENTERED, 920, 630,

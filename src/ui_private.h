@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
+#include "ui_theme.h"
 #include <SDL.h>
 #include <cairo.h>
 #include <glib.h>
@@ -67,14 +68,20 @@ typedef struct {
 	Rect login_mode, email_box, password_box;
 	Rect chat_tools, find_button, friends_button, new_group, members, emoji,
 		attach, call, video, login, back, logout, reload, search_box,
-		list_box, conversation, entry, send, composer, rail_add;
+		list_box, conversation, entry, send, composer, rail_add,
+		rail_chats;
 } Interface;
 
-/* Discord-style direct message rows: 42 px tall with a 2 px gap. */
 enum {
-	UI_CHAT_ROW = 44,
 	UI_HEADER_H = 48
 };
+
+static inline int ui_chat_row_height(void)
+{
+	return ui_theme_is_line() ? 56 : 44;
+}
+
+void ui_theme_changed(int old_row_height);
 
 /* Glyphs for round call controls. */
 enum ui_call_glyph {
@@ -165,11 +172,11 @@ static inline gboolean ui_list_visible(void)
 }
 
 /*
- * One in-flight watermark per conversation. A delayed ACK for a previously
- * visible message must never clear the count of a newer delivery.
+ * Keep the head actually shown on this device separate from the receipt
+ * confirmed by LINE. A delayed ACK must not clear a newer delivery.
  */
 typedef struct {
-	guint64 confirmed, attempted, pending;
+	guint64 viewed, confirmed, attempted, pending;
 } UiReadCursor;
 
 static inline guint64 ui_read_id(const char *text)
@@ -197,15 +204,25 @@ static inline gboolean ui_read_visible(const Interface *view, Uint32 window,
 	       !(window & (SDL_WINDOW_MINIMIZED | SDL_WINDOW_HIDDEN));
 }
 
-static inline gboolean ui_read_begin(UiReadCursor *cursor, guint64 target,
-				     guint64 server_seen)
+/* A presentation can advance the local badge while an earlier RPC is pending. */
+static inline gboolean ui_read_present(UiReadCursor *cursor, guint64 target,
+				       guint64 server_seen)
 {
-	if (!target || cursor->pending ||
-	    target <= MAX(cursor->confirmed, server_seen) ||
+	cursor->confirmed = MAX(cursor->confirmed, server_seen);
+	cursor->viewed = MAX(cursor->viewed, target);
+	if (!target || cursor->pending || target <= cursor->confirmed ||
 	    target <= cursor->attempted)
 		return FALSE;
 	cursor->pending = cursor->attempted = target;
 	return TRUE;
+}
+
+static inline gboolean ui_read_covers(const UiReadCursor *cursor, guint64 head,
+				      guint64 server_seen)
+{
+	return head &&
+	       (head <= server_seen ||
+		(cursor && head <= MAX(cursor->viewed, cursor->confirmed)));
 }
 
 static inline gboolean ui_read_finish(UiReadCursor *cursor, guint64 target,

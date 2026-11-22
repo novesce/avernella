@@ -70,6 +70,7 @@ enum action {
 	A_OPEN_INBOX,
 	A_NOTIFY,
 	A_SOUNDS,
+	A_THEME,
 	A_MOTION,
 	A_MOTION_SYSTEM,
 	A_KEYS,
@@ -815,18 +816,29 @@ static int appearance_section(int x, int y, int w)
 	heading("Appearance", x, y, w);
 	y += 52;
 	caption("Theme", x, y, w);
-	Rect swatch = { x, y + 26, 60, 60 };
+	y += 26;
+	const char *const themes[] = { "Avernella", "LINE" };
 
-	ui_draw_rounded((Rect){ swatch.x - 3, swatch.y - 3, 66, 66 }, 33,
-			ACCENT);
-	ui_draw_rounded(swatch, 30, UI_BG);
-	ui_draw_rounded((Rect){ swatch.x + 18, swatch.y + 18, 24, 24 }, 12,
-			ACCENT);
-	ui_draw_icon((Rect){ swatch.x + 18, swatch.y + 18, 24, 24 },
-		     UI_ICON_CHECK, UI_ON_ACCENT);
-	ui_draw_label("Dark pink", (Rect){ x + 76, y + 46, 200, 22 }, 15, 500,
-		      INK, FALSE);
-	y += 116;
+	for (guint i = 0; i < G_N_ELEMENTS(themes); i++) {
+		gboolean selected = ui_theme_is_line() == (i == 1);
+		Rect r = { x, y, w, 40 };
+		Rect mark = { x + 10, y + 11, 18, 18 };
+
+		ui_draw_rounded(r, 7,
+				selected ? NAV_SELECTED :
+					   ui_blend(CONTENT, NAV_HOVER,
+						    ui_draw_hover(r)));
+		ui_draw_outline(mark, 9, selected ? ACCENT : MUTED);
+		if (selected)
+			ui_draw_rounded((Rect){ mark.x + 4, mark.y + 4, 10,
+						10 },
+					5, ACCENT);
+		ui_draw_label(themes[i], (Rect){ x + 38, y + 9, w - 44, 23 },
+			      15, selected ? 600 : 450, HEADING, FALSE);
+		control(r, A_THEME, i);
+		y += 44;
+	}
+	y += 18;
 	caption("Accessibility", x, y, w);
 	y += 28;
 	int choice = ui_motion_choice();
@@ -1179,6 +1191,19 @@ static void activate(struct control c, int x)
 		if (ui_sounds_enabled())
 			ui_sound_play(CHIP_MESSAGE);
 		break;
+	case A_THEME: {
+		g_autoptr(GError) error = NULL;
+		int height = ui_chat_row_height();
+
+		if (ui_theme_is_line() == (c.arg == 1))
+			break;
+		if (ui_theme_toggle(&error)) {
+			ui_theme_changed(height);
+			set_text(&p.settings_note, NULL);
+		} else
+			set_text(&p.settings_note, error->message);
+		break;
+	}
 	case A_MOTION:
 		ui_motion_save(!ui_reduce_motion());
 		break;
@@ -1231,6 +1256,13 @@ static gboolean key(SDL_KeyboardEvent k)
 	}
 	if (code == SDLK_ESCAPE) {
 		close_view();
+		return TRUE;
+	}
+	if (p.view == SETTINGS && p.section == APPEARANCE &&
+	    (code == SDLK_LEFT || code == SDLK_RIGHT)) {
+		activate((struct control){ .action = A_THEME,
+					   .arg = code == SDLK_RIGHT },
+			 0);
 		return TRUE;
 	}
 	if (p.view == CARD && (code == SDLK_RETURN || code == SDLK_KP_ENTER))

@@ -48,7 +48,7 @@ SOURCES = main pair password_login state thrift transport messaging friends grou
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync tune http_tune
 SOURCES += chat_lists shared_content ui_chat_lists ui_chat_tools ui_shared_content ui_notifications screenshot
 SOURCES += ui_tray ui_logo video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
-SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu
+SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu ui_theme
 OBJECTS = $(SOURCES:%=build/%.o)
 GIT_COMMIT := $(if $(wildcard .git),$(shell git rev-parse HEAD 2>/dev/null | cut -c1-7))
 COMMIT_DEFINE := \#define LINE_BUILD_COMMIT "$(or $(GIT_COMMIT),unknown commit)"
@@ -76,6 +76,7 @@ TESTS += build/test-qr-scan
 TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
+TESTS += build/test-ui-theme
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -207,6 +208,7 @@ build/screencast.o: CFLAGS += -Wno-pedantic
 build/qr_scan.o: CPPFLAGS += $(shell pkg-config --cflags zbar)
 build/test-ui-pixels: tests/ui_pixels.c build/ui_pixels.o build/ui_gpu_scroll.o
 build/test-ui-motion: tests/ui_motion.c build/ui_motion.o
+build/test-ui-theme: tests/ui_theme.c build/ui_theme.o
 build/test-audio: LDFLAGS += -Wl,--wrap=SDL_QueueAudio
 build/test-audio: tests/call_audio.c build/call_audio.o build/call_srtp.o build/call_denoise.o
 build/test-video-record: CPPFLAGS += -DLINE_RECORD_TEST
@@ -255,7 +257,7 @@ build/render-bench: tests/render_bench.c build/ui_gpu.o
 build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
 build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o
+build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 

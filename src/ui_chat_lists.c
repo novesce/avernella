@@ -529,7 +529,7 @@ gboolean ui_lists_event(SDL_Event *e)
 			if (e->button.button == SDL_BUTTON_RIGHT &&
 			    hit(ui.list_box, x, y)) {
 				guint i = (y - ui.list_box.y + ui.list_offset) /
-					  60;
+					  ui_chat_row_height();
 				if (i < ui.visible->len)
 					organize(json_object_array_get_idx(
 						ui.chats,

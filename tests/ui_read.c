@@ -52,28 +52,51 @@ static void watermarks(void)
 	g_assert_cmpuint(ui_read_id("-1"), ==, 0);
 	g_assert_cmpuint(ui_read_id("1x"), ==, 0);
 	g_assert_cmpuint(ui_read_id("9223372036854775808"), ==, 0);
-	g_assert_false(
-		ui_read_begin(&c, id, id)); /* already marked elsewhere */
-	g_assert_true(ui_read_begin(&c, id, id - 1));
-	g_assert_false(ui_read_begin(&c, id, id - 1));
-	g_assert_false(ui_read_begin(&c, next, id - 1));
+	g_assert_true(ui_read_present(&c, id, id - 1));
+	g_assert_false(ui_read_present(&c, id, id - 1));
+	g_assert_false(ui_read_present(&c, next, id - 1));
 	g_assert_false(
 		ui_read_finish(&c, next, TRUE, next)); /* different request */
 	g_assert_cmpuint(c.pending, ==, id);
 	g_assert_false(ui_read_finish(&c, id, TRUE,
 				      next)); /* success for older viewport */
 	g_assert_cmpuint(c.confirmed, ==, id);
-	g_assert_false(ui_read_begin(&c, id, id - 1));
-	g_assert_true(ui_read_begin(&c, next, id - 1));
+	g_assert_false(ui_read_present(&c, id, id - 1));
+	g_assert_true(ui_read_present(&c, next, id - 1));
 	g_assert_false(ui_read_finish(&c, next, FALSE,
 				      next)); /* ambiguous network failure */
 	g_assert_cmpuint(c.confirmed, ==, id);
-	g_assert_false(ui_read_begin(&c, next, id - 1));
+	g_assert_false(ui_read_present(&c, next, id - 1));
 	c.attempted = c.confirmed; /* explicit refresh retries */
-	g_assert_true(ui_read_begin(&c, next, id - 1));
+	g_assert_true(ui_read_present(&c, next, id - 1));
 	g_assert_true(ui_read_finish(&c, next, TRUE, next));
 	g_assert_cmpuint(c.confirmed, ==, next);
-	g_assert_false(ui_read_begin(&c, id, id - 1));
+	g_assert_false(ui_read_present(&c, id, id - 1));
+}
+
+static void stale_counts(void)
+{
+	const guint64 head = 100, next = 101;
+	UiReadCursor cursor = { 0 };
+
+	/* A summary can report a count for a head already seen on the phone. */
+	g_assert_true(ui_read_covers(NULL, head, head));
+	g_assert_false(ui_read_covers(NULL, 0, head));
+	g_assert_false(ui_read_covers(NULL, next, head));
+	g_assert_false(ui_read_present(&cursor, head, head));
+	g_assert_false(ui_read_present(&cursor, head, 0)); /* stale refresh */
+
+	/* Clear the local badge at presentation, even during an RPC outage. */
+	g_assert_true(ui_read_present(&cursor, next, head));
+	g_assert_true(ui_read_covers(&cursor, next, head));
+	g_assert_cmpuint(cursor.confirmed, ==, head);
+	g_assert_false(ui_read_finish(&cursor, next, FALSE, next));
+	g_assert_true(ui_read_covers(&cursor, next, 0));
+	g_assert_false(ui_read_covers(&cursor, next + 1, head));
+	/* The last failed RPC retries once on reopening the conversation. */
+	cursor.attempted = cursor.confirmed;
+	g_assert_true(ui_read_present(&cursor, next, head));
+	g_assert_false(ui_read_present(&cursor, next, head));
 }
 
 int main(int argc, char **argv)
@@ -81,5 +104,7 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/ui-read/visible-latest-focused", visible_only);
 	g_test_add_func("/ui-read/inflight-and-stale-ack", watermarks);
+	g_test_add_func("/ui-read/visible-badge-and-server-watermark",
+			stale_counts);
 	return g_test_run();
 }

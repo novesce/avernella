@@ -2,6 +2,8 @@
 #ifndef UI_THEME_H
 #define UI_THEME_H
 
+#include <glib.h>
+
 /* Window surfaces, ordered from the rail through raised controls. */
 #define UI_RAIL 0x100c13
 #define UI_SIDEBAR 0x181019
@@ -26,5 +28,18 @@
 
 #define UI_DANGER 0xf23f43
 #define UI_ONLINE 0x23a55a
+
+/* LINE-style navigation and conversation surfaces use the same palette. */
+#define UI_NAV_RAIL UI_RAIL
+#define UI_NAV_INK UI_MUTED
+#define UI_NAV_ACTIVE UI_ACCENT
+#define UI_NAV_HOVER UI_HOVER
+#define UI_CHAT_BG UI_BG
+#define UI_BUBBLE_IN UI_RAISED
+#define UI_BUBBLE_OUT UI_TEXT_SELECTION
+
+void ui_theme_init(void);
+gboolean ui_theme_is_line(void);
+gboolean ui_theme_toggle(GError **error);
 
 #endif

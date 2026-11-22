@@ -1964,8 +1964,14 @@ static gboolean message_operation(struct line_worker *w, J *op,
 	json_object_object_add(event, "time", json_object_new_int64(time));
 	json_object_object_add(event, "mine", json_object_new_boolean(mine));
 	line_emit(event);
-	/* The window marks this message read; markRead checks the head. */
-	if (!mine && w->unread_heads)
+	/* Keep the accepted receipt target monotonic across sync replays. */
+	J *previous = field(w->unread_heads, chat);
+	J *summary = g_hash_table_lookup(w->chats, chat);
+	gint64 known = MAX(json_object_get_int64(previous),
+			   json_object_get_int64(field(summary, "lastId")));
+
+	if (w->unread_heads && (!mine || previous) &&
+	    json_object_get_int64(field(msg, "4")) > known)
 		json_object_object_add(w->unread_heads, chat,
 				       json_object_new_string(id));
 	if (!g_hash_table_contains(w->chats, chat))
