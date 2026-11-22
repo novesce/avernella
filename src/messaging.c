@@ -406,6 +406,126 @@ J *line_mark_read(Line *s, const char *chat, const char *id,
 	return result;
 }
 
+J *line_peer_ranges(Line *s, const char *chat, GError **error)
+{
+	g_autoptr(J) args = obj();
+	J *ids = array();
+
+	json_object_array_add(ids, string(chat));
+	put(args, "2:list:str", ids);
+	number(args, "3:i32", 7);
+	g_autoptr(J) reply =
+		line_rpc(s, "/S4", "getMessageReadRange", args, error);
+	for (size_t i = 0; i < length(reply); i++) {
+		J *entry = at(reply, i), *ranges = field(entry, "2");
+
+		if (!g_strcmp0(chat, strfield(entry, "1")) &&
+		    json_object_is_type(ranges, json_type_object))
+			return json_object_get(ranges);
+	}
+	return NULL;
+}
+
+static gboolean peer_reader(const char *self, const char *chat, const char *mid)
+{
+	return talk_id(mid) && mid[0] == 'u' && strcmp(mid, self) &&
+	       (chat[0] != 'u' || !strcmp(mid, chat));
+}
+
+/* Remember new read notifications in the open chat, once per reader and ID. */
+enum peer_notice line_peer_read_notice(const char *self, const char *chat,
+				       J *notices, J *op)
+{
+	const char *reader = strfield(op, "11"), *id = strfield(op, "12");
+	const char *target = strfield(op, "10");
+	guint64 value;
+
+	if (json_object_get_int(field(op, "3")) != 55 || !self ||
+	    !talk_id(target) || !peer_reader(self, target, reader) || !id ||
+	    !g_ascii_string_to_unsigned(id, 10, 1, G_MAXINT64, &value, NULL))
+		return PEER_NOTICE_OTHER;
+	if (!notices || g_strcmp0(target, chat))
+		return PEER_NOTICE_UNCHANGED;
+	/* A receipt can beat the message's arrival in the next history reply. */
+	J *readers = field(notices, id);
+
+	if (field(readers, reader))
+		return PEER_NOTICE_UNCHANGED;
+
+	if (!readers) {
+		if (json_object_object_length(notices) >= 2 * HISTORY_LIMIT) {
+			struct json_object_iterator oldest =
+				json_object_iter_begin(notices);
+
+			json_object_object_del(
+				notices, json_object_iter_peek_name(&oldest));
+		}
+		readers = obj();
+		put(notices, id, readers);
+	}
+	boolean(readers, reader, TRUE);
+	return PEER_NOTICE_ADDED;
+}
+
+static gboolean range_covers(J *intervals, guint64 id)
+{
+	/* Some service versions encode a single entry directly. */
+	gboolean single = json_object_is_type(intervals, json_type_object);
+	size_t count = single ? 1 : length(intervals);
+
+	for (size_t i = 0; i < count; i++) {
+		J *range = single ? intervals : at(intervals, i);
+		J *first = field(range, "1"), *last = field(range, "2");
+		gint64 a = json_object_get_int64(first),
+		       b = json_object_get_int64(last);
+
+		if (json_object_is_type(first, json_type_int) &&
+		    json_object_is_type(last, json_type_int) && a >= 0 &&
+		    b >= 0 && id >= (guint64)MIN(a, b) &&
+		    id <= (guint64)MAX(a, b))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+J *line_peer_read_counts(const char *self, const char *chat, J *messages,
+			 J *ranges, J *notices)
+{
+	J *counts = obj();
+
+	if (!self || !chat || !strcmp(self, chat) ||
+	    !json_object_is_type(messages, json_type_object))
+		return counts;
+	json_object_object_foreach(messages, key, msg) {
+		guint64 id;
+
+		if (g_strcmp0(strfield(msg, "1"), self) ||
+		    !g_ascii_string_to_unsigned(key, 10, 1, G_MAXINT64, &id,
+						NULL))
+			continue;
+		J *seen = field(notices, key);
+		int count = seen ? json_object_object_length(seen) : 0;
+
+		if (ranges) {
+			json_object_object_foreach(ranges, mid, intervals) {
+				if (!field(seen, mid) &&
+				    peer_reader(self, chat, mid) &&
+				    range_covers(intervals, id))
+					count++;
+			}
+		}
+		J *explicit = field(msg, "23");
+
+		if (json_object_is_type(explicit, json_type_int))
+			count = MAX(count, json_object_get_int(explicit));
+		if (count || ranges ||
+		    (json_object_is_type(explicit, json_type_int) &&
+		     json_object_get_int(explicit) >= 0))
+			number(counts, key, count);
+	}
+	return counts;
+}
+
 static const char *content_label(gint64 n)
 {
 	static const char *const labels[] = {
@@ -792,6 +912,11 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 				    "LINE"));
 		put(row, "text", string(text ? text : content_label(type)));
 		boolean(row, "own", own);
+		J *read_count = field(msg, "23");
+		if (own && g_strcmp0(strfield(msg, "2"), s->mid) &&
+		    json_object_is_type(read_count, json_type_int) &&
+		    json_object_get_int(read_count) >= 0)
+			put(row, "readCount", json_object_get(read_count));
 		number(row, "time", json_object_get_int64(field(msg, "5")));
 		json_object_array_add(rows, row);
 	}

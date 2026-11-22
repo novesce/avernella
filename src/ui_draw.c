@@ -1900,12 +1900,14 @@ struct message_layout {
 	struct ui_flex_layout *flex;
 	int y, w, h, top; /* top: offset of the message below any divider */
 	int x, body_top, body_h, text_origin;
-	gboolean mine, group, photo, video, rich;
+	gboolean mine, group, photo, video, rich, receipt;
 	Json *message; /* borrowed from the cached history */
 };
 
 static struct {
 	GArray *rows;
+	PangoLayout *sent, *read;
+	int receipt_height;
 	int width, height;
 	double scale_x, scale_y;
 	gboolean intro, line_style;
@@ -1929,6 +1931,8 @@ void ui_forget_history(void)
 {
 	history_scroll.reusable = FALSE;
 	g_clear_pointer(&cache.rows, g_array_unref);
+	g_clear_object(&cache.sent);
+	g_clear_object(&cache.read);
 	cache.source = NULL;
 	cache.height = 0;
 }
@@ -2027,6 +2031,18 @@ static void prepare_bubbles(Rect area)
 		struct message_layout row = { .y = cache.height,
 					      .message = msg };
 		row.mine = json_object_get_boolean(ui_field(msg, "own"));
+		row.receipt = row.mine && ui.selected &&
+			      g_strcmp0(ui.selected, ui.self_id) &&
+			      ui_read_id(ui_string(msg, "id", NULL));
+		if (row.receipt && !cache.sent) {
+			int sent_h, read_h;
+
+			cache.sent = layout(_("Sent"), 11, 500, -1, FALSE);
+			cache.read = layout(_("Read"), 11, 500, -1, FALSE);
+			pango_layout_get_pixel_size(cache.sent, NULL, &sent_h);
+			pango_layout_get_pixel_size(cache.read, NULL, &read_h);
+			cache.receipt_height = MAX(sent_h, read_h);
+		}
 		const char *who = row.mine ? (ui.name ? ui.name : _("You")) :
 					     ui_string(msg, "from", "LINE");
 		gint64 stamp = json_object_get_int64(ui_field(msg, "time"));
@@ -2164,8 +2180,19 @@ static void prepare_bubbles(Rect area)
 				     MESSAGE_LEFT;
 		row.body_top =
 			gap + 2 + (row.byline ? (line_style ? 18 : 22) : 0);
+		if (line_style && row.receipt) {
+			int clock_h = 0;
+
+			if (row.short_clock)
+				pango_layout_get_pixel_size(row.short_clock,
+							    NULL, &clock_h);
+			body_height = MAX(body_height,
+					  cache.receipt_height + clock_h + 2);
+		}
 		row.body_h = body_height;
 		row.h = row.body_top + body_height + (row.reactions ? 30 : 0);
+		if (!line_style && row.receipt)
+			row.h += cache.receipt_height + 2;
 		if (line_style && !row.mine && !row.group)
 			row.h = MAX(row.h, gap + 4 + CHAT_AVATAR);
 		row.h += line_style ? 4 : 2;
@@ -2564,6 +2591,36 @@ static void text_bubble(const struct message_layout *r, Rect body)
 	      r->mine ? UI_BUBBLE_OUT_INK : UI_BUBBLE_IN_INK);
 }
 
+static void message_status(const struct message_layout *r, Rect body)
+{
+	int bottom = body.y + body.h - 1;
+
+	if (cache.line_style && r->short_clock) {
+		int w, h;
+
+		pango_layout_get_pixel_size(r->short_clock, &w, &h);
+		bottom -= h;
+		paint(r->short_clock,
+		      r->mine ? body.x - w - 6 : body.x + body.w + 6, bottom,
+		      UI_SUBTLE);
+	}
+	if (!r->receipt)
+		return;
+	/* Live receipts update the label without reflowing the history. */
+	PangoLayout *status = ui_message_is_read(r->message) ? cache.read :
+							       cache.sent;
+	int x = body.x, y = body.y + body.h + (r->reactions ? 30 : 0) + 2;
+
+	if (cache.line_style) {
+		int w, h;
+
+		pango_layout_get_pixel_size(status, &w, &h);
+		x -= w + 6;
+		y = bottom - h - 1;
+	}
+	paint(status, x, y, UI_SUBTLE);
+}
+
 static void message_rows(Rect area)
 {
 	prepare_bubbles(area);
@@ -2644,15 +2701,7 @@ static void message_rows(Rect area)
 		} else if (!cache.line_style && (int)i == hover &&
 			   r->short_clock)
 			paint(r->short_clock, area.x + 22, y + 4, UI_SUBTLE);
-		if (cache.line_style && r->short_clock) {
-			int tw, th;
-
-			pango_layout_get_pixel_size(r->short_clock, &tw, &th);
-			int tx = r->mine ? x - tw - 6 : x + body.w + 6;
-
-			paint(r->short_clock, tx, body.y + body.h - th - 1,
-			      UI_SUBTLE);
-		}
+		message_status(r, body);
 		y = body.y;
 		if (r->flex)
 			ui_flex_draw(cr, r->flex, x, y, flex_image, NULL);

@@ -40,7 +40,7 @@ A reply is a Thrift result struct. Field 0 holds the result. Field 1 holds a ser
 
 | Path | Service | Methods this client calls |
 | ---- | ------- | ------------------------- |
-| `/S4` | TalkService | `getProfile`, `getChats`, `getAllChatMids`, `getMessageBoxes`, `getRecentMessagesV2`, `getPreviousMessagesV2WithRequest`, `sendMessage`, `sendChatChecked`, `react`, `createChat`, `updateChat`, `inviteIntoChat`, `cancelChatInvitation`, `acceptChatInvitation`, `rejectChatInvitation`, `deleteOtherFromChat`, `deleteSelfFromChat`, `reissueChatTicket`, `getContactsV2`, `getFriendRequests`, `removeFriendRequest`, `updateProfileAttributes`, `getUserTicket`, `negotiateE2EEPublicKey`, `getLastE2EEGroupSharedKey`, `getChatRoomAnnouncements`, `createChatRoomAnnouncement`, `removeChatRoomAnnouncement`, `acquireEncryptedAccessToken`, `getLastOpRevision` |
+| `/S4` | TalkService | `getProfile`, `getChats`, `getAllChatMids`, `getMessageBoxes`, `getRecentMessagesV2`, `getPreviousMessagesV2WithRequest`, `sendMessage`, `sendChatChecked`, `getMessageReadRange`, `react`, `createChat`, `updateChat`, `inviteIntoChat`, `cancelChatInvitation`, `acceptChatInvitation`, `rejectChatInvitation`, `deleteOtherFromChat`, `deleteSelfFromChat`, `reissueChatTicket`, `getContactsV2`, `getFriendRequests`, `removeFriendRequest`, `updateProfileAttributes`, `getUserTicket`, `negotiateE2EEPublicKey`, `getLastE2EEGroupSharedKey`, `getChatRoomAnnouncements`, `createChatRoomAnnouncement`, `removeChatRoomAnnouncement`, `acquireEncryptedAccessToken`, `getLastOpRevision` |
 | `/RE4` | Relation service | `getContactsV3`, `addFriendByMid`, `updateFriendFavorite`, `updateFriendHidden`, `updateUserFriendOverridenName`, `blockRelation`, `unblockRelation` |
 | `/SYNC4` | Sync service | `sync` (long poll) |
 | `/AS4` | Auth service | `logoutV2` |
@@ -85,6 +85,8 @@ The sequence number must be unique per device, so the client reserves it on disk
 **Loading history.** A linked desktop can receive an empty page from `getRecentMessagesV2` even when its chat list shows a last message. If the chat summary has a valid message ID and delivery time beyond the user's cleared history, Avernella uses them to request a page with `getPreviousMessagesV2WithRequest`. This recovery page includes the known last message. Ordinary backward paging excludes its boundary message so it appears only once. [History retrieval](../src/messaging.c)
 
 **Read receipts.** The window clears the local unread badge once it has displayed the newest message at the bottom of the focused, unobscured conversation. The worker sends `sendChatChecked` with that message ID when a receipt is due. A later chat-list refresh can arrive before LINE acknowledges the receipt. The client uses the ID it already displayed to keep a stale count from restoring the badge. [Read tracking](../src/ui_private.h) · [Chat-list updates](../src/ui.c)
+
+For a message you sent, **Read** uses the message’s `readCount`, a receipt naming that message from sync operation 55, or a peer’s inclusive message-ID range from `getMessageReadRange`. In a group, one confirmed reader is enough. Separate ranges can have gaps, so a receipt for a later group message does not establish that earlier messages were read. The app shows **Sent** while it has only the send confirmation. [Outgoing receipt handling](../src/messaging.c)
 
 ## Letter Sealing: end-to-end encryption
 

@@ -71,6 +71,8 @@ The [Windows and Mac feature comparison](analysis/desktop-features.md) tracks su
 
 The sidebar shows LINE contact and group photos and unread counts. Open a conversation to see up to 50 recent messages. Its unread badge clears when the newest message is visible at the bottom of the focused chat. While you read an older page or keep the app in the tray, new arrivals keep their unread badge. Choose **Earlier messages** to page back or **Back to latest** to return.
 
+Your outgoing messages show **Sent** once LINE accepts them and **Read** when LINE reports that someone else has read them. In a group, **Read** means at least one other member has read that message. If a receipt is unavailable, the message continues to show **Sent**.
+
 **Ctrl+F** finds a conversation by name. **Ctrl+Shift+F** searches the open conversation and can continue into earlier pages. **Ctrl+Alt+F** searches recent messages across chats in batches of up to six chats, using the latest 50 messages from each chat. **Ctrl+R** refreshes, and **Enter** sends. Drafts stay with their conversations while the app is open.
 
 Incoming text supports Letter Sealing v1 and v2. A message encrypted to a key generation that this device lacks displays a separate missing-key notice. [LINE Encryption Overview](https://www.lycorp.co.jp/en/privacy-security/line-encryption-whitepaper-ver2.2.pdf)

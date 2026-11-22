@@ -34,6 +34,8 @@ int line_ui(int argc, char **argv);
 
 struct image_job {
 	char *path, *product, *emoji;
+	char *read_chat, *access, *next_access;
+	J *ranges;
 	gint64 request_id;
 	GBytes *bytes;
 	GError *error;
@@ -63,6 +65,10 @@ struct line_worker {
 	/* Profiles the window opened, and incoming friend requests. */
 	J *cards, *requests;
 	J *unread_heads, *read_acks;
+	/* Only the open chat needs peer receipts. One lookup may be in flight. */
+	J *peer_ranges, *peer_notices;
+	gboolean need_ranges, publish_reads, ranges_pending;
+	gint64 ranges_retry_at;
 	J *announcements, *chat_snapshot, *search_chats;
 	char *global_query, *global_token;
 	size_t global_offset;
@@ -190,6 +196,9 @@ static void clear_view(struct line_worker *w)
 	g_clear_pointer(&w->invited_groups, json_object_put);
 	g_clear_pointer(&w->unread_heads, json_object_put);
 	g_clear_pointer(&w->read_acks, json_object_put);
+	g_clear_pointer(&w->peer_ranges, json_object_put);
+	g_clear_pointer(&w->peer_notices, json_object_put);
+	w->need_ranges = w->publish_reads = FALSE;
 	w->latest_history = FALSE;
 	g_hash_table_remove_all(w->leases);
 	line_talk_sync_clear(&w->sync);
@@ -923,9 +932,15 @@ static void show_history(struct line_worker *w, const char *chat, J *raw)
 	json_object_put(w->messages);
 	w->messages = json_object_get(raw);
 	w->latest_history = TRUE;
+	w->publish_reads = TRUE;
 	if (g_strcmp0(w->history_chat, chat)) {
 		g_free(w->history_chat);
 		w->history_chat = g_strdup(chat);
+		g_clear_pointer(&w->peer_ranges, json_object_put);
+		g_clear_pointer(&w->peer_notices, json_object_put);
+		w->peer_notices = obj();
+		w->need_ranges = TRUE;
+		w->ranges_retry_at = 0;
 	}
 }
 
@@ -937,6 +952,9 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 			error,
 			"Open this conversation to read its earlier messages.");
 	if (!older) {
+		/* A later visit or refresh retries an unavailable snapshot. */
+		if (!w->peer_ranges)
+			w->need_ranges = TRUE;
 		struct cached_history *c =
 			g_hash_table_lookup(w->history_cache, chat);
 
@@ -969,6 +987,7 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 		json_object_put(w->messages);
 		w->messages = raw;
 		w->latest_history = FALSE;
+		w->publish_reads = TRUE;
 	} else
 		json_object_put(raw);
 	J *page = obj();
@@ -998,7 +1017,7 @@ static void revalidate_history(struct line_worker *w, const char *chat)
 	    g_strcmp0(chat, w->history_chat))
 		return;
 	cache_store(w, chat, rows, raw);
-	if (g_strcmp0(chat, w->history_chat))
+	if (g_strcmp0(chat, w->history_chat) || !w->latest_history)
 		return;
 	show_history(w, chat, raw);
 	if (same)
@@ -1645,9 +1664,9 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 }
 
 /*
- * Anonymous CDN transfers have their own queue and HTTPS connection pool so
- * browsing a pack or loading profile photos cannot delay a text send. Only
- * the worker main thread touches session state and allocates image leases.
+ * Optional CDN transfers and peer receipt lookups run off the dispatch
+ * thread so they cannot hold up text sends. Only the dispatch thread
+ * commits token rotations and allocates image leases.
  */
 static struct image_job image_stop;
 
@@ -1658,6 +1677,10 @@ static void image_free(gpointer data)
 	if (job == &image_stop)
 		return;
 	g_clear_pointer(&job->bytes, g_bytes_unref);
+	g_clear_pointer(&job->ranges, json_object_put);
+	g_free(job->read_chat);
+	g_free(job->access);
+	g_free(job->next_access);
 	g_clear_error(&job->error);
 	g_free(job->path);
 	g_free(job->product);
@@ -1675,7 +1698,16 @@ static gpointer fetch_images(gpointer data)
 
 		if (job == &image_stop)
 			break;
-		if (job->sticker)
+		if (job->read_chat) {
+			Line session = { .access = g_strdup(job->access) };
+
+			job->ranges = line_peer_ranges(&session, job->read_chat,
+						       &job->error);
+			if (session.token_changed)
+				job->next_access =
+					g_steal_pointer(&session.access);
+			g_free(session.access);
+		} else if (job->sticker)
 			job->bytes = line_sticker_fetch(job->path, &job->error);
 		else if (job->flex)
 			job->bytes = line_flex_image_download(job->path,
@@ -1692,7 +1724,61 @@ static gpointer fetch_images(gpointer data)
 		while (eventfd_write(w->image_wake, 1) < 0 && errno == EINTR)
 			;
 	}
+	line_transport_release();
 	return NULL;
+}
+
+static gboolean background_ready(struct line_worker *w, GError **error)
+{
+	if (!w->image_thread)
+		w->image_thread =
+			g_thread_try_new("line-images", fetch_images, w, error);
+	return w->image_thread != NULL;
+}
+
+/* Run once after each event batch; the visible history has already been sent. */
+static void update_peer_reads(struct line_worker *w)
+{
+	if (!w->publish_reads)
+		return;
+	w->publish_reads = FALSE;
+	Line *s = &w->session;
+	const char *chat = w->history_chat;
+
+	if (!chat || !s->mid || !strcmp(chat, s->mid) || !w->messages)
+		return;
+	g_autoptr(J) counts = line_peer_read_counts(
+		s->mid, chat, w->messages, w->peer_ranges, w->peer_notices);
+	if (json_object_object_length(counts)) {
+		g_autoptr(J) event = obj();
+		json_object_object_add(event, "event",
+				       json_object_new_string("message_reads"));
+		json_object_object_add(event, "chat",
+				       json_object_new_string(chat));
+		json_object_object_add(event, "counts",
+				       json_object_get(counts));
+		line_emit(event);
+	}
+	if (!w->need_ranges || w->ranges_pending || !s->access ||
+	    w->image_wake < 0 ||
+	    (w->ranges_retry_at && g_get_monotonic_time() < w->ranges_retry_at))
+		return;
+	json_object_object_foreach(w->messages, id, msg) {
+		if (g_strcmp0(strfield(msg, "1"), s->mid) ||
+		    json_object_get_int(field(counts, id)) > 0)
+			continue;
+		w->need_ranges = FALSE;
+		if (!background_ready(w, NULL))
+			return;
+		struct image_job *job = g_new0(struct image_job, 1);
+
+		job->read_chat = g_strdup(chat);
+		job->access = g_strdup(s->access);
+		job->generation = w->generation;
+		w->ranges_pending = TRUE;
+		g_async_queue_push(w->image_requests, job);
+		return;
+	}
 }
 
 static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
@@ -1740,12 +1826,8 @@ static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
 				       "Profile picture is unavailable.");
 		return FALSE;
 	}
-	if (!w->image_thread) {
-		w->image_thread =
-			g_thread_try_new("line-images", fetch_images, w, error);
-		if (!w->image_thread)
-			return FALSE;
-	}
+	if (!background_ready(w, error))
+		return FALSE;
 	struct image_job *job = g_new0(struct image_job, 1);
 
 	job->path = sticker ? g_steal_pointer(&sticker_url) : g_strdup(path);
@@ -1762,6 +1844,36 @@ static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
 	return TRUE;
 }
 
+static void save_rotated_token(struct line_worker *w);
+
+static void finish_peer_ranges(struct line_worker *w, struct image_job *job)
+{
+	w->ranges_pending = FALSE;
+	if (job->generation == w->generation) {
+		if (job->next_access &&
+		    !g_strcmp0(job->access, w->session.access)) {
+			g_free(w->session.access);
+			w->session.access = g_steal_pointer(&job->next_access);
+			w->session.token_changed = TRUE;
+			save_rotated_token(w);
+		}
+		if (!g_strcmp0(job->read_chat, w->history_chat)) {
+			if (job->ranges) {
+				g_clear_pointer(&w->peer_ranges,
+						json_object_put);
+				w->peer_ranges = g_steal_pointer(&job->ranges);
+				w->ranges_retry_at = 0;
+				w->publish_reads = TRUE;
+			} else {
+				w->ranges_retry_at = g_get_monotonic_time() +
+						     5 * G_USEC_PER_SEC;
+				w->need_ranges = TRUE;
+			}
+		}
+	}
+	w->publish_reads |= w->need_ranges;
+}
+
 static void finish_images(struct line_worker *w)
 {
 	eventfd_t tick;
@@ -1771,6 +1883,11 @@ static void finish_images(struct line_worker *w)
 	struct image_job *job;
 
 	while ((job = g_async_queue_try_pop(w->image_results))) {
+		if (job->read_chat) {
+			finish_peer_ranges(w, job);
+			image_free(job);
+			continue;
+		}
 		g_autoptr(J) reply = obj();
 		J *result = NULL;
 
@@ -1792,8 +1909,6 @@ static void finish_images(struct line_worker *w)
 		image_free(job);
 	}
 }
-
-static void save_rotated_token(struct line_worker *w);
 
 static void handle(struct line_worker *w, const char *line)
 {
@@ -1863,12 +1978,24 @@ static void handle(struct line_worker *w, const char *line)
  * A signed-out worker blocks indefinitely. A signed-in worker checks the
  * server revision between interactive requests, with a one-shot timerfd.
  */
-static void apply_operation(J *op, gpointer data)
+static gboolean apply_operation(struct line_worker *w, J *op)
 {
-	Line *s = data;
+	Line *s = &w->session;
+	enum peer_notice notice = line_peer_read_notice(s->mid, w->history_chat,
+							w->peer_notices, op);
 
+	if (notice == PEER_NOTICE_ADDED)
+		w->publish_reads = w->need_ranges = TRUE;
+	if (notice != PEER_NOTICE_OTHER)
+		return TRUE;
 	line_profile_operation(s, op);
 	line_voice_operation(s, op);
+	return FALSE;
+}
+
+static void poll_operation(J *op, gpointer data)
+{
+	apply_operation(data, op);
 }
 
 static gboolean poll_call_operations(struct line_worker *w, gboolean *reload)
@@ -1880,8 +2007,8 @@ static gboolean poll_call_operations(struct line_worker *w, gboolean *reload)
 
 	if (!result)
 		return FALSE;
-	return line_talk_sync_apply(&w->sync, result, apply_operation,
-				    &w->session, reload);
+	return line_talk_sync_apply(&w->sync, result, poll_operation, w,
+				    reload);
 }
 
 /*
@@ -2135,7 +2262,8 @@ static void live_operations(struct line_worker *w)
 	for (size_t i = 0; i < count; i++) {
 		J *op = json_object_array_get_idx(batch.ops, i);
 
-		apply_operation(op, s);
+		if (apply_operation(w, op))
+			continue;
 		if (message_operation(w, op, &open_chat))
 			continue;
 		if (cards < LIVE_CARD_LIMIT && social_operation(w, op))
@@ -2144,6 +2272,8 @@ static void live_operations(struct line_worker *w)
 			other = TRUE;
 	}
 	json_object_put(batch.ops);
+	if (batch.reload)
+		w->publish_reads = w->need_ranges = TRUE;
 	if (batch.reload && s->profiles)
 		g_hash_table_remove_all(s->profiles);
 	w->sync.revision = MAX(w->sync.revision, batch.revision);
@@ -2197,6 +2327,8 @@ static void sync_revision(struct line_worker *w)
 		} else if (w->sync.more || current > w->sync.revision) {
 			/* A revision probe reports activity, never an acknowledged page. */
 			catch_up = poll_call_operations(w, &reload);
+			if (reload)
+				w->publish_reads = w->need_ranges = TRUE;
 			if (reload && s->profiles)
 				g_hash_table_remove_all(s->profiles);
 		}
@@ -2323,6 +2455,7 @@ static int worker(int credentials_fd)
 			    sizeof(tick))
 				w.armed_renewal = 0;
 		}
+		update_peer_reads(&w);
 	}
 	g_clear_pointer(&w.live, line_live_sync_stop);
 	if (w.image_thread) {

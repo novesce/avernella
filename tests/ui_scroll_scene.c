@@ -108,11 +108,14 @@ static void report_difference(int offset)
 
 static void check_chat_bubbles(void)
 {
-	Json *received =
-		json_tokener_parse("{\"from\":\"Grace\",\"text\":\"Hi!\"}");
-	Json *sent = json_tokener_parse("{\"own\":true,\"text\":\"Hi Grace\"}");
+	Json *received = json_tokener_parse(
+		"{\"id\":\"100\",\"from\":\"Grace\",\"text\":\"Hi!\"}");
+	Json *sent = json_tokener_parse(
+		"{\"id\":\"101\",\"own\":true,\"senderId\":\"me\","
+		"\"time\":1700000000000,\"text\":\"Hi Grace\"}");
 	Json *card = json_tokener_parse(
-		"{\"own\":true,\"flex\":{\"type\":\"bubble\",\"size\":\"micro\","
+		"{\"id\":\"102\",\"own\":true,\"senderId\":\"me\",\"time\":1700000001000,"
+		"\"flex\":{\"type\":\"bubble\",\"size\":\"micro\","
 		"\"body\":{\"type\":\"box\",\"layout\":\"vertical\",\"contents\":["
 		"{\"type\":\"button\",\"action\":{\"type\":\"uri\",\"label\":\"Open\","
 		"\"uri\":\"https://example.org/chat\"}}]}}}");
@@ -146,6 +149,61 @@ static void check_chat_bubbles(void)
 	g_assert_true(left);
 	g_assert_true(right);
 	g_assert_true(link);
+}
+
+static void check_message_receipts(void)
+{
+	g_autofree uint32_t (*before)[W] = g_malloc(sizeof(presented));
+	Json *packet = json_tokener_parse(
+		"{\"event\":\"message_reads\",\"chat\":\"other\","
+		"\"counts\":{\"100\":1,\"101\":1,\"102\":1}}");
+	gboolean changed[3] = { FALSE };
+	/* Begin with no confirmed receipts in this fixture. */
+	for (int i = 0; i < 3; i++)
+		json_object_object_del(json_object_array_get_idx(ui.history, i),
+				       "readCount");
+	ui.stick_bottom = TRUE;
+	ui_draw();
+	scene_time += 300000;
+	ui_draw();
+	memcpy(before, presented, sizeof(presented));
+	ui_message_reads(packet);
+	ui_draw();
+	g_assert_cmpmem(before, sizeof(presented), presented,
+			sizeof(presented));
+
+	json_object_object_add(packet, "chat",
+			       json_object_new_string(ui.selected));
+	ui_message_reads(packet);
+	ui_draw();
+	for (int y = 0; y < H; y++) {
+		for (int x = 0; x < W; x++) {
+			if (presented[y][x] == before[y][x])
+				continue;
+			int lx = x * ui.width / W, ly = y * ui.height / H;
+			int row = ui_message_at(lx, ly);
+
+			g_assert_cmpint(row, >=, 0);
+			g_assert_cmpint(row, <, 3);
+			if (ui_theme_is_line())
+				g_assert_null(ui_row_at(lx, ly));
+			changed[row] = TRUE;
+		}
+	}
+	g_assert_false(changed[0]);
+	g_assert_true(changed[1]);
+	g_assert_true(changed[2]);
+	/* A stale count or a duplicate receipt must not undo a confirmed read. */
+	json_object_object_add(packet, "counts",
+			       json_tokener_parse("{\"101\":0,\"102\":1}"));
+	ui.dirty = FALSE;
+	ui_message_reads(packet);
+	g_assert_false(ui.dirty);
+	g_assert_true(
+		ui_message_is_read(json_object_array_get_idx(ui.history, 1)));
+	g_assert_true(
+		ui_message_is_read(json_object_array_get_idx(ui.history, 2)));
+	json_object_put(packet);
 }
 
 static void check_scroll_positions(void)
@@ -285,6 +343,7 @@ static void history(void)
 				  json_object_array_length(ui.history));
 	ui.history_offset = 0;
 	check_chat_bubbles();
+	check_message_receipts();
 	int index = 0, row_height = ui_chat_row_height();
 
 	json_object_array_add(
@@ -298,7 +357,19 @@ static void history(void)
 	g_assert_true(ui_theme_toggle(&error));
 	g_assert_no_error(error);
 	ui_theme_changed(row_height);
+	check_message_receipts();
 	check_row_animation();
+	/* Exercise receipt widths with RTL shaping and a compact chat pane. */
+	g_assert_true(ui_lang_set(UI_LANG_AR, &error));
+	g_assert_no_error(error);
+	ui_language_changed();
+	SDL_SetWindowSize(ui.window, W / 2, H);
+	ui.focus = F_MESSAGE;
+	row_height = ui_chat_row_height();
+	g_assert_true(ui_theme_toggle(&error));
+	g_assert_no_error(error);
+	ui_theme_changed(row_height);
+	check_message_receipts();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
 	g_string_free(ui.message.value, TRUE);

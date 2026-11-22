@@ -321,6 +321,77 @@ const char *ui_string(Json *obj, const char *key, const char *fallback)
 		       fallback;
 }
 
+static int reader_count(Json *value)
+{
+	return json_object_is_type(value, json_type_int) ?
+		       MAX(0, json_object_get_int(value)) :
+		       0;
+}
+
+gboolean ui_message_is_read(Json *message)
+{
+	return reader_count(ui_field(message, "readCount")) > 0;
+}
+
+static gboolean merge_message_reads(Json *rows, Json *counts)
+{
+	gboolean changed = FALSE;
+
+	if (!json_object_is_type(rows, json_type_array) ||
+	    !json_object_is_type(counts, json_type_object))
+		return FALSE;
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		Json *row = json_object_array_get_idx(rows, i);
+		const char *id = ui_string(row, "id", NULL);
+
+		if (!id || !json_object_get_boolean(ui_field(row, "own")))
+			continue;
+		Json *count = ui_field(counts, id);
+		int old = reader_count(ui_field(row, "readCount"));
+
+		if (reader_count(count) <= old)
+			continue;
+		json_object_object_add(row, "readCount",
+				       json_object_get(count));
+		changed |= !old;
+	}
+	return changed;
+}
+
+void ui_message_reads(Json *packet)
+{
+	if (ui.selected && g_strcmp0(ui.selected, ui.self_id) &&
+	    !g_strcmp0(ui.selected, ui_string(packet, "chat", NULL)) &&
+	    merge_message_reads(ui.history, ui_field(packet, "counts")))
+		ui.dirty = TRUE;
+}
+
+/* A delayed history response may predate a receipt for the same message. */
+static void preserve_message_reads(Json *rows)
+{
+	Json *counts = NULL;
+
+	if (!ui.history || !json_object_is_type(rows, json_type_array))
+		return;
+	for (size_t i = 0; i < json_object_array_length(ui.history); i++) {
+		Json *row = json_object_array_get_idx(ui.history, i);
+		const char *id = ui_string(row, "id", NULL);
+
+		if (!id || !json_object_get_boolean(ui_field(row, "own")) ||
+		    !ui_message_is_read(row))
+			continue;
+		if (!counts)
+			counts = json_object_new_object();
+		json_object_object_add(
+			counts, id,
+			json_object_get(ui_field(row, "readCount")));
+	}
+	if (counts) {
+		merge_message_reads(rows, counts);
+		json_object_put(counts);
+	}
+}
+
 static void free_request(gpointer data)
 {
 	struct ui_request *request = data;
@@ -790,6 +861,8 @@ static void set_string(char **dest, const char *s)
 
 static gboolean set_json(Json **dest, Json *value)
 {
+	if (dest == &ui.history && value && value != *dest)
+		preserve_message_reads(value);
 	if (dest == &ui.history && !value) {
 		ui.older_page = ui.older_pending = ui.has_older = FALSE;
 		wire.rendered_history = 0;
@@ -1691,6 +1764,9 @@ static void handle_packet(Json *packet)
 	else if (!strcmp(event, "chat_message") && ui.connected &&
 		 !ui.logging_out)
 		chat_message(packet);
+	else if (!strcmp(event, "message_reads") && ui.connected &&
+		 !ui.logging_out)
+		ui_message_reads(packet);
 	else if (!strcmp(event, "history") && ui.connected)
 		pushed_history(packet);
 	else if ((!strcmp(event, "self") || !strcmp(event, "contact") ||
