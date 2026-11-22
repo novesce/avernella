@@ -37,11 +37,11 @@ The worker ([`src/main.c`](../src/main.c), from `worker()`) is the only process 
 - separate one-shot timers for the fallback revision check and the token renewal time LINE supplied,
 - eventfds from the image and sync threads.
 
-A pending call invitation or failed renewal or save supplies a monotonic timeout for this wait. During healthy long polling, an idle worker with a future renewal can sleep until that deadline or the next event.
+Token renewal uses an absolute `CLOCK_REALTIME` timer for the date LINE supplies. Call invitations, revision checks and retries use monotonic time. During healthy long polling, an idle worker can sleep until its next deadline or until a descriptor becomes readable.
 
-**The sync thread** ([`live_sync.c`](../src/live_sync.c)) keeps one `sync` request open on `/SYNC4` on its own HTTPS connection. LINE answers as soon as anything happens, so a new message reaches the window about one network round trip after it was sent. The thread hands operations to the worker through the eventfd. If the long poll keeps failing, the worker falls back to checking `getLastOpRevision` every second.
+**The sync thread** keeps one `sync` request open on `/SYNC4` on its own HTTPS connection. When operations arrive, the thread signals the worker through an eventfd. If the long poll fails, the worker checks `getLastOpRevision`. Successful fallback checks recur after one second in the foreground or while catching up, and after three seconds in the background. Failed checks back off and the worker honors the transport’s retry delay. [Long poll](../src/live_sync.c) · [Worker scheduling](../src/main.c)
 
-**The call thread** ([`call.c`](../src/call.c)) owns at most one call: UDP sockets, SRTP, the Opus audio path and the VP8 video path.
+**The call thread** owns one active call’s UDP sockets, SRTP sessions and Opus and VP8 codecs. After SRTP authentication and decryption, a complete single-packet VP8 picture goes straight from the decrypted buffer to libvpx. This skips both the fragment copy and the assembled-picture copy for EVS3 and RFC 7741 packets. Fragmented pictures are assembled in sequence. Libvpx decodes on the CPU into I420 planes, which the native Vulkan renderer uploads and converts to color for display. [Call transport](../src/call.c) · [VP8 receiver](../src/call_video.c) · [Vulkan canvas](../src/render/vk_canvas.c)
 
 ### The in-app browser
 
@@ -97,6 +97,7 @@ A reader thread in the UI sleeps in `recv` and posts an SDL event only when the 
 | Calls | `call.c`, `call_schema.c`, `call_wire.c`, `call_srtp.c`, `call_pdtp.c`, `call_audio.c`, `call_denoise.c`, `call_video.c`, `camera.c`, `camera_pixels.c`, `screencast.c` |
 | Video clips | `video_record.c`, `video_play.c` |
 | Drawing, layout, animation | `ui.c`, `ui_draw.c`, `ui_media.c`, `ui_motion.c`, `ui_pixels.c`, `ui_apng.c` |
+| Layout preference, language selection and translation tables | `ui_theme.c`, `ui_lang.c`, `ui_lang_table.h`, `ui_lang_*.c` |
 | Screens and panels | `ui_friends.c`, `ui_groups.c`, `ui_profile.c`, `ui_find.c`, `ui_emoji.c`, `ui_chat_lists.c`, `ui_chat_tools.c`, `ui_shared_content.c` |
 | Desktop integration | `ui_tray.c`, `ui_notifications.c`, `screenshot.c`, `clipboard_paste.c`, `chat_lists.c`, `qr_scan.c` |
 | Sounds: NES APU synth and playback | `chiptune.c`, `ui_sounds.c` |
@@ -113,15 +114,16 @@ A reader thread in the UI sleeps in `recv` and posts an SDL event only when the 
 **Receiving.** The other person's message arrives on the open `/SYNC4` long poll as a `RECEIVE_MESSAGE` operation (type 26).
 
 1. The sync thread hands it to the worker.
-2. The worker opens the sealed text and emits a `history` event.
-3. The UI updates the chat row and, if the window is in the background, shows a notification.
+2. The worker emits a `chat_message` event with the chat ID, message ID and time. The UI can update the chat row as soon as that event arrives. If the affected chat is open, the worker revalidates its history. Otherwise it drops that chat’s cached page so the next open fetches fresh messages.
+3. Once the focused window has presented the newest message at the bottom of an unobscured chat, the UI clears the local unread badge and submits `markRead` when a receipt is due. Reading an older page or leaving the window minimized keeps newer messages unread. [Read receipt conditions](../src/ui_private.h) · [UI event handling](../src/ui.c)
 
 ## Saved state
 
 | Path | Contents |
 | ---- | -------- |
 | `$XDG_STATE_HOME/avernella/session.json` (default `~/.local/state/avernella`) | Access and refresh tokens, their renewal schedule, your MID, Letter Sealing keys and the message sequence counter. Mode 0600 in a 0700 directory, written by atomic rename under an exclusive directory lock. |
-| `$XDG_STATE_HOME/avernella/` (same directory) | Per-account pins, folders, mutes and shortcuts ([`chat_lists.c`](../src/chat_lists.c)) |
+| `$XDG_STATE_HOME/avernella/` (same directory) | Per-account pins, folders, mutes, shortcuts and the Reduce Motion preference ([`chat_lists.c`](../src/chat_lists.c)) |
+| `$XDG_CONFIG_HOME/avernella/layout` and `language` (under `~/.config` by default) | Layout and interface language shared across local accounts. A fresh profile starts with the LINE layout and chooses its language from the desktop locale. |
 | `$XDG_RUNTIME_DIR/avernella/` | Pictures pasted for sending, deleted after use |
 | `~/.cache/kitatide/liff`, `~/.local/share/kitatide/liff` | The in-app browser's HTTP cache and cookies |
 
@@ -156,8 +158,10 @@ The app leans on the kernel and glibc instead of frameworks.
 - **Zero-copy pictures.** Pictures cross processes as sealed memfds.
 
 **Scheduling and drawing**
+
 - **Thread priorities.** Image decoding runs under `SCHED_BATCH`. The call's media thread asks for tight timer slack.
-- **Drawing only what changed.** Scrolling uploads only the changed region. Animation follows the monitor's refresh rate against monotonic deadlines and sleeps when nothing moves.
+- **Frame pacing.** The UI uses monotonic deadlines paced to the reported display refresh rate. It uses `SDL_WaitEventTimeout` for a future frame deadline and `SDL_WaitEvent` when idle or hidden. Input and worker events wake either wait. A held button stops requesting frames once it reaches its pressed position. [UI loop](../src/ui.c) · [Motion timing](../src/ui_motion.c)
+- **Partial redraws.** Chat row highlights and button presses can repaint their combined bounds, including the last frame as they settle. On unrotated surfaces with Vulkan incremental presentation, the renderer tracks the changes each swapchain image has missed and restricts drawing to their bounding rectangle when that image returns. A resize or unknown damage triggers a full redraw. [UI damage tracking](../src/ui_draw.c) · [Vulkan presentation](../src/render/vk_present.c)
 - **Vectorized pixel loops.** Pixel loops are built with `-O3`, which lets GCC vectorize them.
 - **Sounds without a sound server stream at rest.** Call and message sounds come from an emulated NES APU. Its timers run event by event rather than every CPU cycle, so a whole ringtone renders in under 10 ms. The SDL audio device opens when a sound starts and closes once it ends.
 

@@ -6,7 +6,7 @@ Install the packages listed in the [README](../README.md#build-and-test), then b
 
 ```sh
 make            # avernella, plus helpers for installed WebKit SDKs
-make check      # every test in tests/
+make check      # offline regression suite
 make bench      # render benchmark
 ```
 
@@ -40,21 +40,52 @@ The offscreen tests read back rendered pixels. The swapchain test uses the produ
 
 ## Tests
 
-Each `tests/<name>.c` builds to `build/test-<name>` and uses GLib's test framework. The tests run offline:
+`make check` runs the GLib test binaries listed in `TESTS` in the Makefile. The fixtures run offline.
 
 - **RPC fixtures.** Protocol tests replace `line_rpc` with a fixture that checks the Thrift-encoded request field by field and feeds a synthetic reply through the real decoder (see `tests/friends.c` and `tests/liff.c`).
 - **Wrapped libcurl.** HTTP tests wrap `curl_easy_*` with `-Wl,--wrap`.
 - **Wrapped SDL audio.** Call tests wrap the SDL audio functions.
 - **Generated media.** Media tests generate their own pictures, audio and video. FFmpeg is needed for the recording tests.
 
-Run one test, or one case of it:
+Run a single test binary or select one case by its GLib test path.
 
 ```sh
-make build/test-liff && ./build/test-liff
+make build/test-liff build/test-sealing
+./build/test-liff
 ./build/test-sealing -p /sealing/authenticated-history-cache
 ```
 
 To add a test, write `tests/foo.c`, add `build/test-foo` to `TESTS` in the Makefile, and add a rule listing its objects.
+
+### Checking motion and repainting
+
+Run the motion and scene tests when changing a control, its hit area, or the size of a chat row. Both run with SDL's dummy video driver.
+
+```sh
+make build/test-ui-motion build/test-ui-scroll-scene
+./build/test-ui-motion
+./build/test-ui-scroll-scene
+```
+
+The motion test samples a short tap at 60, 90, 120, 144 and 240 Hz. It checks the press, rebound and final deadline, then measures SDL wakeup timing separately at 60, 144 and 240 Hz. The scene test draws a hover fade frame by frame in both layouts and compares each partial repaint with a full redraw at the same timestamp. When changing row geometry, pass the whole painted row to `track_strength()` so the last frame of the fade clears every highlighted pixel.
+
+To check the VP8 receive path, run the single-packet cases. They decode complete EVS3 and RFC 7741 frames and exercise declared-length validation.
+
+```sh
+make build/test-call-video
+./build/test-call-video -r /video/single-packet
+```
+
+### Translating interface text
+
+Use English literals as lookup keys, for example `_("Send")`. Mark labels in static tables with `N_()` and translate them with `_()` when displayed. Add the matching English and translated pair to each `src/ui_lang_<tag>.c` table. Keep the order and types of format arguments such as `%s` and `%d`. Use `ui_lang_date()` for month and weekday names in the selected language. [Language API](../src/ui_lang.h) · [Translation table format](../src/ui_lang_table.h)
+
+```sh
+make build/test-ui-lang
+./build/test-ui-lang
+```
+
+The language tests check UTF-8 text, duplicate keys and format arguments. They also exercise saved preferences, locale fallback and date formatting in isolated configuration directories.
 
 ## Code style
 

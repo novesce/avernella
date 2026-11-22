@@ -78,9 +78,13 @@ LINE describes every change to your account as an **operation** with a revision 
 
 ## Messages
 
-`sendMessage` takes a sequence number and a Message struct: recipient MID, content type, text or metadata (`contentMetadata`, a string map) and, for encrypted chats, a chunked Letter Sealing payload. Content types the client handles include text, image, video, audio, file, sticker, location, contact, Flex, rich message (imagemap) and call records. History comes from `getRecentMessagesV2` and `getPreviousMessagesV2WithRequest`. `sendChatChecked` marks messages read, and `react` adds a reaction.
+`sendMessage` takes a sequence number and a Message struct containing the recipient MID, content type, text or metadata (`contentMetadata`, a string map) and, for encrypted chats, a chunked Letter Sealing payload. Content types the client handles include text, image, video, audio, file, sticker, location, contact, Flex, rich message (imagemap) and call records. `react` adds a reaction.
 
 The sequence number must be unique per device, so the client reserves it on disk before each send.
+
+**Loading history.** A linked desktop can receive an empty page from `getRecentMessagesV2` even when its chat list shows a last message. If the chat summary has a valid message ID and delivery time beyond the user's cleared history, Avernella uses them to request a page with `getPreviousMessagesV2WithRequest`. This recovery page includes the known last message. Ordinary backward paging excludes its boundary message so it appears only once. [History retrieval](../src/messaging.c)
+
+**Read receipts.** The window clears the local unread badge once it has displayed the newest message at the bottom of the focused, unobscured conversation. The worker sends `sendChatChecked` with that message ID when a receipt is due. A later chat-list refresh can arrive before LINE acknowledges the receipt. The client uses the ID it already displayed to keep a stale count from restoring the badge. [Read tracking](../src/ui_private.h) · [Chat-list updates](../src/ui.c)
 
 ## Letter Sealing: end-to-end encryption
 
