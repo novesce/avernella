@@ -2,6 +2,7 @@
 #include "ui_private.h"
 #include "ui_gpu.h"
 #include "ui_motion.h"
+#include <gmodule.h>
 #include <string.h>
 
 enum {
@@ -11,6 +12,13 @@ enum {
 static uint32_t texture[H][W], presented[H][W];
 static unsigned int sparse, full, uploaded;
 static gboolean skip;
+static gint64 scene_time = 1000000;
+static struct gpu_rect dirty;
+
+G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
+{
+	return scene_time;
+}
 
 /* A deterministic consumer of the production scene's texel-copy commands. */
 bool ui_gpu_active(void)
@@ -47,6 +55,7 @@ int ui_gpu_draw(const struct gpu_scene *s)
 {
 	struct gpu_rect screen = { 0, 0, W, H };
 
+	dirty = s->damage;
 	if (skip) {
 		skip = FALSE;
 		return 0;
@@ -99,11 +108,14 @@ static void report_difference(int offset)
 
 static void check_chat_bubbles(void)
 {
-	Json *received =
-		json_tokener_parse("{\"from\":\"Grace\",\"text\":\"Hi!\"}");
-	Json *sent = json_tokener_parse("{\"own\":true,\"text\":\"Hi Grace\"}");
+	Json *received = json_tokener_parse(
+		"{\"id\":\"100\",\"from\":\"Grace\",\"text\":\"Hi!\"}");
+	Json *sent = json_tokener_parse(
+		"{\"id\":\"101\",\"own\":true,\"senderId\":\"me\","
+		"\"time\":1700000000000,\"text\":\"Hi Grace\"}");
 	Json *card = json_tokener_parse(
-		"{\"own\":true,\"flex\":{\"type\":\"bubble\",\"size\":\"micro\","
+		"{\"id\":\"102\",\"own\":true,\"senderId\":\"me\",\"time\":1700000001000,"
+		"\"flex\":{\"type\":\"bubble\",\"size\":\"micro\","
 		"\"body\":{\"type\":\"box\",\"layout\":\"vertical\",\"contents\":["
 		"{\"type\":\"button\",\"action\":{\"type\":\"uri\",\"label\":\"Open\","
 		"\"uri\":\"https://example.org/chat\"}}]}}}");
@@ -137,6 +149,61 @@ static void check_chat_bubbles(void)
 	g_assert_true(left);
 	g_assert_true(right);
 	g_assert_true(link);
+}
+
+static void check_message_receipts(void)
+{
+	g_autofree uint32_t (*before)[W] = g_malloc(sizeof(presented));
+	Json *packet = json_tokener_parse(
+		"{\"event\":\"message_reads\",\"chat\":\"other\","
+		"\"counts\":{\"100\":1,\"101\":1,\"102\":1}}");
+	gboolean changed[3] = { FALSE };
+	/* Begin with no confirmed receipts in this fixture. */
+	for (int i = 0; i < 3; i++)
+		json_object_object_del(json_object_array_get_idx(ui.history, i),
+				       "readCount");
+	ui.stick_bottom = TRUE;
+	ui_draw();
+	scene_time += 300000;
+	ui_draw();
+	memcpy(before, presented, sizeof(presented));
+	ui_message_reads(packet);
+	ui_draw();
+	g_assert_cmpmem(before, sizeof(presented), presented,
+			sizeof(presented));
+
+	json_object_object_add(packet, "chat",
+			       json_object_new_string(ui.selected));
+	ui_message_reads(packet);
+	ui_draw();
+	for (int y = 0; y < H; y++) {
+		for (int x = 0; x < W; x++) {
+			if (presented[y][x] == before[y][x])
+				continue;
+			int lx = x * ui.width / W, ly = y * ui.height / H;
+			int row = ui_message_at(lx, ly);
+
+			g_assert_cmpint(row, >=, 0);
+			g_assert_cmpint(row, <, 3);
+			if (ui_theme_is_line())
+				g_assert_null(ui_row_at(lx, ly));
+			changed[row] = TRUE;
+		}
+	}
+	g_assert_false(changed[0]);
+	g_assert_true(changed[1]);
+	g_assert_true(changed[2]);
+	/* A stale count or a duplicate receipt must not undo a confirmed read. */
+	json_object_object_add(packet, "counts",
+			       json_tokener_parse("{\"101\":0,\"102\":1}"));
+	ui.dirty = FALSE;
+	ui_message_reads(packet);
+	g_assert_false(ui.dirty);
+	g_assert_true(
+		ui_message_is_read(json_object_array_get_idx(ui.history, 1)));
+	g_assert_true(
+		ui_message_is_read(json_object_array_get_idx(ui.history, 2)));
+	json_object_put(packet);
 }
 
 static void check_scroll_positions(void)
@@ -187,6 +254,37 @@ static void check_scroll_positions(void)
 	g_assert_cmpuint(sparse - sparse_before, >=, 8);
 	for (guint i = 0; i < G_N_ELEMENTS(positions); i++)
 		g_free(reference[i]);
+}
+
+static void check_row_animation(void)
+{
+	g_autofree guint8 *saved = g_malloc(sizeof(presented));
+
+	ui.hover_x = ui.list_box.x + 24;
+	/* LINE's taller row must also highlight at its lower edge. */
+	ui.hover_y = ui.list_box.y +
+		     (ui_theme_is_line() ? ui_chat_row_height() - 3 : 20);
+	ui_draw();
+	/* Settle pre-existing controls, then exit the hovered chat row. */
+	scene_time += 300000;
+	ui_draw();
+	ui.hover_x = ui.hover_y = -1;
+	ui_draw();
+	g_assert_cmpint(ui_animation_deadline(scene_time), >, scene_time);
+	for (int i = 0; i < 8; i++) {
+		scene_time += 16667;
+		ui_draw_animation();
+		g_assert_cmpint(dirty.w, >, 0);
+		g_assert_cmpint(dirty.w, <=, ui.list_box.w + 4);
+		g_assert_cmpint(dirty.h, <=, ui_chat_row_height() + 4);
+		memcpy(saved, presented, sizeof(presented));
+		ui_draw();
+		g_assert_cmpmem(saved, sizeof(presented), presented,
+				sizeof(presented));
+		if (!ui_animation_deadline(scene_time))
+			break;
+	}
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
 }
 
 static void history(void)
@@ -245,6 +343,33 @@ static void history(void)
 				  json_object_array_length(ui.history));
 	ui.history_offset = 0;
 	check_chat_bubbles();
+	check_message_receipts();
+	int index = 0, row_height = ui_chat_row_height();
+
+	json_object_array_add(
+		ui.chats,
+		json_tokener_parse(
+			"{\"id\":\"another\",\"name\":\"Fixture friend\"}"));
+	g_array_append_val(ui.visible, index);
+	g_setenv("LINE_REDUCE_MOTION", "0", TRUE);
+	ui_motion_refresh_preferences();
+	check_row_animation();
+	g_assert_true(ui_theme_toggle(&error));
+	g_assert_no_error(error);
+	ui_theme_changed(row_height);
+	check_message_receipts();
+	check_row_animation();
+	/* Exercise receipt widths with RTL shaping and a compact chat pane. */
+	g_assert_true(ui_lang_set(UI_LANG_AR, &error));
+	g_assert_no_error(error);
+	ui_language_changed();
+	SDL_SetWindowSize(ui.window, W / 2, H);
+	ui.focus = F_MESSAGE;
+	row_height = ui_chat_row_height();
+	g_assert_true(ui_theme_toggle(&error));
+	g_assert_no_error(error);
+	ui_theme_changed(row_height);
+	check_message_receipts();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
 	g_string_free(ui.message.value, TRUE);

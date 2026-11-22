@@ -48,6 +48,7 @@ enum {
 	FLEX_MAX_EDGE = 2048,
 	STICKER_EDGE = 144,
 	EMOJI_EDGE = 64,
+	CACHE_TARGET = 12 * 1024 * 1024,
 	CACHE_BYTES = 32 * 1024 * 1024
 };
 
@@ -149,7 +150,7 @@ static struct {
 	GHashTable *thumbs, *avatars, *emoji, *flex_images;
 	gsize cache_bytes;
 	gboolean emoji_busy;
-	guint use_seq, frame;
+	guint use_seq, frame, last_full_frame, previous_full_frame;
 	gboolean avatar_busy, flex_busy;
 	guint session, avatar_seq;
 	GThreadPool *pool;
@@ -268,8 +269,14 @@ static void touch(struct media_thumbnail *t)
 	t->seen = m.frame;
 }
 
+static gboolean seen_in_scene(const struct media_thumbnail *t)
+{
+	/* Partial damage leaves pictures outside the clip on screen. */
+	return m.frame - t->seen <= m.frame - m.previous_full_frame;
+}
+
 /* A count eviction may also remove failed entries. Byte eviction needs pixels. */
-static gboolean evict_thumbnail(GHashTable *table)
+static gboolean evict_thumbnail(GHashTable *table, gboolean cold_only)
 {
 	GHashTable *caches[] = { m.thumbs, m.avatars, m.emoji, m.flex_images };
 	GHashTable *old_table = NULL;
@@ -289,6 +296,7 @@ static gboolean evict_thumbnail(GHashTable *table)
 			guint age = m.use_seq - item->used;
 
 			if (m.frame - item->seen <= 1 ||
+			    (cold_only && seen_in_scene(item)) ||
 			    (!item->image && (!table || item->bytes)))
 				continue;
 			if (!old_table || age > oldest) {
@@ -301,19 +309,45 @@ static gboolean evict_thumbnail(GHashTable *table)
 	return old_table && g_hash_table_remove(old_table, old_key);
 }
 
+static gboolean cold_pixels(gpointer key, gpointer value, gpointer unused)
+{
+	struct media_thumbnail *item = value;
+
+	(void)key;
+	(void)unused;
+	return item->image && !seen_in_scene(item);
+}
+
+static void trim_cold_pixels(void)
+{
+	GHashTable *caches[] = { m.thumbs, m.avatars, m.emoji, m.flex_images };
+
+	for (guint i = 0; i < G_N_ELEMENTS(caches); i++)
+		if (caches[i])
+			g_hash_table_foreach_remove(caches[i], cold_pixels,
+						    NULL);
+}
+
 /*
  * Reserve the decoded poster before issuing a download. Keep the surfaces
- * seen in the current or last frame. Animation frames have their own bound.
+ * seen in the current or last frame even if they exceed the soft target.
+ * Animation frames have their own bound and go away with their poster.
  */
 static struct media_thumbnail *reserve_thumbnail(GHashTable *cache,
 						 guint entries, guint edge)
 {
 	gsize bytes = (gsize)edge * edge * 4;
 
-	if (g_hash_table_size(cache) >= entries && !evict_thumbnail(cache))
+	if (bytes > CACHE_BYTES)
 		return NULL;
-	while (m.cache_bytes > CACHE_BYTES - bytes)
-		if (!evict_thumbnail(NULL))
+	if (g_hash_table_size(cache) >= entries &&
+	    !evict_thumbnail(cache, FALSE))
+		return NULL;
+	while (m.cache_bytes + bytes > CACHE_TARGET)
+		if (!evict_thumbnail(NULL, TRUE))
+			break;
+	while (m.cache_bytes + bytes > CACHE_BYTES)
+		if (!evict_thumbnail(NULL, FALSE))
 			return NULL;
 	struct media_thumbnail *t = g_new0(struct media_thumbnail, 1);
 
@@ -1503,11 +1537,15 @@ gboolean ui_flex_image_failed(const char *url)
 	return entry && entry->settled && !entry->image;
 }
 
-void ui_emoji_frame_start(gint64 now)
+void ui_emoji_frame_start(gint64 now, gboolean full)
 {
 	emoji_now = now;
 	emoji_until = 0;
 	m.frame++;
+	if (full) {
+		m.previous_full_frame = m.last_full_frame;
+		m.last_full_frame = m.frame;
+	}
 }
 
 gint64 ui_emoji_deadline(void)
@@ -2142,6 +2180,8 @@ static void sync_call_preview(void)
 
 void ui_media_window_visibility(gboolean visible)
 {
+	if (!visible && !m.window_hidden)
+		trim_cold_pixels();
 	m.window_hidden = !visible;
 	if (!visible)
 		ui_media_leave_fullscreen();

@@ -9,6 +9,16 @@
 J *line_chats(Line *s, GError **error);
 J *line_mark_read(Line *s, const char *chat, const char *id,
 		  gint32 reserved_seq, GError **error);
+J *line_peer_ranges(Line *s, const char *chat, GError **error);
+enum peer_notice {
+	PEER_NOTICE_OTHER,
+	PEER_NOTICE_UNCHANGED,
+	PEER_NOTICE_ADDED
+};
+enum peer_notice line_peer_read_notice(const char *self, const char *chat,
+				       J *notices, J *op);
+J *line_peer_read_counts(const char *self, const char *chat, J *messages,
+			 J *ranges, J *notices);
 J *line_history(Line *s, const char *chat, GError **error);
 J *line_send(Line *s, const char *chat, const char *text, GError **error);
 J *line_forward_text(Line *s, const char *chat, J *message, GError **error);

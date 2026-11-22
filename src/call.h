@@ -20,7 +20,8 @@ void line_call_frame_socket(int fd);
 
 /* Only feed operations from the authenticated account's Talk sync stream. */
 void line_voice_operation(Line *s, J *op);
-void line_voice_tick(void);
+/* Expire a due invitation; return its monotonic deadline, or zero. */
+gint64 line_voice_tick(void);
 J *line_voice_answer(const char *caller, GError **error);
 J *line_voice_decline(const char *caller, GError **error);
 /* Takes the latest pending remote frame as tightly packed I420. */

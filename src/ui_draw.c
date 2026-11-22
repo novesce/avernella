@@ -240,7 +240,7 @@ static gboolean hovered(Rect r)
  * fast pointer moves and interrupted keyboard navigation do not jump.
  */
 struct color_transition {
-	Rect r;
+	Rect r, damage;
 	int kind;
 	double from, to;
 	gint64 start, end;
@@ -255,6 +255,15 @@ enum {
 static struct color_transition tracks[48];
 static gint64 frame_us;
 static double scrim;
+static struct {
+	UiPress timing;
+	int x, y, layer;
+	gboolean connected;
+	double depth;
+	gint64 next, end;
+	SDL_Rect damage;
+} press;
+static int painting_layer;
 
 struct slide_transition {
 	int key;
@@ -283,7 +292,7 @@ static double sample(const struct color_transition *t)
 	return t->to + (t->from - t->to) * remaining(t->start, t->end);
 }
 
-static double strength(int kind, Rect r, gboolean on)
+static double track_strength(int kind, Rect r, gboolean on, Rect damage)
 {
 	if (ui_reduce_motion())
 		return on ? 1. : 0.;
@@ -295,6 +304,7 @@ static double strength(int kind, Rect r, gboolean on)
 		if (t->kind == kind && !memcmp(&t->r, &r, sizeof(r))) {
 			double v = sample(t), target = on ? 1. : 0.;
 
+			t->damage = damage;
 			if (t->to != target) {
 				t->from = v;
 				t->to = target;
@@ -315,12 +325,61 @@ static double strength(int kind, Rect r, gboolean on)
 		return 0.;
 	struct color_transition *t = free_track ? free_track : oldest;
 	*t = (struct color_transition){ .r = r,
+					.damage = damage,
 					.kind = kind,
 					.from = 0,
 					.to = 1,
 					.start = frame_us,
 					.end = frame_us + 120000 };
 	return 0.;
+}
+
+static double strength(int kind, Rect r, gboolean on)
+{
+	return track_strength(kind, r, on, (Rect){ 0 });
+}
+
+void ui_draw_pointer(const SDL_Event *e)
+{
+	if (e->type == SDL_WINDOWEVENT) {
+		if (e->window.windowID == SDL_GetWindowID(ui.window) &&
+		    (e->window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+		     e->window.event == SDL_WINDOWEVENT_HIDDEN)) {
+			press.timing = (UiPress){ 0 };
+			press.end = 0;
+		}
+		return;
+	}
+	if (e->button.windowID != SDL_GetWindowID(ui.window) ||
+	    e->button.button != SDL_BUTTON_LEFT || ui_reduce_motion())
+		return;
+	if (e->type == SDL_MOUSEBUTTONDOWN) {
+		press.timing = (UiPress){ .down = g_get_monotonic_time() };
+		press.x = e->button.x;
+		press.y = e->button.y;
+		press.layer = ui.connected ? ui_media_layer() : 0;
+		press.connected = ui.connected;
+	} else if (press.timing.down)
+		press.timing.up = g_get_monotonic_time();
+	else
+		return;
+	ui.dirty = TRUE;
+}
+
+static double button_depth(Rect r)
+{
+	if (!press.timing.down || ui_reduce_motion() ||
+	    press.connected != ui.connected || press.layer != painting_layer ||
+	    press.x < r.x || press.x >= r.x + r.w || press.y < r.y ||
+	    press.y >= r.y + r.h)
+		return 0.;
+	if (press.next) {
+		SDL_Rect bounds = { r.x - 3, r.y - 3, r.w + 6, r.h + 6 };
+
+		SDL_UnionRect(&press.damage, &bounds, &press.damage);
+		press.end = press.next;
+	}
+	return press.depth;
 }
 
 static int blend(guint a, guint b, double v)
@@ -341,17 +400,23 @@ static int blend(guint a, guint b, double v)
 
 static double slide(struct slide_transition *s, int key, double distance)
 {
-	double position = s->from * remaining(s->start, s->end);
+	enum {
+		SETTLE_US = 180000
+	};
+	gboolean reduced = ui_reduce_motion();
+	double position =
+		s->from * ui_settle((double)(frame_us - s->start) / SETTLE_US);
 
-	if (s->key != key) {
-		s->from = (s->key < 0 || ui_reduce_motion()) ?
-				  0. :
-				  CLAMP(position + distance, -14., 14.);
+	if (s->key != key || reduced) {
+		s->from = s->key < 0 || reduced || !distance ? 0. :
+			  frame_us < s->end		     ? position :
+							       distance;
 		s->key = key;
 		s->start = frame_us;
-		s->end = s->from == 0 ? frame_us : frame_us + 155000;
+		s->end = s->from == 0 ? frame_us : frame_us + SETTLE_US;
+		return s->from;
 	}
-	return s->from * remaining(s->start, s->end);
+	return position;
 }
 
 gint64 ui_animation_deadline(gint64 now_us)
@@ -359,7 +424,7 @@ gint64 ui_animation_deadline(gint64 now_us)
 	if (ui_reduce_motion())
 		return 0;
 	gint64 end = MAX(MAX(pane_slide.end, dialog_slide.end),
-			 stage_motion.end);
+			 MAX(stage_motion.end, press.end));
 
 	for (guint i = 0; i < G_N_ELEMENTS(tracks); i++)
 		if (tracks[i].kind)
@@ -376,11 +441,13 @@ static void active_ring(Rect r)
 static void action(Rect r, const char *s, gboolean solid, gboolean focus)
 {
 	double h = strength(HOVER, r, hovered(r));
+	double depth = button_depth(r);
 	/* Dark lettering keeps the hot-pink primary button readable. */
 	guint bg = blend(solid ? UI_ACCENT : UI_RAISED,
 			 solid ? UI_ACCENT_HOVER : UI_SELECTED, h);
 
-	box(r.x, r.y, r.w, r.h, 8, bg);
+	box(r.x + 2. * depth, r.y + 2. * depth, r.w - 4. * depth,
+	    r.h - 3. * depth, 8, bg);
 	centered(s, r, 14, 600, solid ? UI_ON_ACCENT : UI_HEADING);
 	double f = strength(FOCUSED, r, focus && ui.active);
 
@@ -1199,6 +1266,7 @@ static void icon_search(double cx, double cy, guint ink, double r)
 static void rail_button(Rect r, gboolean selected, gboolean unread, guint fill)
 {
 	double hover = strength(HOVER, r, hovered(r));
+	double depth = fill ? button_depth(r) : 0.;
 	double radius = selected ? 16 : 24 - 8 * hover;
 	int pill = selected   ? 40 :
 		   hover > 0. ? (int)(8 + 12 * hover) :
@@ -1209,7 +1277,8 @@ static void rail_button(Rect r, gboolean selected, gboolean unread, guint fill)
 		box(-4, r.y + (r.h - pill) / 2, 8, pill, 4,
 		    selected ? UI_ACCENT : UI_BODY);
 	if (fill)
-		box(r.x, r.y, r.w, r.h, radius, fill);
+		box(r.x + depth, r.y + depth, r.w - 2. * depth,
+		    r.h - 2. * depth, radius, fill);
 }
 
 static void rail_avatar(Rect r, Json *c)
@@ -1240,9 +1309,11 @@ static void nav_tab(Rect r, enum ui_icon icon, gboolean active, int count,
 		    gboolean focus, const char *tip)
 {
 	double hover = strength(HOVER, r, hovered(r));
+	double depth = button_depth(r);
 
 	if (active || hover > 0.)
-		box(r.x, r.y, r.w, r.h, 12,
+		box(r.x + depth, r.y + depth, r.w - 2. * depth,
+		    r.h - 2. * depth, 12,
 		    blend(UI_NAV_RAIL, UI_NAV_HOVER, active ? 1. : hover));
 	ui_draw_icon(r, icon,
 		     active	? UI_NAV_ACTIVE :
@@ -1559,6 +1630,12 @@ static void line_chat_row(Json *c, Rect row, gboolean selected, double sel,
 		box(row.x, row.y, row.w, row.h, 0,
 		    blend(blend(UI_SIDEBAR, UI_HOVER, row_hover), UI_SELECTED,
 			  sel));
+	if (sel > 0.) {
+		double mark = (row.h - 22) * sel;
+
+		box(row.x, row.y + (row.h - mark) / 2., 3, mark, 1.5,
+		    blend(UI_SELECTED, UI_ACCENT, sel));
+	}
 	if (selected && ui.focus == F_LIST)
 		outline((Rect){ row.x + 2, row.y + 1, row.w - 4, row.h - 2 }, 6,
 			UI_ACCENT, 1);
@@ -1725,28 +1802,32 @@ static void chats_panel(void)
 			ui.chats, g_array_index(ui.visible, guint, i));
 		const char *id = ui_string(c, "id", ""),
 			   *name = ui_string(c, "name", id);
-		Rect row = { rail + 8, y + 1, s - rail - 16, 42 };
+		Rect row = line_style ? (Rect){ rail, y, s - rail, row_h } :
+					(Rect){ rail + 8, y + 1, s - rail - 16, 42 };
 		gboolean selected = ui_compact() && ui.focus == F_LIST ?
 					    (int)i == ui.list_cursor :
 					    !friends_open &&
 						    !g_strcmp0(ui.selected, id);
 		Rect track_key = { (int)g_str_hash(id), 0, 0,
 				   0 }; /* stays fixed as the list scrolls */
-		double sel = strength(SELECTED, track_key, selected),
-		       row_hover = strength(HOVER, track_key, hovered(row));
+		double sel = track_strength(SELECTED, track_key, selected, row),
+		       row_hover = track_strength(HOVER, track_key,
+						  hovered(row), row);
 
 		if (line_style) {
-			line_chat_row(c, (Rect){ rail, y, s - rail, row_h },
-				      selected, sel, row_hover);
+			line_chat_row(c, row, selected, sel, row_hover);
 			continue;
 		}
 		if (sel > 0. || row_hover > 0.)
 			box(row.x, row.y, row.w, row.h, 6,
 			    blend(blend(UI_SIDEBAR, UI_HOVER, row_hover),
 				  UI_SELECTED, sel));
-		if (sel > 0.)
-			box(row.x, row.y + 11, 3, row.h - 22, 1.5,
+		if (sel > 0.) {
+			double mark = (row.h - 22) * sel;
+
+			box(row.x, row.y + (row.h - mark) / 2., 3, mark, 1.5,
 			    blend(UI_SELECTED, UI_ACCENT, sel));
+		}
 		if (selected && ui.focus == F_LIST)
 			outline(row, 6, UI_ACCENT, 1);
 		avatar(name, row.x + 8, row.y + 5, 32, id, id,
@@ -1819,12 +1900,14 @@ struct message_layout {
 	struct ui_flex_layout *flex;
 	int y, w, h, top; /* top: offset of the message below any divider */
 	int x, body_top, body_h, text_origin;
-	gboolean mine, group, photo, video, rich;
+	gboolean mine, group, photo, video, rich, receipt;
 	Json *message; /* borrowed from the cached history */
 };
 
 static struct {
 	GArray *rows;
+	PangoLayout *sent, *read;
+	int receipt_height;
 	int width, height;
 	double scale_x, scale_y;
 	gboolean intro, line_style;
@@ -1848,6 +1931,8 @@ void ui_forget_history(void)
 {
 	history_scroll.reusable = FALSE;
 	g_clear_pointer(&cache.rows, g_array_unref);
+	g_clear_object(&cache.sent);
+	g_clear_object(&cache.read);
 	cache.source = NULL;
 	cache.height = 0;
 }
@@ -1946,6 +2031,18 @@ static void prepare_bubbles(Rect area)
 		struct message_layout row = { .y = cache.height,
 					      .message = msg };
 		row.mine = json_object_get_boolean(ui_field(msg, "own"));
+		row.receipt = row.mine && ui.selected &&
+			      g_strcmp0(ui.selected, ui.self_id) &&
+			      ui_read_id(ui_string(msg, "id", NULL));
+		if (row.receipt && !cache.sent) {
+			int sent_h, read_h;
+
+			cache.sent = layout(_("Sent"), 11, 500, -1, FALSE);
+			cache.read = layout(_("Read"), 11, 500, -1, FALSE);
+			pango_layout_get_pixel_size(cache.sent, NULL, &sent_h);
+			pango_layout_get_pixel_size(cache.read, NULL, &read_h);
+			cache.receipt_height = MAX(sent_h, read_h);
+		}
 		const char *who = row.mine ? (ui.name ? ui.name : _("You")) :
 					     ui_string(msg, "from", "LINE");
 		gint64 stamp = json_object_get_int64(ui_field(msg, "time"));
@@ -2083,8 +2180,19 @@ static void prepare_bubbles(Rect area)
 				     MESSAGE_LEFT;
 		row.body_top =
 			gap + 2 + (row.byline ? (line_style ? 18 : 22) : 0);
+		if (line_style && row.receipt) {
+			int clock_h = 0;
+
+			if (row.short_clock)
+				pango_layout_get_pixel_size(row.short_clock,
+							    NULL, &clock_h);
+			body_height = MAX(body_height,
+					  cache.receipt_height + clock_h + 2);
+		}
 		row.body_h = body_height;
 		row.h = row.body_top + body_height + (row.reactions ? 30 : 0);
+		if (!line_style && row.receipt)
+			row.h += cache.receipt_height + 2;
 		if (line_style && !row.mine && !row.group)
 			row.h = MAX(row.h, gap + 4 + CHAT_AVATAR);
 		row.h += line_style ? 4 : 2;
@@ -2483,6 +2591,36 @@ static void text_bubble(const struct message_layout *r, Rect body)
 	      r->mine ? UI_BUBBLE_OUT_INK : UI_BUBBLE_IN_INK);
 }
 
+static void message_status(const struct message_layout *r, Rect body)
+{
+	int bottom = body.y + body.h - 1;
+
+	if (cache.line_style && r->short_clock) {
+		int w, h;
+
+		pango_layout_get_pixel_size(r->short_clock, &w, &h);
+		bottom -= h;
+		paint(r->short_clock,
+		      r->mine ? body.x - w - 6 : body.x + body.w + 6, bottom,
+		      UI_SUBTLE);
+	}
+	if (!r->receipt)
+		return;
+	/* Live receipts update the label without reflowing the history. */
+	PangoLayout *status = ui_message_is_read(r->message) ? cache.read :
+							       cache.sent;
+	int x = body.x, y = body.y + body.h + (r->reactions ? 30 : 0) + 2;
+
+	if (cache.line_style) {
+		int w, h;
+
+		pango_layout_get_pixel_size(status, &w, &h);
+		x -= w + 6;
+		y = bottom - h - 1;
+	}
+	paint(status, x, y, UI_SUBTLE);
+}
+
 static void message_rows(Rect area)
 {
 	prepare_bubbles(area);
@@ -2563,15 +2701,7 @@ static void message_rows(Rect area)
 		} else if (!cache.line_style && (int)i == hover &&
 			   r->short_clock)
 			paint(r->short_clock, area.x + 22, y + 4, UI_SUBTLE);
-		if (cache.line_style && r->short_clock) {
-			int tw, th;
-
-			pango_layout_get_pixel_size(r->short_clock, &tw, &th);
-			int tx = r->mine ? x - tw - 6 : x + body.w + 6;
-
-			paint(r->short_clock, tx, body.y + body.h - th - 1,
-			      UI_SUBTLE);
-		}
+		message_status(r, body);
 		y = body.y;
 		if (r->flex)
 			ui_flex_draw(cr, r->flex, x, y, flex_image, NULL);
@@ -2659,6 +2789,7 @@ static void header_icon(Rect r, enum header_icon kind, gboolean focus)
 
 	if (focus)
 		active_ring(r);
+	y += 2. * button_depth(r);
 	color(ink);
 	switch (kind) {
 	case ICON_CALL:
@@ -3554,7 +3685,13 @@ static void draw_frame(const Rect *region)
 		ui_forget_history();
 	}
 	frame_us = g_get_monotonic_time();
-	ui_emoji_frame_start(frame_us);
+	press.end = 0;
+	press.damage = (SDL_Rect){ 0 };
+	press.depth = ui_press_depth(press.timing, frame_us, &press.next);
+	if (press.timing.up && !press.next)
+		press.timing = (UiPress){ 0 };
+	painting_layer = 0;
+	ui_emoji_frame_start(frame_us, !partial);
 	if (fullscreen) {
 		ui_media_draw_fullscreen();
 		goto finish_canvas;
@@ -3605,6 +3742,7 @@ static void draw_frame(const Rect *region)
 	dy = slide(&dialog_slide, layer, layer ? 8. : 0.);
 
 	if (layer) {
+		painting_layer = layer;
 		cairo_save(cr);
 		cairo_translate(cr, 0, dy);
 		ui_media_overlay();
@@ -3666,6 +3804,39 @@ void ui_draw(void)
 void ui_draw_region(Rect logical)
 {
 	draw_frame(&logical);
+}
+
+void ui_draw_animation(void)
+{
+	SDL_Rect damage = press.damage;
+	SDL_Rect list = { ui.list_box.x, ui.list_box.y, ui.list_box.w,
+			  ui.list_box.h };
+
+	/* Use the previous sample so the final, resting frame is repainted. */
+	if (!ui.connected || ui_media_layer() || ui_friends_active() ||
+	    ui_emoji_deadline() || pane_slide.end > frame_us ||
+	    dialog_slide.end > frame_us || stage_motion.end > frame_us)
+		goto full;
+	for (guint i = 0; i < G_N_ELEMENTS(tracks); i++) {
+		const struct color_transition *t = &tracks[i];
+		Rect r = t->damage;
+
+		if (!t->kind || t->end <= frame_us)
+			continue;
+		if (!r.w)
+			goto full;
+		SDL_Rect row = { r.x - 2, r.y - 2, r.w + 4, r.h + 4 };
+
+		if (SDL_IntersectRect(&row, &list, &row))
+			SDL_UnionRect(&damage, &row, &damage);
+	}
+	if (!SDL_RectEmpty(&damage)) {
+		ui_draw_region(
+			(Rect){ damage.x, damage.y, damage.w, damage.h });
+		return;
+	}
+full:
+	ui_draw();
 }
 
 void ui_draw_box(Rect r, guint rgb)
@@ -3886,11 +4057,14 @@ void ui_draw_round_button(Rect r, enum ui_call_glyph glyph, guint fill,
 			  guint ink, const char *tip)
 {
 	double hover = strength(HOVER, r, hovered(r));
+	double depth = button_depth(r);
 	double x = r.x + (r.w - 24) / 2., y = r.y + (r.h - 24) / 2.;
 	gboolean slash = glyph == UI_GLYPH_CAMERA_OFF ||
 			 glyph == UI_GLYPH_MIC_OFF;
 
-	box(r.x, r.y, r.w, r.h, MIN(r.w, r.h) / 2.,
+	y += 1.5 * depth;
+	box(r.x + 2. * depth, r.y + 2. * depth, r.w - 4. * depth,
+	    r.h - 4. * depth, MIN(r.w, r.h) / 2.,
 	    blend(fill, blend(fill, WHITE, .35), hover * .4));
 	color(ink);
 	switch (glyph) {

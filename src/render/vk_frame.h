@@ -13,18 +13,19 @@ static inline VkResult vk_ui_pipeline(const struct vk_ctx *ctx, VkFormat format,
 }
 
 /* The caller owns layout transitions and synchronization for the target.
- * Discard the load only if opaque primitives cover the complete target.
+ * Discard the load only if opaque primitives cover the render area.
  */
 void vk_ui_draw_mode(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 		     VkPipeline pipeline, VkImageView target, VkExtent2D extent,
-		     const struct ui_push *push, uint32_t count,
+		     VkRect2D area, const struct ui_push *push, uint32_t count,
 		     VkClearColorValue clear, bool discard);
 static inline void vk_ui_draw(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 			      VkPipeline pipeline, VkImageView target,
 			      VkExtent2D extent, const struct ui_push *push,
 			      uint32_t count, VkClearColorValue clear)
 {
-	vk_ui_draw_mode(ctx, cmd, pipeline, target, extent, push, count, clear,
+	vk_ui_draw_mode(ctx, cmd, pipeline, target, extent,
+			(VkRect2D){ .extent = extent }, push, count, clear,
 			false);
 }
 

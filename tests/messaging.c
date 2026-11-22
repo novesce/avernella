@@ -6,6 +6,7 @@
 #define ALICE "u00000000000000000000000000000001"
 #define SELF "u00000000000000000000000000000002"
 #define GROUP "c00000000000000000000000000000003"
+#define BOB "u00000000000000000000000000000004"
 
 static gboolean reject_key, repeat_cursor, older_contacts_service;
 static unsigned int sends, pages, profiles, group_profiles;
@@ -85,6 +86,23 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		}
 		return obj();
 	}
+	if (!strcmp(method, "getMessageReadRange")) {
+		J *ids = field(args, "2:list:str");
+
+		g_assert_cmpstr(path, ==, "/S4");
+		g_assert_cmpuint(json_object_array_length(ids), ==, 1);
+		g_assert_cmpstr(json_object_get_string(
+					json_object_array_get_idx(ids, 0)),
+				==, GROUP);
+		g_assert_cmpint(json_object_get_int(field(args, "3:i32")), ==,
+				7);
+		return json_tokener_parse(
+			"[{\"1\":\"" ALICE "\",\"2\":{}},"
+			"{\"1\":\"" GROUP "\",\"2\":{\"" ALICE "\":["
+			"{\"1\":9007199254740992,\"2\":9007199254740992},"
+			"{\"1\":9007199254740996,\"2\":9007199254740994}],"
+			"\"" SELF "\":[{\"1\":1,\"2\":9007199254740996}]}}]");
+	}
 	if (!strcmp(method, "getContactsV3")) {
 		profiles++;
 		g_assert_cmpstr(path, ==, "/RE4");
@@ -113,7 +131,8 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		if (recent_fixture)
 			return json_object_get(recent_fixture);
 		return json_tokener_parse(
-			"[{\"1\":\"" SELF "\",\"4\":\"103\",\"5\":20,\"15\":7},"
+			"[{\"1\":\"" SELF
+			"\",\"4\":\"103\",\"5\":20,\"15\":7,\"23\":2},"
 			"{\"1\":\"" ALICE
 			"\",\"4\":\"101\",\"5\":10,\"20\":[\"e\"]},"
 			"{\"1\":\"" ALICE
@@ -276,8 +295,84 @@ static void recent_messages(void)
 
 	g_assert_cmpstr(strfield(last, "text"), ==, "[Sticker]");
 	g_assert_true(json_object_get_boolean(field(last, "own")));
+	g_assert_cmpint(json_object_get_int(field(last, "readCount")), ==, 2);
+	g_assert_null(field(oldest, "readCount"));
 	older_contacts_service = FALSE;
 	g_clear_pointer(&s.profiles, g_hash_table_unref);
+}
+
+static void peer_read_counts(void)
+{
+	Line s = { .mid = SELF };
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) ranges = line_peer_ranges(&s, GROUP, &error);
+	g_autoptr(J) notices = obj();
+	g_autoptr(J) raw = json_tokener_parse(
+		"{\"9007199254740992\":{\"1\":\"" SELF "\"},"
+		"\"9007199254740993\":{\"1\":\"" SELF "\"},"
+		"\"9007199254740994\":{\"1\":\"" SELF "\",\"23\":3},"
+		"\"9007199254740995\":{\"1\":\"" ALICE "\",\"23\":8}}");
+	g_autoptr(J) op = json_tokener_parse("{\"3\":55,\"10\":\"" GROUP
+					     "\",\"11\":\"" ALICE
+					     "\",\"12\":\"9007199254740992\"}");
+
+	g_assert_no_error(error);
+	g_assert_nonnull(ranges);
+	g_assert_cmpint(line_peer_read_notice(SELF, GROUP, notices, op), ==,
+			PEER_NOTICE_ADDED);
+	g_assert_cmpint(line_peer_read_notice(SELF, GROUP, notices, op), ==,
+			PEER_NOTICE_UNCHANGED);
+	json_object_object_add(op, "11", json_object_new_string(BOB));
+	g_assert_cmpint(line_peer_read_notice(SELF, GROUP, notices, op), ==,
+			PEER_NOTICE_ADDED);
+	json_object_object_add(op, "11", json_object_new_string(SELF));
+	g_assert_cmpint(line_peer_read_notice(SELF, GROUP, notices, op), ==,
+			PEER_NOTICE_OTHER);
+	g_assert_cmpint(line_peer_read_notice(SELF, ALICE, notices, op), ==,
+			PEER_NOTICE_OTHER);
+	json_object_object_add(op, "11", json_object_new_string(BOB));
+	g_assert_cmpint(line_peer_read_notice(SELF, ALICE, notices, op), ==,
+			PEER_NOTICE_UNCHANGED);
+
+	g_autoptr(J) counts =
+		line_peer_read_counts(SELF, GROUP, raw, ranges, notices);
+	g_assert_cmpuint(json_object_object_length(counts), ==, 3);
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740992")),
+			==, 2);
+	g_assert_nonnull(field(counts, "9007199254740993"));
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740993")),
+			==, 0);
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740994")),
+			==, 3);
+	g_assert_null(field(counts, "9007199254740995"));
+
+	/* An early event still applies when the matching outgoing message arrives. */
+	json_object_object_add(op, "11", json_object_new_string(BOB));
+	json_object_object_add(op, "12",
+			       json_object_new_string("9007199254740996"));
+	g_assert_cmpint(line_peer_read_notice(SELF, GROUP, notices, op), ==,
+			PEER_NOTICE_ADDED);
+	json_object_object_add(raw, "9007199254740996",
+			       json_tokener_parse("{\"1\":\"" SELF "\"}"));
+	g_clear_pointer(&counts, json_object_put);
+	counts = line_peer_read_counts(SELF, GROUP, raw, ranges, notices);
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740996")),
+			==, 2);
+
+	/* A single interval may arrive as the map value directly. */
+	json_object_object_add(
+		ranges, BOB,
+		json_tokener_parse(
+			"{\"1\":9007199254740993,\"2\":9007199254740993}"));
+	g_clear_pointer(&counts, json_object_put);
+	counts = line_peer_read_counts(SELF, GROUP, raw, ranges, notices);
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740993")),
+			==, 1);
+	g_clear_pointer(&counts, json_object_put);
+	counts = line_peer_read_counts(SELF, GROUP, raw, NULL, notices);
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740992")),
+			==, 2);
+	g_assert_null(field(counts, "9007199254740993"));
 }
 
 static void encrypted_send(void)
@@ -638,6 +733,7 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/messaging/chats", chat_list);
 	g_test_add_func("/messaging/read-watermark", checked_watermark);
+	g_test_add_func("/messaging/peer-read-counts", peer_read_counts);
 	g_test_add_func("/messaging/history", recent_messages);
 	g_test_add_func("/messaging/flex-history", flex_messages);
 	g_test_add_func("/messaging/rich-messages", rich_messages);

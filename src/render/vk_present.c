@@ -15,6 +15,7 @@ struct present_image {
 	VkImageView view;
 	VkSemaphore ready;
 	VkFence presented;
+	VkRect2D repair; /* Damage since this specific image was last rendered. */
 	bool pending;
 };
 
@@ -38,7 +39,7 @@ struct vk_present {
 	VkSemaphore timeline;
 	SDL_Window *window;
 	VkExtent2D drawable;
-	bool log, opaque, rebuild, previous_present, identity_transform;
+	bool log, opaque, rebuild, previous_present, retain_images;
 	VkRect2D damage;
 	struct frame_slot slots[VK_PRESENT_SLOTS];
 	uint64_t submitted;
@@ -305,6 +306,9 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 			return result;
 		p->format = format.format;
 	}
+	bool retain = ctx->incremental_present &&
+		      caps.currentTransform ==
+			      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
 	VkSwapchainCreateInfoKHR info = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.surface = ctx->surface,
@@ -317,7 +321,8 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		.preTransform = caps.currentTransform,
 		.compositeAlpha = alpha & (0u - alpha),
 		.presentMode = VK_PRESENT_MODE_FIFO_KHR,
-		.clipped = VK_TRUE,
+		/* Reacquired images must also retain previously obscured pixels. */
+		.clipped = !retain,
 	};
 	result = vkCreateSwapchainKHR(ctx->device, &info, NULL, &p->swapchain);
 	if (result != VK_SUCCESS)
@@ -327,8 +332,7 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		return result;
 	p->extent = extent;
 	p->drawable = (VkExtent2D){ w, h };
-	p->identity_transform = caps.currentTransform ==
-				VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	p->retain_images = retain;
 	p->rebuild = false;
 	if (p->log)
 		fprintf(stderr, "Vulkan swapchain: %ux%u, %u images, FIFO\n",
@@ -336,8 +340,11 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	return VK_SUCCESS;
 }
 
-static void transition(VkCommandBuffer cmd, VkImage image, bool present)
+static void transition(VkCommandBuffer cmd, VkImage image, VkImageLayout from,
+		       VkImageLayout to)
 {
+	bool present = to == VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+
 	VkImageMemoryBarrier2 barrier = {
 		.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER_2,
 		.srcStageMask = VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
@@ -349,11 +356,8 @@ static void transition(VkCommandBuffer cmd, VkImage image, bool present)
 				VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT,
 		.dstAccessMask =
 			present ? 0 : VK_ACCESS_2_COLOR_ATTACHMENT_WRITE_BIT,
-		.oldLayout = present ?
-				     VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL :
-				     VK_IMAGE_LAYOUT_UNDEFINED,
-		.newLayout = present ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
-				       VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		.oldLayout = from,
+		.newLayout = to,
 		.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
 		.image = image,
@@ -404,8 +408,8 @@ static VkResult record_frame(struct vk_present *p, VkCommandBuffer cmd,
 			     const struct present_image *image,
 			     VkDeviceAddress address, uint32_t count,
 			     VkClearColorValue clear, bool discard,
-			     uint32_t index, vk_present_upload_fn upload,
-			     void *user)
+			     VkRect2D area, uint32_t index,
+			     vk_present_upload_fn upload, void *user)
 {
 	VkCommandBufferBeginInfo begin = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -426,10 +430,16 @@ static VkResult record_frame(struct vk_present *p, VkCommandBuffer cmd,
 		.inv_viewport = { 2.0f / p->extent.width,
 				  2.0f / p->extent.height },
 	};
-	transition(cmd, image->image, false);
-	vk_ui_draw_mode(&p->ctx, cmd, p->pipeline, image->view, p->extent,
+	bool partial = area.extent.width != p->extent.width ||
+		       area.extent.height != p->extent.height;
+	transition(cmd, image->image,
+		   partial ? VK_IMAGE_LAYOUT_PRESENT_SRC_KHR :
+			     VK_IMAGE_LAYOUT_UNDEFINED,
+		   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+	vk_ui_draw_mode(&p->ctx, cmd, p->pipeline, image->view, p->extent, area,
 			&push, count, clear, discard);
-	transition(cmd, image->image, true);
+	transition(cmd, image->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+		   VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 	return vkEndCommandBuffer(cmd);
 }
 
@@ -473,6 +483,25 @@ void vk_present_set_damage(struct vk_present *p, const VkRect2D *changed)
 	p->damage = changed ? *changed : (VkRect2D){ 0 };
 }
 
+/* Both rectangles are inside the swapchain, and delta is nonempty. */
+static VkRect2D include_damage(VkRect2D old, VkRect2D delta)
+{
+	if (!old.extent.width)
+		return delta;
+	uint32_t right = old.offset.x + old.extent.width;
+	uint32_t bottom = old.offset.y + old.extent.height;
+	uint32_t x2 = delta.offset.x + delta.extent.width;
+	uint32_t y2 = delta.offset.y + delta.extent.height;
+
+	if (old.offset.x < delta.offset.x)
+		delta.offset.x = old.offset.x;
+	if (old.offset.y < delta.offset.y)
+		delta.offset.y = old.offset.y;
+	delta.extent.width = (right > x2 ? right : x2) - delta.offset.x;
+	delta.extent.height = (bottom > y2 ? bottom : y2) - delta.offset.y;
+	return delta;
+}
+
 VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 			 uint32_t count, VkClearColorValue clear,
 			 vk_present_upload_fn upload, void *user)
@@ -482,7 +511,7 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	struct frame_slot *slot = &p->slots[slot_index];
 	VkExtent2D drawable = vk_present_extent(p);
 	VkRect2D damage = p->damage;
-	bool incremental = p->previous_present && p->ctx.incremental_present;
+	bool incremental = p->previous_present;
 	p->damage = (VkRect2D){ 0 };
 	p->previous_present = false;
 	VkDeviceAddress address;
@@ -536,13 +565,32 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 		if (result != VK_SUCCESS)
 			return result;
 	}
+	incremental = incremental && p->retain_images && damage.extent.width &&
+		      damage.extent.height && damage.offset.x >= 0 &&
+		      damage.offset.y >= 0 &&
+		      (uint64_t)damage.offset.x + damage.extent.width <=
+			      p->extent.width &&
+		      (uint64_t)damage.offset.y + damage.extent.height <=
+			      p->extent.height;
+	VkRect2D area = { .extent = p->extent };
+	if (p->retain_images) {
+		/* A fresh chain or unknown delta invalidates every image. */
+		for (uint32_t i = 0; i < p->image_count; i++)
+			p->images[i].repair =
+				incremental ?
+					include_damage(p->images[i].repair,
+						       damage) :
+					area;
+		area = image->repair;
+		image->repair = (VkRect2D){ 0 };
+	}
 	bool full_canvas =
 		p->opaque && count && prims[0].prim_type == UI_PRIM_CANVAS &&
 		prims[0].clip_rect_idx == UI_NO_CLIP && prims[0].pos[0] == 0 &&
 		prims[0].pos[1] == 0 && prims[0].size[0] == p->extent.width &&
 		prims[0].size[1] == p->extent.height;
 	result = record_frame(p, slot->cmd, image, address, count, clear,
-			      full_canvas, slot_index, upload, user);
+			      full_canvas, area, slot_index, upload, user);
 	if (result != VK_SUCCESS)
 		return result;
 	VkCommandBufferSubmitInfo command = {
@@ -589,13 +637,6 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 		.swapchainCount = 1,
 		.pRegions = &region
 	};
-	incremental = incremental && p->identity_transform &&
-		      damage.extent.width && damage.extent.height &&
-		      damage.offset.x >= 0 && damage.offset.y >= 0 &&
-		      (uint64_t)damage.offset.x + damage.extent.width <=
-			      p->extent.width &&
-		      (uint64_t)damage.offset.y + damage.extent.height <=
-			      p->extent.height;
 	VkSwapchainPresentFenceInfoKHR fence = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
 		.pNext = incremental ? &regions : NULL,

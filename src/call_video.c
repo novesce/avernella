@@ -540,8 +540,24 @@ static gboolean describe(enum video_format framing, const guint8 *p, gsize n,
 				       parse_vp8(p, n, marker, out);
 }
 
-static gboolean finish_picture(struct call_video *v, guint count,
-			       call_video_display_fn display, gpointer data)
+static gboolean finish_picture(struct call_video *v, const guint8 *picture,
+			       gsize len, call_video_display_fn display,
+			       gpointer data)
+{
+	if (v->expected && len != v->expected) {
+		v->stats.length++;
+		return FALSE;
+	}
+	if (v->have_previous_end && (guint16)(v->first - v->previous_end) != 1)
+		v->need_key = TRUE;
+	v->previous_end = v->last;
+	v->have_previous_end = TRUE;
+	v->rx_format = v->framing;
+	return decode_picture(v, picture, len, display, data);
+}
+
+static gboolean assemble_picture(struct call_video *v, guint count,
+				 call_video_display_fn display, gpointer data)
 {
 	g_autofree guint8 *picture = g_malloc(v->received);
 	gsize len = 0;
@@ -569,16 +585,7 @@ static gboolean finish_picture(struct call_video *v, guint count,
 		memcpy(picture + len, p + payload.offset, bytes);
 		len += bytes;
 	}
-	if (v->expected && len != v->expected) {
-		v->stats.length++;
-		return FALSE;
-	}
-	if (v->have_previous_end && (guint16)(v->first - v->previous_end) != 1)
-		v->need_key = TRUE;
-	v->previous_end = v->last;
-	v->have_previous_end = TRUE;
-	v->rx_format = v->framing;
-	return decode_picture(v, picture, len, display, data);
+	return finish_picture(v, picture, len, display, data);
 }
 
 static gboolean mark_end(struct call_video *v, guint16 seq)
@@ -661,6 +668,13 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 		return FALSE;
 	if (v->framing != VIDEO_UNKNOWN && payload.end && !mark_end(v, seq))
 		goto invalid;
+	/* Decryption owns this buffer through the synchronous VP8 decode. */
+	if (!v->fragments && payload.start && payload.end) {
+		if (!finish_picture(v, p + payload.offset, n - payload.offset,
+				    display, data))
+			goto invalid;
+		goto complete;
+	}
 	part->seq = seq;
 	part->marker = marker;
 	part->bytes = g_bytes_new(p, n);
@@ -674,8 +688,9 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 		goto invalid;
 	if (v->fragments < count)
 		return TRUE;
-	if (!finish_picture(v, count, display, data))
+	if (!assemble_picture(v, count, display, data))
 		goto invalid;
+complete:
 	v->finished = TRUE;
 	clear_picture(v);
 	return TRUE;
