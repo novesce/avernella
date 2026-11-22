@@ -150,6 +150,9 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"10:str")); /* plaintext must never be transmitted */
 		g_assert_cmpstr(strfield(msg, "2:str"), ==,
 				expected_chat ? expected_chat : ALICE);
+		g_assert_nonnull(field(msg, "19:byte"));
+		g_assert_cmpint(json_object_get_int(field(msg, "19:byte")), ==,
+				0);
 		g_assert_cmpuint(
 			json_object_array_length(field(msg, "20:list:str")), ==,
 			5);

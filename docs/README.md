@@ -1,12 +1,13 @@
 # Avernella documentation
 
-Avernella is an unofficial native client for LINE personal accounts, written in C for GNU/Linux. These pages explain how LINE's service works and how this app talks to it.
+Avernella is an independent native client for LINE personal accounts, written in C for GNU/Linux.
 
-| Page | What it covers |
-| ---- | -------------- |
-| [Architecture](architecture.md) | The processes and threads, how they talk, where each feature lives in `src/`, saved state, and the Linux facilities that keep it fast and light |
-| [How LINE works](line-protocol.md) | LINE's servers, Compact Thrift RPC, sign-in, sync, messages, Letter Sealing, media, stickers and emoji, official-account messages, LINE apps (LIFF) and calls |
-| [Development](development.md) | Building, build options, tests, code style, environment variables, debugging and how the protocol was reverse engineered |
+The developer documentation is available in two languages, with the same pages in each:
+
+- **English:** [docs/en/](en/README.md)
+- **ภาษาไทย (Thai):** [docs/th/](th/README.md)
+
+Both cover the app (building, architecture, the user interface, testing, contributing) and LINE's protocol as this client speaks it (Thrift RPC, sign-in, sync, messages, Letter Sealing, media, friends and groups, LINE apps and calls). AI coding agents should also read [CLAUDE.md](../CLAUDE.md) at the repository root.
 
 Using the app (features, shortcuts, packages) is covered in the [project README](../README.md). The detailed reverse-engineering evidence lives in [`analysis/`](../analysis):
 
@@ -14,5 +15,13 @@ Using the app (features, shortcuts, packages) is covered in the [project README]
 - [Video call wire format](../analysis/video-call-wire.md): PLANET, SRTP, PDTP and screen sharing.
 - [LIFF](../analysis/liff.md): LiffService field IDs, the token handoff and the native bridge.
 - [Windows and Mac feature comparison](../analysis/desktop-features.md): what LINE's desktop apps do and what this client covers.
+
+## Older pages
+
+These single pages came before the split documentation. Their content now lives in the pages above, and each one points to where its sections went:
+
+- [architecture.md](architecture.md)
+- [line-protocol.md](line-protocol.md)
+- [development.md](development.md)
 
 Avernella is an independent project. LINE is a trademark of LY Corporation.

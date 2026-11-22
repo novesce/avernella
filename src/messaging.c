@@ -1107,8 +1107,7 @@ J *line_send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
 	boolean(msg, "14:bool", FALSE);
 	number(msg, "15:i32", type);
 	put(msg, "18:map:str:str", json_object_get(meta));
-	if (type)
-		number(msg, "19:byte", 0);
+	number(msg, "19:byte", 0);
 	put(msg, "20:list:str", json_object_get(chunks));
 	if (reply_to) {
 		put(msg, "21:str", string(reply_to));

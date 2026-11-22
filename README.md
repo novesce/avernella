@@ -8,7 +8,7 @@ Avernella is an independent Linux desktop client compatible with LINE personal a
 
 Use of the service is subject to [LY Corporation’s terms](https://www.lycorp.co.jp/en/company/terms/). The client uses LINE’s companion protocol, and LINE controls whether a linked device can connect.
 
-How the app is built and how LINE's service works, from sign-in and sync to Letter Sealing, media, official-account messages, LINE apps and calls, is documented in [docs/](docs/README.md).
+How the app is built and how LINE's service works, from sign-in and sync to Letter Sealing, media, official-account messages, LINE apps and calls, is documented in [docs/](docs/README.md), in [English](docs/en/README.md) and [Thai (ภาษาไทย)](docs/th/README.md).
 
 ## Run
 

@@ -1,0 +1,189 @@
+# Testing
+
+[Index](README.md) · Previous: [Calls](calls.md) · Next: [Contributing](contributing.md)
+
+All tests run **offline**. None of them talk to LINE, and none need an account. They use synthetic accounts, keys, pictures, audio and video, and replace the network or sound card at the edge of the module under test.
+
+## Running tests
+
+```sh
+make check                      # build and run everything
+make build/test-liff            # build one test
+./build/test-liff               # run it
+./build/test-sealing -p /sealing/authenticated-history-cache   # run one case
+./build/test-sealing -l         # list the cases
+./build/test-sealing --verbose  # print each case as it runs
+```
+
+`make check` runs the tests one after another and stops at the first failure. The tests use [GLib's test framework](https://docs.gtk.org/glib/testing.html), so all of GLib's options work, including `-m perf` for performance cases (`./build/test-sealing -m perf -p /sealing/authenticated-history-cache`).
+
+Some tests need extra tools at run time:
+
+- FFmpeg (`ffmpeg`, `ffprobe`) for `test-video-record` and `test-video-play`.
+- SDL's dummy video driver for the UI tests (they set it themselves).
+
+## The tests
+
+Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names, listed below). The rule for each test in the [Makefile](../../Makefile) lists exactly which objects it links, which keeps the test small and shows what it depends on.
+
+| Test binary | Source | Covers |
+| ----------- | ------ | ------ |
+| `test-thrift` | `thrift.c` | Compact and Binary encoding and decoding, limits, malformed input |
+| `test-transport` | `transport.c` | Headers, token rotation, renewal on code 119, refresh rejection, `Retry-After` (wrapped libcurl) |
+| `test-state` | `state.c` | Session load and save, permissions, size limits, the sequence reservation, migration |
+| `test-pair` | `pair.c` | QR pairing flow, PIN path, key import failure |
+| `test-password-login` | `password_login.c` | Email sign-in: RSA wrapping, PIN secret, verifier and confirmation |
+| `test-sealing` | `sealing.c` | Key chain import and verification, v1 and v2 direct messages, groups, two key generations, mismatched IDs, authentication failures, the secret cache |
+| `test-messaging` | `messaging.c` | Chat list, history rows, sending, replies, mentions, reactions, receipts, announcements |
+| `test-emoji-message` | `emoji_message.c` | Sealed LINE emoji in text, including Thai and astral Unicode |
+| `test-media` | `media.c` | Attachment envelopes, previews, video hash objects, file names, rejected uploads, corruption, metadata relabeling |
+| `test-obs` | `obs_http.c` | OBS requests and headers (wrapped libcurl) |
+| `test-media-io` | `media_io.c` | Leases, sealing, frame passing |
+| `test-friends` | `friends.c` | Lookup, add, rosters and paging, favorites, names, hide and block, requests, cards |
+| `test-groups` | `groups.c` | Create, invite preflight, members, invitations, rename, links, leave |
+| `test-stickers` | `stickers.c` | Catalog, entitlement, asset URLs, sending |
+| `test-emoji` | `emoji.c` | Catalog, pack index, manifests, asset policy |
+| `test-shared-content` | `shared_content.c` | Albums, notes, channel tokens (wrapped libcurl) |
+| `test-liff` | `liff.c` | `issueLiffView`, launch URLs, consent and fallback |
+| `test-rich-message` | `rich_message.c` | Imagemap markup parsing |
+| `test-flex-asset` | `flex_asset.c` | Allowed hosts, public-address checks, redirects (wrapped libcurl) |
+| `test-talk-sync` | `talk_sync.c` | Cursor, paging, full and partial resync |
+| `test-live-sync` | `live_sync.c` | The long-poll thread, batching, rotation, failure pacing |
+| `test-call` | `call.c` | Whole calls against a local relay fixture (wrapped SDL audio) |
+| `test-call-video` | `call_video.c` | VP8 through EVS3 and SRTP, loss, reordering, replay, keyframes, descriptors |
+| `test-audio` | `call_audio.c` | Opus and EAS2 framing, playout (wrapped `SDL_QueueAudio`) |
+| `test-denoise` | `call_denoise.c` | RNNoise on synthetic audio |
+| `test-video-record` | `video_record.c` | Recording a generated picture and tone, checked with ffprobe, cancellation, cleanup |
+| `test-video-play` | `video_play.c` | Playback process handling |
+| `test-profile-image` | `profile_image.c` | Crop, scale, transparency, JPEG output |
+| `test-clipboard-paste` | `clipboard_paste.c` | Picture paste staging |
+| `test-qr-scan` | `qr_scan.c` | ZBar loading and decoding (wrapped `dlopen`) |
+| `test-chat-lists` | `chat_lists.c` | Folders, pins, mutes, shortcuts, file safety |
+| `test-chiptune` | `chiptune.c` | The sound chip and every sound |
+| `test-ui-motion` | `ui_motion.c` | Frame clock and scrolling, including timing at 60, 144 and 240 Hz |
+| `test-ui-pixels` | `ui_pixels.c` | Premultiplication, scroll copy maths |
+| `test-ui-apng` | `ui_apng.c` | Animated PNG frames and timing |
+| `test-ui-emoji` | `ui_emoji.c` | Draft tokens and export ranges |
+| `test-ui-flex` | `ui_flex.c` | Flex layout |
+| `test-ui-friends` | `ui_friends.c` | Friends screen behavior |
+| `test-ui-tray` | `ui_tray.c` | Tray item properties and menu |
+| `test-ui-read` | `ui_read.c` | The read-receipt rules in `ui_private.h` |
+| `test-ui-theme` | `ui_theme.c` | Theme file reading and toggling |
+| `test-ui-scroll-scene` | `ui_scroll_scene.c` | Scroll reuse against full redraws |
+| `test-ui-call-fullscreen` | `ui_call_fullscreen.c` | Full-screen call video |
+| `test-ui-lang` | `ui_lang.c` | Language selection and the translation tables, including printf conversions |
+
+The `TESTS` list in the Makefile is the authoritative set.
+
+## How the tests isolate a module
+
+### 1. Replacing `line_rpc`
+
+Protocol tests link the module under test with `thrift.o` but **not** `transport.o`, and define their own `line_rpc()`. The fixture in [`tests/friends.c`](../../tests/friends.c) is the model:
+
+```c
+struct rpc_step {
+	const char *path, *method, *request, *reply;
+};
+
+J *line_rpc(Line *s, const char *path, const char *method, J *args, GError **error)
+{
+	const struct rpc_step *step = &script[calls++];
+
+	g_assert_cmpstr(path, ==, step->path);
+	g_assert_cmpstr(method, ==, step->method);
+	/* Encode the real request with the real encoder, decode it again,
+	 * and compare it field by field with the expected JSON. */
+	...
+	/* Encode the scripted reply as a Thrift result and decode it with the
+	 * real reply decoder, so success and service errors take the real path. */
+	return line_decode_reply(method, response, bytes, &s->service_code, error);
+}
+```
+
+A test is then a script of expected calls:
+
+```c
+static const struct rpc_step steps[] = {
+	{ "/RE4", "findContactBySearchIdOrTicketV3", FIND_ID, "{\"0:obj\": {…}}" },
+	{ "/RE4", "addFriendByMid", "{…}", "{\"0:obj\": {}}" },
+};
+use(steps, G_N_ELEMENTS(steps));
+```
+
+This checks two things at once: the exact Thrift **request** the code sends (paths, methods, field IDs, types, values), and how the code handles realistic **replies**, including service exceptions (`"{\"1:obj\": {\"1:i32\": 10}}"`), timeouts (`"timeout"`) and unavailable methods (`"unavailable"`).
+
+### 2. Wrapping libcurl
+
+HTTP-level tests (`test-transport`, `test-obs`, `test-shared-content`, `test-flex-asset`) link with `-Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo`. The linker then sends calls to `__wrap_curl_easy_perform()` and friends in the test, which record the options and headers and play back a scripted status, headers and body. See [`tests/transport.c`](../../tests/transport.c).
+
+### 3. Wrapping SDL and dlopen
+
+The call and audio tests wrap `SDL_OpenAudioDevice`, `SDL_CloseAudioDevice` and `SDL_QueueAudio`, so no sound card is needed and the test can inspect what would have been played. `test-qr-scan` wraps `dlopen`. The UI render tests and the benchmark wrap `SDL_RenderPresent`.
+
+### 4. Generated media and local fixtures
+
+Media tests make their own pictures, tones and videos. The call tests run a local UDP relay that speaks enough PLANET to connect two ends, so the real call engine, SRTP and codecs run end to end on your machine.
+
+### 5. Synthetic identities
+
+All MIDs in tests are obviously fake (`u00000000000000000000000000000001`), and all keys are generated or fixed test vectors. Never put real tokens, keys or message contents in a test.
+
+## Writing a new test
+
+1. Create `tests/<name>.c`:
+
+   ```c
+   // SPDX-License-Identifier: GPL-3.0-or-later
+   #include "<module>.h"
+
+   static void my_case(void)
+   {
+   	g_autoptr(GError) error = NULL;
+   	...
+   	g_assert_no_error(error);
+   }
+
+   int main(int argc, char **argv)
+   {
+   	g_test_init(&argc, &argv, NULL);
+   	g_test_add_func("/<name>/my-case", my_case);
+   	return g_test_run();
+   }
+   ```
+
+2. Add `build/test-<name>` to `TESTS` in the Makefile.
+3. Add a rule listing its objects, plus any wrap flags:
+
+   ```make
+   build/test-<name>: tests/<name>.c build/<module>.o build/thrift.o
+   ```
+
+   The shared recipe `$(TESTS):` does the linking.
+4. Run `make build/test-<name> && ./build/test-<name>`, then `make check`.
+5. Run `make format` and `make checkpatch`. Test files may keep long JSON strings split across lines; the Makefile relaxes those checkpatch rules for `tests/`.
+
+**What a good protocol test checks:** the exact request (so a field-number typo fails), the happy reply, at least one service error, input validation (empty, too long, wrong kind of MID), and that nothing is sent when validation fails.
+
+## Benchmarks and renderer tests
+
+**Render benchmark.** `make bench` renders a 920 × 630 fixture with 900 contacts and 50 messages using SDL's dummy video driver, and reports CPU render and submit times. To exercise the X11 scrolling path and compare the final partial frame with a full redraw:
+
+```sh
+xvfb-run -a env LINE_REDUCE_MOTION=1 LINE_BENCH_VIDEODRIVER=x11 LINE_BENCH_DAMAGE=1 ./build/render-bench
+```
+
+**Vulkan.** These need a GPU and the Vulkan SDK:
+
+```sh
+make vulkan-smoke                                   # offscreen: renders and reads back pixels
+VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation make vulkan-smoke VK_VENDOR=0x10de
+AVERNELLA_VK_DESCRIPTORS=buffer make vulkan-smoke VK_VENDOR=0x1002
+make vulkan-preview VK_PREVIEW_ARGS=--test          # the real presenter: resize, hide, present
+```
+
+Run them with the validation layer whenever you touch `src/render/`.
+
+## What tests can't cover
+
+Live interoperability with LINE: real sign-in, delivery to another account, media on LINE's servers, calls with LINE's phone and desktop apps. Those need a real account and a second device. [analysis/desktop-features.md](../../analysis/desktop-features.md) and [analysis/video-call-wire.md](../../analysis/video-call-wire.md) record what has been verified live. When you verify something live, say so there, without any personal data.

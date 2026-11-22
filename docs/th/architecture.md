@@ -1,0 +1,328 @@
+# สถาปัตยกรรม
+
+[สารบัญ](README.md) · ก่อนหน้า: [การ build](building.md) · ถัดไป: [ส่วนติดต่อผู้ใช้](ui.md)
+
+หน้านี้อธิบายส่วนประกอบที่ทำงานอยู่: มีโปรเซสและเธรดอะไรบ้าง แต่ละตัวแตะอะไรได้ สื่อสารกันอย่างไร และเขียนอะไรลงดิสก์ อ่านหน้านี้ก่อนแก้อะไรก็ตามที่ข้ามเส้นแบ่งระหว่างโปรเซสหรือเธรด
+
+## ภาพใหญ่
+
+Avernella เป็นโปรแกรมไฟล์เดียวชื่อ `avernella` ที่ทำงานเป็น **สองโปรเซส** และมี **โปรแกรมเบราว์เซอร์** เสริมอีกตัวหนึ่ง
+
+```
+┌──────────────────────────── avernella (โปรเซส UI) ──────────────────────────────┐
+│ หน้าต่าง SDL · วาดด้วย Cairo/Pango · โมดูล Vulkan · ถอดรหัสรูป · tray ·            │
+│ การแจ้งเตือน · เสียง · portal (จับภาพหน้าจอ) · คลิปบอร์ด · ฉบับร่างในหน่วยความจำ    │
+└───────┬───────────────────────────────┬──────────────────────────────┬──────────┘
+        │ JSON ทีละบรรทัด                │ เฟรมวิดีโอคอล                 │ datagram คั่นด้วยแท็บ
+        │ (socketpair SOCK_STREAM,      │ (SOCK_SEQPACKET, memfd ที่    │ (SOCK_SEQPACKET, fd 3)
+        │  เป็น stdin/stdout ของ worker) │  ปิดผนึกแล้ว ส่งด้วย SCM_RIGHTS) │
+┌───────┴───────────────────────────────┴────────┐          ┌──────────┴───────────┐
+│ avernella --worker (โปรเซส worker)              │          │ avernella-liff       │
+│ เซสชัน โทเค็น กุญแจ Letter Sealing · RPC ·       │          │ (WPE WebKit หรือ     │
+│ อัปโหลด/ดาวน์โหลดมีเดีย · เธรด sync · เธรดรูป     │          │ avernella-liff-gtk)  │
+│ · เธรดการโทร · การจับภาพหน้าจอ                   │          │ แอป LINE (LIFF)      │
+└───────┬────────────────────────────────────────┘          └──────────┬───────────┘
+        │ HTTPS (libcurl, HTTP/2)        UDP (การโทร)                   │ HTTPS
+  legy.line-apps.com · obs.line-apps.com · CDN ของ LINE · relay การโทร   เว็บไซต์ของแอปนั้น
+```
+
+การแบ่งแบบนี้มีเป้าหมายเดียว: **โปรเซสที่วาดเนื้อหาซึ่งเชื่อถือไม่ได้จะไม่ถือข้อมูลยืนยันตัวตน LINE ของคุณ และโปรเซสที่ถือข้อมูลยืนยันตัวตนจะไม่วาดอะไรเลย** รูป การ์ด Flex และ rich message จากคนแปลกหน้าถูกถอดรหัสและวาดในโปรเซส UI ส่วนโทเค็น refresh token และกุญแจส่วนตัว Letter Sealing มีอยู่แค่ใน worker หน้าเว็บของแอป LINE รันในโปรเซสที่สามซึ่งมี sandbox ของตัวเอง
+
+## โปรเซส UI
+
+`main()` ใน [`main.c`](../../src/main.c) เรียก `line_ui()` ใน [`ui.c`](../../src/ui.c) เว้นแต่อาร์กิวเมนต์แรกเป็น `--worker` หรือ `--worker-password` โปรเซส UI รับผิดชอบ
+
+- หน้าต่าง SDL อินพุต คลิปบอร์ด และการลากวางไฟล์
+- การวาดด้วย Cairo และ Pango แล้วนำเสนอผ่านโมดูล Vulkan แบบเนทีฟ ตัววาด Vulkan ของ SDL หรือพื้นผิวหน้าต่างของ SDL
+- การถอดรหัสรูป (JPEG, PNG, WebP, PNG เคลื่อนไหว) ในเธรดเบื้องหลัง
+- รายการแชต ประวัติของแชตที่เปิดอยู่ และฉบับร่างทั้งหมด เก็บไว้ในหน่วยความจำ
+- บริการของเดสก์ท็อปผ่าน D-Bus ได้แก่ tray การแจ้งเตือน และ portal จับภาพหน้าจอ
+- การตั้งค่าแชต (โฟลเดอร์ หมุด การปิดเสียง ปุ่มลัด) ผ่าน [`chat_lists.c`](../../src/chat_lists.c)
+- เสียง ผ่าน [`ui_sounds.c`](../../src/ui_sounds.c)
+- การเริ่มและดูแล worker กับโปรแกรมเบราว์เซอร์
+
+มันไม่เคยเปิดการเชื่อมต่อไปยังเซิร์ฟเวอร์ RPC ของ LINE เลย อะไรที่ต้องการจาก LINE จะขอผ่าน worker ทั้งหมด
+
+### เธรดของ UI
+
+| เธรด | เริ่มใน | หน้าที่ |
+| ---- | ------- | ------- |
+| main | `line_ui()` | อีเวนต์ของ SDL การจัดวาง การวาด และสถานะของส่วนติดต่อทั้งหมด **มีเธรดนี้เท่านั้นที่แตะ `ui` (struct `Interface`) หรือสถานะของคำขอได้** |
+| `line-ipc` | `start_worker()` ใน `ui.c` | เขียนคำขอที่รอคิวไปยัง worker อ่านคำตอบและอีเวนต์ และรับเฟรมวิดีโอคอล แปลงแต่ละบรรทัดเป็น SDL user event เธรดหลักจึงไม่ต้องรอซ็อกเก็ตเลย |
+| พูลถอดรหัสรูป (1 เธรด) | `start_decode()` ใน [`ui_media.c`](../../src/ui_media.c) | ถอดรหัสรูป ภาพย่อ และเฟรมแอนิเมชัน ภายใต้ `SCHED_BATCH` |
+| `avernella-liff` | [`ui_liff.c`](../../src/ui_liff.c) | รอ `recv()` บนซ็อกเก็ตของเบราว์เซอร์ และส่ง SDL event เมื่อเบราว์เซอร์ส่งข้อความมา |
+| `line-tray` | [`ui_tray.c`](../../src/ui_tray.c) | รันบริการ D-Bus ของ StatusNotifierItem |
+| `line-notify` | [`ui_notifications.c`](../../src/ui_notifications.c) | ส่งการแจ้งเตือนบนเดสก์ท็อปหนึ่งครั้ง |
+| `line-screenshot` | `ui_media_screenshot()` | รอ portal จับภาพหน้าจอ |
+| `line-player` | [`video_play.c`](../../src/video_play.c) | เฝ้าโปรเซสลูก `ffplay` |
+| `camera-recorder` | [`video_record.c`](../../src/video_record.c) | เฝ้าการอัดด้วย `ffmpeg` |
+
+เธรดช่วยเหล่านี้ไม่แตะสถานะของส่วนติดต่อ แต่ส่งผลกลับด้วย SDL user event แล้วเธรดหลักเป็นผู้นำไปใช้
+
+## โปรเซส worker
+
+worker ([`main.c`](../../src/main.c) เริ่มที่ `worker()`) เป็นโปรเซสเดียวที่ถือเซสชัน ได้แก่ access token และ refresh token, MID ของบัญชี, key chain ของ Letter Sealing และตัวนับลำดับคำขอ มันรัน RPC ทุกตัว เข้ารหัสและถอดรหัสข้อความ อัปโหลดและดาวน์โหลดมีเดีย และดูแลการโทร
+
+### เริ่มต้นอย่างไร
+
+UI เริ่ม worker ตอนพยายามลงชื่อเข้าใช้ครั้งแรก (หรือตอนเปิดแอปถ้ามีเซสชันบันทึกไว้) ใน `start_worker()` ของ `ui.c`
+
+1. สร้าง socketpair แบบ `SOCK_STREAM` สำหรับ JSON และ socketpair แบบ `SOCK_SEQPACKET` สำหรับเฟรมวิดีโอคอล
+2. รัน `posix_spawn("/proc/self/exe", ["avernella", "--worker"])` พร้อม file action ที่ทำให้ซ็อกเก็ต JSON เป็น **stdin และ stdout** ของ worker และให้ซ็อกเก็ตเฟรมเป็น **fd 3** บน glibc 2.34 ขึ้นไป `posix_spawn_file_actions_addclosefrom_np` จะปิด descriptor อื่นที่สืบทอดมาทั้งหมด
+3. สำหรับการลงชื่อด้วยอีเมล จะรัน `--worker-password` แทน ตอนนั้น fd 3 เป็นไปป์ที่บรรจุ `struct line_credentials` หนึ่งชุด (อีเมลและรหัสผ่าน ช่องละ 256 ไบต์) และซ็อกเก็ตเฟรมย้ายไปเป็น fd 4 worker อ่านไปป์ครั้งเดียว ปิด แล้วล้างบัฟเฟอร์ด้วย `explicit_bzero` UI ก็ล้างสำเนาของตัวเองด้วย รหัสผ่านจึงไม่เคยปรากฏในอาร์กิวเมนต์ ตัวแปรสภาพแวดล้อม หรือช่อง JSON
+
+สิ่งแรกที่ worker ทำคือ `prctl(PR_SET_PDEATHSIG, SIGTERM)` เพื่อให้จบตามหน้าต่าง แล้วตรวจว่าโปรเซสแม่ยังไม่จบไปก่อน ซึ่งปิดช่องโหว่ของจังหวะเวลา
+
+### ลูปหลักของ worker
+
+`worker()` รอใน `poll()` บน descriptor สี่ตัว และจัดการตัวที่พร้อม
+
+| Descriptor | พร้อมเมื่อ | ตัวจัดการ |
+| ---------- | ---------- | --------- |
+| stdin | UI ส่งคำขอมาหนึ่งบรรทัด | `handle()` → `dispatch()` |
+| `image_wake` (eventfd) | เธรดรูปดาวน์โหลดเสร็จ | `finish_images()` |
+| eventfd ของ live-sync | เธรด long poll มี operation หรือโทเค็นที่ถูกหมุนเวียน | `live_operations()` |
+| `timer` (timerfd แบบครั้งเดียว) | ถึงเวลางานบำรุงรักษา | `sync_revision()`: ต่ออายุโทเค็น หมดอายุคำเชิญโทร และตรวจ revision สำรองเมื่อ long poll มีปัญหา |
+
+คำขอถูกประมวลผลทีละตัวตามลำดับ RPC ที่ช้าจึงทำให้คำขอถัดไปรอ ตั้งใจทำแบบนี้เพื่อให้สถานะเซสชันอยู่ในเธรดเดียว ส่วน long poll และการดาวน์โหลดแบบไม่ระบุตัวตนรันในเธรดของตัวเอง จึงไม่ต้องรอหลังการส่งข้อความ
+
+### เธรดของ worker
+
+| เธรด | เริ่มใน | หน้าที่ | แตะเซสชันได้ไหม |
+| ---- | ------- | ------- | --------------- |
+| main | `worker()` | คำขอ ผลการ sync การต่ออายุโทเค็น | ได้ และเป็นผู้เดียว |
+| `line-sync` | `line_live_sync_start()` ใน [`live_sync.c`](../../src/live_sync.c) | ถือ long poll `sync` ค้างไว้หนึ่งตัว | ไม่ได้ มีสำเนา access token และการเชื่อมต่อ HTTPS ของตัวเอง |
+| `line-images` | `queue_image()` ใน `main.c` | ดาวน์โหลดอวตาร ภาพสติกเกอร์และอีโมจิ และรูปใน Flex จาก CDN สาธารณะ | ไม่ได้ การดาวน์โหลดไม่ระบุตัวตน |
+| `line-voice` | `launch_call()` ใน [`call.c`](../../src/call.c) | การโทรหนึ่งสาย: ซ็อกเก็ต UDP การส่งสัญญาณ SRTP เสียง วิดีโอ | ไม่ได้ ได้รับเฉพาะข้อมูลของสายนั้น ไม่เคยได้โทเค็นของบัญชี |
+| `line-screencast` | [`screencast.c`](../../src/screencast.c) | คุยกับ portal ScreenCast และ PipeWire ระหว่างแชร์หน้าจอ | ไม่ได้ |
+
+ทุกเธรดที่ใช้ HTTPS เก็บ curl handle ของตัวเองใน thread-local storage (`static __thread CURL *client` ใน [`transport.c`](../../src/transport.c)) long poll จึงไม่ขวาง RPC
+
+## UI กับ worker คุยกันอย่างไร
+
+### ช่อง JSON
+
+แต่ละข้อความคืออ็อบเจกต์ JSON หนึ่งตัวในหนึ่งบรรทัด ปิดท้ายด้วย `\n` มีสามแบบ
+
+**คำขอ (request)** ส่งจาก UI ไป worker และมี `id` เป็นตัวเลข
+
+```json
+{"id": 12, "method": "send", "params": {"chat": "u0123…", "text": "hi", "replyTo": "5123…"}}
+```
+
+**คำตอบ (reply)** ส่งกลับพร้อม `id` เดิม และมี `result` หรือ `error`
+
+```json
+{"id": 12, "result": {"id": "5124…", "sentAt": 1764000000000}}
+{"id": 12, "error": "LINE declined sendMessage (service code 10)."}
+```
+
+ถ้า `login` ล้มเหลวเพราะเชื่อมต่อเครือข่ายไม่ได้ คำตอบจะมี `"retry": true` ด้วย UI จึงเก็บเซสชันไว้แล้วลองใหม่แบบเว้นระยะ แทนที่จะกลับไปหน้าลงชื่อเข้าใช้
+
+**อีเวนต์ (event)** ส่งจาก worker ไป UI ไม่มี `id` แต่มีชื่อใน `event`
+
+```json
+{"event": "chat_message", "chat": "c0123…", "id": "5125…", "time": 1764000000000, "mine": false}
+```
+
+ฝั่ง worker ใช้ `line_emit()` เขียนอ็อบเจกต์ JSON ตามด้วยขึ้นบรรทัดใหม่ลง stdout ด้วย `writev` ภายใต้ mutex เพราะเธรดการโทรก็ส่งอีเวนต์ด้วย `line_event(name, key, value)` เป็นทางลัดสำหรับอีเวนต์ที่มีฟิลด์เดียว
+
+ฝั่ง UI ใช้ `submit()` ใน `ui.c` กำหนด `id` ถัดไป เก็บ `struct ui_request` ที่บอกว่าจะทำอะไรกับคำตอบ เข้ารหัสบรรทัด แล้วปลุกเธรด `line-ipc` ผ่าน eventfd เมื่อคำตอบมาถึง `handle_packet()` จะหาคำขอจาก `id` แล้วเรียก `handle_reply()` คำตอบของคำขอหลัก (login, chats, history, send, หน้าเก่า, การแจ้งอ่าน, logout) จัดการใน `ui.c` ที่เหลือเป็นคำขอแบบ `MEDIA`: `handle_reply()` ยื่นคำตอบให้ `ui_liff_reply()`, `ui_profile_reply()`, `ui_find_reply()`, `ui_groups_reply()`, `ui_friends_reply()` และสุดท้าย `ui_media_reply()` โมดูลแรกที่รู้จักชื่อเมธอดจะเป็นผู้จัดการ โมดูลส่งคำขอแบบนี้ด้วย `ui_rpc(method, params, tag)` โดย `tag` คือหมายเลขของโมดูลเองไว้จับคู่กับคำตอบ
+
+ตัวเลข **generation** ป้องกันคำตอบที่ค้างมาจากรอบเก่า: `stop_worker()` เพิ่ม `wire.generation` และแพ็กเก็ตที่ส่งมาจากเธรด `line-ipc` รุ่นเก่าจะถูกทิ้ง
+
+### เมธอดของ worker
+
+`dispatch()` ใน `main.c` คือรายการเดียวของทุกอย่างที่ UI ขอได้ ก่อนลงชื่อเข้าใช้รับเฉพาะ `login` เมธอดเกี่ยวกับแชตส่วนใหญ่ยังกำหนดให้ `params.chat` ต้องเป็นแชตที่ worker เคยเห็นในรายการแชตแล้ว
+
+| หมวด | เมธอด |
+| ---- | ----- |
+| เซสชัน | `login`, `logout`, `foreground` (บอก worker ว่าหน้าต่างได้โฟกัสอยู่หรือไม่ ซึ่งเปลี่ยนความถี่ในการตรวจ) |
+| รายการแชตและประวัติ | `chats`, `history`, `olderHistory`, `markRead`, `findMessages`, `findAllMessages` |
+| การส่ง | `send`, `sendPhoto`, `sendFile` (`type` เป็น `video`, `audio` หรือไฟล์), `sendSticker`, `forwardMessage`, `react`, `unsend` |
+| ประกาศ | `announcements`, `announceMessage`, `removeAnnouncement` |
+| มีเดีย | `photo`, `saveFile`, `openVideo`, `videoPoster`, `releaseMedia` |
+| รูป (เข้าคิวในเธรดรูป) | `avatar`, `emoji`, `sticker`, `flexImage` และ `photo` สำหรับข้อความสติกเกอร์ |
+| สติกเกอร์และอีโมจิ | `stickerCatalog`, `emojiCatalog` |
+| เพื่อน | `friends`, `findFriend`, `addFriend`, `friendInvite`, `openFriend`, `renameFriend`, `setFriendFavorite`, `setFriendHidden`, `setFriendBlocked`, `addRecommendation`, `friendRequests`, `acceptFriendRequest`, `declineFriendRequest` |
+| โปรไฟล์ | `myProfile`, `updateMyProfile`, `updateMyPicture`, `profileCard`, `openProfileChat`, `addProfileFriend`, `setProfileBlocked` |
+| กลุ่ม | `createGroup`, `groupMembers`, `inviteGroup`, `removeGroupMember`, `cancelGroupInvite`, `renameGroup`, `leaveGroup`, `groupLink`, `setGroupLink`, `renewGroupLink`, `groupInvitations`, `joinGroup`, `declineGroup` |
+| เนื้อหาที่แชร์ | `sharedList`, `sharedPost`, `sharedPhotos`, `sharedPhoto` |
+| แอป LINE | `liffView` |
+| การโทร | `callStart`, `callAccept`, `callDecline`, `callEnd`, `callMute`, `callCamera`, `callShare`, `callPreview`, `callFrame` |
+
+### อีเวนต์จาก worker
+
+| อีเวนต์ | ความหมาย | UI จัดการที่ |
+| ------- | -------- | ------------ |
+| `qr` (`url`) | แสดง QR code สำหรับลงชื่อเข้าใช้นี้ | `handle_packet()` ใน `ui.c` |
+| `pin` (`pin`) | แสดงรหัสนี้ให้ผู้ใช้กรอกบนโทรศัพท์ | `handle_packet()` |
+| `status` (`message`) | แสดงข้อความนี้ในบรรทัดสถานะ | `handle_packet()` |
+| `signed_out` (`message`) | LINE ยุติเซสชันแล้ว กลับไปหน้าลงชื่อเข้าใช้ | `reset_login()` |
+| `changed` | มีความเปลี่ยนแปลงที่ต้องโหลดรายการแชตและแชตที่เปิดอยู่ใหม่ทั้งหมด | `refresh()` |
+| `chat_message` (`chat`, `id`, `time`, `mine`) | มีข้อความเข้ามาหรือส่งออกไปใน `chat` | `chat_message()` |
+| `history` (`chat`, `messages`) | แถวข้อความใหม่ของแชตที่เปิดอยู่ | `pushed_history()` |
+| `self`, `contact`, `friend_added`, `friend_request` (`row`) | โปรไฟล์หรือความเป็นเพื่อนเปลี่ยน | `ui_profile_packet()` ใน [`ui_profile.c`](../../src/ui_profile.c) |
+| `call`, `call_incoming`, `call_error`, `call_camera_error`, `call_frame`, `call_self_frame`, `call_share`, `call_share_frame` | สถานะและวิดีโอของการโทร | `ui_media_call_event()` ใน [`ui_media.c`](../../src/ui_media.c) |
+
+### ข้อมูลขนาดใหญ่: media lease
+
+รูป ไฟล์ และภาพตัวอย่างวิดีโอใหญ่เกินกว่าจะใส่ในบรรทัด JSON worker จึงเขียนลง **memfd ที่ปิดผนึก** แทน (`line_media_lease()` ใน [`media_io.c`](../../src/media_io.c)): สร้างไฟล์ด้วย `memfd_create` เขียนข้อมูล เพิ่ม seal `F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL` แล้วตอบกลับว่า
+
+```json
+{"lease": "4b1c…-uuid", "path": "/proc/<pid ของ worker>/fd/<n>"}
+```
+
+UI เปิดพาธนั้น (เพราะรันด้วยผู้ใช้คนเดียวกัน) แมปหรืออ่านข้อมูล แล้วส่ง `releaseMedia` พร้อม lease เพื่อให้ worker ปิด descriptor เนื่องจากไฟล์ถูกปิดผนึก UI จึงแมปได้โดยไม่ต้องกลัวว่าข้อมูลจะเปลี่ยนระหว่างใช้ เปิด lease ค้างไว้ได้พร้อมกันไม่เกินสี่ตัว
+
+### เฟรมวิดีโอคอล
+
+วิดีโอคอลเป็นสตรีมเดียวที่ไม่ผ่าน JSON เธรดการโทรเขียนเฟรมที่ถอดรหัสแล้ว (ระนาบ I420) ลง memfd ที่ปิดผนึกตัวใหม่ด้วย `pwritev` แล้วส่ง descriptor ผ่านซ็อกเก็ตเฟรม `SOCK_SEQPACKET` ด้วย `SCM_RIGHTS` พร้อมหัวข้อมูลเล็ก ๆ `struct line_preview_frame` (ขนาด การหมุน แหล่ง แชต เวลาที่ถอดรหัส) มีสามแหล่ง: กล้องของอีกฝ่าย กล้องของคุณ และหน้าจอของอีกฝ่าย
+
+เธรด `line-ipc` ของ UI รับ descriptor ใน `pump_preview()` และเก็บ **เฉพาะเฟรมล่าสุดของแต่ละแหล่ง** ถ้ามีเฟรมรออยู่แล้ว descriptor ตัวเก่าจะถูกปิดทิ้ง จากนั้นเธรดหลักอัปโหลดเฟรมเป็น texture บัฟเฟอร์ส่งของซ็อกเก็ตถูกตั้งให้เล็ก (4 KiB) โดยตั้งใจ หน้าต่างที่ยุ่งจึงไม่สะสมเฟรมเก่าค้าง การซ่อนหน้าต่างหรือหน้าจอการโทรจะหยุดส่งภาพตัวอย่าง ขณะที่การโทรยังดำเนินต่อ (`callPreview`)
+
+### ช่องสื่อสารกับโปรแกรมเบราว์เซอร์
+
+UI กับ `avernella-liff` ใช้ socketpair แบบ `SOCK_SEQPACKET` ที่ fd 3 ของเบราว์เซอร์ แต่ละ datagram คือข้อความหนึ่งข้อความที่คั่นฟิลด์ด้วยแท็บ (ดู [`liff_url.h`](../../src/liff_url.h)) รายละเอียดอยู่ในหน้า [LIFF](liff.md)
+
+## ไฟล์บนดิสก์
+
+Avernella เก็บข้อมูลน้อยมาก ข้อความ ประวัติ รายการแชต และฉบับร่าง **ไม่เคย** ถูกเขียนลงดิสก์
+
+| พาธ | เขียนโดย | เนื้อหา |
+| --- | -------- | ------- |
+| `$XDG_STATE_HOME/avernella/session.json` (ค่าเริ่มต้น `~/.local/state/avernella/`) | worker, [`state.c`](../../src/state.c) | เซสชัน ดู [การลงชื่อเข้าใช้](sign-in.md) |
+| `$XDG_STATE_HOME/avernella/session.new` | worker | ไฟล์ชั่วคราวระหว่างการบันทึกแบบ atomic |
+| `$XDG_STATE_HOME/avernella/lists-<sha256(MID)>.json` | UI, [`chat_lists.c`](../../src/chat_lists.c) | การตั้งค่าแชตของแต่ละบัญชี: `folders`, `view` (โฟลเดอร์ที่เลือก), `pins`, `muted`, `bindings` (ปุ่มลัดที่เปลี่ยน), `notify`, `sounds`, `motion` |
+| `$XDG_CONFIG_HOME/avernella/layout` (ค่าเริ่มต้น `~/.config/avernella/`) | UI, [`ui_theme.c`](../../src/ui_theme.c) | `avernella\n` หมายถึงเลือกธีม Avernella ค่าอื่นหรือไม่มีไฟล์หมายถึงธีม LINE ซึ่งเป็นค่าเริ่มต้น |
+| `$XDG_CONFIG_HOME/avernella/` | UI, [`ui_lang.c`](../../src/ui_lang.c) | ภาษาของส่วนติดต่อที่เลือก |
+| `$XDG_RUNTIME_DIR/avernella/` | UI, [`clipboard_paste.c`](../../src/clipboard_paste.c) | รูปที่วางเพื่อเตรียมส่ง ลบทิ้งหลังส่งหรือเมื่อปิดหน้าตัวอย่าง |
+| `~/.cache/kitatide/liff`, `~/.local/share/kitatide/liff` | โปรแกรมเบราว์เซอร์ | แคช HTTP และคุกกี้ของ WebKit สำหรับแอป LINE |
+
+กฎที่ผู้เขียนไฟล์ทุกตัวทำตาม
+
+- **สิทธิ์แบบส่วนตัว** ไดเรกทอรีสร้างด้วยโหมด `0700` และไฟล์ `0600` (umask ของโปรเซสคือ `0077`) ฝั่งอ่านจะปฏิเสธไฟล์หรือไดเรกทอรีที่ผู้ใช้อื่นเป็นเจ้าของ หรือที่กลุ่มหรือคนอื่นอ่านได้
+- **แทนที่แบบ atomic** เวอร์ชันใหม่เขียนลงไฟล์ชั่วคราวในไดเรกทอรีเดียวกัน `fdatasync` แล้ว rename ทับไฟล์เดิม และ `fsync` ไดเรกทอรี ถ้าเครื่องดับกลางทาง จะเหลือไฟล์เก่าหรือไฟล์ใหม่อย่างใดอย่างหนึ่ง
+- **จำกัดขนาด** ไฟล์เซสชันใหญ่ได้ไม่เกิน 8 MiB และไฟล์การตั้งค่าแชต 2 MiB ไฟล์ที่ใหญ่กว่าจะถูกปฏิเสธโดยไม่อ่าน
+- **เจ้าของคนเดียว** worker ถือ `flock` แบบ exclusive บนไดเรกทอรีเซสชันตลอดเวลาที่รัน
+
+### การย้ายจากชื่อเก่า
+
+Avernella เคยชื่อ *kitatide* ตอนใช้ครั้งแรก `line_store_open()` จะย้ายไดเรกทอรี `$XDG_STATE_HOME/kitatide` ที่มีอยู่ไปเป็น `avernella` ด้วย `renameat2(RENAME_NOREPLACE)` ภายใต้ล็อกของไดเรกทอรีนั้น เซสชันและการตั้งค่าแชตจึงตามมาด้วย ส่วนพาธแคชของเบราว์เซอร์ยังใช้ชื่อเก่า
+
+## อะไรอยู่ตรงไหน
+
+| หมวด | ไฟล์ |
+| ---- | ---- |
+| จุดเริ่มโปรแกรม ลูปของ worker การกระจายคำขอ คิวรูป การจัดการ sync | `main.c` |
+| ชนิดข้อมูลและฟังก์ชันช่วยที่ใช้ร่วม (`Line`, `J`, `field()`, `strfield()`, รหัสข้อผิดพลาด) | `line.h` |
+| การส่ง HTTPS การต่ออายุโทเค็น `Retry-After` | `transport.c` |
+| การปรับแต่ง libcurl แคช DNS และ TLS ที่ใช้ร่วมกัน | `http_tune.c` |
+| การปรับแต่ง glibc และตัวจัดตารางงาน | `tune.c` |
+| ตัวเข้ารหัสและถอดรหัส Thrift แบบ Compact และ Binary | `thrift.c` |
+| การจับคู่ด้วย QR | `pair.c` |
+| การลงชื่อเข้าใช้ด้วยอีเมลและรหัสผ่าน | `password_login.c` |
+| เซสชันที่บันทึก ลำดับคำขอ | `state.c`, `state.h` |
+| ตัวชี้ตำแหน่ง sync และการแบ่งหน้า operation | `talk_sync.c` |
+| เธรด long poll | `live_sync.c` |
+| รายการแชต ประวัติ การส่ง รีแอ็กชัน ยกเลิกส่ง การแจ้งอ่าน ประกาศ การเมนชัน ช่วงอีโมจิ | `messaging.c` |
+| Letter Sealing | `sealing.c` |
+| ไฟล์แนบที่เข้ารหัส | `media.c`, `media_crypto.c` |
+| HTTP ของ object storage อวตาร ทรัพยากรจาก CDN สาธารณะ | `obs_http.c` |
+| media lease เฟรมตัวอย่าง การบันทึกไฟล์ | `media_io.c` |
+| เพื่อน โปรไฟล์ คำขอเป็นเพื่อน คำแนะนำเพื่อน | `friends.c` |
+| การแปลงและอัปโหลดรูปโปรไฟล์ | `profile_image.c` |
+| กลุ่มและคำเชิญ | `groups.c` |
+| สติกเกอร์ | `stickers.c` |
+| อีโมจิ LINE | `emoji.c`, `emoji_pack_index.inc` |
+| อัลบั้ม โน้ต และโพล | `shared_content.c` |
+| Rich message (imagemap) | `rich_message.c` |
+| การดาวน์โหลดรูปของ Flex และ rich message | `flex_asset.c` |
+| มุมมอง LIFF และ URL สำหรับเปิด | `liff.c` |
+| การจดจำ URL ของ LIFF โปรโตคอลกับเบราว์เซอร์ user agent | `liff_url.c`, `liff_url.h` |
+| โปรแกรมเบราว์เซอร์ในแอป | `liff_browser.c` |
+| การโทร: เครื่องยนต์ call route คำเชิญเข้า | `call.c` |
+| ข้อความส่งสัญญาณ PLANET | `call_schema.c` |
+| การเข้ารหัสแพ็กเก็ต PLANET ตัวช่วย protobuf การสร้างกุญแจมีเดีย | `call_wire.c` |
+| context ของ SRTP | `call_srtp.c` |
+| PDTP (การขนส่งสำหรับแชร์หน้าจอ) | `call_pdtp.c` |
+| เสียงในการโทร (SDL, Opus, EAS2) | `call_audio.c` |
+| การตัดเสียงรบกวน | `call_denoise.c` |
+| วิดีโอในการโทร (VP8, แพ็กเก็ต EVS3, feedback, การเข้ารหัสภาพหน้าจอ) | `call_video.c` |
+| กล้อง (V4L2) และการแปลงพิกเซล | `camera.c`, `camera_pixels.c` |
+| การจับภาพหน้าจอ (portal และ PipeWire) | `screencast.c` |
+| portal จับภาพหน้าจอเดสก์ท็อป | `screenshot.c` |
+| คลิปจากกล้อง การเล่นวิดีโอ | `video_record.c`, `video_play.c` |
+| การวางรูปจากคลิปบอร์ด | `clipboard_paste.c` |
+| การอ่านรูป QR (ZBar โหลดเมื่อใช้) | `qr_scan.c` |
+| ตัวสังเคราะห์เสียงชิป NES | `chiptune.c` |
+| UI: ลูปหลัก การเชื่อมกับ worker อินพุต | `ui.c`, `ui_private.h` |
+| UI: การวาด การจัดวาง รายการแชต ประวัติ ช่องพิมพ์ | `ui_draw.c` |
+| UI: ไฟล์แนบ ตัวดูรูป ตัวเลือกไฟล์ เมนูข้อความ หน้าจอการโทร | `ui_media.c` |
+| UI: ตัวโหลดโมดูล Vulkan คณิตของการคัดลอกตอนเลื่อน | `ui_gpu.c`, `ui_gpu_scroll.c` |
+| โมดูลตัววาด Vulkan แบบเนทีฟ | `src/render/` |
+| UI: จังหวะแอนิเมชันและการเลื่อน | `ui_motion.c` |
+| UI: การแปลงพิกเซล PNG เคลื่อนไหว | `ui_pixels.c`, `ui_apng.c` |
+| UI: ธีม ภาษาของส่วนติดต่อ | `ui_theme.c`, `ui_lang.c` |
+| UI: เพื่อน กลุ่ม โปรไฟล์และการตั้งค่า การค้นหา อีโมจิและสติกเกอร์ โฟลเดอร์ เครื่องมือแชต เนื้อหาที่แชร์ การ์ด Flex ลิงก์ LIFF | `ui_friends.c`, `ui_groups.c`, `ui_profile.c`, `ui_find.c`, `ui_emoji.c`, `ui_chat_lists.c`, `ui_chat_tools.c`, `ui_shared_content.c`, `ui_flex.c`, `ui_liff.c` |
+| UI: tray การแจ้งเตือน เสียง โลโก้ | `ui_tray.c`, `ui_notifications.c`, `ui_sounds.c`, `ui_logo.c` |
+| ที่เก็บการตั้งค่าแชต | `chat_lists.c` |
+
+## เส้นทางของข้อความหนึ่งข้อความ ตั้งแต่ต้นจนจบ
+
+**การส่ง** คุณพิมพ์ "hi" แล้วกด Enter
+
+1. `send_message()` ใน `ui.c` เรียก `request(SEND, chat, text)` `ui_emoji_export()` แปลงอีโมจิ LINE ในฉบับร่างเป็นข้อความธรรมดาพร้อมช่วง `emojis` และ `mention_ranges()` เพิ่ม `mentions` ในแชตกลุ่ม ข้อความจะแสดงเป็นสถานะกำลังส่ง
+2. `dispatch()` ของ worker ตรวจข้อความ (UTF-8 ยาวไม่เกิน 20,000 ไบต์) แล้วเรียก `reserve_sequence()` ซึ่งจองหมายเลขลำดับคำขอ และเมื่อชุดที่จองไว้ 32 ตัวหมด จะบันทึกค่าสูงสุดใหม่ลงดิสก์ **ก่อน** ส่งคำขอ เพราะการหมดเวลาอาจหมายความว่า LINE รับข้อความไปแล้ว หมายเลขจึงไม่ถูกใช้ซ้ำเด็ดขาด
+3. `line_send_decorated()` ใน `messaging.c` สร้าง payload แล้ว `line_seal_payload()` ใน `sealing.c` เข้ารหัสด้วย Letter Sealing v2
+4. `line_send_sealed()` เรียก `sendMessage` บน `/S4`
+5. คำตอบมีรหัสข้อความใหม่ `show_sent()` ใน `ui.c` แทนแถวที่กำลังส่ง และล้างฉบับร่างถ้ายังไม่ถูกแก้หลังจากกดส่ง
+
+**การรับ** อีกฝ่ายส่ง "hello" มา
+
+1. LINE ตอบ long poll `sync` ที่ค้างอยู่บน `/SYNC4` ด้วย operation `RECEIVE_MESSAGE` (ชนิด 26)
+2. เธรด `line-sync` เข้าคิวไว้แล้วส่งสัญญาณผ่าน eventfd
+3. `live_operations()` ของ worker เรียก `message_operation()` ซึ่งส่งอีเวนต์ `chat_message` และทำเครื่องหมายว่าประวัติที่แคชไว้ของแชตนั้นล้าสมัย ถ้าแชตนั้นเปิดอยู่ `revalidate_history()` จะดึงหน้าล่าสุดและส่งอีเวนต์ `history` worker เปิดข้อความที่ปิดผนึกด้วย `line_open_payload()` ระหว่างสร้างแถว
+4. `chat_message()` ของ UI ย้ายแชตขึ้นบนสุดและปรับจำนวนที่ยังไม่อ่าน จากนั้น `notify_unread()` แสดงการแจ้งเตือนบนเดสก์ท็อปถ้าหน้าต่างอยู่เบื้องหลัง และเล่นเสียงข้อความถ้าหน้าต่างไม่ได้ถูกใช้อยู่หรือข้อความอยู่ในแชตอื่นที่ไม่ได้เปิด แชตที่ปิดเสียงไว้จะเงียบ
+
+## กลไกของ Linux ที่แอปพึ่งพา
+
+Avernella พึ่งพาเคอร์เนลและ glibc แทนเฟรมเวิร์ก การรู้จักกลไกเหล่านี้ช่วยได้มากเวลามีพฤติกรรมแปลก ๆ
+
+**โปรเซส**
+- `posix_spawn` ของ `/proc/self/exe` สำหรับ worker, `pidfd_spawn` (clone3 พร้อม pidfd) สำหรับโปรแกรมเบราว์เซอร์ และ `PR_SET_PDEATHSIG` ในโปรเซสลูกทั้งสอง
+- `posix_spawn_file_actions_addclosefrom_np` เพื่อให้โปรเซสลูกได้รับเฉพาะ descriptor ที่จำเป็น
+
+**การรอโดยไม่ใช้ตัวจับเวลา**
+- worker หลับใน `poll()` บนซ็อกเก็ต eventfd สองตัว และ `timerfd` แบบครั้งเดียว ตื่นเฉพาะเมื่อมีเหตุการณ์
+- long poll แทนการตรวจเป็นระยะ การตรวจ revision สำรองทำเฉพาะตอนที่ long poll มีปัญหา
+- UI รอใน `SDL_WaitEventTimeout` ตามเวลาที่เหลือถึงเฟรมหรือขั้นแอนิเมชันถัดไป และรอไม่มีกำหนดเมื่อไม่มีอะไรขยับหรือหน้าต่างถูกซ่อน
+
+**หน่วยความจำ** ([`tune.c`](../../src/tune.c))
+- `mallopt` ตั้งให้มี malloc arena สองตัว เกณฑ์ mmap 128 KiB และเกณฑ์ trim 512 KiB บัฟเฟอร์รูปขนาดใหญ่จึงคืนให้เคอร์เนลทันทีที่ปล่อย
+- UI เรียก `malloc_trim` เมื่อหน้าต่างเสียโฟกัส
+- ภาพย่อใช้แคชร่วม 12 MiB แอนิเมชันมีงบ 32 MiB
+- รูปข้ามโปรเซสเป็น memfd ที่ปิดผนึกแทนการคัดลอก
+
+**การจัดตารางงาน**
+- การดึงและถอดรหัสรูปรันภายใต้ `SCHED_BATCH` ด้วยลำดับความสำคัญต่ำกว่า (`LINE_THREAD_BACKGROUND`)
+- เธรดมีเดียของการโทรขอ timer slack ที่แคบ (`LINE_THREAD_MEDIA`)
+
+**เครือข่าย** ([`http_tune.c`](../../src/http_tune.c))
+- libcurl กับ TLS 1.2 ขึ้นไป ตรวจใบรับรองและชื่อโฮสต์ HTTP/2, TCP Fast Open และ keepalive
+- แคช DNS และ TLS session ใช้ร่วมกันข้ามเธรด แต่แต่ละเธรดมีพูลการเชื่อมต่อของตัวเอง
+- `Retry-After` จาก HTTP 429 หรือ 503 ทำให้ RPC ทั้งหมดหยุดรอตามเวลาที่กำหนด (`line_transport_retry_after()`)
+
+**โปรแกรมเบราว์เซอร์** ([`liff_browser.c`](../../src/liff_browser.c))
+- systemd transient scope (cgroup v2 แยกของตัวเอง) ที่มี `MemoryHigh=768M`, `CPUWeight=50` และ `IOWeight=50`
+- เพิ่ม `oom_score_adj` เคอร์เนลจึงเลือกเก็บคืนหน่วยความจำจากเบราว์เซอร์ก่อนไคลเอนต์ และตั้ง timer slack 1 ms ซึ่งโปรเซสของ WebKit สืบทอดไป
+- web process ของ WebKit ถูกจำกัดที่ 512 MB และ network process ตัดแคชเมื่อเกิน 128 MB
+
+## สรุปเส้นแบ่งด้านความปลอดภัย
+
+- โทเค็นและกุญแจอยู่แค่ใน worker UI ไม่เคยเห็น access token, refresh token หรือกุญแจส่วนตัว
+- เธรดการโทรได้เฉพาะข้อมูลของสายนั้น ไม่เคยได้โทเค็นของบัญชี
+- โปรแกรมเบราว์เซอร์ได้รับโทเค็นของแอป LINE ผ่านซ็อกเก็ตเท่านั้น ไม่ผ่านอาร์กิวเมนต์หรือตัวแปรสภาพแวดล้อม และไม่ถูกบันทึกลง log
+- การดาวน์โหลดรูปจากโฮสต์ใดก็ได้ (Flex, rich message) ทำแบบไม่ระบุตัวตน ใช้ HTTPS เท่านั้น และปฏิเสธที่อยู่ในเครือข่ายส่วนตัวและเครือข่ายในเครื่อง ([`flex_asset.c`](../../src/flex_asset.c))
+- อินพุตทุกอย่างจาก LINE ถูกตรวจขนาดและชนิดก่อนใช้: ตัวถอดรหัส Thrift จำกัดการซ้อนไว้ 48 ชั้นและค่าทั้งหมด 300,000 ค่า ฟังก์ชันอ่านฟิลด์ตรวจชนิดของ JSON
+- ไฟล์เซสชันเป็นข้อความธรรมดาที่ป้องกันด้วยสิทธิ์ของไฟล์ ใครที่อ่านไฟล์นี้ได้ก็สวมรอยเป็นอุปกรณ์ที่เชื่อมนี้ได้
