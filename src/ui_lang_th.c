@@ -569,6 +569,8 @@ static const char *const strings[][2] = {
 	{ "View", "ดู" },
 	{ "View image", "ดูรูป" },
 	{ "View invitation", "ดูคำเชิญ" },
+	{ "Wait %d seconds before signing in again.",
+	  "รอ %d วินาทีก่อนลงชื่อเข้าใช้อีกครั้ง" },
 	{ "Waiting for video…", "กำลังรอวิดีโอ…" },
 	{ "Welcome to Avernella", "ยินดีต้อนรับสู่ Avernella" },
 	{ "Welcome to the beginning of %s.", "ยินดีต้อนรับสู่จุดเริ่มต้นของ %s" },

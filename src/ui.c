@@ -230,6 +230,16 @@ static gboolean window_visible(void)
 		 (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED));
 }
 
+static struct {
+	gint64 not_before; /* monotonic µs */
+	guint rejected;
+	char *notice;
+	int shown;
+} sign_in;
+
+static int sign_in_wait(void);
+static void show_sign_in_wait(void);
+
 static int frame_wait(gint64 now, gboolean visual_animation)
 {
 	/* Keep receiving worker and input events while the tray or window
@@ -251,6 +261,14 @@ static int frame_wait(gint64 now, gboolean visual_animation)
 		if (wait < 0 || next_image < wait)
 			wait = next_image;
 	}
+	int left = !ui.connected && !ui.authenticating ? sign_in_wait() : 0;
+
+	if (left != sign_in.shown) {
+		show_sign_in_wait();
+		ui.dirty = TRUE;
+	}
+	if (left)
+		wait = wait < 0 ? 1000 : MIN(wait, 1000);
 	return wait;
 }
 
@@ -300,6 +318,64 @@ static struct pending_preview previews[LINE_PREVIEW_COUNT] = {
 };
 
 extern char **environ;
+
+static void set_string(char **dest, const char *s);
+
+/*
+ * Sign-in pacing that outlives each attempt's worker: the wait LINE asked
+ * for, and the run of rejected email passwords, which waits 10 s, 30 s
+ * and then 2 minutes before the next try. A success clears the run.
+ */
+static int sign_in_wait(void)
+{
+	gint64 left = sign_in.not_before - g_get_monotonic_time();
+
+	return left > 0 ? (int)((left + G_USEC_PER_SEC - 1) / G_USEC_PER_SEC) :
+			  0;
+}
+
+static void note_sign_in_failure(Json *packet)
+{
+	static const int pause[] = { 0, 0, 10, 30, 120 };
+	int wait = json_object_get_int(ui_field(packet, "retryAfter"));
+
+	if (json_object_get_int(ui_field(packet, "code")) ==
+	    LINE_CREDENTIALS_REJECTED) {
+		sign_in.rejected =
+			MIN(sign_in.rejected + 1, G_N_ELEMENTS(pause) - 1);
+		wait = MAX(wait, pause[sign_in.rejected]);
+	}
+	if (wait > 0)
+		sign_in.not_before =
+			MAX(sign_in.not_before,
+			    g_get_monotonic_time() + wait * G_USEC_PER_SEC);
+	g_clear_pointer(&sign_in.notice, g_free);
+}
+
+/* Adds how long to wait to the sign-in notice, while a wait is due. */
+static void show_sign_in_wait(void)
+{
+	int wait = sign_in_wait();
+
+	if (!wait) {
+		if (sign_in.notice)
+			set_string(&ui.notice, sign_in.notice);
+		g_clear_pointer(&sign_in.notice, g_free);
+		sign_in.shown = 0;
+		return;
+	}
+	if (!sign_in.notice)
+		sign_in.notice = g_strdup(ui.notice);
+	g_autofree char *pause = g_strdup_printf(
+		_("Wait %d seconds before signing in again."), wait);
+	g_autofree char *notice =
+		sign_in.notice && *sign_in.notice ?
+			g_strconcat(sign_in.notice, " ", pause, NULL) :
+			g_strdup(pause);
+
+	set_string(&ui.notice, notice);
+	sign_in.shown = wait;
+}
 static void reset_login(const char *message);
 static void handle_packet(Json *packet);
 
@@ -1007,6 +1083,11 @@ static void login(gboolean resume)
 	}
 	gboolean password = ui.email_login && !resume;
 
+	if (!resume && sign_in_wait()) {
+		set_string(&ui.notice, "");
+		show_sign_in_wait();
+		return;
+	}
 	if (password &&
 	    (!ui.login_email.value->len || !ui.login_password.value->len)) {
 		set_string(&ui.notice,
@@ -1058,7 +1139,7 @@ static void retry_login(const char *error)
 {
 	guint delay = 5u << MIN(wire.login_failures, 6u);
 
-	delay = MIN(delay, 300u);
+	delay = MAX(MIN(delay, 300u), (guint)sign_in_wait());
 	wire.login_failures++;
 	g_autofree char *notice = g_strdup_printf(
 		_("Still signed in. %s Retrying in %u s…"), error, delay);
@@ -1525,8 +1606,13 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			reset_login(
 				error ? error :
 					_("Sign-in returned an unexpected response."));
+			show_sign_in_wait();
 			return;
 		}
+		sign_in.rejected = 0;
+		sign_in.not_before = 0;
+		g_clear_pointer(&sign_in.notice, g_free);
+		sign_in.shown = 0;
 		ui.authenticating = FALSE;
 		ui.connected = TRUE;
 		ui.email_login = FALSE;
@@ -1711,6 +1797,8 @@ static void handle_packet(Json *packet)
 			const char *error = ui_string(packet, "error", NULL);
 
 			g_hash_table_steal(wire.requests, GUINT_TO_POINTER(id));
+			if (saved->method == LOGIN && error)
+				note_sign_in_failure(packet);
 			if (saved->method == LOGIN && error &&
 			    json_object_get_boolean(ui_field(packet, "retry")))
 				retry_login(error);
@@ -2677,6 +2765,7 @@ int line_ui(int argc, char **argv)
 	json_object_put(ui.opened);
 	g_free(ui.name);
 	g_free(ui.notice);
+	g_free(sign_in.notice);
 	g_free(ui.pin);
 	g_free(ui.composition);
 	set_json(&ui.history, NULL);

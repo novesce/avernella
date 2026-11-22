@@ -566,6 +566,8 @@ static const char *const strings[][2] = {
 	{ "View", "檢視" },
 	{ "View image", "檢視圖片" },
 	{ "View invitation", "檢視邀請" },
+	{ "Wait %d seconds before signing in again.",
+	  "請等待 %d 秒後再登入。" },
 	{ "Waiting for video…", "正在等待影片…" },
 	{ "Welcome to Avernella", "歡迎使用 Avernella" },
 	{ "Welcome to the beginning of %s.", "歡迎來到 %s 的開始。" },

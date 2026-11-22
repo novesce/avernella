@@ -604,6 +604,8 @@ static const char *const strings[][2] = {
 	{ "View", "表示" },
 	{ "View image", "画像を表示" },
 	{ "View invitation", "招待を表示" },
+	{ "Wait %d seconds before signing in again.",
+	  "%d秒待ってから、もう一度ログインしてください。" },
 	{ "Waiting for video…", "動画を待っています…" },
 	{ "Welcome to Avernella", "Avernellaへようこそ" },
 	{ "Welcome to the beginning of %s.", "%sの始まりへようこそ。" },

@@ -596,6 +596,8 @@ static const char *const strings[][2] = {
 	{ "View", "보기" },
 	{ "View image", "이미지 보기" },
 	{ "View invitation", "초대 보기" },
+	{ "Wait %d seconds before signing in again.",
+	  "%d초 후에 다시 로그인하세요." },
 	{ "Waiting for video…", "동영상을 기다리는 중…" },
 	{ "Welcome to Avernella", "Avernella에 오신 것을 환영합니다" },
 	{ "Welcome to the beginning of %s.",

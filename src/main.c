@@ -290,6 +290,28 @@ static void end_session(struct line_worker *w)
 			"LINE ended this desktop session. Choose sign in to pair again.");
 }
 
+/*
+ * Sign-in refusals that retrying can never fix, explained in the words of
+ * LINE's own help. TalkException numbers from LINE 26.x (iu8.n9).
+ */
+static const char *sign_in_refusal(int code)
+{
+	switch (code) {
+	case 44: /* NOT_ALLOWED_SECONDARY_DEVICE */
+		return "LINE doesn't allow sign-in on other devices for this account. Turn on Allow login in LINE on your phone (Settings, Account), then try again.";
+	case 16: /* NO_AVAILABLE_VERIFICATION_METHOD */
+		return "LINE has no way to confirm this sign-in. Sign in with a QR code instead.";
+	case 22: /* DEACTIVATED_ACCOUNT_BOUND_TO_THIS_IDENTITY */
+		return "The LINE account for this email address has been deactivated.";
+	case 11: /* INCOMPATIBLE_APP_VERSION */
+	case 50: /* MUST_UPGRADE */
+	case 124: /* INCOMPATIBLE_APP_TYPE */
+		return "LINE no longer accepts sign-in from this app version.";
+	default:
+		return NULL;
+	}
+}
+
 static gboolean pair_worker(struct line_worker *w, GError **error)
 {
 	if (w->credentials_fd < 0)
@@ -325,8 +347,16 @@ static J *login(struct line_worker *w, GError **error)
 	}
 	if (!w->ready) {
 		if (!s->access) {
-			if (!pair_worker(w, error))
+			if (!pair_worker(w, error)) {
+				const char *why =
+					sign_in_refusal(s->service_code);
+
+				if (why && error && *error) {
+					g_clear_error(error);
+					problem(error, why);
+				}
 				return NULL;
+			}
 			if (!line_store_save(w->dir, s, error)) {
 				/*
 				 * The phone has already approved a live session. End it
@@ -2092,6 +2122,18 @@ static void handle(struct line_worker *w, const char *line)
 	if (g_error_matches(error, LINE_ERROR, LINE_RETRY))
 		json_object_object_add(reply, "retry",
 				       json_object_new_boolean(TRUE));
+	/*
+	 * Each sign-in attempt runs in a fresh worker, so the window keeps
+	 * what this one learned: why it failed and how long LINE asked to wait.
+	 */
+	if (error && error->domain == LINE_ERROR)
+		json_object_object_add(reply, "code",
+				       json_object_new_int(error->code));
+	int wait = line_transport_retry_after();
+
+	if (wait && g_error_matches(error, LINE_ERROR, LINE_RATE_LIMITED))
+		json_object_object_add(reply, "retryAfter",
+				       json_object_new_int(wait));
 	line_emit(reply);
 	/* A request LINE answered with an auth refusal ends the session. */
 	if (w->ready && w->session.denied) {

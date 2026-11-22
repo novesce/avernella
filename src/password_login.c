@@ -246,12 +246,18 @@ static gboolean password_session(Line *s, const char *id, const char *cipher,
 		line_auth_call(s, AUTH_PATH, "loginV2", args, error);
 
 	if (!initial) {
+		/*
+		 * INVALID_IDENTITY_CREDENTIAL, NOT_AVAILABLE_IDENTITY_IDENTIFIER,
+		 * NO_SUCH_IDENTITY_IDENFIER and ILLEGAL_IDENTITY_CREDENTIAL. The
+		 * window paces further attempts on this code.
+		 */
 		if (s->service_code == 18 || s->service_code == 19 ||
 		    s->service_code == 21 || s->service_code == 23) {
 			g_clear_error(error);
-			return fail(
-				error,
+			g_set_error_literal(
+				error, LINE_ERROR, LINE_CREDENTIALS_REJECTED,
 				"LINE did not accept that email address and password.");
+			return FALSE;
 		}
 		return FALSE;
 	}

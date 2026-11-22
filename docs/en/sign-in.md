@@ -71,6 +71,14 @@ Implemented in [`password_login.c`](../../src/password_login.c). These endpoints
 8. **Confirm.** `confirmE2EELogin({1: verifier, 2: proof})` returns a new verifier string.
 9. **Second `loginV2`** with field 1 changed to 1 and field 9 set to that verifier. Reply field 9 holds the tokens (1 access, 2 refresh, 3 duration, 6 issue time), and field 10 the MID.
 
+### Failed sign-ins and pacing
+
+Email sign-in never retries automatically. A refusal returns to the form and waits for another explicit sign-in action. The UI keeps the delay across the fresh worker processes used by separate attempts:
+
+- A 429 or 503 reply carries its remaining `retryAfter` seconds back to the window. Sign-in stays unavailable until that cooldown expires, and a visible countdown updates once per second.
+- The first two rejected email/password attempts have no added delay. Further rejections wait 10 seconds, then 30 seconds, then 2 minutes between attempts. A successful sign-in clears this run. These delays are cautious local pacing, not limits published by LINE.
+- Code 44 explains how to enable **Allow login** on the phone, code 16 recommends QR sign-in when no verification method is available, and code 22 reports a deactivated account. None of these responses is retried automatically.
+
 ## Staying signed in
 
 - **Launch without network.** `login()` returns `LINE_RETRY` only when `transient_failure()` says a network could have caused the failure: no HTTP answer at all, HTTP 408, 429 or 5xx, or a local cooldown. The UI then keeps the session and retries (`retry_login()` in `ui.c`) after 5, 10, 20… seconds, at most every five minutes, showing "Still signed in". During a cooldown those retries fail locally without a request.

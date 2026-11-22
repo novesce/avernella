@@ -199,6 +199,9 @@ static void attempt(gconstpointer data)
 	g_assert_cmpmem(password, sizeof(password), wiped, sizeof(wiped));
 	if (outcome) {
 		g_assert_nonnull(error);
+		if (outcome == 1)
+			g_assert_error(error, LINE_ERROR,
+				       LINE_CREDENTIALS_REJECTED);
 		g_assert_null(s.access);
 		g_assert_null(s.keys);
 		g_assert_cmpuint(stage, ==, outcome + 1);

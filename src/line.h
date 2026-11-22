@@ -143,7 +143,9 @@ enum {
 	LINE_RETRY = 8,
 	LINE_RATE_LIMITED = 9,
 	/* HTTP 401 or 403: LINE refused the request's credentials. */
-	LINE_ACCESS_DENIED = 10
+	LINE_ACCESS_DENIED = 10,
+	/* LINE did not accept the email address and password. */
+	LINE_CREDENTIALS_REJECTED = 11
 };
 
 /*
