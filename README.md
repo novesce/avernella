@@ -215,7 +215,7 @@ The [Android build analysis](analysis/portability.md) identifies the packaged ar
 
 ## License
 
-Avernella starts from the [line-linux source snapshot](https://github.com/novesce/line-linux/commit/86958170a61cadf8bda0d4edfb8b784e9954e0da). See the original project for its development history and contributor credits.
+Avernella starts from the [line-linux source snapshot](https://github.com/novesce/line-linux/commit/86958170a61cadf8bda0d4edfb8b784e9954e0da). See the original project for its development history and contributor credits. line-linux was first released under GPL-2.0-only; its copyright holder, who is also Avernella's author, relicensed it under GPL-3.0-or-later, including the snapshot Avernella starts from.
 
 Avernella is released under the GNU General Public License, version 3 or (at your option) any later version. The NES sound-chip emulation in `src/chiptune.c` is ported from [Mesen](https://github.com/nesdev-org/MesenCE), copyright Sour and the Mesen contributors, under the same license. The protocol references retain their MIT notices. [GPL-3.0-or-later](LICENSE) · [line-rs notice](analysis/protocol-reference-LICENSE) · [LINEJS notice](analysis/linejs-LICENSE) · [Beeper LINE notice](analysis/beeper-line-LICENSE)
 
