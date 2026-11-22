@@ -158,7 +158,7 @@ finish:
 
 void vk_ui_draw_mode(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 		     VkPipeline pipeline, VkImageView target, VkExtent2D extent,
-		     const struct ui_push *push, uint32_t count,
+		     VkRect2D area, const struct ui_push *push, uint32_t count,
 		     VkClearColorValue clear, bool discard)
 {
 	VkRenderingAttachmentInfo color = {
@@ -172,7 +172,7 @@ void vk_ui_draw_mode(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 	};
 	VkRenderingInfo rendering = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_INFO,
-		.renderArea.extent = extent,
+		.renderArea = area,
 		.layerCount = 1,
 		.colorAttachmentCount = 1,
 		.pColorAttachments = &color,

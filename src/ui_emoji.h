@@ -22,5 +22,5 @@ gboolean ui_emoji_input(SDL_Event *event);
 void ui_emoji_pick_close(void);
 cairo_surface_t *ui_emoji_image(Json *meta, gboolean load, gboolean *failed);
 
-void ui_emoji_frame_start(gint64 now);
+void ui_emoji_frame_start(gint64 now, gboolean full);
 gint64 ui_emoji_deadline(void);

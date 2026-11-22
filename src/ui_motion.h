@@ -30,3 +30,13 @@ void ui_motion_refresh_preferences(void);
 void ui_motion_choose(int reduce);
 int ui_motion_choice(void);
 void ui_motion_shutdown(void);
+
+/* Remaining displacement for a short slide with one soft overshoot. */
+double ui_settle(double progress);
+
+typedef struct {
+	gint64 down, up;
+} UiPress;
+
+/* A short tap still reaches full depth; holding at rest needs no frames. */
+double ui_press_depth(UiPress press, gint64 now, gint64 *deadline);

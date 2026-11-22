@@ -31,11 +31,13 @@ The UI starts the worker on the first sign-in attempt with `posix_spawn` of `/pr
 
 ### The worker process
 
-The worker ([`src/main.c`](../src/main.c), from `worker()`) is the only process that holds your session: access and refresh tokens, Letter Sealing keys and the message sequence counter. It runs every LINE request, encrypts and decrypts messages, uploads and downloads media, and runs calls. Its main loop blocks in `poll` on three things:
+The worker ([`src/main.c`](../src/main.c), from `worker()`) is the only process that holds your session: access and refresh tokens, Letter Sealing keys and the message sequence counter. It runs every LINE request, encrypts and decrypts messages, uploads and downloads media, and runs calls. Its main loop blocks in `poll` on these descriptors:
 
 - the UI socket,
-- a one-shot `timerfd` for token renewal and the fallback revision check,
-- an `eventfd` from the sync thread.
+- separate one-shot timers for the fallback revision check and the token renewal time LINE supplied,
+- eventfds from the image and sync threads.
+
+A pending call invitation or failed renewal or save supplies a monotonic timeout for this wait. During healthy long polling, an idle worker with a future renewal can sleep until that deadline or the next event.
 
 **The sync thread** ([`live_sync.c`](../src/live_sync.c)) keeps one `sync` request open on `/SYNC4` on its own HTTPS connection. LINE answers as soon as anything happens, so a new message reaches the window about one network round trip after it was sent. The thread hands operations to the worker through the eventfd. If the long poll keeps failing, the worker falls back to checking `getLastOpRevision` every second.
 
@@ -146,11 +148,11 @@ The app leans on the kernel and glibc instead of frameworks.
 
 **Network**
 - **Connection reuse.** Native HTTPS uses libcurl with HTTP/2 negotiation, TCP Fast Open and keepalive. The RPC threads share caches for DNS answers and TLS sessions ([`http_tune.c`](../src/http_tune.c)). Each thread keeps its own curl handle and connection pool, so the long poll can run independently of sends ([`transport.c`](../src/transport.c)).
-- **Long poll instead of timers.** Messages arrive by long poll. The worker sleeps in `poll` on a socket, an `eventfd` and a `timerfd`, and wakes only when something happens.
+- **Long poll instead of timers.** Messages arrive by long poll. The worker sleeps in `poll` until a socket, eventfd, or maintenance deadline needs attention.
 
 **Memory**
 - **Few allocator arenas.** `mallopt` sets two malloc arenas, a 128 KiB mmap threshold and a 512 KiB trim threshold, so big picture buffers go back to the kernel when freed, and the UI calls `malloc_trim` when it loses focus ([`tune.c`](../src/tune.c)).
-- **Bounded caches.** Thumbnails share a 12 MiB cache and animations a 32 MiB budget.
+- **Decoded image caches.** Image reservations shed old thumbnails above 12 MiB. Recent pictures and pending requests can use up to 32 MiB. A partial repaint keeps previously visible pictures eligible for reuse. Hiding or minimizing the window releases cold decoded entries. Animation frames have a separate 32 MiB budget and are released with their poster.
 - **Zero-copy pictures.** Pictures cross processes as sealed memfds.
 
 **Scheduling and drawing**

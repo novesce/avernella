@@ -79,6 +79,22 @@ static void scrolling(void)
 	offset = 30; /* Search / keyboard selection reset the viewport. */
 	g_assert_false(ui_scroll_sample(&scroll, &offset, 2400, 701000, FALSE));
 	g_assert_cmpint(offset, ==, 30);
+
+	/* Preserve fractional wheel input without waking for invisible motion. */
+	ui_scroll_reset(&scroll, offset);
+	for (int i = 1; i <= 3; i++) {
+		ui_scroll_by(&scroll, &offset, .125, 100, 710000, FALSE);
+		g_assert_cmpint(scroll.end_us, ==, 0);
+		g_assert_cmpint(offset, ==, 30);
+	}
+	ui_scroll_by(&scroll, &offset, .125, 100, 710000, FALSE);
+	g_assert_cmpint(scroll.end_us, >, 0);
+	g_assert_false(ui_scroll_sample(&scroll, &offset, 100, 830000, FALSE));
+	g_assert_cmpint(offset, ==, 31);
+	ui_scroll_reset(&scroll, offset);
+	ui_scroll_by(&scroll, &offset, -1, 100, 900000, FALSE);
+	g_assert_false(ui_scroll_sample(&scroll, &offset, 100, 930000, FALSE));
+	g_assert_cmpint(offset, ==, 30);
 }
 
 static int compare_us(gconstpointer a, gconstpointer b)
@@ -177,12 +193,50 @@ static void preferences(void)
 	ui_motion_shutdown();
 }
 
+static void control_motion(void)
+{
+	const gint64 start = 1000000;
+	UiPress tap = { .down = start, .up = start + 5000 };
+	gint64 deadline;
+
+	g_assert_cmpfloat(ui_press_depth(tap, start, &deadline), ==, 0.);
+	g_assert_cmpfloat(ui_press_depth(tap, start + 40000, &deadline), ==,
+			  1.);
+	g_assert_cmpint(deadline, ==, start + 185000);
+	const int rates[] = { 60, 90, 120, 144, 240 };
+
+	for (guint i = 0; i < G_N_ELEMENTS(rates); i++) {
+		double peak = 0., rebound = 0.;
+		for (int frame = 0; frame < rates[i] / 4; frame++) {
+			gint64 elapsed =
+				(gint64)frame * G_USEC_PER_SEC / rates[i];
+			double depth =
+				ui_press_depth(tap, start + elapsed, &deadline);
+
+			peak = MAX(peak, depth);
+			rebound = MIN(rebound, depth);
+		}
+		g_assert_cmpfloat(peak, >, .96);
+		g_assert_cmpfloat(rebound, <, 0.);
+		g_assert_cmpfloat(rebound, >, -.09);
+		g_assert_cmpint(deadline, ==, 0);
+	}
+	tap.up = 0;
+	g_assert_cmpfloat(ui_press_depth(tap, start + 900000, &deadline), ==,
+			  1.);
+	g_assert_cmpint(deadline, ==, 0);
+	g_assert_cmpfloat(ui_settle(0.), ==, 1.);
+	g_assert_cmpfloat(ui_settle(1.), ==, 0.);
+	g_assert_cmpfloat(ui_settle(5.), ==, 0.);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/motion/clock", cadence);
 	g_test_add_func("/motion/scroll", scrolling);
 	g_test_add_func("/motion/preference", preferences);
+	g_test_add_func("/motion/control-feedback", control_motion);
 	g_test_add_func("/motion/headless-sdl", sdl_timing);
 	return g_test_run();
 }

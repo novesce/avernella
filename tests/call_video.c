@@ -285,6 +285,69 @@ static void standard_vp8(void)
 	done(&loop);
 }
 
+static void single_packet(gconstpointer mode)
+{
+	gboolean rfc = GPOINTER_TO_INT(mode);
+	struct loop loop = { 0 };
+	srtp_t observer, sender;
+
+	prepare(&loop);
+	memset(loop.pixels, 120, W * H);
+	g_assert_true(call_srtp_open(&observer, key_a, ssrc_specific, 101));
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < 5; i++) {
+		if (i == 4)
+			call_video_keyframe(loop.tx);
+		encode(&loop, 1000000 + i * 100000);
+		g_assert_cmpuint(loop.packets->len, ==, 1);
+		if (rfc)
+			reframe_vp8(&loop, observer, sender);
+		if (i == 2)
+			continue; /* Losing a whole frame requires a keyframe. */
+		g_assert_true(deliver(&loop, 0));
+		g_assert_cmpuint(loop.count, ==, i == 4 ? 3 : MIN(i + 1, 2));
+		g_assert_cmpint(call_video_needs_keyframe(loop.rx), ==, i == 3);
+	}
+	srtp_dealloc(sender);
+	srtp_dealloc(observer);
+	done(&loop);
+}
+
+static void single_packet_length(void)
+{
+	struct loop loop = { 0 };
+	srtp_t observer, sender;
+	guint8 packet[1200 + SRTP_MAX_TRAILER_LEN];
+	gsize size;
+
+	prepare(&loop);
+	memset(loop.pixels, 120, W * H);
+	encode(&loop, 1000000);
+	g_assert_cmpuint(loop.packets->len, ==, 1);
+	const guint8 *wire = g_bytes_get_data(loop.packets->pdata[0], &size);
+	int n = size;
+
+	g_assert_true(call_srtp_open(&observer, key_a, ssrc_specific, 101));
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	memcpy(packet, wire, size);
+	g_assert_cmpint(srtp_unprotect(observer, packet, &n), ==,
+			srtp_err_status_ok);
+	g_assert_cmphex(packet[12], ==, 0xbe); /* Single EVS3 keyframe. */
+	packet[17] ^= 1; /* Change the declared length, keep the VP8 data. */
+	g_assert_cmpint(srtp_protect(sender, packet, &n), ==,
+			srtp_err_status_ok);
+	g_assert_false(call_video_receive(loop.rx, packet, n, display, &loop));
+	g_assert_cmpuint(loop.count, ==, 0);
+	g_assert_true(call_video_needs_keyframe(loop.rx));
+	call_video_keyframe(loop.tx);
+	encode(&loop, 1100000);
+	g_assert_true(deliver(&loop, 0));
+	g_assert_cmpuint(loop.count, ==, 1);
+	srtp_dealloc(sender);
+	srtp_dealloc(observer);
+	done(&loop);
+}
+
 static void encrypted_feedback(void)
 {
 	struct loop loop = { 0 };
@@ -756,6 +819,12 @@ int main(int argc, char **argv)
 	g_test_add_func("/video/authentication-loss-and-keyframe-recovery",
 			recovery);
 	g_test_add_func("/video/standard-vp8-reordering", standard_vp8);
+	g_test_add_data_func("/video/single-packet/evs3", GINT_TO_POINTER(0),
+			     single_packet);
+	g_test_add_data_func("/video/single-packet/rfc7741", GINT_TO_POINTER(1),
+			     single_packet);
+	g_test_add_func("/video/single-packet/declared-length",
+			single_packet_length);
 	g_test_add_func("/video/encrypted-keyframe-feedback",
 			encrypted_feedback);
 	g_test_add_func("/video/profile-negotiation", negotiation);

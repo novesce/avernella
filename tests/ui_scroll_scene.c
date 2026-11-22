@@ -2,6 +2,7 @@
 #include "ui_private.h"
 #include "ui_gpu.h"
 #include "ui_motion.h"
+#include <gmodule.h>
 #include <string.h>
 
 enum {
@@ -11,6 +12,13 @@ enum {
 static uint32_t texture[H][W], presented[H][W];
 static unsigned int sparse, full, uploaded;
 static gboolean skip;
+static gint64 scene_time = 1000000;
+static struct gpu_rect dirty;
+
+G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
+{
+	return scene_time;
+}
 
 /* A deterministic consumer of the production scene's texel-copy commands. */
 bool ui_gpu_active(void)
@@ -47,6 +55,7 @@ int ui_gpu_draw(const struct gpu_scene *s)
 {
 	struct gpu_rect screen = { 0, 0, W, H };
 
+	dirty = s->damage;
 	if (skip) {
 		skip = FALSE;
 		return 0;
@@ -189,6 +198,37 @@ static void check_scroll_positions(void)
 		g_free(reference[i]);
 }
 
+static void check_row_animation(void)
+{
+	g_autofree guint8 *saved = g_malloc(sizeof(presented));
+
+	ui.hover_x = ui.list_box.x + 24;
+	/* LINE's taller row must also highlight at its lower edge. */
+	ui.hover_y = ui.list_box.y +
+		     (ui_theme_is_line() ? ui_chat_row_height() - 3 : 20);
+	ui_draw();
+	/* Settle pre-existing controls, then exit the hovered chat row. */
+	scene_time += 300000;
+	ui_draw();
+	ui.hover_x = ui.hover_y = -1;
+	ui_draw();
+	g_assert_cmpint(ui_animation_deadline(scene_time), >, scene_time);
+	for (int i = 0; i < 8; i++) {
+		scene_time += 16667;
+		ui_draw_animation();
+		g_assert_cmpint(dirty.w, >, 0);
+		g_assert_cmpint(dirty.w, <=, ui.list_box.w + 4);
+		g_assert_cmpint(dirty.h, <=, ui_chat_row_height() + 4);
+		memcpy(saved, presented, sizeof(presented));
+		ui_draw();
+		g_assert_cmpmem(saved, sizeof(presented), presented,
+				sizeof(presented));
+		if (!ui_animation_deadline(scene_time))
+			break;
+	}
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
+}
+
 static void history(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -245,6 +285,20 @@ static void history(void)
 				  json_object_array_length(ui.history));
 	ui.history_offset = 0;
 	check_chat_bubbles();
+	int index = 0, row_height = ui_chat_row_height();
+
+	json_object_array_add(
+		ui.chats,
+		json_tokener_parse(
+			"{\"id\":\"another\",\"name\":\"Fixture friend\"}"));
+	g_array_append_val(ui.visible, index);
+	g_setenv("LINE_REDUCE_MOTION", "0", TRUE);
+	ui_motion_refresh_preferences();
+	check_row_animation();
+	g_assert_true(ui_theme_toggle(&error));
+	g_assert_no_error(error);
+	ui_theme_changed(row_height);
+	check_row_animation();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
 	g_string_free(ui.message.value, TRUE);

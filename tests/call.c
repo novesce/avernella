@@ -1318,6 +1318,7 @@ static void incoming(gconstpointer mode)
 	g_autoptr(GError) e = NULL;
 	g_autoptr(J) stale = incoming_op(++revision, 50000, "CA");
 	line_voice_operation(&session, stale);
+	g_assert_cmpint(line_voice_tick(), ==, 0);
 	if (!video_fixture) {
 		g_autoptr(J) video = incoming_op(++revision, 0, "CV");
 
@@ -1328,6 +1329,7 @@ static void incoming(gconstpointer mode)
 		incoming_op(++revision, 0, video_fixture ? "CV" : "CA");
 	line_voice_operation(&session, op);
 	line_voice_operation(&session, op);
+	g_assert_cmpint(line_voice_tick(), >, g_get_monotonic_time());
 	expect_event("call_incoming u22222222222222222222222222222222");
 	g_assert_cmpint(g_async_queue_length(events), ==, 0);
 	struct pollfd fd = { .fd = server_fd, .events = POLLIN };
@@ -1341,6 +1343,7 @@ static void incoming(gconstpointer mode)
 	g_autoptr(J) result = decline ? line_voice_decline(peer, &e) :
 					line_voice_answer(peer, &e);
 	g_assert_no_error(e);
+	g_assert_cmpint(line_voice_tick(), ==, 0);
 	g_assert_cmpstr(strfield(result, "state"), ==, "connecting");
 	g_assert_cmpint(json_object_get_boolean(field(result, "video")), ==,
 			video_fixture);

@@ -44,7 +44,7 @@ struct image_job {
 struct line_worker {
 	Line session;
 	LineStickers *stickers;
-	int dir, timer, credentials_fd;
+	int dir, timer, renewal_timer, credentials_fd;
 	gboolean ready, latest_history, foreground;
 	struct line_talk_sync sync;
 	/* Long-poll sync thread; the timer polls only while it fails. */
@@ -52,8 +52,8 @@ struct line_worker {
 	gboolean live_failing;
 	gint64 displayed_revision;
 	guint sync_failures;
-	/* Scheduled token renewal: monotonic retry time and failure count. */
-	gint64 refresh_retry;
+	/* Retry deadlines use monotonic microseconds; renewal uses Unix seconds. */
+	gint64 refresh_retry, save_retry, armed_renewal;
 	guint refresh_failures;
 	/* Chat IDs map to borrowed chat_snapshot rows, or NULL before first sync. */
 	GHashTable *chats;
@@ -197,6 +197,8 @@ static void clear_view(struct line_worker *w)
 	g_clear_pointer(&w->live, line_live_sync_stop);
 	w->live_failing = FALSE;
 	w->sync_failures = 0;
+	w->refresh_retry = w->save_retry = 0;
+	w->refresh_failures = 0;
 	w->generation++;
 	w->ready = w->foreground = FALSE;
 	w->displayed_revision = -1;
@@ -1235,7 +1237,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "foreground")) {
 		gboolean active = json_object_get_boolean(field(params, "active"));
 
-		if (active && !w->foreground && !w->sync_failures && w->timer >= 0) {
+		if (active && !w->foreground && !w->sync_failures &&
+		    (!w->live || w->live_failing) && w->timer >= 0) {
 			struct itimerspec timer;
 
 			if (!timerfd_gettime(w->timer, &timer) &&
@@ -1790,6 +1793,8 @@ static void finish_images(struct line_worker *w)
 	}
 }
 
+static void save_rotated_token(struct line_worker *w);
+
 static void handle(struct line_worker *w, const char *line)
 {
 	g_autoptr(J) req = json_tokener_parse(line), reply = obj();
@@ -1833,11 +1838,8 @@ static void handle(struct line_worker *w, const char *line)
 		g_clear_pointer(&w->session.obs_token, g_free);
 		w->session.obs_until = 0;
 	}
-	if (w->session.token_changed && w->session.access && w->dir >= 0) {
-		g_autoptr(GError) save_error = NULL;
-		if (!line_store_save(w->dir, &w->session, &save_error))
-			line_event("status", "message", save_error->message);
-	}
+	if (w->session.token_changed && w->session.access && w->dir >= 0)
+		save_rotated_token(w);
 	json_object_object_add(reply, "id", json_object_get(id));
 	if (value)
 		json_object_object_add(reply, "result", value);
@@ -1896,11 +1898,21 @@ static void maintain_tokens(struct line_worker *w)
 
 	if (mono < w->refresh_retry || !line_refresh_due(s, now))
 		return;
+	int cooldown = line_transport_retry_after();
+	if (cooldown) {
+		w->refresh_retry = mono + (gint64)cooldown * G_USEC_PER_SEC;
+		return;
+	}
 	g_autoptr(GError) error = NULL;
 	gboolean debug = !g_strcmp0(g_getenv("LINE_DEBUG_SESSION"), "1");
 
 	if (line_refresh_session(s, &error)) {
 		w->refresh_failures = 0;
+		w->refresh_retry = 0;
+		/* A successful response can still carry a past issue time. */
+		if (line_refresh_due(s, now))
+			w->refresh_retry =
+				g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
 		if (debug)
 			g_printerr(
 				"line-session renewed; next renewal in %lld s\n",
@@ -1924,10 +1936,60 @@ static void save_rotated_token(struct line_worker *w)
 
 	if (s->access && s->token_changed) {
 		g_autoptr(GError) storage_error = NULL;
-		if (!line_store_save(w->dir, s, &storage_error))
+		if (!line_store_save(w->dir, s, &storage_error)) {
+			w->save_retry =
+				g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
 			line_event("status", "message", storage_error->message);
+		} else
+			w->save_retry = 0;
 	}
 	line_live_sync_set_access(w->live, s->access);
+}
+
+static gint64 earlier_deadline(gint64 first, gint64 second)
+{
+	return !first || (second && second < first) ? second : first;
+}
+
+/*
+ * With healthy long polling the eventfd announces changes. Renewals use
+ * LINE's absolute Unix time so suspend and wall-clock changes are respected.
+ * Invitation expiry and retry intervals use elapsed monotonic time.
+ */
+static int maintenance_wait(struct line_worker *w)
+{
+	Line *s = &w->session;
+	gint64 next = line_voice_tick(), renewal = 0;
+
+	if (w->live && !w->live_failing && s->access) {
+		gint64 now = g_get_monotonic_time();
+		gint64 wall = g_get_real_time() / G_USEC_PER_SEC;
+
+		if (line_refresh_due(s, wall)) {
+			maintain_tokens(w);
+			next = earlier_deadline(next, w->refresh_retry);
+		}
+		if (s->refresh && *s->refresh && s->refresh_at > wall)
+			renewal = s->refresh_at;
+		if (s->token_changed && now >= w->save_retry)
+			save_rotated_token(w);
+		if (s->token_changed)
+			next = earlier_deadline(next, w->save_retry);
+	}
+	if (renewal != w->armed_renewal) {
+		struct itimerspec timer = { .it_value.tv_sec = renewal };
+		if (w->renewal_timer >= 0 &&
+		    !timerfd_settime(w->renewal_timer, TFD_TIMER_ABSTIME,
+				     &timer, NULL))
+			w->armed_renewal = renewal;
+		else if (renewal)
+			next = earlier_deadline(next,
+						g_get_monotonic_time() +
+							2 * G_USEC_PER_SEC);
+	}
+	if (!next)
+		return -1;
+	return CLAMP((next - g_get_monotonic_time() + 999) / 1000, 0, G_MAXINT);
 }
 
 /*
@@ -2107,22 +2169,13 @@ static void sync_revision(struct line_worker *w)
 
 	if (!w->ready || read(w->timer, &tick, sizeof(tick)) != sizeof(tick))
 		return;
-	line_voice_tick();
+	if (w->live && !w->live_failing)
+		return;
 	Line *s = &w->session;
 	int wait = line_transport_retry_after();
 
 	if (wait) {
-		/* Continue expiring local call invitations during the cooldown. */
-		wake_after(w, MIN(wait, 3));
-		return;
-	}
-
-	/* The long poll delivers operations; only maintenance runs here. */
-	if (w->live && !w->live_failing) {
-		wake_after(w, 2);
-		if (s->access)
-			maintain_tokens(w);
-		save_rotated_token(w);
+		wake_after(w, wait);
 		return;
 	}
 
@@ -2156,7 +2209,8 @@ static void sync_revision(struct line_worker *w)
 		     current > w->displayed_revision))
 			line_event("changed", NULL, NULL);
 		w->displayed_revision = MAX(w->displayed_revision, current);
-		wake_after(w, catch_up || w->foreground ? 1 : 3);
+		if (!w->live || w->live_failing)
+			wake_after(w, catch_up || w->foreground ? 1 : 3);
 	} else if (session_rejected(s, error)) {
 		g_autoptr(GError) removal = NULL;
 		forget(w, &removal);
@@ -2199,13 +2253,16 @@ static int worker(int credentials_fd)
 	} else {
 		frame_fd = -1;
 	}
-	struct line_worker w = { .dir = -1,
-				 .credentials_fd = credentials_fd,
-				 .sync.revision = -1,
-				 .displayed_revision = -1,
-				 .timer = timerfd_create(
-					 CLOCK_MONOTONIC,
-					 TFD_CLOEXEC | TFD_NONBLOCK) };
+	struct line_worker w = {
+		.dir = -1,
+		.credentials_fd = credentials_fd,
+		.sync.revision = -1,
+		.displayed_revision = -1,
+		.renewal_timer = timerfd_create(CLOCK_REALTIME,
+						TFD_CLOEXEC | TFD_NONBLOCK),
+		.timer = timerfd_create(CLOCK_MONOTONIC,
+					TFD_CLOEXEC | TFD_NONBLOCK)
+	};
 	w.image_wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	w.image_requests = g_async_queue_new_full(image_free);
 	w.image_results = g_async_queue_new_full(image_free);
@@ -2220,10 +2277,13 @@ static int worker(int credentials_fd)
 	struct pollfd fds[] = { { .fd = STDIN_FILENO, .events = POLLIN },
 				{ .fd = w.timer, .events = POLLIN },
 				{ .fd = w.image_wake, .events = POLLIN },
-				{ .fd = -1, .events = POLLIN } };
+				{ .fd = -1, .events = POLLIN },
+				{ .fd = w.renewal_timer, .events = POLLIN } };
 	for (;;) {
+		int timeout = maintenance_wait(&w);
+
 		fds[3].fd = line_live_sync_fd(w.live);
-		if (poll(fds, G_N_ELEMENTS(fds), -1) < 0) {
+		if (poll(fds, G_N_ELEMENTS(fds), timeout) < 0) {
 			if (errno == EINTR)
 				continue;
 			break;
@@ -2253,8 +2313,16 @@ static int worker(int credentials_fd)
 			finish_images(&w);
 		if (fds[3].revents & POLLIN && w.live)
 			live_operations(&w);
+		if (fds[0].revents || fds[3].revents)
+			line_live_sync_set_access(w.live, w.session.access);
 		if (fds[1].revents & POLLIN)
 			sync_revision(&w);
+		if (fds[4].revents & POLLIN) {
+			guint64 tick;
+			if (read(w.renewal_timer, &tick, sizeof(tick)) ==
+			    sizeof(tick))
+				w.armed_renewal = 0;
+		}
 	}
 	g_clear_pointer(&w.live, line_live_sync_stop);
 	if (w.image_thread) {
@@ -2275,6 +2343,8 @@ static int worker(int credentials_fd)
 		close(w.credentials_fd);
 	if (w.timer >= 0)
 		close(w.timer);
+	if (w.renewal_timer >= 0)
+		close(w.renewal_timer);
 	line_session_clear(&w.session);
 	g_hash_table_unref(w.chats);
 	g_hash_table_unref(w.left_groups);

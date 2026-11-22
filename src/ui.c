@@ -2298,6 +2298,9 @@ static void event(SDL_Event *e)
 		}
 		return;
 	}
+	if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP ||
+	    e->type == SDL_WINDOWEVENT)
+		ui_draw_pointer(e);
 	if (ui_media_event(e) || ui_liff_event(e))
 		return;
 	switch (e->type) {
@@ -2545,7 +2548,9 @@ int line_ui(int argc, char **argv)
 				 history_changed = old_history !=
 						   ui.history_offset;
 			gboolean scrolled = list_changed || history_changed;
-			gboolean full = ui.dirty || visual_animation ||
+			gboolean full = ui.dirty ||
+					(visual_animation &&
+					 (scrolled || ui.video_dirty)) ||
 					(scrolled && (ui_emoji_deadline() ||
 						      ui_media_layer())) ||
 					(list_changed && history_changed);
@@ -2554,6 +2559,8 @@ int line_ui(int argc, char **argv)
 			ui.dirty = ui.video_dirty = FALSE;
 			if (full)
 				ui_draw();
+			else if (visual_animation)
+				ui_draw_animation();
 			else if (scrolled)
 				ui_draw_region(list_changed ? ui.list_box :
 							      ui.conversation);

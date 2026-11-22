@@ -67,6 +67,11 @@ gboolean ui_scroll_sample(UiScroll *scroll, int *offset, int maximum,
 	}
 	scroll->position = CLAMP(scroll->position, 0, maximum);
 	*offset = scroll->displayed = (int)(scroll->position + 0.5);
+	/* A monotonic ease cannot leave its final pixel once it reaches it. */
+	if (scroll->displayed == (int)(scroll->to + 0.5)) {
+		scroll->position = scroll->to;
+		scroll->end_us = 0;
+	}
 	return scroll->end_us != 0;
 }
 
@@ -152,4 +157,39 @@ void ui_motion_shutdown(void)
 {
 	g_clear_object(&preferences);
 	looked_up = FALSE;
+}
+
+double ui_settle(double progress)
+{
+	double t = CLAMP(progress, 0., 1.);
+	double remaining = 1. - t;
+
+	return remaining * remaining * (1. - 2.5 * t);
+}
+
+double ui_press_depth(UiPress press, gint64 now, gint64 *deadline)
+{
+	enum {
+		PRESS_US = 40000,
+		RELEASE_US = 145000
+	};
+
+	*deadline = 0;
+	if (!press.down)
+		return 0.;
+	gint64 bottom = press.down + PRESS_US;
+	gint64 release = MAX(bottom, press.up);
+
+	if (now < bottom) {
+		double left = CLAMP((double)(bottom - now) / PRESS_US, 0., 1.);
+
+		*deadline = bottom;
+		return 1. - left * left;
+	}
+	if (!press.up)
+		return 1.;
+	if (now >= release + RELEASE_US)
+		return 0.;
+	*deadline = release + RELEASE_US;
+	return ui_settle((double)(now - release) / RELEASE_US);
 }

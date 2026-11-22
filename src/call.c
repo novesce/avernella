@@ -88,12 +88,13 @@ static void clear_pending(void)
 	pending = (struct incoming_call){ 0 };
 }
 
-void line_voice_tick(void)
+gint64 line_voice_tick(void)
 {
 	if (pending.route && g_get_monotonic_time() >= pending.expires) {
 		call_state(pending.caller, "ended", NULL, pending.video);
 		clear_pending();
 	}
+	return pending.expires;
 }
 
 static struct call_task *active;

@@ -246,6 +246,8 @@ const char *ui_string(Json *obj, const char *key, const char *fallback);
 gboolean ui_draw_init(void);
 void ui_draw(void);
 void ui_draw_region(Rect logical);
+void ui_draw_animation(void);
+void ui_draw_pointer(const SDL_Event *event);
 void ui_draw_video(void);
 void ui_draw_reset_renderer(void);
 void ui_forget_history(void);

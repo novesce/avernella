@@ -134,7 +134,7 @@ static void image_barrier(VkCommandBuffer cmd, VkImage image,
 static VkResult draw_readback(struct render_test *test, uint64_t frame,
 			      const struct ui_prim *items, uint32_t count,
 			      const struct ui_clip *clips, uint32_t clip_count,
-			      VkClearColorValue clear,
+			      VkRect2D area, VkClearColorValue clear,
 			      vk_present_upload_fn upload, void *user)
 {
 	const struct vk_ctx *ctx = &test->ctx;
@@ -181,8 +181,8 @@ static VkResult draw_readback(struct render_test *test, uint64_t frame,
 		      items[0].pos[0] == 0 && items[0].pos[1] == 0 &&
 		      items[0].size[0] == WIDTH && items[0].size[1] == HEIGHT;
 	vk_ui_draw_mode(ctx, cmd, upload ? test->opaque : test->pipeline,
-			test->view, test->target.extent, &push, count, clear,
-			covers);
+			test->view, test->target.extent, area, &push, count,
+			clear, covers);
 	image_barrier(cmd, test->target.handle,
 		      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
@@ -276,6 +276,7 @@ static VkResult draw(struct render_test *test, uint64_t frame)
 	};
 	return draw_readback(test, frame, items, sizeof(items) / sizeof(*items),
 			     clips, sizeof(clips) / sizeof(*clips),
+			     (VkRect2D){ .extent = test->target.extent },
 			     (VkClearColorValue){ 0 }, NULL, NULL);
 }
 
@@ -308,8 +309,12 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 			 uint32_t count, VkClearColorValue clear,
 			 vk_present_upload_fn upload, void *user)
 {
-	return draw_readback(p->test, p->frame++, prims, count, NULL, 0, clear,
-			     upload, user);
+	VkRect2D area = p->damage.extent.width ?
+				p->damage :
+				(VkRect2D){ .extent = p->test->target.extent };
+
+	return draw_readback(p->test, p->frame++, prims, count, NULL, 0, area,
+			     clear, upload, user);
 }
 
 static bool check_color(struct render_test *test, unsigned x, unsigned y,
@@ -445,6 +450,20 @@ static VkResult check_canvas(struct render_test *test)
 	    !check_color(test, 1, 0, 153, 187, 68, 0) ||
 	    !check_color(test, 2, 0, 0, 0, 0, 0) ||
 	    !check_video(test, tile, (const uint8_t (*)[4])y, 16, -18))
+		goto failed;
+	/* Both the clear and the full-screen primitive must spare old pixels
+	 * outside the damaged rectangle on the reacquired target.
+	 */
+	const struct ui_prim fill = { .size = { WIDTH, HEIGHT },
+				      .color = 0xff00ff00,
+				      .clip_rect_idx = UI_NO_CLIP };
+	result = draw_readback(test, p.frame, &fill, 1, NULL, 0,
+			       (VkRect2D){ { 2, 1 }, { 3, 2 } },
+			       (VkClearColorValue){ .float32 = { 1, 0, 1, 1 } },
+			       NULL, NULL);
+	if (result != VK_SUCCESS || !check_color(test, 0, 0, 204, 17, 51, 0) ||
+	    !check_color(test, 3, 2, 0, 255, 0, 0) ||
+	    !check_color(test, 5, 2, 0, 0, 0, 0))
 		goto failed;
 	vk_canvas_close(canvas);
 	return VK_SUCCESS;
