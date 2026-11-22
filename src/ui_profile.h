@@ -25,6 +25,9 @@ void ui_profile_picture_chosen(const char *path);
 
 /* User panel: the name block opens your popout; inbox and settings. */
 Rect ui_profile_self_area(Rect panel);
+/* The LINE layout moves these into the navigation bar instead. */
+void ui_profile_place(Rect self, Rect inbox, Rect gear);
+gboolean ui_profile_in_bar(void);
 const char *ui_profile_self_avatar(void);
 const char *ui_profile_self_status(void);
 void ui_profile_panel_draw(void);

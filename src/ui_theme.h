@@ -29,14 +29,20 @@
 #define UI_DANGER 0xf23f43
 #define UI_ONLINE 0x23a55a
 
-/* LINE-style navigation and conversation surfaces use the same palette. */
+/*
+ * The LINE layout maps LINE's green onto the Avernella accent: sent bubbles,
+ * unread counts and the active tab are hot pink, and the conversation sits on
+ * a slightly raised plum so the list and the chat read as separate panes.
+ */
 #define UI_NAV_RAIL UI_RAIL
-#define UI_NAV_INK UI_MUTED
+#define UI_NAV_INK UI_SUBTLE
 #define UI_NAV_ACTIVE UI_ACCENT
 #define UI_NAV_HOVER UI_HOVER
-#define UI_CHAT_BG UI_BG
+#define UI_CHAT_BG UI_PANEL
 #define UI_BUBBLE_IN UI_RAISED
-#define UI_BUBBLE_OUT UI_TEXT_SELECTION
+#define UI_BUBBLE_IN_INK UI_BODY
+#define UI_BUBBLE_OUT UI_ACCENT
+#define UI_BUBBLE_OUT_INK UI_ON_ACCENT
 
 void ui_theme_init(void);
 gboolean ui_theme_is_line(void);

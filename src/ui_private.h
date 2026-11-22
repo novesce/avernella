@@ -78,7 +78,7 @@ enum {
 
 static inline int ui_chat_row_height(void)
 {
-	return ui_theme_is_line() ? 56 : 44;
+	return ui_theme_is_line() ? 68 : 44;
 }
 
 void ui_theme_changed(int old_row_height);
@@ -101,6 +101,8 @@ void ui_draw_round_button(Rect r, enum ui_call_glyph glyph, guint fill,
 void ui_draw_rounded(Rect r, int radius, guint rgb);
 void ui_draw_avatar(const char *name, const char *seed, Rect r);
 void ui_draw_tooltip(Rect anchor, const char *s);
+/* A tooltip to the right of anchor, for the navigation bar. */
+void ui_draw_tooltip_beside(Rect anchor, const char *s);
 void ui_draw_centered(const char *s, Rect r, int size, int weight, guint rgb);
 
 /* Left edge of the main pane: the rail and list stay visible beside it. */

@@ -124,6 +124,7 @@ static struct {
 	struct control controls[MAX_CONTROLS];
 	int ncontrols, hover;
 	Rect self_area, inbox_button, gear_button, user_panel;
+	gboolean in_bar; /* the buttons sit in the LINE navigation bar */
 } p = { .hover = -1 };
 
 static guint next_tag(void)
@@ -1043,6 +1044,13 @@ static void draw_inbox(void)
 	int x = CLAMP(anchor.x - 40, 8, MAX(8, ui.width - w - 8));
 	int y = MAX(8, anchor.y - h - 12);
 
+	if (p.in_bar) {
+		/* Open beside the bar, level with the button. */
+		x = anchor.x + anchor.w + 12;
+		y = CLAMP(anchor.y + anchor.h - h, 8,
+			  MAX(8, ui.height - h - 8));
+	}
+
 	p.panel = (Rect){ x, y, w, h };
 	control(p.panel, A_NOTHING, 0);
 	ui_draw_rounded((Rect){ x - 1, y - 1, w + 2, h + 2 }, 9, POPOUT_EDGE);
@@ -1654,12 +1662,27 @@ void ui_profile_reset(void)
 Rect ui_profile_self_area(Rect panel)
 {
 	p.user_panel = panel;
+	p.in_bar = FALSE;
 	p.gear_button = (Rect){ ui.logout.x - 34, ui.logout.y, 32, 32 };
 	p.inbox_button = (Rect){ ui.logout.x - 68, ui.logout.y, 32, 32 };
 	p.self_area = (Rect){ panel.x + 4, panel.y + 6,
 			      MAX(40, p.inbox_button.x - panel.x - 8),
 			      panel.h - 12 };
 	return p.self_area;
+}
+
+void ui_profile_place(Rect self, Rect inbox, Rect gear)
+{
+	p.user_panel = (Rect){ 0 };
+	p.self_area = self;
+	p.inbox_button = inbox;
+	p.gear_button = gear;
+	p.in_bar = TRUE;
+}
+
+gboolean ui_profile_in_bar(void)
+{
+	return p.in_bar;
 }
 
 const char *ui_profile_self_avatar(void)
@@ -1682,11 +1705,21 @@ static void panel_button(Rect r, enum ui_icon icon, gboolean lit,
 {
 	double h = ui_draw_hover(r);
 
+	guint base = p.in_bar ? UI_NAV_RAIL : UI_PANEL;
+
 	if (h > 0. || lit)
-		ui_draw_rounded(r, 6,
-				ui_blend(UI_PANEL, UI_LINE, lit ? 1. : h));
-	ui_draw_icon(r, icon, h > .5 || lit ? HEADING : UI_MUTED);
-	if (h > .5)
+		ui_draw_rounded(r, p.in_bar ? 12 : 6,
+				ui_blend(base,
+					 p.in_bar ? UI_NAV_HOVER : UI_LINE,
+					 lit ? 1. : h));
+	ui_draw_icon(r, icon,
+		     lit && p.in_bar ? UI_NAV_ACTIVE :
+		     h > .5 || lit   ? HEADING :
+		     p.in_bar	     ? UI_NAV_INK :
+				       UI_MUTED);
+	if (h > .5 && p.in_bar)
+		ui_draw_tooltip_beside(r, tip);
+	else if (h > .5)
 		ui_draw_tooltip((Rect){ r.x, r.y - 80, r.w, 34 }, tip);
 }
 
@@ -1694,10 +1727,10 @@ void ui_profile_panel_draw(void)
 {
 	panel_button(p.inbox_button, UI_ICON_INBOX, p.view == INBOX, "Inbox");
 	if (p.unseen > 0) {
-		Rect dot = { p.inbox_button.x + 18, p.inbox_button.y + 4, 12,
-			     12 };
+		Rect dot = { p.inbox_button.x + p.inbox_button.w - 14,
+			     p.inbox_button.y + 4, 12, 12 };
 		ui_draw_rounded((Rect){ dot.x - 2, dot.y - 2, 16, 16 }, 8,
-				UI_PANEL);
+				p.in_bar ? UI_NAV_RAIL : UI_PANEL);
 		ui_draw_rounded(dot, 6, UI_DANGER);
 	}
 	panel_button(p.gear_button, UI_ICON_GEAR, p.view == SETTINGS,
@@ -1743,8 +1776,9 @@ gboolean ui_profile_panel_click(int x, int y)
 					""));
 		/* Discord opens your own popout above the panel. */
 		ui_profile_open(me, NULL,
-				(Rect){ p.self_area.x, p.self_area.y - 420, 0,
-					0 });
+				p.in_bar ? p.self_area :
+					   (Rect){ p.self_area.x,
+						   p.self_area.y - 420, 0, 0 });
 		json_object_put(me);
 		return TRUE;
 	}
