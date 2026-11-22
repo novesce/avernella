@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_emoji.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_apng.h"
 #include <math.h>
@@ -217,7 +218,8 @@ static void insert_pick(Json *meta)
 			}
 		}
 		if (!replaces) {
-			ui_status("This message has reached the emoji limit.");
+			ui_status(
+				_("This message has reached the emoji limit."));
 			return;
 		}
 	}
@@ -461,9 +463,10 @@ void ui_emoji_catalog(guint tag, Json *result, const char *error)
 				  json_object_get(result) :
 				  NULL;
 	if (!palette.catalog && !palette.error)
-		palette.error = g_strdup(
-			palette.stickers ? "Could not load your stickers." :
-					   "Could not load your LINE emoji.");
+		palette.error =
+			g_strdup(palette.stickers ?
+					 _("Could not load your stickers.") :
+					 _("Could not load your LINE emoji."));
 	int n = palette.catalog ?
 			(int)json_object_array_length(palette.catalog) :
 			0;
@@ -603,7 +606,7 @@ static void draw_preview(Rect r)
 	Json *row = palette.preview;
 	cairo_surface_t *image = ui_emoji_image(row, TRUE, &failed);
 	g_autofree char *recipient = g_strdup_printf(
-		"Send to %s",
+		_("Send to %s"),
 		ui_string(ui_selected_chat(), "name", "this conversation"));
 	int side = MIN(196, r.h - 190);
 	Rect image_area = { r.x + (r.w - side) / 2, r.y + 66, side, side };
@@ -614,8 +617,8 @@ static void draw_preview(Rect r)
 	if (image)
 		ui_draw_image(image, image_area);
 	else
-		ui_draw_label(failed ? "Sticker preview unavailable." :
-				       "Loading sticker…",
+		ui_draw_label(failed ? _("Sticker preview unavailable.") :
+				       _("Loading sticker…"),
 			      (Rect){ r.x + 24, image_area.y + side / 2,
 				      r.w - 48, 35 },
 			      15, 450, MUTED, FALSE);
@@ -631,9 +634,9 @@ static void draw_preview(Rect r)
 	palette.back = (Rect){ r.x + 16, r.y + r.h - 49, 66, 34 };
 	palette.send = (Rect){ r.x + r.w - 122, r.y + r.h - 49, 106, 34 };
 	if (!palette.send_tag)
-		ui_draw_button(palette.back, "Back", FALSE);
+		ui_draw_button(palette.back, _("Back"), FALSE);
 	ui_draw_button(palette.send,
-		       palette.send_tag ? "Sending…" : "Send sticker",
+		       palette.send_tag ? _("Sending…") : _("Send sticker"),
 		       image && !palette.send_tag);
 }
 
@@ -651,23 +654,25 @@ void ui_emoji_draw(void)
 	if (ui.stickers && ui.emojis) {
 		palette.emoji_tab = (Rect){ x + 16, y + 12, 77, 31 };
 		palette.sticker_tab = (Rect){ x + 98, y + 12, 82, 31 };
-		ui_draw_button(palette.emoji_tab, "Emoji", !palette.stickers);
-		ui_draw_button(palette.sticker_tab, "Stickers",
+		ui_draw_button(palette.emoji_tab, _("Emoji"),
+			       !palette.stickers);
+		ui_draw_button(palette.sticker_tab, _("Stickers"),
 			       palette.stickers);
 	} else
-		ui_draw_label(palette.stickers ? "Stickers" : "LINE emoji",
+		ui_draw_label(palette.stickers ? _("Stickers") :
+						 _("LINE emoji"),
 			      (Rect){ x + 18, y + 16, w - 87, 32 }, 22, 650,
 			      INK, FALSE);
 	palette.close = (Rect){ x + w - 69, y + 12, 54, 31 };
-	ui_draw_button(palette.close, "Close", FALSE);
+	ui_draw_button(palette.close, _("Close"), FALSE);
 	palette.search = (Rect){ x + 16, y + 55, w - 32, 35 };
 	ui_draw_box(palette.search, UI_INPUT);
 	g_autofree char *query =
 		g_strconcat(palette.query ? palette.query : "",
 			    palette.preedit ? palette.preedit : "", NULL);
 	ui_draw_label(*query	       ? query :
-		      palette.stickers ? "Search stickers or packs…" :
-					 "Search emoji or packs…",
+		      palette.stickers ? _("Search stickers or packs…") :
+					 _("Search emoji or packs…"),
 		      (Rect){ x + 26, y + 62, w - 53, 26 }, 14, 450,
 		      *query ? INK : MUTED, FALSE);
 	int n = page_size(), dy = tile_height(), cell = (w - 32) / palette.cols;
@@ -708,15 +713,16 @@ void ui_emoji_draw(void)
 	if (!count)
 		ui_draw_label(
 			palette.loading ?
-				(palette.stickers ? "Loading stickers…" :
-						    "Loading your emoji…") :
+				(palette.stickers ? _("Loading stickers…") :
+						    _("Loading your emoji…")) :
 			palette.error ?
 				palette.error :
 			palette.query && *palette.query ?
-				(palette.stickers ? "No matching stickers." :
-						    "No matching emoji.") :
-				(palette.stickers ? "No stickers available." :
-						    "No emoji available."),
+				(palette.stickers ? _("No matching stickers.") :
+						    _("No matching emoji.")) :
+				(palette.stickers ?
+					 _("No stickers available.") :
+					 _("No emoji available.")),
 			(Rect){ x + 20, y + 119, w - 40, 80 }, 14, 450, MUTED,
 			TRUE);
 	palette.prev = (Rect){ x + w - 91, y + h - 46, 32, 30 };

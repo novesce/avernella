@@ -277,7 +277,7 @@ static gboolean send_browser(char kind, const char *a, const char *b)
 static void open_outside(const char *url)
 {
 	if (SDL_OpenURL(url) < 0)
-		ui_status("Could not open the link.");
+		ui_status(_("Could not open the link."));
 }
 
 void ui_liff_open_link(const char *url)
@@ -301,12 +301,12 @@ void ui_liff_open_link(const char *url)
 			json_object_object_add(
 				args, "chat",
 				json_object_new_string(ui.selected));
-		ui_status("Opening the LINE app…");
+		ui_status(_("Opening the LINE app…"));
 		ui_rpc("liffView", args, 0);
 		return;
 	}
 	if (line_liff_line_scheme(url)) {
-		ui_status("Open this LINE link on your phone.");
+		ui_status(_("Open this LINE link on your phone."));
 		return;
 	}
 	if (!line_flex_link_allowed(url))
@@ -334,7 +334,7 @@ gboolean ui_liff_reply(const char *action, guint tag, Json *result,
 	if (!page ||
 	    !send_browser('L', size ? json_object_get_string(size) : "full",
 			  page))
-		ui_status("Could not open the LINE app window.");
+		ui_status(_("Could not open the LINE app window."));
 	else
 		ui_status("");
 	return TRUE;
@@ -395,8 +395,8 @@ gboolean ui_liff_event(const SDL_Event *e)
 			if (pending[0] == 'W')
 				open_outside(pending + sizeof("W\tweb\t") - 1);
 			else
-				ui_status(
-					"Could not open the LINE app window.");
+				ui_status(_(
+					"Could not open the LINE app window."));
 		}
 		return TRUE;
 	}

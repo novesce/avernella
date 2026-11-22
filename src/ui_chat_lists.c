@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_chat_lists.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_sounds.h"
 #include "ui_motion.h"
@@ -47,17 +48,17 @@ static struct {
 
 static const struct {
 	const char *id, *name;
-} builtins[] = { { "all", "All chats" },
-		 { "unread", "Unread" },
-		 { "pinned", "Pinned" },
-		 { "people", "People" },
-		 { "groups", "Groups" } };
+} builtins[] = { { "all", N_("All chats") },
+		 { "unread", N_("Unread") },
+		 { "pinned", N_("Pinned") },
+		 { "people", N_("People") },
+		 { "groups", N_("Groups") } };
 
-static const char *const commands[] = { [LIST_FOLDERS] = "Chat folders",
-					[LIST_PIN] = "Pin or unpin chat",
-					[LIST_SEARCH] = "Find a chat",
-					[LIST_FIND] = "Find messages",
-					[LIST_REFRESH] = "Refresh chats" };
+static const char *const commands[] = { [LIST_FOLDERS] = N_("Chat folders"),
+					[LIST_PIN] = N_("Pin or unpin chat"),
+					[LIST_SEARCH] = N_("Find a chat"),
+					[LIST_FIND] = N_("Find messages"),
+					[LIST_REFRESH] = N_("Refresh chats") };
 
 static void free_choice(gpointer value)
 {
@@ -125,8 +126,8 @@ const char *ui_folder_title(void)
 		return view + 7;
 	for (guint i = 0; i < G_N_ELEMENTS(builtins); i++)
 		if (!strcmp(view, builtins[i].id))
-			return builtins[i].name;
-	return "All chats";
+			return _(builtins[i].name);
+	return _("All chats");
 }
 
 static gboolean matches(Json *row, const char *id)
@@ -245,12 +246,13 @@ static void choices(void)
 
 	if (panel.pane == PREFS) {
 		add(ALERT,
-		    ui_notifications_enabled() ? "Desktop notifications · On" :
-						 "Desktop notifications · Off",
+		    ui_notifications_enabled() ?
+			    _("Desktop notifications · On") :
+			    _("Desktop notifications · Off"),
 		    NULL, 0);
 		for (int i = 0; i < LIST_COMMANDS; i++) {
 			g_autofree char *label =
-				g_strdup_printf("%s    %s", commands[i],
+				g_strdup_printf("%s    %s", _(commands[i]),
 						chat_binding(panel.store, i));
 			add(BIND, label, NULL, i);
 		}
@@ -260,14 +262,16 @@ static void choices(void)
 		return;
 	if (panel.pane == VIEWS) {
 		for (guint i = 0; i < G_N_ELEMENTS(builtins); i++)
-			add(FILTER, builtins[i].name, builtins[i].id, 0);
+			add(FILTER, _(builtins[i].name), builtins[i].id, 0);
 	} else {
-		add(PIN, ui_list_pinned(panel.chat) ? "Unpin chat" : "Pin chat",
+		add(PIN,
+		    ui_list_pinned(panel.chat) ? _("Unpin chat") :
+						 _("Pin chat"),
 		    NULL, 0);
 		add(MUTE,
 		    chat_muted(panel.store, panel.chat) ?
-			    "Unmute conversation" :
-			    "Mute conversation",
+			    _("Unmute conversation") :
+			    _("Mute conversation"),
 		    NULL, 0);
 	}
 	Json *folders = chat_folders(panel.store);
@@ -278,13 +282,13 @@ static void choices(void)
 			add(FOLDER, name, name, 0);
 		}
 	}
-	add(NEW, "New folder…", NULL, 0);
+	add(NEW, _("New folder…"), NULL, 0);
 	if (panel.pane == VIEWS) {
 		if (g_str_has_prefix(view, "folder:")) {
-			add(EDIT, "Rename current folder…", NULL, 0);
-			add(DELETE, "Delete current folder…", NULL, 0);
+			add(EDIT, _("Rename current folder…"), NULL, 0);
+			add(DELETE, _("Delete current folder…"), NULL, 0);
 		}
-		add(PREF, "Preferences & shortcuts…", NULL, 0);
+		add(PREF, _("Preferences & shortcuts…"), NULL, 0);
 	}
 }
 
@@ -481,8 +485,8 @@ static void capture(SDL_KeyboardEvent key)
 	for (guint i = 0; i < G_N_ELEMENTS(reserved); i++)
 		if (!strcmp(value, reserved[i])) {
 			g_free(panel.note);
-			panel.note = g_strdup(
-				"This shortcut is used by the editor, calls or desktop.");
+			panel.note = g_strdup(_(
+				"This shortcut is used by the editor, calls or desktop."));
 			ui.dirty = TRUE;
 			return;
 		}
@@ -655,27 +659,27 @@ void ui_lists_draw(void)
 	ui_scrim();
 	ui_draw_box(panel.box, UI_DIALOG);
 	const char *title = panel.pane == ORGANIZE ? panel.name :
-			    panel.pane == PREFS	   ? "Preferences" :
-			    panel.pane == CAPTURE  ? "Keyboard shortcut" :
-			    panel.pane == CREATE   ? "New folder" :
-			    panel.pane == RENAME   ? "Rename folder" :
-			    panel.pane == REMOVE   ? "Delete folder?" :
-						     "Chat folders";
+			    panel.pane == PREFS	   ? _("Preferences") :
+			    panel.pane == CAPTURE  ? _("Keyboard shortcut") :
+			    panel.pane == CREATE   ? _("New folder") :
+			    panel.pane == RENAME   ? _("Rename folder") :
+			    panel.pane == REMOVE   ? _("Delete folder?") :
+						     _("Chat folders");
 	ui_draw_label(title, (Rect){ x + 16, y + 17, w - 105, 34 }, 21, 650,
 		      ink, FALSE);
 	panel.close = (Rect){ x + w - 74, y + 12, 58, 32 };
 	ui_draw_button(panel.close,
 		       (panel.pane == ORGANIZE || panel.pane == VIEWS) ?
-			       "Done" :
-			       "Back",
+			       _("Done") :
+			       _("Back"),
 		       FALSE);
 	if (editor() || panel.pane == REMOVE || panel.pane == CAPTURE) {
 		const char *label =
 			editor() ?
-				"Folder name" :
+				_("Folder name") :
 			panel.pane == REMOVE ?
-				"Chats in this folder will stay in All chats." :
-				commands[panel.binding];
+				_("Chats in this folder will stay in All chats.") :
+				_(commands[panel.binding]);
 		ui_draw_label(label, (Rect){ x + 18, y + 73, w - 36, 48 }, 15,
 			      500, ink, TRUE);
 		if (editor()) {
@@ -683,17 +687,18 @@ void ui_lists_draw(void)
 			ui_draw_path_entry(&panel.edit, panel.edit_box);
 		} else if (panel.pane == CAPTURE)
 			ui_draw_label(
-				"Press Ctrl or Alt with a letter or number, or a function key.",
+				_("Press Ctrl or Alt with a letter or number, or a function key."),
 				(Rect){ x + 18, y + 123, w - 36, 70 }, 15, 400,
 				muted, TRUE);
 		if (panel.pane != CAPTURE) {
 			panel.submit =
 				(Rect){ x + w - 122, y + h - 55, 106, 38 };
-			ui_draw_button(panel.submit,
-				       panel.pane == REMOVE ? "Delete folder" :
-				       panel.pane == CREATE ? "Create folder" :
-							      "Save name",
-				       TRUE);
+			ui_draw_button(
+				panel.submit,
+				panel.pane == REMOVE ? _("Delete folder") :
+				panel.pane == CREATE ? _("Create folder") :
+						       _("Save name"),
+				TRUE);
 		}
 	} else {
 		int rows = MAX(1, (h - 112) / 38);
@@ -731,7 +736,7 @@ void ui_lists_draw(void)
 	}
 	if (!panel.note && panel.pane == VIEWS)
 		ui_draw_label(
-			"Right-click a chat to pin it or choose its folders.",
+			_("Right-click a chat to pin it or choose its folders."),
 			(Rect){ x + 18, y + h - 40, w - 36, 34 }, 13, 450,
 			muted, TRUE);
 	if (panel.note)

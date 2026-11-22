@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_groups.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_friends.h"
 #include <string.h>
@@ -397,7 +398,7 @@ static void manage_action(enum manage_action a)
 		rpc("groupLink", manage_params(), FALSE);
 	} else if (a == M_SAVE) {
 		if (!g.name.value->len) {
-			set(&g.notice, "Enter a group name.");
+			set(&g.notice, _("Enter a group name."));
 			return;
 		}
 		Json *args = manage_params();
@@ -412,8 +413,8 @@ static void manage_action(enum manage_action a)
 		if (url)
 			set(&g.notice,
 			    SDL_SetClipboardText(url) == 0 ?
-				    "Link copied." :
-				    "Could not copy the group link.");
+				    _("Link copied.") :
+				    _("Could not copy the group link."));
 	} else if (a == M_CONFIRM && manager.page == MG_CONFIRM) {
 		Json *args = manage_params();
 		enum manage_action q = manager.question;
@@ -535,17 +536,17 @@ static void manage_draw(void)
 	ui_scrim();
 	ui_draw_box((Rect){ left, top, w, h }, UI_DIALOG);
 	const char *title =
-		manager.page == MG_MENU	       ? "Group settings" :
-		manager.page == MG_EDIT	       ? "Rename group" :
-		manager.page == MG_LINK	       ? "Invitation link and QR code" :
-		manager.question == M_LEAVE    ? "Leave group?" :
-		manager.question == M_REMOVE   ? "Remove member?" :
-		manager.question == M_WITHDRAW ? "Cancel invitation?" :
-		manager.question == M_ENABLE   ? "Enable invitation link?" :
-		manager.question == M_DISABLE  ? "Disable invitation link?" :
+		manager.page == MG_MENU	    ? _("Group settings") :
+		manager.page == MG_EDIT	    ? _("Rename group") :
+		manager.page == MG_LINK	    ? _("Invitation link and QR code") :
+		manager.question == M_LEAVE ? _("Leave group?") :
+		manager.question == M_REMOVE   ? _("Remove member?") :
+		manager.question == M_WITHDRAW ? _("Cancel invitation?") :
+		manager.question == M_ENABLE   ? _("Enable invitation link?") :
+		manager.question == M_DISABLE  ? _("Disable invitation link?") :
 		ui_string(manager.link, "url", NULL) ?
-						"Replace invitation link?" :
-						"Create invitation link?";
+						_("Replace invitation link?") :
+						_("Create invitation link?");
 	ui_draw_label(title, (Rect){ x, y, width, 34 }, 21, 650, UI_HEADING,
 		      FALSE);
 	y += 40;
@@ -553,40 +554,40 @@ static void manage_draw(void)
 		      FALSE);
 	y += 38;
 	manage_button((Rect){ x, top + h - 52, 96, 34 },
-		      manager.page == MG_CONFIRM ? "Cancel" : "Back", M_BACK,
-		      FALSE);
+		      manager.page == MG_CONFIRM ? _("Cancel") : _("Back"),
+		      M_BACK, FALSE);
 	if (manager.page == MG_MENU) {
-		manage_button((Rect){ x, y, width, 36 }, "Rename group",
+		manage_button((Rect){ x, y, width, 36 }, _("Rename group"),
 			      M_RENAME, FALSE);
 		manage_button((Rect){ x, y + 48, width, 36 },
-			      "Invitation link and QR code", M_LINK, FALSE);
-		manage_button((Rect){ x, y + 96, width, 36 }, "Leave group…",
+			      _("Invitation link and QR code"), M_LINK, FALSE);
+		manage_button((Rect){ x, y + 96, width, 36 }, _("Leave group…"),
 			      M_LEAVE, FALSE);
 	} else if (manager.page == MG_EDIT) {
 		g.name_box = (Rect){ x, y, width, 40 };
 		ui_draw_edit(&g.name, g.name_box, manager.focus < 0,
-			     "Group name");
+			     _("Group name"));
 		manage_button((Rect){ x + width - 94, top + h - 52, 94, 34 },
-			      "Save", M_SAVE, TRUE);
+			      _("Save"), M_SAVE, TRUE);
 	} else if (manager.page == MG_LINK) {
 		const char *url = ui_string(manager.link, "url", NULL);
 
 		if (!manager.link) {
 			if (g.pending)
-				ui_draw_label("Loading…",
+				ui_draw_label(_("Loading…"),
 					      (Rect){ x, y, width, 30 }, 15,
 					      450, UI_MUTED, FALSE);
 			else
 				manage_button((Rect){ x, y, width, 36 },
-					      "Reload", M_REFRESH, FALSE);
+					      _("Reload"), M_REFRESH, FALSE);
 		} else if (!flag(manager.link, "allowed"))
 			ui_draw_label(
-				"LINE has disabled link invitations for this group.",
+				_("LINE has disabled link invitations for this group."),
 				(Rect){ x, y, width, 52 }, 15, 450, UI_MUTED,
 				TRUE);
 		else if (!flag(manager.link, "enabled"))
 			manage_button((Rect){ x, y, width, 36 },
-				      "Enable invitation link…", M_ENABLE,
+				      _("Enable invitation link…"), M_ENABLE,
 				      FALSE);
 		else {
 			if (url) {
@@ -602,53 +603,56 @@ static void manage_draw(void)
 					      13, 450, UI_MUTED, FALSE);
 				y += 30;
 				manage_button((Rect){ x, y, width, 34 },
-					      "Copy link", M_COPY, FALSE);
+					      _("Copy link"), M_COPY, FALSE);
 				y += 42;
 			}
 			int half = (width - 8) / 2;
 
 			manage_button((Rect){ x, y, half, 34 },
-				      url ? "Replace link…" : "Create link…",
+				      url ? _("Replace link…") :
+					    _("Create link…"),
 				      M_RENEW, FALSE);
 			manage_button((Rect){ x + half + 8, y, width - half - 8,
 					      34 },
-				      "Disable link…", M_DISABLE, FALSE);
+				      _("Disable link…"), M_DISABLE, FALSE);
 		}
 	} else {
 		const char *verb =
-			manager.question == M_LEAVE    ? "Leave group" :
-			manager.question == M_REMOVE   ? "Remove member" :
-			manager.question == M_WITHDRAW ? "Cancel invitation" :
-			manager.question == M_ENABLE   ? "Enable link" :
-			manager.question == M_DISABLE  ? "Disable link" :
+			manager.question == M_LEAVE  ? _("Leave group") :
+			manager.question == M_REMOVE ? _("Remove member") :
+			manager.question == M_WITHDRAW ?
+						       _("Cancel invitation") :
+			manager.question == M_ENABLE  ? _("Enable link") :
+			manager.question == M_DISABLE ? _("Disable link") :
 			ui_string(manager.link, "url", NULL) ? "Replace link" :
-							       "Create link";
+							       _("Create link");
 		g_autofree char *summary = NULL;
 
 		if (manager.question == M_REMOVE ||
 		    manager.question == M_WITHDRAW)
 			summary = g_strdup_printf(
 				manager.question == M_REMOVE ?
-					"Remove %s from this group?" :
-					"Withdraw the pending invitation for %s?",
+					_("Remove %s from this group?") :
+					_("Withdraw the pending invitation for %s?"),
 				manager.person_name);
 		else if (manager.question == M_LEAVE)
-			summary = g_strdup(
-				"You will leave the conversation and stop receiving new group messages.");
+			summary = g_strdup(_(
+				"You will leave the conversation and stop receiving new group messages."));
 		else if (manager.question == M_DISABLE)
-			summary = g_strdup(
-				"People using this link or QR code will no longer be able to join.");
+			summary = g_strdup(_(
+				"People using this link or QR code will no longer be able to join."));
 		else if (manager.question == M_RENEW &&
 			 ui_string(manager.link, "url", NULL))
-			summary = g_strdup(
-				"The earlier link and QR code will stop working. Anyone with the new link can join.");
+			summary = g_strdup(_(
+				"The earlier link and QR code will stop working. Anyone with the new link can join."));
 		else
-			summary = g_strdup(
-				"Anyone with the invitation link or QR code can join this group.");
+			summary = g_strdup(_(
+				"Anyone with the invitation link or QR code can join this group."));
 		ui_draw_label(summary, (Rect){ x, y, width, 98 }, 16, 450,
 			      UI_BODY, TRUE);
 		manage_button((Rect){ x + width - 148, top + h - 52, 148, 34 },
-			      g.writing ? "Updating…" : verb, M_CONFIRM, TRUE);
+			      g.writing ? _("Updating…") : verb, M_CONFIRM,
+			      TRUE);
 	}
 	if (g.notice)
 		ui_draw_label(g.notice, (Rect){ x, top + h - 98, width, 40 },
@@ -682,7 +686,7 @@ static void toggle(int index)
 	if (ui_field(g.chosen, id))
 		json_object_object_del(g.chosen, id);
 	else if (json_object_object_length(g.chosen) >= 499)
-		set(&g.notice, "Choose up to 499 friends.");
+		set(&g.notice, _("Choose up to 499 friends."));
 	else
 		json_object_object_add(g.chosen, id, json_object_get(row));
 	g.cursor = index;
@@ -727,12 +731,12 @@ static void primary(void)
 			g_autofree char *name = g_strdup(g.name.value->str);
 
 			if (!*g_strstrip(name)) {
-				set(&g.notice, "Enter a group name.");
+				set(&g.notice, _("Enter a group name."));
 				focus(NAME);
 				return;
 			}
 		} else if (!json_object_object_length(g.chosen)) {
-			set(&g.notice, "Choose at least one friend.");
+			set(&g.notice, _("Choose at least one friend."));
 			return;
 		}
 		switch_to(g.pane == CREATE ? REVIEW_CREATE : REVIEW_INVITE);
@@ -1077,14 +1081,14 @@ void ui_groups_overlay(void)
 	g.panel = (Rect){ left, top, w, h };
 	ui_scrim();
 	ui_draw_box(g.panel, UI_DIALOG);
-	const char *title = g.pane == MEMBERS	    ? "Group members" :
-			    g.pane == CREATE	    ? "New group" :
-			    g.pane == INVITE	    ? "Invite friends" :
-			    g.pane == INBOX	    ? "Group invitations" :
-			    g.pane == OFFER	    ? "Group invitation" :
-			    g.pane == DECLINE	    ? "Decline invitation?" :
-			    g.pane == REVIEW_CREATE ? "Create this group?" :
-						      "Send invitations?";
+	const char *title = g.pane == MEMBERS	    ? _("Group members") :
+			    g.pane == CREATE	    ? _("New group") :
+			    g.pane == INVITE	    ? _("Invite friends") :
+			    g.pane == INBOX	    ? _("Group invitations") :
+			    g.pane == OFFER	    ? _("Group invitation") :
+			    g.pane == DECLINE	    ? _("Decline invitation?") :
+			    g.pane == REVIEW_CREATE ? _("Create this group?") :
+						      _("Send invitations?");
 	ui_draw_label(
 		title,
 		(Rect){ x, y,
@@ -1098,43 +1102,43 @@ void ui_groups_overlay(void)
 	    (g.pane == MEMBERS && flag(g.detail, "canManage"))) {
 		g.incoming = (Rect){ x + width - 106, y - 2, 106, 31 };
 		button(g.incoming,
-		       g.pane == CREATE ? "Invitations" : "Settings", INCOMING,
-		       FALSE);
+		       g.pane == CREATE ? _("Invitations") : _("Settings"),
+		       INCOMING, FALSE);
 	}
 	y += 42;
 	if (g.pane == CREATE) {
 		g.name_box = (Rect){ x, y, width, 38 };
 		ui_draw_edit(&g.name, g.name_box, g.focus == NAME,
-			     "Group name");
+			     _("Group name"));
 		y += 47;
 	}
 	if (form()) {
 		g.filter_box = (Rect){ x, y, width, 36 };
 		ui_draw_edit(&g.filter, g.filter_box, g.focus == FILTER,
-			     "Search friends");
+			     _("Search friends"));
 		y += 44;
 	}
 	int chosen = json_object_object_length(g.chosen);
 	g_autofree char *heading = NULL;
 
 	if (g.pane == MEMBERS)
-		heading = g_strdup_printf("%s · %u members · %u pending",
+		heading = g_strdup_printf(_("%s · %u members · %u pending"),
 					  ui_string(g.detail, "name", "Group"),
 					  size(ui_field(g.detail, "members")),
 					  size(ui_field(g.detail, "invitees")));
 	else if (g.pane == INBOX)
-		heading = g_strdup("Invitations to join");
+		heading = g_strdup(_("Invitations to join"));
 	else if (g.pane == OFFER || g.pane == DECLINE)
-		heading = g_strdup("Invited group");
+		heading = g_strdup(_("Invited group"));
 	else if (review())
-		heading = g_strdup_printf("%s · %d invitation%s",
+		heading = g_strdup_printf(_("%s · %d invitation%s"),
 					  g.pane == REVIEW_CREATE ?
 						  g.name.value->str :
 						  ui_string(g.detail, "name",
-							    "Group"),
+							    _("Group")),
 					  chosen, chosen == 1 ? "" : "s");
 	else
-		heading = g_strdup_printf("%d selected", chosen);
+		heading = g_strdup_printf(_("%d selected"), chosen);
 	ui_draw_label(heading, (Rect){ x, y, width, 24 }, 14, 550, UI_MUTED,
 		      FALSE);
 	y += 28;
@@ -1171,25 +1175,25 @@ void ui_groups_overlay(void)
 					25 },
 				15, 500, UI_HEADING, FALSE);
 			if (item.pending)
-				ui_draw_label("Pending",
+				ui_draw_label(_("Pending"),
 					      (Rect){ x + width - 68, r.y + 7,
 						      68, 25 },
 					      13, 450, UI_MUTED, FALSE);
 		}
 	} else {
 		const char *empty =
-			g.pending	  ? "Loading…" :
-			review()	  ? "Only you" :
-			g.pane == MEMBERS ? "No members listed" :
-			g.pane == INBOX	  ? "No pending group invitations" :
-					    "No matching friends";
+			g.pending	  ? _("Loading…") :
+			review()	  ? _("Only you") :
+			g.pane == MEMBERS ? _("No members listed") :
+			g.pane == INBOX	  ? _("No pending group invitations") :
+					    _("No matching friends");
 		ui_draw_label(empty, g.list, 15, 450, UI_MUTED, FALSE);
 	}
 	if (more)
 		button(g.more,
-		       g.pending ? "Loading…" :
-		       g.loaded	 ? "More friends" :
-				   "Load friends",
+		       g.pending ? _("Loading…") :
+		       g.loaded	 ? _("More friends") :
+				   _("Load friends"),
 		       MORE, FALSE);
 	if (g.notice)
 		ui_draw_label(g.notice,
@@ -1199,25 +1203,26 @@ void ui_groups_overlay(void)
 	button(g.back,
 	       review() || g.pane == INVITE || g.pane == INBOX ||
 			       g.pane == OFFER || g.pane == DECLINE ?
-		       "Back" :
-		       "Close",
+		       _("Back") :
+		       _("Close"),
 	       BACK, FALSE);
 	if (g.pane == OFFER) {
 		g.refuse = (Rect){ x + 100, g.back.y, 82, 36 };
-		button(g.refuse, "Decline", REFUSE, FALSE);
+		button(g.refuse, _("Decline"), REFUSE, FALSE);
 		g.primary = (Rect){ x + width - 90, g.back.y, 90, 36 };
 	}
 	const char *action =
-		g.writing ? "Sending…" :
+		g.writing ?
+			_("Sending…") :
 		g.pane == MEMBERS ?
-			    (g.detail ? "Invite friends" : "Reload") :
+			(g.detail ? _("Invite friends") : _("Reload")) :
 		g.pane == INBOX ?
-			    (g.rows->len ? "View invitation" : "Refresh") :
-		g.pane == OFFER		? "Join" :
-		g.pane == DECLINE	? "Decline" :
-		g.pane == REVIEW_CREATE ? "Create group" :
-		g.pane == REVIEW_INVITE ? "Send invitations" :
-					  "Review";
+			(g.rows->len ? _("View invitation") : _("Refresh")) :
+		g.pane == OFFER		? _("Join") :
+		g.pane == DECLINE	? _("Decline") :
+		g.pane == REVIEW_CREATE ? _("Create group") :
+		g.pane == REVIEW_INVITE ? _("Send invitations") :
+					  _("Review");
 	if (g.pane != MEMBERS || !g.detail || flag(g.detail, "canInvite"))
 		button(g.primary, action, PRIMARY, review());
 }

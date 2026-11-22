@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_shared_content.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_find.h"
 #include "ui_friends.h"
@@ -199,7 +200,7 @@ static void open_item(void)
 		if (json_object_get_boolean(ui_field(r, "viewable")))
 			ui_media_album_photo(view.album, id);
 		else
-			set(&view.notice, "This album item is a video.");
+			set(&view.notice, _("This album item is a video."));
 	} else {
 		view.return_page = view.page;
 		view.page = DETAIL;
@@ -221,7 +222,8 @@ static void post(void)
 	if (view.writing || !view.edit.value || !view.edit.value->len)
 		return;
 	if (view.edit.value->len > 10000) {
-		set(&view.notice, "Shorten this note to 10,000 UTF-8 bytes.");
+		set(&view.notice,
+		    _("Shorten this note to 10,000 UTF-8 bytes."));
 		return;
 	}
 	Json *p = json_object_new_object();
@@ -248,7 +250,7 @@ gboolean ui_shared_reply(const char *method, guint tag, Json *result,
 	}
 	if (!strcmp(method, "sharedPost")) {
 		if (!json_object_get_boolean(ui_field(result, "saved"))) {
-			set(&view.notice, "LINE did not confirm the note.");
+			set(&view.notice, _("LINE did not confirm the note."));
 			return TRUE;
 		}
 		g_string_truncate(view.edit.value, 0);
@@ -259,7 +261,7 @@ gboolean ui_shared_reply(const char *method, guint tag, Json *result,
 	Json *rows = ui_field(result, "items");
 
 	if (!json_object_is_type(rows, json_type_array)) {
-		set(&view.notice, "LINE returned an unreadable page.");
+		set(&view.notice, _("LINE returned an unreadable page."));
 		return TRUE;
 	}
 	for (size_t i = 0; i < json_object_array_length(rows) && count() < 4096;
@@ -313,20 +315,20 @@ void ui_shared_draw(void)
 	view.panel = (Rect){ x, y, w, h };
 	ui_draw_box(view.panel, PANEL);
 	const char *title = view.page == PHOTOS	   ? view.headline :
-			    view.page == NOTE_FORM ? "New group note" :
-			    view.page == DETAIL	   ? "Group note" :
-						     "Shared content";
+			    view.page == NOTE_FORM ? _("New group note") :
+			    view.page == DETAIL	   ? _("Group note") :
+						     _("Shared content");
 	ui_draw_label(title, (Rect){ x + 16, y + 16, w - 118, 35 }, 21, 700,
 		      INK, FALSE);
 	view.back = (Rect){ x + w - 84, y + 13, 70, 33 };
-	button(view.back, is_root() ? "Close" : "Back", FALSE, CLOSE);
+	button(view.back, is_root() ? _("Close") : _("Back"), FALSE, CLOSE);
 	int top = y + 65, bottom = y + h - 16;
 
 	view.extra = view.more = (Rect){ 0 };
 	memset(view.tabs, 0, sizeof(view.tabs));
 	if (is_root()) {
-		const char *const labels[] = { "Albums", "Notes",
-					       "Poll notes" };
+		const char *const labels[] = { _("Albums"), _("Notes"),
+					       _("Poll notes") };
 		int n = *view.chat == 'c' ? 3 : 1;
 		int tab_w = (w - 32 - 6 * (n - 1)) / n;
 
@@ -341,9 +343,9 @@ void ui_shared_draw(void)
 	if (view.page == NOTES || view.page == NOTE_FORM ||
 	    (view.notice && !view.writing && !view.pending &&
 	     view.page != DETAIL)) {
-		const char *label = view.page == NOTE_FORM ? "Post note" :
-				    view.page == NOTES	   ? "New note" :
-							     "Reload";
+		const char *label = view.page == NOTE_FORM ? _("Post note") :
+				    view.page == NOTES	   ? _("New note") :
+							     _("Reload");
 		view.extra = (Rect){ x + 16, bottom - 36, 102, 36 };
 		button(view.extra, label,
 		       view.page == NOTE_FORM || view.page == NOTES, NEW);
@@ -351,18 +353,18 @@ void ui_shared_draw(void)
 	if (view.next && !view.writing && view.page != DETAIL &&
 	    view.page != NOTE_FORM) {
 		view.more = (Rect){ x + w - 106, bottom - 36, 90, 36 };
-		button(view.more, "More", FALSE, MORE);
+		button(view.more, _("More"), FALSE, MORE);
 	}
 	if (view.more.w || view.extra.w)
 		bottom -= 51;
 	const char *msg = view.notice;
 
 	if (!msg && view.pending)
-		msg = view.writing ? "Posting…" : "Loading…";
+		msg = view.writing ? _("Posting…") : _("Loading…");
 	if (!msg && view.page == POLLS)
-		msg = "Group notes matching “poll”.";
+		msg = _("Group notes matching “poll”.");
 	if (!msg && view.page == NOTE_FORM)
-		msg = "Everyone in this group can read this note.";
+		msg = _("Everyone in this group can read this note.");
 	if (msg) {
 		ui_draw_label(msg, (Rect){ x + 16, top, w - 32, 46 }, 14, 450,
 			      MUTED, TRUE);
@@ -372,7 +374,7 @@ void ui_shared_draw(void)
 	if (view.page == NOTE_FORM) {
 		view.body.h = 42;
 		ui_draw_edit(&view.edit, view.body, view.focus == BODY,
-			     "Write a group note");
+			     _("Write a group note"));
 		return;
 	}
 	if (view.page == DETAIL) {
@@ -393,11 +395,12 @@ void ui_shared_draw(void)
 		return;
 	}
 	if (!view.pending && !view.notice && !count())
-		ui_draw_label(view.page == POLLS  ? "No matching poll notes." :
-			      view.page == ALBUMS ? "No albums on this page." :
-			      view.page == PHOTOS ? "No photos in this album." :
-						    "No group notes.",
-			      view.body, 15, 450, MUTED, FALSE);
+		ui_draw_label(
+			view.page == POLLS  ? _("No matching poll notes.") :
+			view.page == ALBUMS ? _("No albums on this page.") :
+			view.page == PHOTOS ? _("No photos in this album.") :
+					      _("No group notes."),
+			view.body, 15, 450, MUTED, FALSE);
 	for (int i = view.first; i < count() && i < view.first + slots(); i++) {
 		Json *r = json_object_array_get_idx(view.rows, i);
 		Rect row = { view.body.x, top + (i - view.first) * 54,

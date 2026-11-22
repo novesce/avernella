@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_friends.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include <string.h>
 
@@ -392,7 +393,7 @@ static void find(void)
 	g_strstrip(query);
 	if (!*query || strlen(query) > 2048) {
 		replace(&f.note,
-			"Enter a LINE ID, phone number or personal invite link.");
+			_("Enter a LINE ID, phone number or personal invite link."));
 		return;
 	}
 	rpc(LOOKUP, "query", query);
@@ -429,7 +430,7 @@ static void activate(void)
 	}
 	if (f.page == INVITE) {
 		if (f.url && SDL_SetClipboardText(f.url) == 0)
-			replace(&f.note, "Invite link copied.");
+			replace(&f.note, _("Invite link copied."));
 		else if (!f.url && !f.pending[TICKET].tag)
 			rpc(TICKET, NULL, NULL);
 	} else if (f.page == FIND) {
@@ -503,11 +504,12 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 			replace(&ui.name, ui_string(result, "name", ""));
 			if (same && cmd == EDIT_PROFILE) {
 				page(PROFILE);
-				replace(&f.note, "Profile updated.");
+				replace(&f.note, _("Profile updated."));
 			}
 		} else if (same)
 			replace(&f.note,
-				error ? error : "Could not read your profile.");
+				error ? error :
+					_("Could not read your profile."));
 		return TRUE;
 	}
 	if (cmd == ADD_RECOMMENDED) {
@@ -518,7 +520,7 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 			    (same || f.page == ROSTER)) {
 				forget_roster();
 				page(ROSTER);
-				replace(&f.note, "Friend added.");
+				replace(&f.note, _("Friend added."));
 			} else if (f.directory == EVERYONE && f.loaded) {
 				store_row(result);
 				update_filter();
@@ -526,7 +528,7 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 		} else if (same)
 			replace(&f.note,
 				error ? error :
-					"Could not confirm this friend.");
+					_("Could not confirm this friend."));
 		return TRUE;
 	}
 	if (cmd == LIST) {
@@ -554,7 +556,7 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 		} else if (f.page == ROSTER)
 			replace(&f.note,
 				error ? error :
-					"Could not read your friends list.");
+					_("Could not read your friends list."));
 		return TRUE;
 	}
 	if ((cmd == BLOCKING || cmd == VISIBILITY) && !error &&
@@ -609,7 +611,7 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 			replace(&f.url, url);
 		else
 			replace(&f.note,
-				"Your account has no personal invite link available.");
+				_("Your account has no personal invite link available."));
 	} else if (cmd == FAVORITE || cmd == RENAME) {
 		drop(&f.person);
 		f.person = json_object_get(result);
@@ -617,13 +619,13 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 			if (!g_strcmp0(sent_name, f.alias.value->str))
 				input(&f.alias,
 				      ui_string(result, "overrideName", ""));
-			replace(&f.note, "Display name updated.");
+			replace(&f.note, _("Display name updated."));
 		} else
 			replace(&f.note, known(result, "favorite") ?
-						 "Added to favorites." :
-						 "Removed from favorites.");
+						 _("Added to favorites.") :
+						 _("Removed from favorites."));
 	} else if (!*ui_string(result, "id", ""))
-		replace(&f.note, "LINE returned an incomplete profile.");
+		replace(&f.note, _("LINE returned an incomplete profile."));
 	else if (cmd == OPEN_CHAT) {
 		page(OFF);
 		ui_open_conversation(result);
@@ -631,15 +633,16 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 		drop(&f.person);
 		f.person = json_object_get(result);
 		if (cmd == ADD)
-			replace(&f.note, "Friend added.");
+			replace(&f.note, _("Friend added."));
 		else if (known(result, "self"))
-			replace(&f.note, "This is your profile.");
+			replace(&f.note, _("This is your profile."));
 		else if (known(result, "blocked"))
-			replace(&f.note, "This person is blocked.");
+			replace(&f.note, _("This person is blocked."));
 		else if (known(result, "hidden"))
-			replace(&f.note, "This friend is in your hidden list.");
+			replace(&f.note,
+				_("This friend is in your hidden list."));
 		else if (known(result, "friend"))
-			replace(&f.note, "Already in your friends list.");
+			replace(&f.note, _("Already in your friends list."));
 		else
 			replace(&f.note, NULL);
 		/* A second Enter typed while searching must never add a contact. */
@@ -662,7 +665,7 @@ void ui_friends_scan_result(const char *value, const char *error)
 		       !g_str_has_prefix(value, "https://line.me/R/ti/p/") &&
 		       !g_str_has_prefix(value, "line://ti/p/"))) {
 		replace(&f.note,
-			"This QR code does not contain a personal LINE invite link.");
+			_("This QR code does not contain a personal LINE invite link."));
 		return;
 	}
 	input(&f.query, value);
@@ -726,13 +729,13 @@ static void header(int x0, int w)
 		const char *label, *short_label;
 		int wide, slim;
 	} tabs[] = {
-		{ ALL_PAGE, "All", "All", 44, 36 },
-		{ HIDDEN_PAGE, "Hidden", "Hidden", 70, 58 },
-		{ BLOCKED_PAGE, "Blocked", "Blocked", 76, 64 },
-		{ RECOMMEND_PAGE, "Suggestions", "Suggested", 106, 84 },
-		{ PROFILE_PAGE, "Profile", "Profile", 66, 56 },
-		{ QR_PAGE, "My QR Code", "QR", 102, 40 },
-		{ ADD_PAGE, "Add Friend", "Add", 98, 52 },
+		{ ALL_PAGE, _("All"), _("All"), 44, 36 },
+		{ HIDDEN_PAGE, _("Hidden"), _("Hidden"), 70, 58 },
+		{ BLOCKED_PAGE, _("Blocked"), _("Blocked"), 76, 64 },
+		{ RECOMMEND_PAGE, _("Suggestions"), _("Suggested"), 106, 84 },
+		{ PROFILE_PAGE, _("Profile"), _("Profile"), 66, 56 },
+		{ QR_PAGE, _("My QR Code"), "QR", 102, 40 },
+		{ ADD_PAGE, _("Add Friend"), _("Add"), 98, 52 },
 	};
 	int x = x0 + 16, y = 12;
 
@@ -740,8 +743,8 @@ static void header(int x0, int w)
 		x = f.back.x + f.back.w + 12;
 	if (!narrow) {
 		ui_draw_icon((Rect){ x, 12, 24, 24 }, UI_ICON_PEOPLE, SUBTLE);
-		ui_draw_label("Friends", (Rect){ x + 32, 13, 70, 24 }, 16, 600,
-			      HEADING, FALSE);
+		ui_draw_label(_("Friends"), (Rect){ x + 32, 13, 70, 24 }, 16,
+			      600, HEADING, FALSE);
 		ui_draw_box((Rect){ x + 108, 14, 1, 20 }, UI_LINE);
 		x += 124;
 	}
@@ -797,8 +800,8 @@ void ui_friends_draw(void)
 	if (ui_compact() || sub)
 		f.back = (Rect){ x0 + 8, 10, 58, 28 };
 	if (f.back.w)
-		button(f.back, ui_compact() && !sub ? "Chats" : "Back", FALSE,
-		       CHATS);
+		button(f.back, ui_compact() && !sub ? _("Chats") : _("Back"),
+		       FALSE, CHATS);
 	header(x0, w);
 	f.add = f.invite = f.entry = f.list = f.more = f.submit = f.scan =
 		f.card = f.save = f.fav = (Rect){ 0 };
@@ -819,35 +822,36 @@ void ui_friends_draw(void)
 					      14, 450, MUTED, FALSE);
 			f.profile_button =
 				(Rect){ x, 171, MIN(188, content), 36 };
-			button(f.profile_button, "Edit display name", FALSE,
+			button(f.profile_button, _("Edit display name"), FALSE,
 			       EDIT_MY_NAME);
-			ui_draw_label("Status message",
+			ui_draw_label(_("Status message"),
 				      (Rect){ x, 234, content, 25 }, 15, 550,
 				      INK, FALSE);
 			const char *status = ui_string(f.profile, "status", "");
 
-			ui_draw_label(*status ? status : "No status message",
+			ui_draw_label(*status ? status : _("No status message"),
 				      (Rect){ x, 266, content, 69 }, 15, 450,
 				      MUTED, TRUE);
 			f.save = (Rect){ x, 346, MIN(188, content), 36 };
-			button(f.save, "Edit status message", FALSE,
+			button(f.save, _("Edit status message"), FALSE,
 			       EDIT_MY_STATUS);
 		} else if (!f.pending[GET_PROFILE].tag) {
 			f.submit = (Rect){ x, 155, 100, 36 };
-			button(f.submit, "Retry", FALSE, SUBMIT);
+			button(f.submit, _("Retry"), FALSE, SUBMIT);
 		}
 		if (f.note || f.pending[GET_PROFILE].tag)
-			ui_draw_label(f.note ? f.note : "Loading profile…",
+			ui_draw_label(f.note ? f.note : _("Loading profile…"),
 				      (Rect){ x, f.profile ? 401 : 90, content,
 					      55 },
 				      14, 450, MUTED, TRUE);
 	} else if (f.page == EDIT_NAME || f.page == EDIT_STATUS) {
 		f.entry = (Rect){ x, 100, content, 42 };
 		ui_draw_edit(&f.own, f.entry, f.focus == FIELD,
-			     f.page == EDIT_NAME ? "Display name" :
-						   "Status message");
+			     f.page == EDIT_NAME ? _("Display name") :
+						   _("Status message"));
 		f.save = (Rect){ x, 165, 105, 36 };
-		button(f.save, f.pending[EDIT_PROFILE].tag ? "Saving…" : "Save",
+		button(f.save,
+		       f.pending[EDIT_PROFILE].tag ? _("Saving…") : _("Save"),
 		       TRUE, SAVE_NAME);
 		if (f.note)
 			ui_draw_label(f.note, (Rect){ x, 229, content, 90 }, 14,
@@ -855,19 +859,19 @@ void ui_friends_draw(void)
 	} else if (f.page == MANAGE) {
 		f.hidden = (Rect){ x, 94, MIN(content, 195), 38 };
 		f.blocked = (Rect){ x, 146, MIN(content, 195), 38 };
-		button(f.hidden, "Hidden friends", FALSE, HIDDEN_PAGE);
-		button(f.blocked, "Blocked friends", FALSE, BLOCKED_PAGE);
+		button(f.hidden, _("Hidden friends"), FALSE, HIDDEN_PAGE);
+		button(f.blocked, _("Blocked friends"), FALSE, BLOCKED_PAGE);
 		f.recommendations = (Rect){ x, 198, MIN(content, 218), 38 };
 		f.profile_button = (Rect){ x, 250, MIN(content, 195), 38 };
-		button(f.recommendations, "Friend recommendations", FALSE,
+		button(f.recommendations, _("Friend recommendations"), FALSE,
 		       RECOMMEND_PAGE);
-		button(f.profile_button, "My profile", FALSE, PROFILE_PAGE);
+		button(f.profile_button, _("My profile"), FALSE, PROFILE_PAGE);
 	} else if (f.page == ROSTER) {
 		/* The roster spans the pane with Discord's 30 px gutters. */
 		int rx = x0 + 30, rw = MAX(120, pane - 60);
 
 		f.entry = (Rect){ rx, f.top + 16, rw, 34 };
-		ui_draw_edit(&f.search, f.entry, f.focus == FIELD, "Search");
+		ui_draw_edit(&f.search, f.entry, f.focus == FIELD, _("Search"));
 		int bottom = h - 18;
 
 		if (f.note && *f.note)
@@ -876,19 +880,20 @@ void ui_friends_draw(void)
 		    (!f.loaded && !f.pending[LIST].tag)) {
 			f.more = (Rect){ rx, bottom - 34, MIN(170, rw), 34 };
 			button(f.more,
-			       f.pending[LIST].tag ? "Loading…" :
-			       f.loaded		   ? "Load more friends" :
-						     "Retry",
+			       f.pending[LIST].tag ? _("Loading…") :
+			       f.loaded		   ? _("Load more friends") :
+						     _("Retry"),
 			       FALSE, MORE);
 			bottom -= 42;
 		}
 		if (f.note && *f.note)
 			ui_draw_label(f.note, (Rect){ rx, h - 52, rw, 45 }, 14,
 				      450, MUTED, TRUE);
-		const char *title = f.directory == HIDDEN      ? "HIDDEN" :
-				    f.directory == BLOCKED     ? "BLOCKED" :
-				    f.directory == RECOMMENDED ? "SUGGESTIONS" :
-								 "ALL FRIENDS";
+		const char *title = f.directory == HIDDEN  ? "HIDDEN" :
+				    f.directory == BLOCKED ? "BLOCKED" :
+				    f.directory == RECOMMENDED ?
+							     "SUGGESTIONS" :
+							     _("ALL FRIENDS");
 		g_autofree char *count = g_strdup_printf(
 			"%s — %u", title, f.filtered ? f.filtered->len : 0);
 
@@ -923,11 +928,12 @@ void ui_friends_draw(void)
 					    DIVIDER);
 			ui_draw_profile(row, (Rect){ r.x, r.y + 15, 32, 32 });
 			const char *sub_line =
-				f.directory == HIDDEN  ? "Hidden" :
-				f.directory == BLOCKED ? "Blocked" :
+				f.directory == HIDDEN ? _("Hidden") :
+				f.directory == BLOCKED ?
+							_("Blocked") :
 				f.directory == RECOMMENDED ?
-							 "Suggested for you" :
-				known(row, "favorite") ? "★ Favorite" :
+							_("Suggested for you") :
+				known(row, "favorite") ? _("★ Favorite") :
 							 NULL;
 			int name_y = sub_line ? r.y + 11 : r.y + 19;
 
@@ -955,13 +961,13 @@ void ui_friends_draw(void)
 		if (!f.filtered->len)
 			ui_draw_label(
 				f.pending[LIST].tag ?
-					"Loading friends…" :
+					_("Loading friends…") :
 				f.search.value->len ?
-					"No matching names loaded." :
+					_("No matching names loaded.") :
 				f.loaded ?
 					(f.directory == RECOMMENDED ?
-						 "No friend recommendations." :
-						 "No friends to show.") :
+						 _("No friend recommendations.") :
+						 _("No friends to show.")) :
 					"",
 				(Rect){ rx + 2, f.list.y + 8, rw - 4, 55 }, 15,
 				450, MUTED, TRUE);
@@ -973,23 +979,24 @@ void ui_friends_draw(void)
 		content = rw;
 		int t = f.top;
 
-		ui_draw_label("Add Friend", (Rect){ rx, t + 18, rw, 28 }, 20,
+		ui_draw_label(_("Add Friend"), (Rect){ rx, t + 18, rw, 28 }, 20,
 			      600, HEADING, FALSE);
 		ui_draw_label(
-			"You can add friends with their LINE ID, phone number or personal link.",
+			_("You can add friends with their LINE ID, phone number or personal link."),
 			(Rect){ rx, t + 50, rw, 22 }, 14, 450, TAB_INK, FALSE);
 		/* One dark strip holds both the field and its button. */
 		ui_draw_rounded((Rect){ rx, t + 86, rw, 50 }, 8, UI_RAIL);
 		f.entry = (Rect){ rx, t + 86, rw - 136, 50 };
 		ui_draw_edit(&f.query, f.entry, f.focus == FIELD,
-			     "ID, +country code and number, or link");
+			     _("ID, +country code and number, or link"));
 		f.submit = (Rect){ rx + rw - 128, t + 94, 116, 34 };
 		if (!f.person)
 			button(f.submit,
-			       f.pending[LOOKUP].tag ? "Looking…" : "Find",
+			       f.pending[LOOKUP].tag ? _("Looking…") :
+						       _("Find"),
 			       TRUE, SUBMIT);
 		f.scan = (Rect){ rx, t + 148, 132, 34 };
-		button(f.scan, "Read QR image", FALSE, SCAN);
+		button(f.scan, _("Read QR image"), FALSE, SCAN);
 		if (f.person) {
 			int y = t + 198;
 
@@ -1009,11 +1016,11 @@ void ui_friends_draw(void)
 						   MIN(144, content - 94), 32 };
 				button(f.submit,
 				       open ? (f.pending[OPEN_CHAT].tag ?
-						       "Opening…" :
-						       "Open chat") :
+						       _("Opening…") :
+						       _("Open chat")) :
 					      (f.pending[ADD].tag ?
-						       "Adding…" :
-						       "Add friend"),
+						       _("Adding…") :
+						       _("Add friend")),
 				       TRUE, SUBMIT);
 			} else
 				f.submit = (Rect){ 0 };
@@ -1040,8 +1047,8 @@ void ui_friends_draw(void)
 				f.submit = (Rect){ x, 170, 125, 36 };
 				button(f.submit,
 				       f.pending[ADD_RECOMMENDED].tag ?
-					       "Adding…" :
-					       "Add friend",
+					       _("Adding…") :
+					       _("Add friend"),
 				       TRUE, SUBMIT);
 			}
 			if (f.note)
@@ -1051,17 +1058,17 @@ void ui_friends_draw(void)
 			return;
 		}
 		if (f.confirming) {
-			ui_draw_label("Block this friend?",
+			ui_draw_label(_("Block this friend?"),
 				      (Rect){ x, 174, content, 34 }, 20, 650,
 				      INK, FALSE);
 			ui_draw_label(
-				"LINE will stop delivering their messages and calls.",
+				_("LINE will stop delivering their messages and calls."),
 				(Rect){ x, 219, content, 52 }, 15, 450, MUTED,
 				TRUE);
 			f.cancel = (Rect){ x, 285, 100, 36 };
 			f.confirm = (Rect){ x + 112, 285, 145, 36 };
-			button(f.cancel, "Cancel", FALSE, CANCEL);
-			button(f.confirm, "Confirm block", TRUE, CONFIRM);
+			button(f.cancel, _("Cancel"), FALSE, CANCEL);
+			button(f.confirm, _("Confirm block"), TRUE, CONFIRM);
 			if (f.note)
 				ui_draw_label(f.note,
 					      (Rect){ x, 343, content, 56 }, 14,
@@ -1071,11 +1078,12 @@ void ui_friends_draw(void)
 		if (known(f.person, "hidden") || known(f.person, "blocked")) {
 			if (known(f.person, "blocked")) {
 				f.blocked = (Rect){ x, 170, 124, 36 };
-				button(f.blocked, "Unblock", FALSE,
+				button(f.blocked, _("Unblock"), FALSE,
 				       BLOCK_PERSON);
 			} else {
 				f.hidden = (Rect){ x, 170, 124, 36 };
-				button(f.hidden, "Unhide", FALSE, HIDE_PERSON);
+				button(f.hidden, _("Unhide"), FALSE,
+				       HIDE_PERSON);
 			}
 			if (f.note)
 				ui_draw_label(f.note,
@@ -1084,24 +1092,25 @@ void ui_friends_draw(void)
 			return;
 		}
 		f.submit = (Rect){ x, 165, 114, 36 };
-		button(f.submit, "Open chat", TRUE, SUBMIT);
+		button(f.submit, _("Open chat"), TRUE, SUBMIT);
 		f.fav = (Rect){ x + 127, 165, MIN(content - 127, 182), 36 };
 		button(f.fav,
-		       known(f.person, "favorite") ? "Remove favorite" :
-						     "Add to favorites",
+		       known(f.person, "favorite") ? _("Remove favorite") :
+						     _("Add to favorites"),
 		       FALSE, STAR);
-		ui_draw_label("Display name", (Rect){ x, 230, content, 24 }, 15,
-			      550, INK, FALSE);
+		ui_draw_label(_("Display name"), (Rect){ x, 230, content, 24 },
+			      15, 550, INK, FALSE);
 		f.entry = (Rect){ x, 260, content, 38 };
 		ui_draw_edit(&f.alias, f.entry, f.focus == FIELD,
-			     "Use their LINE profile name");
+			     _("Use their LINE profile name"));
 		f.save = (Rect){ x, 311, 115, 34 };
-		button(f.save, f.pending[RENAME].tag ? "Saving…" : "Save name",
+		button(f.save,
+		       f.pending[RENAME].tag ? _("Saving…") : _("Save name"),
 		       FALSE, SAVE_NAME);
 		f.hidden = (Rect){ x, 363, 115, 34 };
 		f.blocked = (Rect){ x + 128, 363, 115, 34 };
-		button(f.hidden, "Hide", FALSE, HIDE_PERSON);
-		button(f.blocked, "Block", FALSE, BLOCK_PERSON);
+		button(f.hidden, _("Hide"), FALSE, HIDE_PERSON);
+		button(f.blocked, _("Block"), FALSE, BLOCK_PERSON);
 		if (f.note)
 			ui_draw_label(f.note, (Rect){ x, 412, content, 56 }, 14,
 				      450, MUTED, TRUE);
@@ -1118,14 +1127,14 @@ void ui_friends_draw(void)
 					      48 },
 				      14, 500, INK, TRUE);
 			f.submit = (Rect){ x, top + actual + 67, 122, 36 };
-			button(f.submit, "Copy link", TRUE, SUBMIT);
+			button(f.submit, _("Copy link"), TRUE, SUBMIT);
 		} else if (!f.pending[TICKET].tag) {
 			f.submit = (Rect){ x, 162, 92, 36 };
-			button(f.submit, "Retry", FALSE, SUBMIT);
+			button(f.submit, _("Retry"), FALSE, SUBMIT);
 		}
 		if (f.note || f.pending[TICKET].tag)
 			ui_draw_label(f.note ? f.note :
-					       "Loading your invite link…",
+					       _("Loading your invite link…"),
 				      (Rect){ x, f.qr ? f.submit.y + 48 : 100,
 					      content, 58 },
 				      14, 500, MUTED, TRUE);

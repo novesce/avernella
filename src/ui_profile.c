@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_profile.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_sounds.h"
 #include "ui_chat_lists.h"
@@ -71,6 +72,7 @@ enum action {
 	A_NOTIFY,
 	A_SOUNDS,
 	A_THEME,
+	A_LANGUAGE,
 	A_MOTION,
 	A_MOTION_SYSTEM,
 	A_KEYS,
@@ -87,9 +89,12 @@ struct control {
 };
 
 static const char *const section_names[] = {
-	[MY_ACCOUNT] = "My Account",	[PROFILES] = "Profiles",
-	[PRIVACY] = "Privacy & Safety", [NOTIFICATIONS] = "Notifications",
-	[KEYBINDS] = "Keybinds",	[APPEARANCE] = "Appearance",
+	[MY_ACCOUNT] = N_("My Account"),
+	[PROFILES] = N_("Profiles"),
+	[PRIVACY] = N_("Privacy & Safety"),
+	[NOTIFICATIONS] = N_("Notifications"),
+	[KEYBINDS] = N_("Keybinds"),
+	[APPEARANCE] = N_("Appearance"),
 };
 
 static struct {
@@ -378,19 +383,19 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 	int cx = x + 16, cy = ty + (second ? 54 : 32);
 
 	if (self)
-		chip(&cx, cy, "You", INK);
+		chip(&cx, cy, _("You"), INK);
 	if (flag(row, "friend") && !flag(row, "blocked"))
-		chip(&cx, cy, "Friend", INK);
+		chip(&cx, cy, _("Friend"), INK);
 	if (flag(row, "favorite"))
-		chip(&cx, cy, "Favorite", 0xf0b232);
+		chip(&cx, cy, _("Favorite"), 0xf0b232);
 	if (flag(row, "official"))
-		chip(&cx, cy, "Official", UI_ACCENT);
+		chip(&cx, cy, _("Official"), UI_ACCENT);
 	if (flag(row, "blocked"))
-		chip(&cx, cy, "Blocked", DANGER);
+		chip(&cx, cy, _("Blocked"), DANGER);
 	Rect inner = { x + 12, y + info_y, w - 24, inner_h };
 
 	ui_draw_rounded(inner, 8, INNER);
-	ui_draw_label(self ? "STATUS MESSAGE" : "ABOUT ME",
+	ui_draw_label(self ? _("STATUS MESSAGE") : _("ABOUT ME"),
 		      (Rect){ inner.x + 12, inner.y + 12, inner.w - 24, 16 },
 		      12, 700, HEADING, FALSE);
 	if (*status)
@@ -399,11 +404,11 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 				      status_h + 4 },
 			      14, 400, INK, TRUE);
 	else
-		ui_draw_label(flag(row, "loading") ? "Loading profile…" :
-						     "No status message yet.",
-			      (Rect){ inner.x + 12, inner.y + 34, inner.w - 24,
-				      20 },
-			      14, 400, MUTED, FALSE);
+		ui_draw_label(
+			flag(row, "loading") ? _("Loading profile…") :
+					       _("No status message yet."),
+			(Rect){ inner.x + 12, inner.y + 34, inner.w - 24, 20 },
+			14, 400, MUTED, FALSE);
 	if (!actions)
 		return h;
 	int by = inner.y + inner.h + 12;
@@ -414,10 +419,10 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 		by += 22;
 	}
 	int bw = w - 24, bx = x + 12;
-	const char *busy = p.busy ? "Working…" : NULL;
+	const char *busy = p.busy ? _("Working…") : NULL;
 
 	if (self) {
-		button((Rect){ bx, by, bw, 32 }, "Edit Profile", ACCENT,
+		button((Rect){ bx, by, bw, 32 }, _("Edit Profile"), ACCENT,
 		       UI_ON_ACCENT, A_EDIT_PROFILE, 0);
 	} else if (flag(row, "loading")) {
 		button((Rect){ bx, by, bw, 32 }, "Message", ACCENT,
@@ -432,11 +437,11 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 		       0);
 		if (add)
 			button((Rect){ bx + bw - second_w, by, second_w, 32 },
-			       "Add Friend", ACCENT, UI_ON_ACCENT, A_ADD, 0);
+			       _("Add Friend"), ACCENT, UI_ON_ACCENT, A_ADD, 0);
 		else if (friend)
 			button((Rect){ bx + bw - second_w, by, second_w, 32 },
-			       flag(row, "blocked") ? "Unblock" : "Block", CHIP,
-			       flag(row, "blocked") ? INK : 0xfa777c,
+			       flag(row, "blocked") ? _("Unblock") : _("Block"),
+			       CHIP, flag(row, "blocked") ? INK : 0xfa777c,
 			       flag(row, "blocked") ? A_UNBLOCK : A_BLOCK, 0);
 	}
 	return h;
@@ -564,7 +569,7 @@ static void save_form(void)
 			changes, "status",
 			json_object_new_string(editor_value(&p.status)));
 	p.save_tag = next_tag();
-	set_text(&p.settings_note, "Saving…");
+	set_text(&p.settings_note, _("Saving…"));
 	ui_rpc("updateMyProfile", changes, p.save_tag);
 }
 
@@ -576,7 +581,7 @@ void ui_profile_picture_chosen(const char *path)
 
 	json_object_object_add(params, "path", json_object_new_string(path));
 	p.picture_tag = next_tag();
-	set_text(&p.settings_note, "Uploading your new avatar…");
+	set_text(&p.settings_note, _("Uploading your new avatar…"));
 	ui_rpc("updateMyPicture", params, p.picture_tag);
 }
 
@@ -628,7 +633,8 @@ static void field(int which, const char *title, int x, int y, int w)
 	ui_draw_rounded(r, 4, INNER);
 	ui_draw_edit(e, (Rect){ r.x + 2, r.y + 2, r.w - 4, r.h - 4 },
 		     p.editing == which,
-		     which == 1 ? "Display name" : "What's on your mind?");
+		     which == 1 ? _("Display name") :
+				  _("What's on your mind?"));
 	control(r, A_FIELD, which);
 }
 
@@ -637,7 +643,7 @@ static int account_section(int x, int y, int w)
 	Json *row = p.me ? p.me : p.card;
 	int top = y;
 
-	heading("My Account", x, y, w);
+	heading(_("My Account"), x, y, w);
 	y += 44;
 	Rect card = { x, y, w, 260 };
 
@@ -651,32 +657,32 @@ static int account_section(int x, int y, int w)
 	ui_draw_label(ui_string(row, "name", ui.name ? ui.name : ""),
 		      (Rect){ x + 112, y + 110, w - 270, 28 }, 20, 700, HEADING,
 		      FALSE);
-	button((Rect){ x + w - 150, y + 112, 134, 32 }, "Edit User Profile",
+	button((Rect){ x + w - 150, y + 112, 134, 32 }, _("Edit User Profile"),
 	       ACCENT, UI_ON_ACCENT, A_NAV, PROFILES);
 	Rect info = { x + 16, y + 172, w - 32, 76 };
 
 	ui_draw_rounded(info, 8, FIELD);
-	caption("LINE ID", info.x + 16, info.y + 14, info.w / 2 - 24);
+	caption(_("LINE ID"), info.x + 16, info.y + 14, info.w / 2 - 24);
 	const char *line_id = ui_string(row, "lineId", "");
 
-	ui_draw_label(*line_id ? line_id : "Not set",
+	ui_draw_label(*line_id ? line_id : _("Not set"),
 		      (Rect){ info.x + 16, info.y + 34, info.w / 2 - 24, 22 },
 		      16, 400, *line_id ? INK : MUTED, FALSE);
-	caption("Status message", info.x + info.w / 2, info.y + 14,
+	caption(_("Status message"), info.x + info.w / 2, info.y + 14,
 		info.w / 2 - 16);
 	const char *status = ui_string(row, "status", "");
 
-	ui_draw_label(*status ? status : "None",
+	ui_draw_label(*status ? status : _("None"),
 		      (Rect){ info.x + info.w / 2, info.y + 34, info.w / 2 - 16,
 			      22 },
 		      16, 400, *status ? INK : MUTED, FALSE);
 	y += 260 + 40;
-	caption("Sign out", x, y, w);
+	caption(_("Sign out"), x, y, w);
 	y += 24;
 	y += setting_row(
-		x, y, w, "Log out of this computer",
-		"Ends this linked desktop session and removes its keys. Your phone stays signed in.",
-		"Log Out", A_LOGOUT, 0, FALSE, FALSE);
+		x, y, w, _("Log out of this computer"),
+		_("Ends this linked desktop session and removes its keys. Your phone stays signed in."),
+		_("Log Out"), A_LOGOUT, 0, FALSE, FALSE);
 	return y - top;
 }
 
@@ -686,19 +692,19 @@ static int profiles_section(int x, int y, int w)
 	gboolean preview = w >= 620;
 	int form_w = preview ? w - CARD_W - 32 : w;
 
-	heading("Profiles", x, y, w);
+	heading(_("Profiles"), x, y, w);
 	y += 44;
-	caption("Avatar", x, y, form_w);
-	button((Rect){ x, y + 24, 150, 32 }, "Change Avatar", ACCENT,
+	caption(_("Avatar"), x, y, form_w);
+	button((Rect){ x, y + 24, 150, 32 }, _("Change Avatar"), ACCENT,
 	       UI_ON_ACCENT, A_PICTURE, 0);
-	ui_draw_label("JPEG, PNG or WebP. LINE shows a centered square.",
+	ui_draw_label(_("JPEG, PNG or WebP. LINE shows a centered square."),
 		      (Rect){ x, y + 64, form_w, 20 }, 13, 400, MUTED, FALSE);
 	y += 104;
-	field(1, "Display name", x, y, form_w);
+	field(1, _("Display name"), x, y, form_w);
 	y += 88;
-	field(2, "Status message", x, y, form_w);
+	field(2, _("Status message"), x, y, form_w);
 	y += 88;
-	ui_draw_label("Names up to 20 characters, status up to 500.",
+	ui_draw_label(_("Names up to 20 characters, status up to 500."),
 		      (Rect){ x, y - 16, form_w, 20 }, 13, 400, FAINT, FALSE);
 	if (preview) {
 		Json *row = json_object_new_object();
@@ -720,7 +726,7 @@ static int profiles_section(int x, int y, int w)
 					""));
 		json_object_object_add(row, "self",
 				       json_object_new_boolean(TRUE));
-		caption("Preview", x + w - CARD_W, top + 44, CARD_W);
+		caption(_("Preview"), x + w - CARD_W, top + 44, CARD_W);
 		draw_card(row, x + w - CARD_W, top + 68, CARD_W, FALSE);
 		json_object_put(row);
 	}
@@ -731,21 +737,22 @@ static int privacy_section(int x, int y, int w)
 {
 	int top = y;
 
-	heading("Privacy & Safety", x, y, w);
+	heading(_("Privacy & Safety"), x, y, w);
 	y += 52;
-	y += setting_row(x, y, w, "Friend requests",
-			 "Review incoming requests and people who added you.",
-			 "Open Inbox", A_OPEN_INBOX, 0, FALSE, FALSE);
-	y += setting_row(x, y, w, "Blocked",
-			 "Blocked people can't message or call you on LINE.",
-			 "View", A_VIEW, 2, FALSE, FALSE);
-	y += setting_row(x, y, w, "Hidden friends",
-			 "Hidden friends leave your list but stay friends.",
-			 "View", A_VIEW, 1, FALSE, FALSE);
 	y += setting_row(
-		x, y, w, "Friend suggestions",
-		"People LINE recommends, including some who added you.", "View",
-		A_VIEW, 3, FALSE, FALSE);
+		x, y, w, _("Friend requests"),
+		_("Review incoming requests and people who added you."),
+		_("Open Inbox"), A_OPEN_INBOX, 0, FALSE, FALSE);
+	y += setting_row(x, y, w, _("Blocked"),
+			 _("Blocked people can't message or call you on LINE."),
+			 _("View"), A_VIEW, 2, FALSE, FALSE);
+	y += setting_row(x, y, w, _("Hidden friends"),
+			 _("Hidden friends leave your list but stay friends."),
+			 _("View"), A_VIEW, 1, FALSE, FALSE);
+	y += setting_row(
+		x, y, w, _("Friend suggestions"),
+		_("People LINE recommends, including some who added you."),
+		_("View"), A_VIEW, 3, FALSE, FALSE);
 	return y - top;
 }
 
@@ -753,52 +760,53 @@ static int notifications_section(int x, int y, int w)
 {
 	int top = y;
 
-	heading("Notifications", x, y, w);
+	heading(_("Notifications"), x, y, w);
 	y += 52;
 	y += setting_row(
-		x, y, w, "Enable Desktop Notifications",
-		"Messages, calls and friend activity while the window is in the background. Previews stay hidden.",
+		x, y, w, _("Enable Desktop Notifications"),
+		_("Messages, calls and friend activity while the window is in the background. Previews stay hidden."),
 		NULL, A_NOTIFY, 0, TRUE, ui_notifications_enabled());
 	y += setting_row(
-		x, y, w, "Sounds",
-		"Ringtone, call sounds and a chime for new messages, played on an emulated NES sound chip.",
+		x, y, w, _("Sounds"),
+		_("Ringtone, call sounds and a chime for new messages, played on an emulated NES sound chip."),
 		NULL, A_SOUNDS, 0, TRUE, ui_sounds_enabled());
 	ui_draw_label(
-		"To mute one conversation, right-click it in the list and choose Mute conversation.",
+		_("To mute one conversation, right-click it in the list and choose Mute conversation."),
 		(Rect){ x, y, w, 40 }, 14, 400, MUTED, TRUE);
 	return y - top + 40;
 }
 
 static const char *const shortcuts[][2] = {
-	{ "Open settings", "Ctrl+," },
-	{ "Find a conversation", "Ctrl+F" },
-	{ "Search this conversation", "Ctrl+Shift+F" },
-	{ "Search recent messages", "Ctrl+Alt+F" },
-	{ "Refresh", "Ctrl+R" },
-	{ "Send message", "Enter" },
-	{ "Close a dialog", "Escape" },
-	{ "Switch to the call", "Alt+C" },
-	{ "Mute or unmute", "Alt+M" },
-	{ "Camera on or off", "Alt+V" },
-	{ "Share your screen", "Alt+S" },
-	{ "Accept a call", "Alt+A" },
-	{ "Decline a call", "Alt+D" },
+	{ N_("Open settings"), "Ctrl+," },
+	{ N_("Find a conversation"), "Ctrl+F" },
+	{ N_("Search this conversation"), "Ctrl+Shift+F" },
+	{ N_("Search recent messages"), "Ctrl+Alt+F" },
+	{ N_("Refresh"), "Ctrl+R" },
+	{ N_("Send message"), "Enter" },
+	{ N_("Close a dialog"), "Escape" },
+	{ N_("Switch to the call"), "Alt+C" },
+	{ N_("Mute or unmute"), "Alt+M" },
+	{ N_("Camera on or off"), "Alt+V" },
+	{ N_("Share your screen"), "Alt+S" },
+	{ N_("Accept a call"), "Alt+A" },
+	{ N_("Decline a call"), "Alt+D" },
 };
 
 static int keybinds_section(int x, int y, int w)
 {
 	int top = y;
 
-	heading("Keybinds", x, y, w);
+	heading(_("Keybinds"), x, y, w);
 	y += 52;
-	y += setting_row(x, y, w, "Chat list shortcuts",
-			 "Folders, pins, search and refresh can be rebound.",
-			 "Customize", A_KEYS, 0, FALSE, FALSE);
-	caption("Built in", x, y, w);
+	y += setting_row(x, y, w, _("Chat list shortcuts"),
+			 _("Folders, pins, search and refresh can be rebound."),
+			 _("Customize"), A_KEYS, 0, FALSE, FALSE);
+	caption(_("Built in"), x, y, w);
 	y += 26;
 	for (guint i = 0; i < G_N_ELEMENTS(shortcuts); i++) {
-		ui_draw_label(shortcuts[i][0], (Rect){ x, y + 6, w - 180, 22 },
-			      15, 450, INK, FALSE);
+		ui_draw_label(_(shortcuts[i][0]),
+			      (Rect){ x, y + 6, w - 180, 22 }, 15, 450, INK,
+			      FALSE);
 		int kw = ui_text_width(shortcuts[i][1], 13, 600) + 20;
 		Rect k = { x + w - kw, y + 2, kw, 28 };
 
@@ -810,48 +818,71 @@ static int keybinds_section(int x, int y, int w)
 	return y - top;
 }
 
+/* A radio row; returns its height. */
+static int choice_row(int x, int y, int w, const char *label, gboolean selected,
+		      int action, int arg)
+{
+	Rect r = { x, y, w, 40 };
+	Rect mark = { x + 10, y + 11, 18, 18 };
+
+	ui_draw_rounded(r, 7,
+			selected ?
+				NAV_SELECTED :
+				ui_blend(CONTENT, NAV_HOVER, ui_draw_hover(r)));
+	ui_draw_outline(mark, 9, selected ? ACCENT : MUTED);
+	if (selected)
+		ui_draw_rounded((Rect){ mark.x + 4, mark.y + 4, 10, 10 }, 5,
+				ACCENT);
+	ui_draw_label(label, (Rect){ x + 38, y + 9, w - 44, 23 }, 15,
+		      selected ? 600 : 450, HEADING, FALSE);
+	control(r, action, arg);
+	return 44;
+}
+
 static int appearance_section(int x, int y, int w)
 {
 	int top = y;
 
-	heading("Appearance", x, y, w);
+	heading(_("Appearance"), x, y, w);
 	y += 52;
-	caption("Theme", x, y, w);
+	caption(_("Theme"), x, y, w);
 	y += 26;
 	const char *const themes[] = { "Avernella", "LINE" };
 
-	for (guint i = 0; i < G_N_ELEMENTS(themes); i++) {
-		gboolean selected = ui_theme_is_line() == (i == 1);
-		Rect r = { x, y, w, 40 };
-		Rect mark = { x + 10, y + 11, 18, 18 };
+	for (guint i = 0; i < G_N_ELEMENTS(themes); i++)
+		y += choice_row(x, y, w, themes[i],
+				ui_theme_is_line() == (i == 1), A_THEME, i);
+	y += 18;
+	caption(_("Language"), x, y, w);
+	y += 26;
+	/*
+	 * Each language is named in itself so anyone can find their own,
+	 * two to a row when the pane is wide enough.
+	 */
+	int columns = w >= 360 ? 2 : 1, cw = (w - (columns - 1) * 8) / columns;
 
-		ui_draw_rounded(r, 7,
-				selected ? NAV_SELECTED :
-					   ui_blend(CONTENT, NAV_HOVER,
-						    ui_draw_hover(r)));
-		ui_draw_outline(mark, 9, selected ? ACCENT : MUTED);
-		if (selected)
-			ui_draw_rounded((Rect){ mark.x + 4, mark.y + 4, 10,
-						10 },
-					5, ACCENT);
-		ui_draw_label(themes[i], (Rect){ x + 38, y + 9, w - 44, 23 },
-			      15, selected ? 600 : 450, HEADING, FALSE);
-		control(r, A_THEME, i);
-		y += 44;
+	for (int i = 0; i < UI_LANG_COUNT; i++) {
+		int col = i % columns;
+
+		choice_row(x + col * (cw + 8), y, cw, ui_lang_native_name(i),
+			   ui_lang_current() == (enum ui_language)i, A_LANGUAGE,
+			   i);
+		if (col == columns - 1 || i == UI_LANG_COUNT - 1)
+			y += 44;
 	}
 	y += 18;
-	caption("Accessibility", x, y, w);
+	caption(_("Accessibility"), x, y, w);
 	y += 28;
 	int choice = ui_motion_choice();
 
 	y += setting_row(
-		x, y, w, "Reduce Motion",
+		x, y, w, _("Reduce Motion"),
 		choice < 0 ?
-			"Follows your desktop's animation setting." :
-			"Set here for this account. Choose Use desktop setting to follow the desktop again.",
+			_("Follows your desktop's animation setting.") :
+			_("Set here for this account. Choose Use desktop setting to follow the desktop again."),
 		NULL, A_MOTION, 0, TRUE, ui_reduce_motion());
 	if (choice >= 0) {
-		button((Rect){ x, y, 180, 32 }, "Use desktop setting", CHIP,
+		button((Rect){ x, y, 180, 32 }, _("Use desktop setting"), CHIP,
 		       INK, A_MOTION_SYSTEM, 0);
 		y += 48;
 	}
@@ -874,7 +905,7 @@ static void draw_settings(void)
 				ui_draw_box((Rect){ nav_x + 10, y + 4,
 						    nav_w - 20, 1 },
 					    UI_LINE);
-			caption(s ? "App Settings" : "User Settings",
+			caption(s ? _("App Settings") : _("User Settings"),
 				nav_x + 10, y + (s ? 14 : 0), nav_w - 20);
 			y += s ? 36 : 24;
 		}
@@ -885,7 +916,7 @@ static void draw_settings(void)
 			ui_draw_rounded(r, 4, NAV_SELECTED);
 		else if (h > 0.)
 			ui_draw_rounded(r, 4, ui_blend(NAV, NAV_HOVER, h));
-		ui_draw_label(section_names[s],
+		ui_draw_label(_(section_names[s]),
 			      (Rect){ r.x + 10, r.y + 6, r.w - 20, 22 }, 16,
 			      500,
 			      p.section == (enum section)s ? HEADING : MUTED,
@@ -900,7 +931,7 @@ static void draw_settings(void)
 
 	if (oh > 0.)
 		ui_draw_rounded(out, 4, ui_blend(NAV, NAV_HOVER, oh));
-	ui_draw_label("Log Out",
+	ui_draw_label(_("Log Out"),
 		      (Rect){ out.x + 10, out.y + 6, out.w - 20, 22 }, 16, 500,
 		      0xfa777c, FALSE);
 	control(out, A_LOGOUT, 0);
@@ -952,13 +983,13 @@ static void draw_settings(void)
 		Rect bar = { cx, H - 72, cw, 52 };
 
 		ui_draw_rounded(bar, 8, INNER);
-		ui_draw_label("Careful — you have unsaved changes!",
+		ui_draw_label(_("Careful — you have unsaved changes!"),
 			      (Rect){ bar.x + 16, bar.y + 15, bar.w - 250, 22 },
 			      15, 500, INK, FALSE);
 		button((Rect){ bar.x + bar.w - 220, bar.y + 10, 80, 32 },
-		       "Reset", INNER, INK, A_RESET, 0);
+		       _("Reset"), INNER, INK, A_RESET, 0);
 		button((Rect){ bar.x + bar.w - 132, bar.y + 10, 120, 32 },
-		       p.save_tag ? "Saving…" : "Save Changes", ACCENT,
+		       p.save_tag ? _("Saving…") : _("Save Changes"), ACCENT,
 		       UI_ON_ACCENT, A_SAVE, 0);
 	}
 	if (p.settings_note && *p.settings_note) {
@@ -1008,9 +1039,10 @@ static int inbox_row(Json *row, int x, int y, int w, int index,
 	ui_draw_label(ui_string(row, "name", ""),
 		      (Rect){ x + 54, y + 9, w - 150, 20 }, 15, 600, HEADING,
 		      FALSE);
-	ui_draw_label(
-		request ? "Incoming friend request" : "Added you as a friend",
-		(Rect){ x + 54, y + 30, w - 150, 18 }, 13, 400, MUTED, FALSE);
+	ui_draw_label(request ? _("Incoming friend request") :
+				_("Added you as a friend"),
+		      (Rect){ x + 54, y + 30, w - 150, 18 }, 13, 400, MUTED,
+		      FALSE);
 	gboolean busy = p.answer_id &&
 			!g_strcmp0(p.answer_id, ui_string(row, "id", ""));
 
@@ -1027,11 +1059,13 @@ static int inbox_row(Json *row, int x, int y, int w, int index,
 		control(yes, A_ACCEPT, index);
 		control(no, A_DECLINE, index);
 	} else if (flag(row, "canAdd") && !flag(row, "friend")) {
-		button((Rect){ x + w - 84, y + 12, 72, 32 }, busy ? "…" : "Add",
-		       ACCENT, UI_ON_ACCENT, A_ADD_BACK, index);
+		button((Rect){ x + w - 84, y + 12, 72, 32 },
+		       busy ? "…" : _("Add"), ACCENT, UI_ON_ACCENT, A_ADD_BACK,
+		       index);
 	} else {
-		ui_draw_label("Friends", (Rect){ x + w - 80, y + 19, 68, 18 },
-			      13, 500, MUTED, FALSE);
+		ui_draw_label(_("Friends"),
+			      (Rect){ x + w - 80, y + 19, 68, 18 }, 13, 500,
+			      MUTED, FALSE);
 	}
 	return 58;
 }
@@ -1056,7 +1090,7 @@ static void draw_inbox(void)
 	ui_draw_rounded((Rect){ x - 1, y - 1, w + 2, h + 2 }, 9, POPOUT_EDGE);
 	ui_draw_rounded(p.panel, 8, POPOUT);
 	ui_draw_icon((Rect){ x + 12, y + 12, 24, 24 }, UI_ICON_INBOX, HEADING);
-	ui_draw_label("Inbox", (Rect){ x + 44, y + 13, w - 60, 24 }, 16, 700,
+	ui_draw_label(_("Inbox"), (Rect){ x + 44, y + 13, w - 60, 24 }, 16, 700,
 		      HEADING, FALSE);
 	ui_draw_box((Rect){ x, y + 48, w, 1 }, POPOUT_EDGE);
 	int ry = y + 58, inner = w - 16;
@@ -1064,7 +1098,7 @@ static void draw_inbox(void)
 	size_t nadd = p.adds ? json_object_array_length(p.adds) : 0;
 
 	if (nreq) {
-		caption("Friend requests", x + 16, ry, inner);
+		caption(_("Friend requests"), x + 16, ry, inner);
 		ry += 22;
 		for (size_t i = 0; i < nreq && ry + 56 < y + h; i++)
 			ry += inbox_row(json_object_array_get_idx(p.requests,
@@ -1073,7 +1107,7 @@ static void draw_inbox(void)
 		ry += 8;
 	}
 	if (nadd && ry + 80 < y + h) {
-		caption("Recent", x + 16, ry, inner);
+		caption(_("Recent"), x + 16, ry, inner);
 		ry += 22;
 		for (size_t i = nadd; i-- > 0 && ry + 56 < y + h;)
 			ry += inbox_row(json_object_array_get_idx(p.adds, i),
@@ -1082,8 +1116,8 @@ static void draw_inbox(void)
 	if (!nreq && !nadd) {
 		const char *empty = p.inbox_note ? p.inbox_note :
 				    !p.requests_loaded ?
-						   "Loading…" :
-						   "You're all caught up.";
+						   _("Loading…") :
+						   _("You're all caught up.");
 		ui_draw_centered(empty, (Rect){ x, y + h / 2 - 12, w, 24 }, 15,
 				 500, MUTED);
 	} else if (p.inbox_note)
@@ -1207,6 +1241,18 @@ static void activate(struct control c, int x)
 			break;
 		if (ui_theme_toggle(&error)) {
 			ui_theme_changed(height);
+			set_text(&p.settings_note, NULL);
+		} else
+			set_text(&p.settings_note, error->message);
+		break;
+	}
+	case A_LANGUAGE: {
+		g_autoptr(GError) error = NULL;
+
+		if (ui_lang_current() == (enum ui_language)c.arg)
+			break;
+		if (ui_lang_set(c.arg, &error)) {
+			ui_language_changed();
 			set_text(&p.settings_note, NULL);
 		} else
 			set_text(&p.settings_note, error->message);
@@ -1420,7 +1466,7 @@ static gboolean requests_reply(guint tag, Json *result, const char *error)
 		if (p.view == INBOX && !p.adds)
 			set_text(
 				&p.inbox_note,
-				"Friend requests aren't available for this account.");
+				_("Friend requests aren't available for this account."));
 	} else if (json_object_is_type(result, json_type_array)) {
 		size_t before =
 			p.requests ? json_object_array_length(p.requests) : 0;
@@ -1513,8 +1559,8 @@ gboolean ui_profile_reply(const char *method, guint tag, Json *result,
 			editor_text(&p.status, ui_string(result, "status", ""));
 			apply_self(result);
 			set_text(&p.settings_note,
-				 picture ? "Your new avatar is live." :
-					   "Saved.");
+				 picture ? _("Your new avatar is live.") :
+					   _("Saved."));
 		}
 		return TRUE;
 	}
@@ -1606,20 +1652,20 @@ void ui_profile_packet(Json *packet)
 	if (!shown) {
 		placeholder = json_object_new_object();
 		json_object_object_add(placeholder, "name",
-				       json_object_new_string("Someone"));
+				       json_object_new_string(_("Someone")));
 		shown = placeholder;
 	}
 	json_object_object_add(
 		shown, "toast",
-		json_object_new_string(added ? "added you as a friend" :
-					       "sent you a friend request"));
+		json_object_new_string(added ? _("added you as a friend") :
+					       _("sent you a friend request")));
 	show_toast(shown);
 	json_object_put(placeholder);
 	if (ui_notifications_enabled() &&
 	    (!ui.active ||
 	     !(SDL_GetWindowFlags(ui.window) & SDL_WINDOW_INPUT_FOCUS))) {
 		g_autofree char *body = g_strdup_printf(
-			"%s %s", ui_string(shown, "name", "Someone"),
+			"%s %s", ui_string(shown, "name", _("Someone")),
 			ui_string(shown, "toast", ""));
 		ui_desktop_notify_text("LINE", body);
 	}
@@ -1725,7 +1771,8 @@ static void panel_button(Rect r, enum ui_icon icon, gboolean lit,
 
 void ui_profile_panel_draw(void)
 {
-	panel_button(p.inbox_button, UI_ICON_INBOX, p.view == INBOX, "Inbox");
+	panel_button(p.inbox_button, UI_ICON_INBOX, p.view == INBOX,
+		     _("Inbox"));
 	if (p.unseen > 0) {
 		Rect dot = { p.inbox_button.x + p.inbox_button.w - 14,
 			     p.inbox_button.y + 4, 12, 12 };
@@ -1734,7 +1781,7 @@ void ui_profile_panel_draw(void)
 		ui_draw_rounded(dot, 6, UI_DANGER);
 	}
 	panel_button(p.gear_button, UI_ICON_GEAR, p.view == SETTINGS,
-		     "User Settings");
+		     _("User Settings"));
 }
 
 int ui_profile_panel_hover(int x, int y)

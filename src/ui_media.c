@@ -205,7 +205,7 @@ void ui_media_leave_fullscreen(void)
 	m.fullscreen_tile = m.first_click_tile = 0;
 	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
 	if (m.window_expanded && SDL_SetWindowFullscreen(ui.window, 0) < 0)
-		ui_status("Could not restore the window size.");
+		ui_status(_("Could not restore the window size."));
 	m.window_expanded = m.saw_fullscreen = FALSE;
 	ui_restore_input();
 	ui.dirty = TRUE;
@@ -420,7 +420,7 @@ void ui_media_album_photo(const char *album, const char *id)
 {
 	if (!ui.selected || !album || !id)
 		return;
-	begin(VIEW, ui.selected, id, "Album photo");
+	begin(VIEW, ui.selected, id, _("Album photo"));
 	m.working = TRUE;
 	Json *p = args(ui.selected, id);
 
@@ -932,8 +932,8 @@ static void decoder(gpointer ptr, gpointer unused)
 			job->png = g_byte_array_free_to_bytes(out);
 		else {
 			g_byte_array_unref(out);
-			job->reason = g_strdup(
-				"Could not encode this image for the clipboard.");
+			job->reason = g_strdup(_(
+				"Could not encode this image for the clipboard."));
 		}
 	}
 	if (job->role == FRIEND_QR && job->image) {
@@ -943,13 +943,13 @@ static void decoder(gpointer ptr, gpointer unused)
 		if (!job->id)
 			job->reason = g_strdup(
 				error ? error->message :
-					"Choose a clear image with one personal LINE QR code.");
+					_("Choose a clear image with one personal LINE QR code."));
 	}
 	close(job->fd);
 	job->fd = -1;
 	if (!job->image)
-		job->reason = g_strdup(
-			"Use a JPEG, PNG or WebP image up to 32 MiB and 32 megapixels.");
+		job->reason = g_strdup(_(
+			"Use a JPEG, PNG or WebP image up to 32 MiB and 32 megapixels."));
 	SDL_Event e = { 0 };
 
 	e.type = m.decode_event;
@@ -1009,9 +1009,10 @@ static void complete_decode(struct decode_job *job)
 					      clipboard_release,
 					      g_bytes_ref(job->png), mime, 1);
 			close_overlay();
-			ui_status(ok	      ? "Image copied." :
-				  job->reason ? job->reason :
-						"Could not copy this image.");
+			ui_status(ok ? _("Image copied.") :
+				  job->reason ?
+				       job->reason :
+				       _("Could not copy this image."));
 		}
 		decoded_free(job);
 		return;
@@ -1164,7 +1165,7 @@ static gboolean play_clip(int fd, gboolean review)
 		m.play_event = SDL_RegisterEvents(1);
 	if (m.play_event == (Uint32)-1) {
 		close(fd);
-		set(&m.note, "Could not start the video player monitor.");
+		set(&m.note, _("Could not start the video player monitor."));
 		return FALSE;
 	}
 	g_clear_pointer(&m.playback, line_video_play_free);
@@ -1178,7 +1179,7 @@ static gboolean play_clip(int fd, gboolean review)
 				     GUINT_TO_POINTER(m.play_serial), &error);
 	if (!m.playback) {
 		set(&m.note, error ? error->message :
-				     "Could not start the video player.");
+				     _("Could not start the video player."));
 		return FALSE;
 	}
 	set(&m.note, NULL);
@@ -1220,13 +1221,13 @@ void ui_media_screenshot(void)
 	if (!ui.selected || !ui.photos || m.mode != CLOSED)
 		return;
 	if (m.screenshot_thread) {
-		ui_status("A screenshot request is already open.");
+		ui_status(_("A screenshot request is already open."));
 		return;
 	}
 	if (!m.screenshot_event)
 		m.screenshot_event = SDL_RegisterEvents(1);
 	if (m.screenshot_event == (Uint32)-1) {
-		ui_status("Could not start a screenshot request.");
+		ui_status(_("Could not start a screenshot request."));
 		return;
 	}
 	struct screenshot_event *out = g_new0(struct screenshot_event, 1);
@@ -1250,7 +1251,7 @@ void ui_media_screenshot(void)
 	if (!m.screenshot_thread) {
 		free_screenshot_event(out);
 		g_clear_object(&m.screenshot_cancel);
-		ui_status("Could not start a screenshot request.");
+		ui_status(_("Could not start a screenshot request."));
 	}
 }
 
@@ -1421,8 +1422,8 @@ void ui_media_thumb(Json *row, Rect r)
 		ui_draw_image(t->sticker ? animation_frame(t->image) : t->image,
 			      r);
 	else
-		ui_draw_label(t && t->reason ? "Open image to retry" :
-					       "Loading image…",
+		ui_draw_label(t && t->reason ? _("Open image to retry") :
+					       _("Loading image…"),
 			      (Rect){ r.x + 8, r.y + r.h / 2 - 10, r.w - 16,
 				      24 },
 			      13, 500, UI_SUBTLE, FALSE);
@@ -1596,7 +1597,7 @@ static void show_emoji(void)
 {
 	if (m.emoji && g_hash_table_foreach_remove(m.emoji, failed_emoji, NULL))
 		ui_forget_history();
-	begin(EMOJI_PICKER, ui.selected, NULL, "LINE emoji");
+	begin(EMOJI_PICKER, ui.selected, NULL, _("LINE emoji"));
 	ui_emoji_open();
 }
 
@@ -1622,7 +1623,7 @@ static void picture(Json *row)
 	const char *id = ui_string(row, "id", "");
 	gboolean sticker = !strcmp(ui_string(row, "type", ""), "sticker");
 
-	begin(VIEW, ui.selected, id, sticker ? "Sticker" : "Photo");
+	begin(VIEW, ui.selected, id, sticker ? _("Sticker") : _("Photo"));
 	m.sticker = sticker;
 	m.working = TRUE;
 	ui_rpc("photo", args(ui.selected, m.id), m.serial);
@@ -1631,7 +1632,7 @@ static void picture(Json *row)
 static void request_video_clip(void)
 {
 	m.working = TRUE;
-	set(&m.note, "Downloading video…");
+	set(&m.note, _("Downloading video…"));
 	ui_rpc("openVideo", args(m.chat, m.id), m.serial);
 }
 
@@ -1640,7 +1641,7 @@ static void open_video(Json *row)
 	Json *video = json_object_get(row);
 	const char *id = ui_string(video, "id", "");
 
-	begin(PLAY_VIDEO, ui.selected, id, "Play video");
+	begin(PLAY_VIDEO, ui.selected, id, _("Play video"));
 	m.row = video;
 	request_video_clip();
 }
@@ -1663,30 +1664,30 @@ static void prepare_attachment(const char *path)
 	gboolean picture_file = ui.photos && is_image_path(copy);
 
 	if (!picture_file && !ui.files) {
-		set(&m.note, "Choose a JPEG, PNG or WebP photo.");
+		set(&m.note, _("Choose a JPEG, PNG or WebP photo."));
 		return;
 	}
 	int fd = open_regular(copy, picture_file ? IMAGE_BOUND : G_MAXSIZE);
 
 	if (fd < 0) {
 		if (m.mode == CLOSED)
-			ui_status("Could not open this attachment.");
+			ui_status(_("Could not open this attachment."));
 		else
 			set(&m.note,
-			    "Could not open this attachment, or it exceeds the size limit.");
+			    _("Could not open this attachment, or it exceeds the size limit."));
 		return;
 	}
 	g_autofree char *name = g_path_get_basename(copy);
 
 	begin(PREVIEW, ui.selected, NULL,
-	      picture_file ? "Send photo" : "Send file");
+	      picture_file ? _("Send photo") : _("Send file"));
 	set(&m.path, copy);
 	set(&m.title, name);
 	m.photo = picture_file;
 	if (picture_file) {
 		m.working = start_decode(fd, LOCAL, NULL, m.serial, FALSE);
 		if (!m.working)
-			set(&m.note, "Could not read this image.");
+			set(&m.note, _("Could not read this image."));
 	} else
 		close(fd);
 }
@@ -1736,14 +1737,15 @@ gboolean ui_media_paste(void)
 		if (data)
 			c->release(data);
 		if (!path) {
-			ui_status(error ? error->message :
-					  "Could not read the pasted picture.");
+			ui_status(
+				error ? error->message :
+					_("Could not read the pasted picture."));
 			return TRUE;
 		}
 		prepare_attachment(path);
 		if (m.mode == PREVIEW && !g_strcmp0(m.path, path)) {
 			m.paste = g_steal_pointer(&path);
-			set(&m.title, "Pasted image");
+			set(&m.title, _("Pasted image"));
 		} else {
 			g_unlink(path);
 		}
@@ -1818,7 +1820,7 @@ static void directory(const char *folder)
 	m.offset = 0;
 	set(&m.note,
 	    m.entries->len == 8192 ?
-		    "Showing the first 8,192 entries. Enter a path to open another." :
+		    _("Showing the first 8,192 entries. Enter a path to open another.") :
 		    NULL);
 	if (m.save) {
 		g_autofree char *full = g_build_filename(path, m.title, NULL);
@@ -1833,7 +1835,7 @@ static void open_picker(gboolean save, Json *row, gboolean friend_qr)
 	g_autofree char *dir =
 		g_strdup(m.directory ? m.directory : g_get_home_dir());
 	const char *name = save ? ui_string(row, "filename", "attachment") :
-				  "Choose an attachment";
+				  _("Choose an attachment");
 	g_autofree char *base = g_path_get_basename(name);
 	g_autofree char *id = g_strdup(ui_string(row, "id", ""));
 
@@ -1853,7 +1855,7 @@ void ui_media_pick_avatar(void)
 {
 	open_picker(FALSE, NULL, FALSE);
 	m.avatar_pick = TRUE;
-	set(&m.title, "Choose a profile picture");
+	set(&m.title, _("Choose a profile picture"));
 	directory(m.directory ? m.directory : g_get_home_dir());
 }
 
@@ -1862,18 +1864,19 @@ void ui_friend_scan_file(const char *path)
 	if (m.working)
 		return;
 	if (m.mode != PICK || !m.friend_qr) {
-		begin(PICK, NULL, NULL, "Read QR image");
+		begin(PICK, NULL, NULL, _("Read QR image"));
 		m.friend_qr = TRUE;
 	}
 	int fd = open_regular(path, IMAGE_BOUND);
 
 	if (fd < 0 || !start_decode(fd, FRIEND_QR, NULL, m.serial, FALSE)) {
 		close_overlay();
-		ui_friends_scan_result(NULL, "Could not open this QR image.");
+		ui_friends_scan_result(NULL,
+				       _("Could not open this QR image."));
 		return;
 	}
 	m.working = TRUE;
-	set(&m.note, "Reading QR code…");
+	set(&m.note, _("Reading QR code…"));
 }
 
 static void save_to(gboolean overwrite)
@@ -1885,7 +1888,7 @@ static void save_to(gboolean overwrite)
 		json_object_object_add(p, "replace",
 				       json_object_new_boolean(TRUE));
 	m.working = TRUE;
-	set(&m.note, "Saving…");
+	set(&m.note, _("Saving…"));
 	ui_rpc("saveFile", p, m.serial);
 }
 
@@ -1921,7 +1924,7 @@ static void choose_path(void)
 	set(&m.path, path);
 	if (g_file_test(path, G_FILE_TEST_EXISTS)) {
 		m.mode = REPLACE;
-		set(&m.note, "Replace the existing file?");
+		set(&m.note, _("Replace the existing file?"));
 		SDL_StopTextInput();
 	} else
 		save_to(FALSE);
@@ -1999,8 +2002,8 @@ static int actions(enum message_action *out)
 static const char *const reaction_names[] = { "nice", "love", "fun", "amazing",
 					      "sad",  "omg",  "none" };
 static const char *const reaction_labels[] = {
-	"Like", "Love",	     "Laugh",	       "Amazing",
-	"Sad",	"Surprised", "Remove reaction"
+	N_("Like"), N_("Love"),	     N_("Laugh"),	   N_("Amazing"),
+	N_("Sad"),  N_("Surprised"), N_("Remove reaction")
 };
 
 static void menu_action(enum message_action a)
@@ -2016,14 +2019,15 @@ static void menu_action(enum message_action a)
 		gboolean ok =
 			SDL_SetClipboardText(ui_string(m.row, "text", "")) == 0;
 		close_overlay();
-		ui_status(ok ? "Text copied." : "Could not copy this message.");
+		ui_status(ok ? _("Text copied.") :
+			       _("Could not copy this message."));
 		break;
 	}
 	case A_COPY_IMAGE:
 		picture(m.row);
 		m.copying = TRUE;
-		set(&m.title, "Copy image");
-		set(&m.note, "Preparing image…");
+		set(&m.title, _("Copy image"));
+		set(&m.note, _("Preparing image…"));
 		break;
 	case A_REACT:
 		m.mode = REACT;
@@ -2062,7 +2066,7 @@ static void menu_action(enum message_action a)
 	}
 	case A_UNSEND:
 		m.mode = UNSEND;
-		set(&m.note, "Remove this message from the conversation?");
+		set(&m.note, _("Remove this message from the conversation?"));
 		break;
 	}
 	ui.dirty = TRUE;
@@ -2224,7 +2228,7 @@ static void dial(gboolean video)
 	set(&m.call_note, NULL);
 	if (video)
 		set(&m.call_note,
-		    "Your camera and microphone start when the call connects.");
+		    _("Your camera and microphone start when the call connects."));
 	call_rpc("callStart");
 }
 
@@ -2473,7 +2477,8 @@ void ui_media_call_event(Json *p)
 		request_self_frame(chat);
 	}
 	if (new_call && m.video_call && !strcmp(state, "incoming"))
-		set(&m.call_note, "Accepting starts your camera and microphone.");
+		set(&m.call_note,
+		    _("Accepting starts your camera and microphone."));
 	/* The ringtone and ringback last only while the call rings. */
 	if (strcmp(state, "incoming") && strcmp(state, "ringing"))
 		ui_sound_stop_loop();
@@ -2699,8 +2704,8 @@ static gboolean enter_fullscreen(enum stage_tile tile)
 	if (!(SDL_GetWindowFlags(ui.window) & SDL_WINDOW_FULLSCREEN)) {
 		if (SDL_SetWindowFullscreen(
 			    ui.window, SDL_WINDOW_FULLSCREEN_DESKTOP) < 0) {
-			ui_status(
-				"Full screen is unavailable on this display.");
+			ui_status(_(
+				"Full screen is unavailable on this display."));
 			return FALSE;
 		}
 		m.window_expanded = TRUE;
@@ -2728,35 +2733,38 @@ void ui_media_draw_fullscreen(void)
 	Rect exit = fullscreen_exit();
 	Rect area = { 0, FULLSCREEN_BAR_H, ui.width,
 		      MAX(0, ui.height - FULLSCREEN_BAR_H) };
-	const char *name =
-		m.fullscreen_tile == TILE_SELF ? (ui.name ? ui.name : "You") :
-		m.fullscreen_tile == TILE_PEER_SCREEN ? "Shared screen" :
-							m.call_name;
+	const char *name = m.fullscreen_tile == TILE_SELF ?
+				   (ui.name ? ui.name : _("You")) :
+			   m.fullscreen_tile == TILE_PEER_SCREEN ?
+				   _("Shared screen") :
+				   m.call_name;
 
 	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
 	ui_draw_box((Rect){ 0, 0, ui.width, ui.height }, 0);
 	if (!picture || !draw_call_frame(picture, area))
-		ui_draw_centered("Waiting for video…", area, 15, 500, UI_BODY);
+		ui_draw_centered(_("Waiting for video…"), area, 15, 500,
+				 UI_BODY);
 	ui_draw_box((Rect){ 0, 0, ui.width, FULLSCREEN_BAR_H }, UI_RAIL);
 	if (exit.x > 20)
-		ui_draw_label(name ? name : "Video call",
+		ui_draw_label(name ? name : _("Video call"),
 			      (Rect){ 12, 10, exit.x - 18, 24 }, 15, 600,
 			      UI_HEADING, FALSE);
-	ui_draw_button(exit, "Exit full screen", FALSE);
+	ui_draw_button(exit, _("Exit full screen"), FALSE);
 }
 
 static const char *call_state_label(void)
 {
 	if (m.mode == DIAL)
-		return m.call_working ? "Calling…" : "";
+		return m.call_working ? _("Calling…") : "";
 	if (call_connected())
-		return "Connected";
+		return _("Connected");
 	if (!g_strcmp0(m.call_state, "incoming"))
-		return m.video_call ? "Incoming Video Call…" : "Incoming Call…";
+		return m.video_call ? _("Incoming Video Call…") :
+				      _("Incoming Call…");
 	if (!g_strcmp0(m.call_state, "outgoing") ||
 	    !g_strcmp0(m.call_state, "ringing"))
-		return "Ringing…";
-	return "Connecting…";
+		return _("Ringing…");
+	return _("Connecting…");
 }
 
 static Rect dock_button(int position)
@@ -2799,8 +2807,8 @@ void ui_media_draw_call_dock(void)
 		       (Rect){ open.x + 5, open.y + 2, 32, 32 });
 	ui_draw_label(m.call_name, (Rect){ x, open.y + 1, width, 16 }, 13, 700,
 		      UI_HEADING, FALSE);
-	ui_draw_label(m.self_sharing ? "Sharing screen · Return to call" :
-				       "Return to call",
+	ui_draw_label(m.self_sharing ? _("Sharing screen · Return to call") :
+				       _("Return to call"),
 		      (Rect){ x, open.y + 18, width, 17 }, 12, 500,
 		      call_connected() ? 0x86d8b0 : UI_MUTED, FALSE);
 	if (m.can_mute && call_connected())
@@ -2808,10 +2816,10 @@ void ui_media_draw_call_dock(void)
 				     m.muted ? UI_GLYPH_MIC_OFF : UI_GLYPH_MIC,
 				     m.muted ? UI_ACCENT : UI_RAISED,
 				     m.muted ? UI_ON_ACCENT : UI_HEADING,
-				     m.muted ? "Unmute (Alt+M)" :
-					       "Mute (Alt+M)");
+				     m.muted ? _("Unmute (Alt+M)") :
+					       _("Mute (Alt+M)"));
 	ui_draw_round_button(dock_button(1), UI_GLYPH_HANG_UP, 0xa52c35,
-			     0xffffff, "Disconnect");
+			     0xffffff, _("Disconnect"));
 }
 
 /* Discord marks a tile that is streaming a screen with a red LIVE pill. */
@@ -2830,7 +2838,7 @@ static void draw_expand_button(Rect r)
 	gboolean hover = at(r, ui.hover_x, ui.hover_y);
 	ui_draw_rounded(r, 4, hover ? UI_SELECTED : UI_INPUT);
 	if (r.w >= 68) {
-		ui_draw_centered("Full screen", r, 11, 600, UI_HEADING);
+		ui_draw_centered(_("Full screen"), r, 11, 600, UI_HEADING);
 	} else {
 		int x = r.x + r.w / 2 - 6, y = r.y + r.h / 2 - 5;
 
@@ -2846,7 +2854,7 @@ static void draw_expand_button(Rect r)
 		}
 	}
 	if (hover)
-		ui_draw_tooltip(r, "Full screen (F11)");
+		ui_draw_tooltip(r, _("Full screen (F11)"));
 }
 
 static void call_tile(int index, struct call_picture *picture, const char *name,
@@ -2906,10 +2914,10 @@ static void draw_incoming_card(Rect area)
 	m.secondary = (Rect){ card.x + 54, card.y + 212, 56, 56 };
 	m.primary = (Rect){ card.x + card.w - 110, card.y + 212, 56, 56 };
 	ui_draw_round_button(m.secondary, UI_GLYPH_HANG_UP, 0xda373c, 0xffffff,
-			     "Decline (Alt+D)");
+			     _("Decline (Alt+D)"));
 	ui_draw_round_button(m.primary,
 			     m.video_call ? UI_GLYPH_CAMERA : UI_GLYPH_ACCEPT,
-			     0x248046, 0xffffff, "Accept (Alt+A)");
+			     0x248046, 0xffffff, _("Accept (Alt+A)"));
 }
 
 /*
@@ -2951,10 +2959,10 @@ static void draw_call_stage(void)
 					  stage.y + 10, 36, 36 };
 		ui_draw_round_button(m.call_minimize, UI_GLYPH_MINIMIZE,
 				     UI_RAISED, UI_HEADING,
-				     "Minimize call (Esc)");
+				     _("Minimize call (Esc)"));
 	}
 	int controls_y = stage.y + stage.h - 76;
-	const char *self = ui.name ? ui.name : "You";
+	const char *self = ui.name ? ui.name : _("You");
 
 	memset(m.tile_rect, 0, sizeof(m.tile_rect));
 	memset(m.fullscreen_button, 0, sizeof(m.fullscreen_button));
@@ -2966,7 +2974,8 @@ static void draw_call_stage(void)
 		 */
 		int order[4], n = 0;
 		g_autofree char *peer_screen = g_strdup_printf(
-			"%s's screen", m.call_name ? m.call_name : "Screen");
+			_("%s's screen"),
+			m.call_name ? m.call_name : _("Screen"));
 
 		order[n++] = 0;
 		if (!m.share_in_video)
@@ -3025,12 +3034,12 @@ static void draw_call_stage(void)
 			Rect t = m.tile_rect[2];
 
 			ui_draw_rounded(t, 8, UI_SIDEBAR);
-			ui_draw_centered("You are sharing your screen",
+			ui_draw_centered(_("You are sharing your screen"),
 					 (Rect){ t.x + 8, t.y + t.h / 2 - 11,
 						 t.w - 16, 22 },
 					 t.h > 80 ? 15 : 11, 600, UI_HEADING);
 			live_badge(t);
-			ui_draw_label("Your screen",
+			ui_draw_label(_("Your screen"),
 				      (Rect){ t.x, t.y + t.h + 6, t.w, 20 }, 13,
 				      600, UI_BODY, FALSE);
 		}
@@ -3080,8 +3089,8 @@ static void draw_call_stage(void)
 					   UI_GLYPH_CAMERA_OFF,
 			m.camera_enabled ? UI_ACCENT : UI_INPUT,
 			m.camera_enabled ? UI_ON_ACCENT : UI_HEADING,
-			m.camera_enabled ? "Turn Off Camera (Alt+V)" :
-					   "Turn On Camera (Alt+V)");
+			m.camera_enabled ? _("Turn Off Camera (Alt+V)") :
+					   _("Turn On Camera (Alt+V)"));
 	}
 	if (call_share_available()) {
 		m.share_button = buttons[i++];
@@ -3090,18 +3099,18 @@ static void draw_call_stage(void)
 			m.self_sharing ? UI_GLYPH_SCREEN_STOP : UI_GLYPH_SCREEN,
 			m.self_sharing ? UI_ACCENT : UI_INPUT,
 			m.self_sharing ? UI_ON_ACCENT : UI_HEADING,
-			m.self_sharing ? "Stop Streaming (Alt+S)" :
-					 "Share Your Screen (Alt+S)");
+			m.self_sharing ? _("Stop Streaming (Alt+S)") :
+					 _("Share Your Screen (Alt+S)"));
 	}
 	if (m.mode == CALL && m.can_mute) {
 		m.secondary = buttons[i++];
-		const char *action = m.muted ? "Unmute" : "Mute";
+		const char *action = m.muted ? _("Unmute") : _("Mute");
 
 		ui_draw_round_button(
 			m.secondary, m.muted ? UI_GLYPH_MIC_OFF : UI_GLYPH_MIC,
 			m.muted ? UI_ACCENT : UI_INPUT,
 			m.muted ? UI_ON_ACCENT : UI_HEADING,
-			m.muted ? "Unmute (Alt+M)" : "Mute (Alt+M)");
+			m.muted ? _("Unmute (Alt+M)") : _("Mute (Alt+M)"));
 		/* The label may be wider than its button. */
 		ui_draw_centered(action,
 				 (Rect){ m.secondary.x - 12, m.secondary.y + 58,
@@ -3112,15 +3121,15 @@ static void draw_call_stage(void)
 	if (m.mode == CALL) {
 		m.primary = buttons[i++];
 		ui_draw_round_button(m.primary, UI_GLYPH_HANG_UP, 0xda373c,
-				     0xffffff, "Disconnect");
+				     0xffffff, _("Disconnect"));
 	} else if (!m.call_working) {
 		/* A failed dial can be retried or dismissed. */
 		m.secondary = buttons[i++];
 		ui_draw_round_button(m.secondary, UI_GLYPH_CLOSE, UI_INPUT,
-				     UI_HEADING, "Cancel");
+				     UI_HEADING, _("Cancel"));
 		m.primary = buttons[i++];
 		ui_draw_round_button(m.primary, UI_GLYPH_ACCEPT, 0x248046,
-				     0xffffff, "Call Again");
+				     0xffffff, _("Call Again"));
 	}
 }
 
@@ -3263,7 +3272,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			if (fd < 0)
 				set(&m.note,
 				    error ? error :
-					    "Could not open the downloaded video.");
+					    _("Could not open the downloaded video."));
 			else if (play_clip(fd, FALSE))
 				close_overlay();
 		}
@@ -3306,7 +3315,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 	}
 	if (!strcmp(method, "sendSticker")) {
 		if (!error && !*ui_string(result, "id", ""))
-			error = "Sticker delivery was not confirmed.";
+			error = _("Sticker delivery was not confirmed.");
 		if (!error && !g_strcmp0(chat, ui.reply_chat) &&
 		    !g_strcmp0(ui.reply_id, ui_string(p, "replyTo", NULL)))
 			ui_media_reply_sent(chat);
@@ -3344,7 +3353,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		store_thumbnail(owner, NULL);
 		m.emoji_busy = FALSE;
 		set(&owner->reason,
-		    error ? error : "Could not load this image.");
+		    error ? error : _("Could not load this image."));
 		ui_forget_history();
 		return;
 	}
@@ -3392,7 +3401,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		if (error && fd >= 0)
 			close(fd);
 		const char *reason = error ? error :
-					     "Could not open this image.";
+					     _("Could not open this image.");
 		if (avatar) {
 			m.avatar_busy = FALSE;
 			store_thumbnail(owner, NULL);
@@ -3469,7 +3478,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 	if (tag && tag == m.serial && m.mode != CLOSED)
 		close_overlay();
 	if (!strcmp(method, "saveFile"))
-		ui_status("File saved.");
+		ui_status(_("File saved."));
 	else {
 		ui.stick_bottom = TRUE;
 		ui_refresh();
@@ -3495,7 +3504,7 @@ static void play_review(void)
 	int fd = open_regular(m.path, LINE_MEDIA_LIMIT);
 
 	if (fd < 0)
-		set(&m.note, "Choose a readable clip up to 64 MiB.");
+		set(&m.note, _("Choose a readable clip up to 64 MiB."));
 	else
 		play_clip(fd, TRUE);
 }
@@ -3505,17 +3514,17 @@ static void record_now(void)
 	if (!m.record_event)
 		m.record_event = SDL_RegisterEvents(1);
 	if (m.record_event == (Uint32)-1) {
-		set(&m.note, "Could not start the recording monitor.");
+		set(&m.note, _("Could not start the recording monitor."));
 		return;
 	}
 	g_autoptr(GError) e = NULL;
 	if (!line_record_start(record_finished, GUINT_TO_POINTER(m.serial),
 			       &e)) {
-		set(&m.note, e ? e->message : "Could not open the camera.");
+		set(&m.note, e ? e->message : _("Could not open the camera."));
 		return;
 	}
 	m.mode = RECORDING;
-	set(&m.note, "The camera and microphone are recording.");
+	set(&m.note, _("The camera and microphone are recording."));
 }
 
 static void primary(void)
@@ -3557,7 +3566,7 @@ static void primary(void)
 					 g_steal_pointer(&m.paste));
 		}
 		m.working = TRUE;
-		set(&m.note, "Sending…");
+		set(&m.note, _("Sending…"));
 		ui_rpc(m.photo ? "sendPhoto" : "sendFile", p, m.serial);
 		break;
 	}
@@ -3567,7 +3576,7 @@ static void primary(void)
 	case RECORDING:
 		line_record_stop();
 		m.working = TRUE;
-		set(&m.note, "Finishing the recording…");
+		set(&m.note, _("Finishing the recording…"));
 		break;
 	case REPLACE:
 		save_to(TRUE);
@@ -3797,9 +3806,9 @@ static void click_overlay(int x, int y, int clicks)
 	}
 	if (at(m.third, x, y) && m.mode == PICK && !m.save && !m.friend_qr &&
 	    !m.avatar_pick) {
-		begin(CAMERA, ui.selected, NULL, "Record a video");
+		begin(CAMERA, ui.selected, NULL, _("Record a video"));
 		set(&m.note,
-		    "Start the camera and microphone to record a video message.");
+		    _("Start the camera and microphone to record a video message."));
 		return;
 	}
 	if (at(m.third, x, y) && m.mode == PREVIEW && m.path) {
@@ -3950,12 +3959,12 @@ gboolean ui_media_event(SDL_Event *e)
 			    !ui_media_layer()) {
 				prepare_attachment(out->path);
 				if (m.mode == PREVIEW)
-					set(&m.title, "Screenshot");
+					set(&m.title, _("Screenshot"));
 			} else {
 				ui_status(
 					out->error ?
 						out->error :
-						"Screenshot saved by the desktop.");
+						_("Screenshot saved by the desktop."));
 			}
 		}
 		free_screenshot_event(out);
@@ -3976,8 +3985,9 @@ gboolean ui_media_event(SDL_Event *e)
 			} else {
 				m.mode = CAMERA;
 				m.working = FALSE;
-				set(&m.note, evt->error ? evt->error :
-							  "Recording stopped.");
+				set(&m.note, evt->error ?
+						     evt->error :
+						     _("Recording stopped."));
 			}
 		}
 		free_record_event(evt);
@@ -4231,12 +4241,17 @@ void ui_media_overlay(void)
 	}
 	m.third = (Rect){ 0 };
 	if (m.mode == MENU || m.mode == REACT) {
-		const char *const labels[] = {
-			"Reply",	  "Copy text",	      "React…",
-			"View image",	  "Save attachment…", "Unsend…",
-			"Copy image",	  "Forward…",	      "Announce…",
-			"Mention sender", "Play video"
-		};
+		const char *const labels[] = { _("Reply"),
+					       _("Copy text"),
+					       _("React…"),
+					       _("View image"),
+					       _("Save attachment…"),
+					       _("Unsend…"),
+					       _("Copy image"),
+					       _("Forward…"),
+					       _("Announce…"),
+					       _("Mention sender"),
+					       _("Play video") };
 		enum message_action arr[12];
 		int count = m.mode == MENU ? actions(arr) :
 					     (int)G_N_ELEMENTS(reaction_labels);
@@ -4256,7 +4271,7 @@ void ui_media_overlay(void)
 			if (m.cursor == j)
 				ui_draw_rounded(r, 4, UI_SELECTED);
 			ui_draw_label(m.mode == MENU ? labels[arr[j]] :
-						       reaction_labels[j],
+						       _(reaction_labels[j]),
 				      (Rect){ r.x + 9, r.y + 5, r.w - 15, 25 },
 				      14, 500, UI_HEADING, FALSE);
 		}
@@ -4283,14 +4298,16 @@ void ui_media_overlay(void)
 	ui_scrim();
 	ui_draw_box(m.dialog, UI_DIALOG);
 	const char *heading =
-		m.mode == PICK ? (m.avatar_pick ? "Choose a profile picture" :
-				  m.friend_qr	? "Read QR image" :
-				  m.save	? "Save attachment" :
-						  "Choose an attachment") :
-		m.mode == PREVIEW ? (m.photo ? "Send photo" : "Send file") :
-		m.mode == REACT	  ? "React to message" :
-		m.mode == UNSEND  ? "Unsend message" :
-		m.mode == REPLACE ? "File already exists" :
+		m.mode == PICK ?
+			(m.avatar_pick ? _("Choose a profile picture") :
+			 m.friend_qr   ? _("Read QR image") :
+			 m.save	       ? _("Save attachment") :
+					 _("Choose an attachment")) :
+		m.mode == PREVIEW ?
+			(m.photo ? _("Send photo") : _("Send file")) :
+		m.mode == REACT	  ? _("React to message") :
+		m.mode == UNSEND  ? _("Unsend message") :
+		m.mode == REPLACE ? _("File already exists") :
 				    m.title;
 	ui_draw_label(heading,
 		      (Rect){ x + 20, y + 16,
@@ -4335,10 +4352,10 @@ void ui_media_overlay(void)
 		}
 		if (!m.save && !m.friend_qr && !m.avatar_pick && ui.files) {
 			m.third = (Rect){ x + w - 132, y + 16, 112, 34 };
-			ui_draw_button(m.third, "Record video", FALSE);
+			ui_draw_button(m.third, _("Record video"), FALSE);
 		}
-		yes = m.save ? "Save" : "Choose";
-		no = "Cancel";
+		yes = m.save ? _("Save") : _("Choose");
+		no = _("Cancel");
 	} else if (m.mode == VIEW || m.mode == PREVIEW) {
 		if (m.mode == PREVIEW)
 			ui_draw_label(m.title,
@@ -4351,36 +4368,36 @@ void ui_media_overlay(void)
 						  m.image,
 				      image);
 		else if (m.working)
-			ui_draw_label("Loading…",
+			ui_draw_label(_("Loading…"),
 				      (Rect){ image.x, image.y + 12, image.w,
 					      32 },
 				      15, 500, muted, FALSE);
 		if (m.mode == PREVIEW && !m.photo &&
 		    strcmp(attachment_type(m.path), "file")) {
 			m.third = (Rect){ x + 20, y + 102, 136, 36 };
-			ui_draw_button(m.third, "Play preview", FALSE);
+			ui_draw_button(m.third, _("Play preview"), FALSE);
 		}
 		if (m.mode == VIEW)
-			yes = "Close";
+			yes = _("Close");
 		else {
-			yes = m.working ? "Please wait…" : "Send";
-			no = "Cancel";
+			yes = m.working ? _("Please wait…") : _("Send");
+			no = _("Cancel");
 		}
 	} else if (m.mode == PLAY_VIDEO) {
-		no = "Close";
+		no = _("Close");
 		if (!m.working) {
-			yes = "Retry";
+			yes = _("Retry");
 			m.third = (Rect){ x + 20, y + 67, 118, 34 };
-			ui_draw_button(m.third, "Save video", FALSE);
+			ui_draw_button(m.third, _("Save video"), FALSE);
 		}
 	} else if (m.mode == CAMERA || m.mode == RECORDING) {
-		yes = m.mode == CAMERA ? "Start recording" :
-		      m.working	       ? "Finishing…" :
-					 "Stop recording";
-		no = "Cancel";
+		yes = m.mode == CAMERA ? _("Start recording") :
+		      m.working	       ? _("Finishing…") :
+					 _("Stop recording");
+		no = _("Cancel");
 	} else {
-		yes = m.mode == REPLACE ? "Replace" : "Unsend";
-		no = "Cancel";
+		yes = m.mode == REPLACE ? _("Replace") : _("Unsend");
+		no = _("Cancel");
 	}
 	if (m.note && *m.note)
 		ui_draw_label(m.note, (Rect){ x + 20, bottom - 48, w - 40, 46 },

@@ -241,7 +241,8 @@ static PangoLayout *label(struct builder *b, Json *node, const char *value,
 	PangoFontDescription *font = pango_font_description_new();
 	int px = MAX(9, size(string(node, "size"), 44, 15, TRUE));
 
-	pango_font_description_set_family(font, "Inter, Noto Sans, sans-serif");
+	pango_font_description_set_family(
+		font, "Inter, Noto Sans, Noto Sans Thai, sans-serif");
 	pango_font_description_set_absolute_size(font, px * PANGO_SCALE);
 	pango_font_description_set_weight(font, button ? PANGO_WEIGHT_SEMIBOLD :
 							 PANGO_WEIGHT_NORMAL);

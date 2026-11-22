@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_notifications.h"
+#include "ui_lang.h"
 #include <gio/gio.h>
 
 struct notice {
@@ -19,8 +20,8 @@ static gpointer notify(gpointer data)
 	if (bus) {
 		const char *summary = notice->name;
 		const char *body = notice->body ? notice->body :
-				   notice->call ? "Incoming LINE call" :
-						  "New LINE message";
+				   notice->call ? _("Incoming LINE call") :
+						  _("New LINE message");
 		GVariantBuilder hints;
 
 		g_variant_builder_init(&hints, G_VARIANT_TYPE_VARDICT);

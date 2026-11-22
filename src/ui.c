@@ -157,6 +157,14 @@ static int max_list_scroll(void)
 		   (int)ui.visible->len * ui_chat_row_height() - ui.list_box.h);
 }
 
+void ui_language_changed(void)
+{
+	/* Cached message rows hold translated dates and labels. */
+	ui_forget_history();
+	ui_layout();
+	ui.dirty = TRUE;
+}
+
 void ui_theme_changed(int old_row_height)
 {
 	/* Keep the same chat at the top when row heights change. */
@@ -921,7 +929,7 @@ static gboolean start_password_worker(void)
 static void login(gboolean resume)
 {
 	if (wire.pid) {
-		reset_login("Sign-in cancelled.");
+		reset_login(_("Sign-in cancelled."));
 		return;
 	}
 	gboolean password = ui.email_login && !resume;
@@ -929,7 +937,7 @@ static void login(gboolean resume)
 	if (password &&
 	    (!ui.login_email.value->len || !ui.login_password.value->len)) {
 		set_string(&ui.notice,
-			   "Enter your email address and password.");
+			   _("Enter your email address and password."));
 		focus_on(ui.login_email.value->len ? F_LOGIN_PASSWORD :
 						     F_LOGIN_EMAIL);
 		return;
@@ -944,7 +952,7 @@ static void login(gboolean resume)
 	clear_password();
 	ui.authenticating = TRUE;
 	focus_on(F_LOGIN);
-	set_string(&ui.notice, "Contacting LINE…");
+	set_string(&ui.notice, _("Contacting LINE…"));
 	request(LOGIN, NULL, NULL);
 }
 
@@ -980,7 +988,7 @@ static void retry_login(const char *error)
 	delay = MIN(delay, 300u);
 	wire.login_failures++;
 	g_autofree char *notice = g_strdup_printf(
-		"Still signed in. %s Retrying in %u s…", error, delay);
+		_("Still signed in. %s Retrying in %u s…"), error, delay);
 	set_string(&ui.notice, notice);
 	if (!wire.login_timer)
 		wire.login_timer =
@@ -994,7 +1002,7 @@ static void logout(void)
 		return;
 	ui.logging_out = TRUE;
 	request(LOGOUT, NULL, NULL);
-	set_string(&ui.notice, "Signing out…");
+	set_string(&ui.notice, _("Signing out…"));
 }
 
 static void request_history(void)
@@ -1170,7 +1178,7 @@ static void select_id(const char *id)
 		wire.selected_summary = chat_summary(id);
 		set_text(&ui.message, g_hash_table_lookup(ui.drafts, id));
 		set_json(&ui.history, NULL);
-		set_string(&ui.notice, "Loading messages…");
+		set_string(&ui.notice, _("Loading messages…"));
 		request_history();
 		ui.stick_bottom = TRUE;
 	}
@@ -1354,7 +1362,7 @@ static void send_message(void)
 		return;
 	g_hash_table_add(ui.sending, g_strdup(ui.selected));
 	request(SEND, ui.selected, ui.message.value->str);
-	set_string(&ui.notice, "Sending…");
+	set_string(&ui.notice, _("Sending…"));
 }
 
 /*
@@ -1374,11 +1382,11 @@ static void rich_action(Json *area, Json *message)
 			return;
 		g_hash_table_add(ui.sending, g_strdup(ui.selected));
 		request(SEND, ui.selected, value);
-		set_string(&ui.notice, "Sending…");
+		set_string(&ui.notice, _("Sending…"));
 	} else if (!strcmp(kind, "copy")) {
 		ui_status(SDL_SetClipboardText(value) ?
-				  "Could not copy to the clipboard." :
-				  "Copied to the clipboard.");
+				  _("Could not copy to the clipboard.") :
+				  _("Copied to the clipboard."));
 	} else if (!strcmp(kind, "scene")) {
 		ui_rich_set_scene(message, value);
 	}
@@ -1443,7 +1451,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		if (error || !json_object_is_type(result, json_type_object)) {
 			reset_login(
 				error ? error :
-					"Sign-in returned an unexpected response.");
+					_("Sign-in returned an unexpected response."));
 			return;
 		}
 		ui.authenticating = FALSE;
@@ -1455,7 +1463,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		g_clear_pointer(&ui.qr, QRcode_free);
 		g_clear_pointer(&ui.pin, g_free);
 		set_string(&ui.name, ui_string(result, "name", "LINE"));
-		set_string(&ui.notice, "Loading chats…");
+		set_string(&ui.notice, _("Loading chats…"));
 		ui_lists_login(ui.self_id);
 		ui_profile_login();
 		ui_layout();
@@ -1468,7 +1476,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		if (error || !json_object_is_type(result, json_type_array))
 			set_string(&ui.notice,
 				   error ? error :
-					   "Could not read the chat list.");
+					   _("Could not read the chat list."));
 		else {
 			notify_unread(result);
 			show_chats(result);
@@ -1487,9 +1495,10 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			break;
 		ui.older_pending = FALSE;
 		if (error || !json_object_is_type(result, json_type_array))
-			set_string(&ui.notice,
-				   error ? error :
-					   "Could not read the conversation.");
+			set_string(
+				&ui.notice,
+				error ? error :
+					_("Could not read the conversation."));
 		else {
 			wire.rendered_history = id;
 			if (ui.older_page)
@@ -1531,7 +1540,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		    !g_strcmp0(ui_string(row, "lastId", NULL), saved->text))
 			set_string(
 				&ui.notice,
-				"Read receipt unconfirmed. Refresh to retry.");
+				_("Read receipt unconfirmed. Refresh to retry."));
 		if (confirmed)
 			ui_refilter_chats();
 		ui.dirty = TRUE;
@@ -1545,15 +1554,16 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		Json *rows = ui_field(result, "messages");
 
 		if (error || !json_object_is_type(rows, json_type_array)) {
-			set_string(&ui.notice,
-				   error ? error :
-					   "Could not read earlier messages.");
+			set_string(
+				&ui.notice,
+				error ? error :
+					_("Could not read earlier messages."));
 			break;
 		}
 		ui.has_older =
 			json_object_get_boolean(ui_field(result, "more"));
 		if (!json_object_array_length(rows)) {
-			set_string(&ui.notice, "Beginning of conversation.");
+			set_string(&ui.notice, _("Beginning of conversation."));
 			break;
 		}
 		ui.older_page = TRUE;
@@ -1585,7 +1595,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		if (error || !json_object_is_type(result, json_type_object))
 			set_string(&ui.notice,
 				   error ? error :
-					   "The message was not confirmed.");
+					   _("The message was not confirmed."));
 		else if (!g_strcmp0(ui.selected, saved->chat)) {
 			show_sent(saved, result);
 			if (same_draft(saved->chat, ui.message.value->str,
@@ -1610,7 +1620,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			set_string(&ui.notice, error);
 		} else {
 			ui_liff_close();
-			reset_login("Signed out.");
+			reset_login(_("Signed out."));
 		}
 		break;
 	}
@@ -1656,22 +1666,24 @@ static void handle_packet(Json *packet)
 		ui_media_call_event(packet);
 	else if (!strcmp(event, "signed_out"))
 		reset_login(ui_string(packet, "message",
-				      "Your LINE session ended."));
+				      _("Your LINE session ended.")));
 	else if (!strcmp(event, "qr") && ui.authenticating) {
 		g_clear_pointer(&ui.qr, QRcode_free);
 		g_clear_pointer(&ui.pin, g_free);
 		ui.qr = QRcode_encodeString8bit(ui_string(packet, "url", ""), 0,
 						QR_ECLEVEL_M);
 		if (ui.qr)
-			set_string(&ui.notice,
-				   "Scan this code with LINE on your phone.");
+			set_string(
+				&ui.notice,
+				_("Scan this code with LINE on your phone."));
 		else
-			reset_login("Could not render the LINE sign-in code.");
+			reset_login(
+				_("Could not render the LINE sign-in code."));
 	} else if (!strcmp(event, "pin") && ui.authenticating) {
 		g_clear_pointer(&ui.qr, QRcode_free);
 		set_string(&ui.pin, ui_string(packet, "pin", ""));
 		set_string(&ui.notice,
-			   "Enter this code in LINE on your phone.");
+			   _("Enter this code in LINE on your phone."));
 	} else if (!strcmp(event, "status"))
 		set_string(&ui.notice, ui_string(packet, "message", ""));
 	else if (!strcmp(event, "changed") && ui.connected && !ui.logging_out)
@@ -1797,7 +1809,7 @@ void ui_mention_member(const char *id, const char *name)
 	GArray *list = mention_list(ui.selected);
 
 	if (list && list->len >= 20) {
-		ui_status("A message can mention up to 20 people.");
+		ui_status(_("A message can mention up to 20 people."));
 		return;
 	}
 	if (!mentions)
@@ -2271,8 +2283,8 @@ static void event(SDL_Event *e)
 		if (json_object_is_type(packet, json_type_object))
 			handle_packet(packet);
 		else
-			reset_login(
-				"The LINE connection closed. Sign in again to reconnect.");
+			reset_login(_(
+				"The LINE connection closed. Sign in again to reconnect."));
 		json_object_put(packet);
 		return;
 	}
@@ -2477,6 +2489,7 @@ int line_ui(int argc, char **argv)
 		SDL_SetHintWithPriority(SDL_HINT_RENDER_VSYNC, "1",
 					SDL_HINT_DEFAULT);
 	ui_theme_init();
+	ui_lang_init();
 	ui.window = ui_gpu_window(
 		"Avernella (" LINE_BUILD_COMMIT ")", SDL_WINDOWPOS_CENTERED,
 		SDL_WINDOWPOS_CENTERED, 920, 630,

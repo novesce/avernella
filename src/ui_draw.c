@@ -106,7 +106,8 @@ static PangoLayout *layout(const char *s, int size, int weight, int width,
 	PangoLayout *item = pango_layout_new(context);
 	PangoFontDescription *font = pango_font_description_new();
 
-	pango_font_description_set_family(font, "Inter, Noto Sans, sans-serif");
+	pango_font_description_set_family(
+		font, "Inter, Noto Sans, Noto Sans Thai, sans-serif");
 	pango_font_description_set_absolute_size(font, size * PANGO_SCALE);
 	pango_font_description_set_weight(font, (PangoWeight)weight);
 	pango_layout_set_font_description(item, font);
@@ -119,6 +120,11 @@ static PangoLayout *layout(const char *s, int size, int weight, int width,
 		else {
 			pango_layout_set_single_paragraph_mode(item, TRUE);
 			pango_layout_set_ellipsize(item, PANGO_ELLIPSIZE_END);
+			/*
+			 * The layout is not mirrored, so a one-line label in a
+			 * right-to-left script still starts at its box's left.
+			 */
+			pango_layout_set_auto_dir(item, FALSE);
 		}
 	}
 	return item;
@@ -144,6 +150,7 @@ struct cached_label {
 static struct cached_label labels[LABEL_SETS][LABEL_WAYS];
 static guint8 victim[LABEL_SETS];
 static double text_scale_x, text_scale_y;
+static const char *context_lang; /* the language the labels were shaped in */
 
 void ui_forget_labels(void)
 {
@@ -796,15 +803,16 @@ static void sign_in(void)
 		draw_image(welcome_art, art, 0, CAIRO_FILTER_BEST);
 	}
 
-	const char *heading = ui.qr	     ? "Log in with QR code" :
-			      ui.pin	     ? "Verify this device" :
-			      ui.email_login ? "Connect your LINE account" :
-					       "Welcome to Avernella";
+	const char *heading = ui.qr	     ? _("Log in with QR code") :
+			      ui.pin	     ? _("Verify this device") :
+			      ui.email_login ? _("Connect your LINE account") :
+					       _("Welcome to Avernella");
 	const char *sub =
-		ui.qr	       ? "Scan this with the LINE app on your phone." :
-		ui.pin	       ? "Enter this code in LINE on your phone." :
-		ui.email_login ? "LINE may ask you to verify on your phone." :
-				 "Independent LINE desktop client.";
+		ui.qr  ? _("Scan this with the LINE app on your phone.") :
+		ui.pin ? _("Enter this code in LINE on your phone.") :
+		ui.email_login ?
+			 _("LINE may ask you to verify on your phone.") :
+			 _("Independent LINE desktop client.");
 
 	centered(heading, sign_heading, 24, 700, UI_HEADING);
 	y += 40;
@@ -841,34 +849,34 @@ static void sign_in(void)
 				   .allocated_len = sizeof(masked) };
 		Editor mask = password_mask(&buffer);
 
-		text("Email address", ui.email_box.x, ui.email_box.y - 20,
+		text(_("Email address"), ui.email_box.x, ui.email_box.y - 20,
 		     inner, 13, 600, UI_HEADING, FALSE);
 		draw_editor(&ui.login_email, ui.email_box,
 			    ui.focus == F_LOGIN_EMAIL, "");
-		text("Password", ui.password_box.x, ui.password_box.y - 20,
+		text(_("Password"), ui.password_box.x, ui.password_box.y - 20,
 		     inner, 13, 600, UI_HEADING, FALSE);
 		draw_editor(&mask, ui.password_box,
 			    ui.focus == F_LOGIN_PASSWORD, "");
 		ui.login_password.scroll = mask.scroll;
 	}
 	action(ui.login,
-	       ui.authenticating ? "Cancel" :
-	       ui.email_login	 ? "Sign in" :
-				   "Sign in with QR code",
+	       ui.authenticating ? _("Cancel") :
+	       ui.email_login	 ? _("Sign in") :
+				   _("Sign in with QR code"),
 	       !ui.authenticating, ui.focus == F_LOGIN);
 	int bottom = ui.login.y + ui.login.h + 16;
 
 	if (!ui.authenticating) {
 		action(ui.login_mode,
-		       ui.email_login ? "Use a QR code instead" :
-					"Sign in with email",
+		       ui.email_login ? _("Use a QR code instead") :
+					_("Sign in with email"),
 		       FALSE, ui.focus == F_LOGIN_MODE);
 		bottom = ui.login_mode.y + ui.login_mode.h + 12;
 	}
 	if (!ui.qr && !ui.pin && ui.notice && *ui.notice)
 		text(ui.notice, x, bottom, inner, 13, 550, UI_HEADING, TRUE);
 	else if (!ui.authenticating)
-		text("Approving a new desktop session may sign you out on another desktop.",
+		text(_("Approving a new desktop session may sign you out on another desktop."),
 		     x, bottom, inner, 12, 400, UI_SUBTLE, TRUE);
 }
 
@@ -1283,9 +1291,9 @@ static void line_bar(void)
 	if (ui.friends)
 		nav_tab(ui.friends_button, UI_ICON_PEOPLE, friends,
 			ui_profile_badge() > 0 ? -1 : 0, ui.focus == F_FRIENDS,
-			"Friends");
+			_("Friends"));
 	nav_tab(ui.rail_chats, UI_ICON_MESSAGE, !friends, unread_chats(), FALSE,
-		"Chats");
+		_("Chats"));
 	Rect me = bar_self;
 	double mh = strength(HOVER, me, hovered(me));
 
@@ -1298,7 +1306,7 @@ static void line_bar(void)
 	dot(me.x + me.w - 9, me.y + me.h - 9, 6, UI_NAV_RAIL);
 	dot(me.x + me.w - 9, me.y + me.h - 9, 4, UI_ONLINE);
 	if (hovered(me))
-		tooltip(me, ui.name && *ui.name ? ui.name : "Profile", TRUE);
+		tooltip(me, ui.name && *ui.name ? ui.name : _("Profile"), TRUE);
 	ui_profile_panel_draw();
 	Rect r = ui.logout;
 	double hv = strength(HOVER, r, hovered(r));
@@ -1310,7 +1318,7 @@ static void line_bar(void)
 		active_ring(r);
 	icon_exit(r.x + 8, r.y + 8, hovered(r) ? UI_DANGER : UI_NAV_INK);
 	if (hovered(r))
-		tooltip(r, "Sign out", TRUE);
+		tooltip(r, _("Sign out"), TRUE);
 }
 
 static void server_rail(void)
@@ -1328,7 +1336,7 @@ static void server_rail(void)
 	ui_draw_image(logo, (Rect){ home.x + 2, home.y + 2, 44, 44 });
 	box(24, 68, 24, 2, 1, UI_LINE);
 	if (hovered(home))
-		tooltip(home, "Direct Messages", TRUE);
+		tooltip(home, _("Direct Messages"), TRUE);
 	for (int i = 0; i < rail_items.count; i++)
 		rail_avatar(rail_items.box[i], rail_items.row[i]);
 	if (ui.groups && ui.rail_add.w) {
@@ -1340,7 +1348,7 @@ static void server_rail(void)
 		icon_plus(a.x + 24, a.y + 24, 9,
 			  blend(UI_ACCENT, UI_ACCENT_HOVER, hover), 2.2);
 		if (hovered(a))
-			tooltip(a, "New group", TRUE);
+			tooltip(a, _("New group"), TRUE);
 	}
 }
 
@@ -1396,7 +1404,7 @@ static void user_panel(void)
 	     600, UI_HEADING, FALSE);
 	const char *status = ui_profile_self_status();
 
-	text(status && *status ? status : "Online", p.x + 48, p.y + 27,
+	text(status && *status ? status : _("Online"), p.x + 48, p.y + 27,
 	     MAX(20, me.w - 48), 12, 450, UI_MUTED, FALSE);
 	ui_profile_panel_draw();
 	Rect r = ui.logout;
@@ -1408,7 +1416,7 @@ static void user_panel(void)
 		active_ring(r);
 	icon_exit(r.x + 4, r.y + 4, hovered(r) ? UI_DANGER : UI_MUTED);
 	if (hovered(r))
-		tooltip((Rect){ r.x, r.y - 80, r.w, 34 }, "Sign out", FALSE);
+		tooltip((Rect){ r.x, r.y - 80, r.w, 34 }, _("Sign out"), FALSE);
 }
 
 static void pin_glyph(int px, int py)
@@ -1472,6 +1480,8 @@ static void remember_preview(void)
 
 	if (old && !g_strcmp0(old->id, id))
 		return;
+	if (*body == '[')
+		body = _(body);
 	size_t len = strlen(body);
 	/* Attachments arrive as "[Photo]"; LINE shows the bare word. */
 	char *text = len > 2 && body[0] == '[' && body[len - 1] == ']' ?
@@ -1524,16 +1534,13 @@ static void list_stamp(gint64 ms, char *out, size_t size)
 	if (days <= 0)
 		s = g_date_time_format(when, "%H:%M");
 	else if (days == 1)
-		s = g_strdup("Yesterday");
+		s = g_strdup(_("Yesterday"));
 	else if (days < 7)
-		s = g_date_time_format(when, "%a");
+		s = ui_lang_date(when, "%a");
 	else if (g_date_time_get_year(when) == g_date_time_get_year(now))
-		s = g_strdup_printf("%d/%d", g_date_time_get_month(when),
-				    g_date_time_get_day_of_month(when));
+		s = ui_lang_date(when, _("%-m/%-d"));
 	else
-		s = g_strdup_printf("%d/%d/%d", g_date_time_get_year(when),
-				    g_date_time_get_month(when),
-				    g_date_time_get_day_of_month(when));
+		s = ui_lang_date(when, _("%Y/%-m/%-d"));
 	g_strlcpy(out, s ? s : "", size);
 }
 
@@ -1558,7 +1565,7 @@ static void line_chat_row(Json *c, Rect row, gboolean selected, double sel,
 	avatar(name, row.x + 14, row.y + (row.h - side) / 2, side, id, id,
 	       ui_string(c, "avatarKey", NULL));
 	gint64 unread = json_object_get_int64(ui_field(c, "unread"));
-	char stamp[24];
+	char stamp[64];
 
 	list_stamp(json_object_get_int64(ui_field(c, "time")), stamp,
 		   sizeof(stamp));
@@ -1604,9 +1611,11 @@ static void line_chat_row(Json *c, Rect row, gboolean selected, double sel,
 	int x = name_x, width = right - (badge ? badge + 10 : 0) - name_x;
 
 	if (draft) {
-		int dw = ui_text_width("Draft", 13, 600) + 6;
+		int dw = ui_text_width(_("Draft"), 13, 600) + 6;
 
-		text("Draft", x, row.y + 37, dw, 13, 600, UI_ACCENT, FALSE);
+		/* Exact width: right-to-left text aligns to its box's end. */
+		text(_("Draft"), x, row.y + 37, dw - 6, 13, 600, UI_ACCENT,
+		     FALSE);
 		x += dw;
 		width -= dw;
 	}
@@ -1623,13 +1632,13 @@ static void chats_panel(void)
 	if (rail)
 		server_rail();
 	if (line_style) {
-		text("Chats", rail + 18, 15, ui.reload.x - rail - 26, 22, 700,
-		     UI_HEADING, FALSE);
+		text(_("Chats"), rail + 18, 15, ui.reload.x - rail - 26, 22,
+		     700, UI_HEADING, FALSE);
 		remember_preview();
 	}
 	draw_editor(&ui.search, ui.search_box, ui.focus == F_SEARCH,
-		    line_style ? "Search chats" :
-				 "Find or start a conversation");
+		    line_style ? _("Search chats") :
+				 _("Find or start a conversation"));
 	if (!line_style)
 		line(rail, HEADER_H, s, HEADER_H, UI_RAIL, 1);
 	gboolean friends_open = ui_friends_active();
@@ -1650,7 +1659,7 @@ static void chats_panel(void)
 			    friends_open ? UI_ACCENT :
 			    lit		 ? UI_HEADING :
 					   UI_MUTED);
-		text("Friends", f.x + 44, f.y + 11, f.w - 54, 16, 500,
+		text(_("Friends"), f.x + 44, f.y + 11, f.w - 54, 16, 500,
 		     lit ? UI_HEADING : UI_MUTED, FALSE);
 		int badge = ui_profile_badge();
 
@@ -1686,22 +1695,23 @@ static void chats_panel(void)
 		cairo_line_to(cr, b.x + b.w - 6, heading_y + 5);
 		cairo_stroke(cr);
 	} else
-		text(line_style ? "All chats" : "DIRECT MESSAGES", rail + 16,
-		     heading_y, ui.reload.x - rail - 22, 12, 650, UI_MUTED,
-		     FALSE);
+		text(line_style ? _("All chats") : _("DIRECT MESSAGES"),
+		     rail + 16, heading_y, ui.reload.x - rail - 22, 12, 650,
+		     UI_MUTED, FALSE);
 	if (ui.groups)
-		sidebar_icon_button(ui.new_group, 0, "New group",
+		sidebar_icon_button(ui.new_group, 0, _("New group"),
 				    ui.focus == F_GROUP_NEW);
-	sidebar_icon_button(ui.reload, 1, "Refresh", ui.focus == F_RELOAD);
+	sidebar_icon_button(ui.reload, 1, _("Refresh"), ui.focus == F_RELOAD);
 	Rect r = ui.list_box;
 
 	cairo_save(cr);
 	cairo_rectangle(cr, r.x, r.y, r.w, r.h);
 	cairo_clip(cr);
 	if (!ui.visible->len)
-		text(ui.chats ? (ui.search.value->len ? "No matches" :
-							"No chats available") :
-				"Loading chats…",
+		text(ui.chats ?
+			     (ui.search.value->len ? _("No matches") :
+						     _("No chats available")) :
+			     _("Loading chats…"),
 		     rail + 18, r.y + 8, s - rail - 36, 14, 450, UI_MUTED,
 		     FALSE);
 	guint first = MAX(0, ui.list_offset / row_h);
@@ -1785,7 +1795,7 @@ static void empty_chat(void)
 	int x = r.x + r.w / 2, y = r.y + r.h / 2 - 40;
 
 	ui_draw_image(logo, (Rect){ x - 32, y - 28, 64, 64 });
-	centered("Select a chat", (Rect){ r.x, y + 43, r.w, 35 }, 24, 650,
+	centered(_("Select a chat"), (Rect){ r.x, y + 43, r.w, 35 }, 24, 650,
 		 UI_HEADING);
 }
 
@@ -1866,9 +1876,9 @@ static char *message_stamp(GDateTime *dt)
 		   (g_date_time_get_year(dt) * 400 +
 		    g_date_time_get_day_of_year(dt));
 
-	return g_date_time_format(dt, days == 0 ? "Today at %H:%M" :
-				      days == 1 ? "Yesterday at %H:%M" :
-						  "%d/%m/%Y %H:%M");
+	return g_date_time_format(dt, days == 0 ? _("Today at %H:%M") :
+				      days == 1 ? _("Yesterday at %H:%M") :
+						  _("%d/%m/%Y %H:%M"));
 }
 
 static gboolean show_intro(void)
@@ -1936,7 +1946,7 @@ static void prepare_bubbles(Rect area)
 		struct message_layout row = { .y = cache.height,
 					      .message = msg };
 		row.mine = json_object_get_boolean(ui_field(msg, "own"));
-		const char *who = row.mine ? (ui.name ? ui.name : "You") :
+		const char *who = row.mine ? (ui.name ? ui.name : _("You")) :
 					     ui_string(msg, "from", "LINE");
 		gint64 stamp = json_object_get_int64(ui_field(msg, "time"));
 
@@ -1956,8 +1966,9 @@ static void prepare_bubbles(Rect area)
 			 (stamp >= last_time && stamp - last_time < 420000));
 		if (dt && local_day != last_date) {
 			g_autofree char *date =
-				g_date_time_format(dt, "%B %e, %Y");
-			row.date = layout(date, 12, 600, maxw, FALSE);
+				ui_lang_date(dt, _("%B %e, %Y"));
+			/* Unbounded, so the pill can centre RTL text too. */
+			row.date = layout(date, 12, 600, -1, FALSE);
 		}
 		if (dt) {
 			g_autofree char *hm = g_date_time_format(dt, "%H:%M");
@@ -2008,6 +2019,9 @@ static void prepare_bubbles(Rect area)
 				body = ui_string(msg, "filename",
 						 ui_string(msg, "type",
 							   "Message"));
+			/* Attachments arrive labelled "[Photo]" and so on. */
+			else if (*body == '[')
+				body = _(body);
 			g_autofree char *with_reply =
 				ui_field(msg, "replyTo") ?
 					g_strdup_printf("↪ Reply\n%s", body) :
@@ -2226,8 +2240,9 @@ static void video_card(Json *row, Rect card)
 	cairo_fill(cr);
 
 	gint64 duration = json_object_get_int64(ui_field(row, "durationMs"));
-	char label[24] = "Video";
+	char label[48];
 
+	g_strlcpy(label, _("Video"), sizeof(label));
 	if (duration > 0) {
 		gint64 seconds = (duration + 999) / 1000;
 
@@ -2253,10 +2268,10 @@ static void conversation_intro(Rect area, int y)
 	       ui_string(chat, "avatarKey", NULL));
 	text(name, x, y + 108, area.w - 32, 30, 800, UI_HEADING, FALSE);
 	g_autofree char *line =
-		group ? g_strdup_printf("Welcome to the beginning of %s.",
+		group ? g_strdup_printf(_("Welcome to the beginning of %s."),
 					name) :
 			g_strdup_printf(
-				"This is the beginning of your direct message history with %s.",
+				_("This is the beginning of your direct message history with %s."),
 				name);
 	text(line, x, y + 150, area.w - 32, 16, 400, UI_MUTED, FALSE);
 }
@@ -2359,7 +2374,7 @@ static void rich_draw(Json *message, Rect r)
 		shown = TRUE;
 	}
 	if (!shown)
-		text(loadable ? "Loading…" :
+		text(loadable ? _("Loading…") :
 				ui_string(message, "text", "Rich message"),
 		     r.x + 16, r.y + r.h / 2 - 10, r.w - 32, 15, 500, UI_MUTED,
 		     FALSE);
@@ -2477,7 +2492,7 @@ static void message_rows(Rect area)
 						    ui.max_history_offset);
 	if (cache.intro && ui.history) {
 		if (cache.line_style)
-			centered("No messages yet", area, 14, 400, UI_MUTED);
+			centered(_("No messages yet"), area, 14, 400, UI_MUTED);
 		else if (INTRO_H - ui.history_offset > 0)
 			conversation_intro(area, area.y - ui.history_offset);
 	}
@@ -2522,7 +2537,7 @@ static void message_rows(Rect area)
 		y += 2;
 		if (!r->group && (!cache.line_style || !r->mine)) {
 			const char *name =
-				r->mine ? (ui.name ? ui.name : "You") :
+				r->mine ? (ui.name ? ui.name : _("You")) :
 					  ui_string(r->message, "from", "LINE");
 			const char *sid = ui_string(r->message, "senderId",
 						    r->mine ? ui.self_id : "");
@@ -2587,8 +2602,8 @@ static void message_rows(Rect area)
 	}
 	if (ui.history && !cache.rows->len && !cache.intro)
 		centered(ui.older_page ?
-				 "No messages on this page." :
-				 "LINE returned no messages on this device.",
+				 _("No messages on this page.") :
+				 _("LINE returned no messages on this device."),
 			 area, 14, 400, UI_MUTED);
 }
 
@@ -2639,8 +2654,8 @@ static void header_icon(Rect r, enum header_icon kind, gboolean focus)
 	gboolean hover = hovered(r);
 	guint ink = hover || focus ? UI_ACCENT_HOVER : UI_MUTED;
 	double x = r.x + (r.w - 24) / 2., y = r.y + (r.h - 24) / 2.;
-	const char *tips[] = { "Start Voice Call", "Start Video Call", "Search",
-			       "Member List", "More" };
+	const char *tips[] = { _("Start Voice Call"), _("Start Video Call"),
+			       _("Search"), _("Member List"), _("More") };
 
 	if (focus)
 		active_ring(r);
@@ -2720,15 +2735,15 @@ static void line_composer(void)
 
 		box(bar.x, bar.y, bar.w, bar.h, 0, UI_DIALOG);
 		box(bar.x, bar.y, 3, bar.h, 0, UI_ACCENT);
-		text("Replying to message", bar.x + 16, bar.y + 9, bar.w - 140,
-		     13, 500, UI_BODY, FALSE);
-		text("Esc to cancel", bar.x + bar.w - 112, bar.y + 10, 100, 12,
-		     500, UI_SUBTLE, FALSE);
+		text(_("Replying to message"), bar.x + 16, bar.y + 9,
+		     bar.w - 140, 13, 500, UI_BODY, FALSE);
+		text(_("Esc to cancel"), bar.x + bar.w - 112, bar.y + 10, 100,
+		     12, 500, UI_SUBTLE, FALSE);
 	}
 	line(c.x, c.y - (replying ? 34 : 0), c.x + c.w,
 	     c.y - (replying ? 34 : 0), UI_LINE, 1);
 	draw_editor(&ui.message, ui.entry, ui.focus == F_MESSAGE,
-		    "Enter a message");
+		    _("Enter a message"));
 	if (ui.emojis || ui.stickers) {
 		Rect e = ui.emoji;
 		double hv = strength(HOVER, e, hovered(e));
@@ -2739,9 +2754,10 @@ static void line_composer(void)
 		glyph_smile(e, hv > .5 ? UI_HEADING : UI_NAV_INK);
 		if (hovered(e))
 			tooltip((Rect){ e.x, e.y - 82, e.w, 34 },
-				ui.stickers && ui.emojis ? "Stickers & Emoji" :
-				ui.stickers		 ? "Stickers" :
-							   "Emoji",
+				ui.stickers && ui.emojis ?
+					_("Stickers & Emoji") :
+				ui.stickers ? _("Stickers") :
+					      _("Emoji"),
 				FALSE);
 	}
 	if (ui.photos || ui.files) {
@@ -2754,7 +2770,7 @@ static void line_composer(void)
 		glyph_clip(a, hv > .5 ? UI_HEADING : UI_NAV_INK);
 		if (hovered(a))
 			tooltip((Rect){ a.x, a.y - 82, a.w, 34 },
-				"Upload a File", FALSE);
+				_("Upload a File"), FALSE);
 	}
 	gboolean sending = g_hash_table_contains(ui.sending, ui.selected);
 	gboolean ready = ui.message.value->len && !sending;
@@ -2765,7 +2781,7 @@ static void line_composer(void)
 	    ready ? blend(UI_ACCENT, UI_ACCENT_HOVER, hv) : UI_INPUT);
 	if (ui.focus == F_SEND)
 		active_ring(r);
-	centered(sending ? "Sending…" : "Send", r, 13, 650,
+	centered(sending ? _("Sending…") : _("Send"), r, 13, 650,
 		 ready ? UI_ON_ACCENT : UI_SUBTLE);
 }
 
@@ -2785,10 +2801,10 @@ static void composer(int s, int w)
 		Rect bar = { c.x, c.y - 34, c.w, 42 };
 
 		box(bar.x, bar.y, bar.w, bar.h, 8, UI_PANEL);
-		text("Replying to message", bar.x + 16, bar.y + 8, bar.w - 140,
-		     14, 500, UI_MUTED, FALSE);
-		text("Esc to cancel", bar.x + bar.w - 116, bar.y + 8, 104, 12,
-		     500, UI_SUBTLE, FALSE);
+		text(_("Replying to message"), bar.x + 16, bar.y + 8,
+		     bar.w - 140, 14, 500, UI_MUTED, FALSE);
+		text(_("Esc to cancel"), bar.x + bar.w - 116, bar.y + 8, 104,
+		     12, 500, UI_SUBTLE, FALSE);
 	}
 	box(c.x, c.y, c.w, c.h, 8, UI_INPUT);
 	if (ui.photos || ui.files) {
@@ -2799,16 +2815,16 @@ static void composer(int s, int w)
 		icon_plus(cx, cy, 5.5, UI_INPUT, 2.4);
 		if (hovered(a))
 			tooltip((Rect){ a.x, a.y - 82, a.w, 34 },
-				"Upload a File", FALSE);
+				_("Upload a File"), FALSE);
 	}
 	g_autofree char *placeholder =
 		ui_theme_is_line() ?
 			NULL :
-			g_strdup_printf("Message %s%s",
+			g_strdup_printf(_("Message %s%s"),
 					*ui.selected == 'c' ? "" : "@",
 					name ? name : "");
 	draw_editor(&ui.message, ui.entry, ui.focus == F_MESSAGE,
-		    placeholder ? placeholder : "Write a message");
+		    placeholder ? placeholder : _("Write a message"));
 	if (ui.emojis || ui.stickers) {
 		Rect e = ui.emoji;
 		double x = e.x + e.w / 2., y = e.y + e.h / 2.;
@@ -2827,9 +2843,10 @@ static void composer(int s, int w)
 		cairo_stroke(cr);
 		if (hovered(e))
 			tooltip((Rect){ e.x, e.y - 82, e.w, 34 },
-				ui.stickers && ui.emojis ? "Stickers & Emoji" :
-				ui.stickers		 ? "Stickers" :
-							   "Emoji",
+				ui.stickers && ui.emojis ?
+					_("Stickers & Emoji") :
+				ui.stickers ? _("Stickers") :
+					      _("Emoji"),
 				FALSE);
 	}
 	gboolean sending = g_hash_table_contains(ui.sending, ui.selected);
@@ -2853,7 +2870,7 @@ static void composer(int s, int w)
 		cairo_fill(cr);
 		if (hovered(r))
 			tooltip((Rect){ r.x, r.y - 82, r.w, 34 },
-				sending ? "Sending…" : "Send", FALSE);
+				sending ? _("Sending…") : _("Send"), FALSE);
 	}
 	(void)s;
 	(void)w;
@@ -2886,7 +2903,7 @@ static void chat_view(void)
 	int left = s + (line_style ? 20 : 16);
 
 	if (ui_compact() && ui.selected) {
-		action(ui.back, "Back", FALSE, ui.focus == F_BACK);
+		action(ui.back, _("Back"), FALSE, ui.focus == F_BACK);
 		left = ui.back.x + ui.back.w + 12;
 	}
 	if (ui.selected) {
@@ -2914,8 +2931,8 @@ static void chat_view(void)
 				(Rect){ 0 };
 		header_icon(ui.chat_tools, ICON_MORE, FALSE);
 	} else
-		text("Messages", left, 13, w - left - 16, 16, 600, UI_HEADING,
-		     FALSE);
+		text(_("Messages"), left, 13, w - left - 16, 16, 600,
+		     UI_HEADING, FALSE);
 	if (line_style)
 		line(s, HEADER_H, w, HEADER_H, UI_LINE, 1);
 	else {
@@ -2939,11 +2956,11 @@ static void chat_view(void)
 
 		if (ui.has_older)
 			action(ui.older_button,
-			       ui.older_pending ? "Loading…" :
-						  "Earlier messages",
+			       ui.older_pending ? _("Loading…") :
+						  _("Earlier messages"),
 			       FALSE, FALSE);
 		if (ui.older_page)
-			action(ui.latest_button, "Back to latest", FALSE,
+			action(ui.latest_button, _("Back to latest"), FALSE,
 			       FALSE);
 		cairo_save(cr);
 		cairo_rectangle(cr, r.x, r.y, r.w, r.h);
@@ -3523,6 +3540,18 @@ static void draw_frame(const Rect *region)
 			pango_cairo_update_context(cr, context);
 		text_scale_x = sx;
 		text_scale_y = sy;
+		context_lang = NULL;
+	}
+	/*
+	 * Tell Pango the interface language so Han characters take the
+	 * Japanese, Korean, Simplified or Traditional forms the reader expects.
+	 */
+	if (context_lang != ui_lang_tag()) {
+		context_lang = ui_lang_tag();
+		pango_context_set_language(
+			context, pango_language_from_string(context_lang));
+		ui_forget_labels();
+		ui_forget_history();
 	}
 	frame_us = g_get_monotonic_time();
 	ui_emoji_frame_start(frame_us);
@@ -3975,7 +4004,7 @@ void ui_draw_image(cairo_surface_t *image, Rect r)
 
 void ui_draw_path_entry(Editor *editor, Rect r)
 {
-	draw_editor(editor, r, TRUE, "Path");
+	draw_editor(editor, r, TRUE, _("Path"));
 }
 
 void ui_scrim(void)

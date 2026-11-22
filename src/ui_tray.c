@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_tray.h"
+#include "ui_lang.h"
 #include "ui_logo.h"
 #include <gio/gio.h>
 #include <string.h>
@@ -89,8 +90,8 @@ static struct {
 	struct host hosts[2];
 } tray;
 
-static const char *const labels[] = { "", "Open Avernella", "Hide window",
-				      "Quit Avernella" };
+static const char *const labels[] = { "", N_("Open Avernella"),
+				      N_("Hide window"), N_("Quit Avernella") };
 
 static void queue_action(enum tray_action which)
 {
@@ -213,7 +214,7 @@ static GVariant *attributes(int id, int mask)
 				      g_variant_new_string("submenu"));
 	if (id && (mask & LABEL))
 		g_variant_builder_add(&a, "{sv}", "label",
-				      g_variant_new_string(labels[id]));
+				      g_variant_new_string(_(labels[id])));
 	if (id && (mask & VISIBLE))
 		g_variant_builder_add(&a, "{sv}", "visible",
 				      g_variant_new_boolean(TRUE));

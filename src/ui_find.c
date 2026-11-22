@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_find.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_friends.h"
 #include <string.h>
@@ -151,11 +152,11 @@ static void request(gboolean more)
 
 	g_strstrip(query);
 	if (!*query) {
-		set(&f.error, "Enter text to search for.");
+		set(&f.error, _("Enter text to search for."));
 		return;
 	}
 	if (strlen(query) > 1024) {
-		set(&f.error, "Enter a search term of up to 1,024 bytes.");
+		set(&f.error, _("Enter a search term of up to 1,024 bytes."));
 		return;
 	}
 	if (f.pending) {
@@ -224,7 +225,7 @@ gboolean ui_find_reply(const char *method, guint tag, Json *result,
 
 	if (error || !json_object_is_type(matches, json_type_array)) {
 		set(&f.error,
-		    error ? error : "Could not read the search results.");
+		    error ? error : _("Could not read the search results."));
 		return TRUE;
 	}
 	for (size_t i = 0; i < json_object_array_length(matches); i++) {
@@ -249,7 +250,7 @@ gboolean ui_find_reply(const char *method, guint tag, Json *result,
 				g_date_time_new_from_unix_local(when / 1000) :
 				NULL;
 		if (time)
-			r.stamp = g_date_time_format(time, "%e %b %Y · %H:%M");
+			r.stamp = ui_lang_date(time, "%e %b %Y · %H:%M");
 		g_array_append_val(f.results, r);
 	}
 	f.skipped += MAX(0, json_object_get_int(ui_field(result, "skipped")));
@@ -348,45 +349,46 @@ void ui_find_draw(void)
 	    x = (ui.width - w) / 2, y = (ui.height - h) / 2;
 	f.modal = (Rect){ x, y, w, h };
 	ui_draw_box(f.modal, PANEL);
-	ui_draw_label(f.all ? "Search all chats" : "Search this chat",
+	ui_draw_label(f.all ? _("Search all chats") : _("Search this chat"),
 		      (Rect){ x + 17, y + 16, w - 106, 34 }, 21, 650, INK,
 		      FALSE);
 	f.close = (Rect){ x + w - 73, y + 13, 56, 32 };
-	button(f.close, "Close", FALSE, CLOSE);
+	button(f.close, _("Close"), FALSE, CLOSE);
 	f.entry = (Rect){ x + 16, y + 60, w - 116, 39 };
-	ui_draw_edit(&f.edit, f.entry, f.focus == INPUT, "Find messages");
+	ui_draw_edit(&f.edit, f.entry, f.focus == INPUT, _("Find messages"));
 	f.search = (Rect){ x + w - 90, y + 60, 73, 39 };
-	button(f.search, "Search", TRUE, SEARCH);
+	button(f.search, _("Search"), TRUE, SEARCH);
 	gboolean older = f.next && *f.next;
 	int footer = y + h - 18;
 
 	if (f.all) {
 		g_autofree char *note =
 			f.skipped ?
-				g_strdup_printf("Could not search %u chats.",
+				g_strdup_printf(_("Could not search %u chats."),
 						f.skipped) :
 				NULL;
 
 		footer -= 24;
 		ui_draw_label(
 			note ? note :
-			       "Searches the latest 50 messages per chat.",
+			       _("Searches the latest 50 messages per chat."),
 			(Rect){ x + 17, footer, w - 34, 23 }, 12, 450, MUTED,
 			FALSE);
 	}
 	f.more = (Rect){ 0 };
 	if (older) {
 		f.more = (Rect){ x + 16, footer - 35, 163, 35 };
-		button(f.more, f.all ? "Search more chats" : "Search earlier",
+		button(f.more,
+		       f.all ? _("Search more chats") : _("Search earlier"),
 		       FALSE, EARLIER);
 		footer -= 49;
 	}
 	const char *note = f.error   ? f.error :
-			   f.pending ? "Searching…" :
+			   f.pending ? _("Searching…") :
 			   !f.done   ? "" :
 			   !f.results->len ?
-				     (older ? "No matches in this batch." :
-					      "No matching messages.") :
+				     (older ? _("No matches in this batch.") :
+					      _("No matching messages.")) :
 				     "";
 	if (*note) {
 		ui_draw_label(note, (Rect){ x + 17, y + 114, w - 34, 50 }, 14,
@@ -414,7 +416,7 @@ void ui_find_draw(void)
 						  "LINE");
 			const char *chat =
 				ui_string(ui_field(r->item, "conversation"),
-					  "name", "Chat");
+					  "name", _("Chat"));
 			g_autofree char *context =
 				f.all && g_strcmp0(chat, name) ?
 					g_strdup_printf("%s · %s", chat, name) :

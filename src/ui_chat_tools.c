@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_chat_tools.h"
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_find.h"
 #include "ui_friends.h"
@@ -227,7 +228,7 @@ gboolean ui_chat_tools_reply(const char *method, guint tag, Json *result,
 	}
 	if (list) {
 		if (!json_object_is_type(result, json_type_array)) {
-			note("Could not read the announcement list.");
+			note(_("Could not read the announcement list."));
 			return TRUE;
 		}
 		g_clear_pointer(&tools.announcements, json_object_put);
@@ -240,7 +241,7 @@ gboolean ui_chat_tools_reply(const char *method, guint tag, Json *result,
 			!g_strcmp0(ui_string(target, "id", NULL), ui.selected);
 
 		close_tools();
-		ui_status("Message forwarded.");
+		ui_status(_("Message forwarded."));
 		if (current)
 			ui_show_latest();
 	} else {
@@ -364,11 +365,11 @@ void ui_chat_tools_draw(void)
 
 	ui_scrim();
 	ui_draw_box((Rect){ x, y, w, h }, UI_DIALOG);
-	const char *title = tools.page == MENU	  ? "Chat tools" :
-			    tools.page == FORWARD ? "Forward message" :
-			    tools.page == PUBLISH ? "Announce message" :
-			    tools.page == REMOVE  ? "Remove announcement" :
-						    "Announcements";
+	const char *title = tools.page == MENU	  ? _("Chat tools") :
+			    tools.page == FORWARD ? _("Forward message") :
+			    tools.page == PUBLISH ? _("Announce message") :
+			    tools.page == REMOVE  ? _("Remove announcement") :
+						    _("Announcements");
 
 	ui_draw_label(title, (Rect){ x + 18, y + 13, w - 36, 35 }, 22, 700,
 		      UI_HEADING, FALSE);
@@ -376,28 +377,29 @@ void ui_chat_tools_draw(void)
 		tools.shared_button = tools.search_button =
 			tools.screenshot_button = (Rect){ 0 };
 	tools.cancel = (Rect){ x + 18, foot, 100, 36 };
-	ui_draw_button(tools.cancel, "Close", FALSE);
+	ui_draw_button(tools.cancel, _("Close"), FALSE);
 
 	if (tools.page == MENU) {
 		tools.announcements_button =
 			(Rect){ x + 18, y + 59, w - 36, 40 };
-		ui_draw_button(tools.announcements_button, "Announcements",
+		ui_draw_button(tools.announcements_button, _("Announcements"),
 			       FALSE);
 		tools.shared_button = (Rect){ x + 18, y + 110, w - 36, 40 };
-		ui_draw_button(tools.shared_button, "Shared content", FALSE);
+		ui_draw_button(tools.shared_button, _("Shared content"), FALSE);
 		tools.search_button = (Rect){ x + 18, y + 161, w - 36, 40 };
-		ui_draw_button(tools.search_button, "Search all chats", FALSE);
+		ui_draw_button(tools.search_button, _("Search all chats"),
+			       FALSE);
 		if (ui.photos) {
 			tools.screenshot_button =
 				(Rect){ x + 18, y + 212, w - 36, 40 };
 			ui_draw_button(tools.screenshot_button,
-				       "Take screenshot", FALSE);
+				       _("Take screenshot"), FALSE);
 		}
 	} else if (tools.page == PUBLISH || tools.page == REMOVE) {
 		const char *description =
 			tools.page == PUBLISH ?
-				"Share a text preview with this chat. LINE stores announcements without Letter Sealing." :
-				"Remove this announcement for everyone in the chat?";
+				_("Share a text preview with this chat. LINE stores announcements without Letter Sealing.") :
+				_("Remove this announcement for everyone in the chat?");
 
 		ui_draw_label(description, (Rect){ x + 18, y + 58, w - 36, 59 },
 			      15, 500, UI_HEADING, TRUE);
@@ -407,7 +409,8 @@ void ui_chat_tools_draw(void)
 				      500, UI_MUTED, FALSE);
 		tools.accept = (Rect){ x + w - 130, foot, 112, 36 };
 		ui_draw_button(tools.accept,
-			       tools.page == PUBLISH ? "Announce" : "Remove",
+			       tools.page == PUBLISH ? _("Announce") :
+						       _("Remove"),
 			       !tools.pending);
 	} else {
 		int top = y + 55;
@@ -415,7 +418,7 @@ void ui_chat_tools_draw(void)
 		if (tools.page == FORWARD) {
 			tools.field = (Rect){ x + 18, top, w - 36, 34 };
 			ui_draw_edit(&tools.filter, tools.field, !tools.pending,
-				     "Find a destination chat");
+				     _("Find a destination chat"));
 			top += 44;
 		}
 		tools.list = (Rect){ x + 18, top, w - 36, foot - top - 42 };
@@ -444,10 +447,10 @@ void ui_chat_tools_draw(void)
 				      15, 550, UI_HEADING, FALSE);
 		}
 		if (!row_count() && !tools.note)
-			ui_draw_label(tools.pending ? "Loading…" :
+			ui_draw_label(tools.pending ? _("Loading…") :
 				      tools.page == FORWARD ?
-						      "No matching chats." :
-						      "No announcements.",
+						      _("No matching chats.") :
+						      _("No announcements."),
 				      (Rect){ x + 18, top + 15, w - 36, 40 },
 				      14, 500, UI_MUTED, FALSE);
 		Json *selected = item(tools.selected);
@@ -457,8 +460,8 @@ void ui_chat_tools_draw(void)
 					 ui_field(selected, "canRemove")))) {
 			tools.accept = (Rect){ x + w - 130, foot, 112, 36 };
 			ui_draw_button(tools.accept,
-				       tools.page == FORWARD ? "Forward" :
-							       "Remove…",
+				       tools.page == FORWARD ? _("Forward") :
+							       _("Remove…"),
 				       !tools.pending);
 		}
 	}
@@ -467,7 +470,7 @@ void ui_chat_tools_draw(void)
 			      (Rect){ x + 18, foot - 42, w - 36, 39 }, 13, 500,
 			      0xf4acb5, TRUE);
 	else if (tools.pending && tools.page != ANNOUNCEMENTS)
-		ui_draw_label("Working…",
+		ui_draw_label(_("Working…"),
 			      (Rect){ x + 18, foot - 37, w - 36, 26 }, 13, 500,
 			      UI_MUTED, FALSE);
 }

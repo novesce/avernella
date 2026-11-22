@@ -1,5 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
+#include "ui_lang.h"
 #include "ui_theme.h"
 #include <SDL.h>
 #include <cairo.h>
@@ -82,6 +83,7 @@ static inline int ui_chat_row_height(void)
 }
 
 void ui_theme_changed(int old_row_height);
+void ui_language_changed(void);
 
 /* Glyphs for round call controls. */
 enum ui_call_glyph {
