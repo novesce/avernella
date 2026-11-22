@@ -194,7 +194,7 @@ static void history(void)
 	g_autoptr(GError) error = NULL;
 
 	ui_theme_init();
-	g_assert_false(ui_theme_is_line());
+	g_assert_true(ui_theme_is_line());
 	SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
 	g_setenv("LINE_REDUCE_MOTION", "1", TRUE);
 	g_assert_cmpint(SDL_Init(SDL_INIT_VIDEO), ==, 0);
@@ -229,14 +229,17 @@ static void history(void)
 			json_object_new_int64(1700000000000LL + i * 60000));
 		json_object_array_add(ui.history, row);
 	}
+	/* Check both layouts, ending on LINE for the bubble checks. */
 	check_scroll_positions();
-	int row_height = ui_chat_row_height();
+	for (int i = 0; i < 2; i++) {
+		int row_height = ui_chat_row_height();
 
-	g_assert_true(ui_theme_toggle(&error));
-	g_assert_no_error(error);
-	g_assert_true(ui_theme_is_line());
-	ui_theme_changed(row_height);
-	check_scroll_positions();
+		g_assert_true(ui_theme_toggle(&error));
+		g_assert_no_error(error);
+		g_assert_true(ui_theme_is_line() == (i == 1));
+		ui_theme_changed(row_height);
+		check_scroll_positions();
+	}
 	ui_forget_history();
 	json_object_array_del_idx(ui.history, 0,
 				  json_object_array_length(ui.history));

@@ -17,9 +17,10 @@ void ui_theme_init(void)
 	g_autofree char *name = NULL;
 	gsize len = 0;
 
-	line_layout = g_file_get_contents(path, &name, &len, NULL) &&
-		      len == sizeof("line\n") - 1 &&
-		      !memcmp(name, "line\n", len);
+	/* LINE is the default; only an explicit choice keeps Avernella. */
+	line_layout = !(g_file_get_contents(path, &name, &len, NULL) &&
+			len == sizeof("avernella\n") - 1 &&
+			!memcmp(name, "avernella\n", len));
 }
 
 gboolean ui_theme_is_line(void)
