@@ -180,10 +180,58 @@ static void local_and_remote_rejections(void)
 		g_assert_null(line_friend_lookup(&s, "id", "alice.1", &error));
 		g_assert_nonnull(error);
 		g_assert_nonnull(strstr(error->message, messages[i]));
+		/* Only LINE's own limit (reason 4) pauses further searches. */
+		g_assert_true(g_error_matches(error, LINE_ERROR,
+					      LINE_RATE_LIMITED) == (i == 2));
 		g_clear_error(&error);
 		g_assert_cmpuint(calls, ==, 1);
 		g_assert_cmpint(s.service_code, ==, -1);
 	}
+}
+
+/* Lookups are spaced, bursts capped, and LINE's own limit starts a pause. */
+static void pacing(void)
+{
+	const gint64 second = G_USEC_PER_SEC, start = 1000 * second;
+	struct line_pace pace = { 0 };
+	const struct line_pace_rule *rule = &line_lookup_pace;
+
+	g_assert_cmpint(line_pace_wait(&pace, rule, start), ==, 0);
+	line_pace_record(&pace, rule, start, FALSE);
+	g_assert_cmpint(line_pace_wait(&pace, rule, start + second), ==, 2);
+	g_assert_cmpint(line_pace_wait(&pace, rule, start + 3 * second), ==, 0);
+
+	/* Ten lookups well spaced, then the eleventh waits out the window. */
+	gint64 now = start;
+
+	for (guint i = 1; i < rule->burst; i++) {
+		now += 10 * second;
+		g_assert_cmpint(line_pace_wait(&pace, rule, now), ==, 0);
+		line_pace_record(&pace, rule, now, FALSE);
+	}
+	now += 10 * second;
+	gint64 wait = line_pace_wait(&pace, rule, now);
+
+	g_assert_cmpint(wait, ==, (start + rule->window_us - now) / second);
+	g_assert_cmpint(line_pace_wait(&pace, rule, start + rule->window_us),
+			==, 0);
+
+	/* After LINE reports a limit, nothing is attempted for an hour. */
+	struct line_pace limited = { 0 };
+
+	line_pace_record(&limited, rule, start, TRUE);
+	g_assert_cmpint(line_pace_wait(&limited, rule,
+				       start + 30 * 60 * second),
+			==, 30 * 60);
+	g_assert_cmpint(line_pace_wait(&limited, rule,
+				       start + rule->cooldown_us),
+			==, 0);
+
+	/* Adds have no gap: Add right after a search is allowed. */
+	struct line_pace adds = { 0 };
+
+	line_pace_record(&adds, &line_add_pace, start, FALSE);
+	g_assert_cmpint(line_pace_wait(&adds, &line_add_pace, start), ==, 0);
 }
 
 static void protected_relationships(void)
@@ -760,5 +808,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/friends/recommendations", recommendations);
 	g_test_add_func("/friends/profile-card", profile_card);
 	g_test_add_func("/friends/friend-requests", friend_requests);
+	g_test_add_func("/friends/pacing", pacing);
 	return g_test_run();
 }

@@ -6,7 +6,8 @@
 enum {
 	BODY_LIMIT = 16 * 1024 * 1024,
 	TOKEN_LIMIT = 16384,
-	DEFAULT_RETRY_SECONDS = 30
+	/* After EXCESSIVE_ACCESS, CONGESTION_CONTROL or SERVER_BUSY. */
+	BUSY_COOLDOWN_SECONDS = 30
 };
 
 static const char origin[] = "https://legy.line-apps.com";
@@ -19,33 +20,16 @@ static const char refresh_path[] = "/EXT/auth/tokenrefresh/v1";
  * every borrowed pointer while retaining the connection.
  */
 static __thread CURL *client;
-static GMutex retry_lock;
-static gint64 retry_until;
 
 int line_transport_retry_after(void)
 {
-	g_mutex_lock(&retry_lock);
-	gint64 remaining = retry_until - g_get_monotonic_time();
-
-	g_mutex_unlock(&retry_lock);
-	if (remaining <= 0)
-		return 0;
-	return (remaining + G_USEC_PER_SEC - 1) / G_USEC_PER_SEC;
+	return line_cooldown_seconds(origin);
 }
 
-static void record_retry_after(CURL *handle)
+/* Talk and sync answers are TalkExceptions; other services number apart. */
+static gboolean talk_path(const char *path)
 {
-	curl_off_t seconds = 0;
-
-	if (curl_easy_getinfo(handle, CURLINFO_RETRY_AFTER, &seconds) ||
-	    seconds <= 0)
-		seconds = DEFAULT_RETRY_SECONDS;
-	gint64 until = g_get_monotonic_time() +
-		       MIN(seconds, G_MAXINT) * (gint64)G_USEC_PER_SEC;
-
-	g_mutex_lock(&retry_lock);
-	retry_until = MAX(retry_until, until);
-	g_mutex_unlock(&retry_lock);
+	return !strcmp(path, "/S4") || !strcmp(path, "/SYNC4");
 }
 
 void line_transport_release(void)
@@ -140,6 +124,16 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 		   GError **error)
 {
 	s->service_code = -1;
+	s->http_status = 0;
+	/*
+	 * Once LINE has refused this session's credentials, nothing more goes
+	 * out with them, as in LINE's own client, until the user pairs again.
+	 */
+	if (s->denied && access && !g_strcmp0(access, s->access)) {
+		g_set_error_literal(error, LINE_ERROR, LINE_SESSION_EXPIRED,
+				    "LINE ended this desktop session.");
+		return NULL;
+	}
 	if ((!service_path(path) &&
 	     (protocol != BINARY_AUTH ||
 	      g_strcmp0(path, "/api/v3/TalkService.do"))) ||
@@ -149,13 +143,8 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 				    "Invalid LINE request parameters.");
 		return NULL;
 	}
-	int wait = line_transport_retry_after();
-
-	if (wait) {
-		g_set_error(error, LINE_ERROR, LINE_RATE_LIMITED,
-			    "LINE requested a retry in %d seconds.", wait);
+	if (line_cooldown_check(origin, error))
 		return NULL;
-	}
 	g_autoptr(GBytes) packet = NULL;
 
 	if (protocol != JSON_APPROVAL) {
@@ -183,10 +172,12 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 	g_autoptr(GByteArray) data = g_byte_array_new();
 	struct http_response response = { .body = data };
 	struct curl_slist *headers = NULL;
-	static const char *const base_headers[] = {
-		"x-line-application: DESKTOPWIN\t9.7.0.3556\tWINDOWS\t10.0.0-NT-x64",
-		"x-lal: en_US", "x-lpv: 1", "Expect:"
-	};
+	char tag[17];
+
+	line_language_tag(tag);
+	g_autofree char *language = g_strconcat("x-lal: ", tag, NULL);
+	const char *const base_headers[] = { LINE_APP_HEADER, language,
+					     "x-lpv: 1", "Expect:" };
 	CURLcode result = CURLE_OUT_OF_MEMORY;
 	long status = 0;
 	gsize bytes = 0;
@@ -228,7 +219,7 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 		result = CURLE_FAILED_INIT;
 		goto cleanup;
 	}
-	SET(CURLOPT_USERAGENT, "Line/9.7.0.3556");
+	SET(CURLOPT_USERAGENT, LINE_USER_AGENT);
 	SET(CURLOPT_ACCEPT_ENCODING, "gzip");
 	SET(CURLOPT_HTTPHEADER, headers);
 	if (packet) {
@@ -245,8 +236,8 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 	if (result == CURLE_OK)
 		result = curl_easy_getinfo(client, CURLINFO_RESPONSE_CODE,
 					   &status);
-	if (!result && (status == 429 || status == 503))
-		record_retry_after(client);
+	if (!result)
+		line_cooldown_note(origin, client, status);
 
 cleanup:
 	curl_easy_reset(client);
@@ -261,6 +252,7 @@ cleanup:
 			    curl_easy_strerror(result));
 		return NULL;
 	}
+	s->http_status = status;
 	if (status < 200 || status >= 300) {
 		/*
 		 * LINE can end an approval poll with 410. Other endpoints
@@ -275,6 +267,8 @@ cleanup:
 
 		if (status == 429 || status == 503)
 			code = LINE_RATE_LIMITED;
+		else if (status == 401 || status == 403)
+			code = LINE_ACCESS_DENIED;
 		g_set_error(error, LINE_ERROR, code,
 			    "LINE returned HTTP %ld for %s.", status, method);
 		return NULL;
@@ -311,6 +305,13 @@ cleanup:
 					    &s->service_code, error) :
 			   line_decode_reply(method, data->data, data->len,
 					     &s->service_code, error);
+	gboolean own = access && s->access && !g_strcmp0(access, s->access);
+
+	if (!reply && talk_path(path) && line_busy_code(s->service_code))
+		line_cooldown_set(origin, BUSY_COOLDOWN_SECONDS);
+	if (!reply && own && talk_path(path) &&
+	    line_auth_rejected(s->service_code))
+		s->denied = TRUE;
 	/*
 	 * A pairing poll carries its own temporary token. Only an authenticated
 	 * call with the current account token may rotate that account's token.
@@ -400,6 +401,7 @@ static gboolean refresh_access(Line *s, GError **error)
 			g_set_error_literal(
 				error, LINE_ERROR, LINE_SESSION_EXPIRED,
 				"LINE no longer accepts this session's refresh token.");
+			s->denied = TRUE;
 		}
 		return FALSE;
 	}
@@ -478,6 +480,7 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			g_set_error_literal(
 				error, LINE_ERROR, LINE_SESSION_EXPIRED,
 				"LINE requires this computer to pair again.");
+			s->denied = TRUE;
 			return NULL;
 		}
 	}

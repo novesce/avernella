@@ -207,6 +207,8 @@ static GByteArray *fetch(const char *url, CURLcode *rc, long *status,
 	*rc = curl_easy_perform(curl);
 	if (*rc == CURLE_OK)
 		*rc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, status);
+	if (*rc == CURLE_OK)
+		line_cooldown_note(url, curl, *status);
 	if (*rc == CURLE_OK && *status >= 300 && *status < 400 &&
 	    curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &where) != CURLE_OK)
 		where = NULL;
@@ -251,6 +253,9 @@ GBytes *line_flex_image_download(const char *url, GError **error)
 		CURLcode rc;
 		long status;
 
+		/* A host that asked us to wait gets no request, LINE or not. */
+		if (line_cooldown_check(current, error))
+			return NULL;
 		g_autoptr(GByteArray) body =
 			fetch(current, &rc, &status, &location, &type);
 
@@ -270,6 +275,12 @@ GBytes *line_flex_image_download(const char *url, GError **error)
 			current = g_steal_pointer(&location);
 			continue;
 		}
+		/*
+		 * fetch() recorded the host's cooldown. Never answer "slow
+		 * down" by trying another URL at once.
+		 */
+		if (status == 429 || status == 503)
+			break;
 		gsize base = imagemap_base(current);
 
 		if (status >= 400 && status < 500 && !plain && base) {

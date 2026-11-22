@@ -133,6 +133,8 @@ static GBytes *transfer(const char *url, const char *token,
 			const char *metadata, GBytes *upload, char **oid,
 			gsize limit, long timeout, GError **error)
 {
+	if (line_cooldown_check(url, error))
+		return NULL;
 	CURL *c = g_private_get(&http_client);
 
 	if (!c) {
@@ -144,9 +146,7 @@ static GBytes *transfer(const char *url, const char *token,
 	g_autofree char *auth =
 		token ? g_strconcat("x-line-access: ", token, NULL) : NULL;
 	const char *const list[] = {
-		auth, metadata,
-		token ? "x-line-application: DESKTOPWIN\t9.7.0.3556\tWINDOWS\t10.0.0-NT-x64" :
-			NULL,
+		auth, metadata, token ? LINE_APP_HEADER : NULL,
 		upload ? "Content-Type: application/octet-stream" : NULL,
 		upload ? "Expect:" : NULL
 	};
@@ -183,7 +183,7 @@ static GBytes *transfer(const char *url, const char *token,
 	OPT(CURLOPT_TIMEOUT, timeout);
 	OPT(CURLOPT_SUPPRESS_CONNECT_HEADERS, 1L);
 	OPT(CURLOPT_HTTPHEADER, headers);
-	OPT(CURLOPT_USERAGENT, "Line/9.7.0.3556");
+	OPT(CURLOPT_USERAGENT, LINE_USER_AGENT);
 	OPT(CURLOPT_WRITEFUNCTION, receive);
 	OPT(CURLOPT_WRITEDATA, &body);
 	OPT(CURLOPT_HEADERFUNCTION, header);
@@ -199,6 +199,8 @@ static GBytes *transfer(const char *url, const char *token,
 	rc = curl_easy_perform(c);
 	if (!rc)
 		rc = curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
+	if (!rc)
+		line_cooldown_note(url, c, status);
 done:
 	if (c)
 		curl_easy_reset(c);
@@ -214,7 +216,8 @@ done:
 		g_set_error(error, LINE_ERROR,
 			    status == 404	   ? LINE_ASSET_NOT_FOUND :
 			    token && status == 401 ? LINE_OBS_UNAUTHORIZED :
-						     1,
+			    status == 429 || status == 503 ? LINE_RATE_LIMITED :
+							     1,
 			    "LINE media service returned HTTP %ld.", status);
 	else if (oid && !body.oid)
 		g_set_error_literal(

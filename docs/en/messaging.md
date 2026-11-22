@@ -217,7 +217,7 @@ Announcements are pinned notes at the top of a chat. They live on LINE's servers
 There is no server-side search API for personal chats, so search runs over pages the worker fetches:
 
 - **In one chat** (`findMessages`, `find_messages()` in `main.c`): searches the open chat's pages, newest first, case-insensitively (`search_text()`), and can continue into older pages, remembering the boundary between calls.
-- **Across chats** (`findAllMessages`, `find_all_messages()`): takes the latest 50 messages of up to six chats per call, within a 350 ms budget, and continues from where it stopped on the next call.
+- **Across chats** (`findAllMessages`, `find_all_messages()`): takes the latest 50 messages of up to six chats per call, within a 350 ms budget, and continues from where it stopped on the next call. A chat whose latest page is in the history cache and not stale is searched from memory, without asking LINE again.
 
 ## Things to keep in mind
 

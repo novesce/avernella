@@ -47,3 +47,32 @@ enum line_friend_source {
 };
 J *line_friend_add_from(Line *s, J *trusted_row, enum line_friend_source source,
 			gint32 reserved_seq, GError **error);
+
+/*
+ * Client-side pacing for friend searches and adds. Many lookups of LINE
+ * IDs or phone numbers in a short time is what LINE treats as account
+ * enumeration or spam, so the worker spaces them out, caps bursts, and
+ * stops for a cooldown once LINE itself reports a temporary limit
+ * (RelationService reason 4, returned as LINE_RATE_LIMITED).
+ */
+enum {
+	LINE_PACE_SLOTS = 10,
+};
+struct line_pace {
+	gint64 recent[LINE_PACE_SLOTS]; /* monotonic µs, 0 when unused */
+	guint next;
+	gint64 blocked_until;
+};
+struct line_pace_rule {
+	gint64 gap_us; /* minimum time between two actions */
+	guint burst; /* at most this many actions ... */
+	gint64 window_us; /* ... within this window */
+	gint64 cooldown_us; /* pause after LINE reports a limit */
+};
+extern const struct line_pace_rule line_lookup_pace, line_add_pace;
+/* 0 when an action may start at now_us, otherwise whole seconds to wait. */
+gint64 line_pace_wait(const struct line_pace *pace,
+		      const struct line_pace_rule *rule, gint64 now_us);
+/* Records an attempted action; limited means LINE refused it as too many. */
+void line_pace_record(struct line_pace *pace, const struct line_pace_rule *rule,
+		      gint64 now_us, gboolean limited);

@@ -12,7 +12,7 @@ static const char *url, *token_reply = "3600\x1e"
 static const char *expected_url;
 static gboolean upload, profile_upload, anonymous, legacy_preview,
 	old_preview_path, large_preview;
-static int token_requests, preview_requests;
+static int token_requests, preview_requests, performs;
 static long http_status = 200, timeout;
 
 J *line_rpc(Line *s, const char *path, const char *method, J *args, GError **e)
@@ -67,11 +67,15 @@ CURLcode __wrap_curl_easy_setopt(CURL *c, CURLoption opt, ...)
 CURLcode __wrap_curl_easy_getinfo(CURL *c, CURLINFO info, ...)
 {
 	(void)c;
-	g_assert_cmpint(info, ==, CURLINFO_RESPONSE_CODE);
 	va_list v;
 
 	va_start(v, info);
-	*va_arg(v, long *) = http_status;
+	if (info == CURLINFO_RETRY_AFTER) {
+		*va_arg(v, curl_off_t *) = 0; /* none: the 30 s default */
+	} else {
+		g_assert_cmpint(info, ==, CURLINFO_RESPONSE_CODE);
+		*va_arg(v, long *) = http_status;
+	}
 	va_end(v);
 	return CURLE_OK;
 }
@@ -79,6 +83,7 @@ CURLcode __wrap_curl_easy_getinfo(CURL *c, CURLINFO info, ...)
 CURLcode __wrap_curl_easy_perform(CURL *c)
 {
 	(void)c;
+	performs++;
 	if (old_preview_path) {
 		g_assert_cmpstr(
 			url, ==,
@@ -258,6 +263,36 @@ static void previews(void)
 	large_preview = FALSE;
 }
 
+/* A 429 from object storage stops its requests; other hosts carry on. */
+static void cooldown(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_autoptr(GError) e = NULL;
+
+	expected_url = "https://obs.line-apps.com/r/talk/emi/oid";
+	http_status = 429;
+	performs = 0;
+	g_assert_null(
+		line_obs_download("test-obs-token", "emi", "oid", "9", &e));
+	g_assert_error(e, LINE_ERROR, LINE_RATE_LIMITED);
+	g_clear_error(&e);
+	g_assert_null(
+		line_obs_download("test-obs-token", "emi", "oid", "9", &e));
+	g_assert_error(e, LINE_ERROR, LINE_RATE_LIMITED);
+	g_assert_cmpint(performs, ==, 1);
+	g_clear_error(&e);
+	anonymous = TRUE;
+	http_status = 200;
+	expected_url = "https://profile.line-scdn.net/0hEXAMPLE";
+	g_autoptr(GBytes) avatar = line_avatar_download("/0hEXAMPLE", &e);
+	g_assert_no_error(e);
+	g_assert_cmpint(performs, ==, 2);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -265,5 +300,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/obs/invalid", invalid);
 	g_test_add_func("/obs/profile-picture-upload", profile_picture);
 	g_test_add_func("/obs/video-preview-paths-and-limit", previews);
+	g_test_add_func("/obs/cooldown", cooldown);
 	return g_test_run();
 }

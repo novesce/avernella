@@ -52,6 +52,8 @@ struct line_worker {
 	/* Long-poll sync thread; the timer polls only while it fails. */
 	struct line_live_sync *live;
 	gboolean live_failing;
+	/* Monotonic time the long poll started failing, or 0. */
+	gint64 live_failing_since;
 	gint64 displayed_revision;
 	guint sync_failures;
 	/* Retry deadlines use monotonic microseconds; renewal uses Unix seconds. */
@@ -78,6 +80,8 @@ struct line_worker {
 	char *lookup_token, *lookup_query;
 	const char *lookup_kind;
 	gint64 lookup_until;
+	/* Friend searches and adds, paced so they never look automated. */
+	struct line_pace lookup_pace, add_pace;
 	char *name, *history_chat;
 	/*
 	 * Recently opened chats, newest last, as in Discord: reopening one
@@ -205,6 +209,7 @@ static void clear_view(struct line_worker *w)
 	cache_clear(w);
 	g_clear_pointer(&w->live, line_live_sync_stop);
 	w->live_failing = FALSE;
+	w->live_failing_since = 0;
 	w->sync_failures = 0;
 	w->refresh_retry = w->save_retry = 0;
 	w->refresh_failures = 0;
@@ -226,10 +231,63 @@ static gboolean forget(struct line_worker *w, GError **error)
 
 static gboolean session_rejected(Line *s, const GError *error)
 {
-	return g_error_matches(error, LINE_ERROR, LINE_SESSION_EXPIRED) ||
-	       s->service_code == 1 || s->service_code == 7 ||
-	       s->service_code == 8 || s->service_code == 14 ||
-	       s->service_code == 17;
+	return s->denied ||
+	       g_error_matches(error, LINE_ERROR, LINE_SESSION_EXPIRED) ||
+	       line_auth_rejected(s->service_code);
+}
+
+/*
+ * Whether a saved session's failed check is worth repeating on its own:
+ * only failures a network can cause. Any answer LINE itself gave (a
+ * TalkException, an HTTP 4xx such as 401 or 403) stops the retries; the
+ * user can choose sign in again, but the app never keeps knocking.
+ */
+static gboolean transient_failure(const Line *s, const GError *error)
+{
+	long status = s->http_status;
+
+	if (s->service_code >= 0 ||
+	    g_error_matches(error, LINE_ERROR, LINE_ACCESS_DENIED))
+		return FALSE;
+	return !status || status == 408 || status == 429 || status >= 500;
+}
+
+/*
+ * getProfile, the check LINE's own client uses to confirm a session. As its
+ * HTTP clients do, a 401 or 403 renews the token once and asks once more.
+ */
+static J *checked_profile(Line *s, GError **error)
+{
+	J *profile = line_rpc(s, "/S4", "getProfile", NULL, error);
+
+	if (profile ||
+	    !g_error_matches(*error, LINE_ERROR, LINE_ACCESS_DENIED) ||
+	    !s->refresh || !*s->refresh)
+		return profile;
+	g_autoptr(GError) renewal = NULL;
+
+	if (line_refresh_session(s, &renewal)) {
+		g_clear_error(error);
+		return line_rpc(s, "/S4", "getProfile", NULL, error);
+	}
+	if (s->denied) {
+		g_clear_error(error);
+		g_propagate_error(error, g_steal_pointer(&renewal));
+	}
+	return NULL;
+}
+
+/* LINE refused the session: forget it and return the window to sign-in. */
+static void end_session(struct line_worker *w)
+{
+	g_autoptr(GError) removal = NULL;
+
+	forget(w, &removal);
+	line_event(
+		"signed_out", "message",
+		removal ?
+			removal->message :
+			"LINE ended this desktop session. Choose sign in to pair again.");
 }
 
 static gboolean pair_worker(struct line_worker *w, GError **error)
@@ -293,8 +351,8 @@ static J *login(struct line_worker *w, GError **error)
 			close(w->credentials_fd);
 			w->credentials_fd = -1;
 		}
-		g_autoptr(J) profile =
-			line_rpc(s, "/S4", "getProfile", NULL, error);
+		g_autoptr(J) profile = checked_profile(s, error);
+
 		if (!profile) {
 			if (session_rejected(s, *error)) {
 				g_clear_error(error);
@@ -305,11 +363,16 @@ static J *login(struct line_worker *w, GError **error)
 					"LINE ended the previous session. Choose sign in to pair again.");
 			}
 			/*
-			 * The saved session is still valid as far as we know. Keep it,
-			 * and let the UI retry instead of showing the sign-in screen.
+			 * A network failure leaves the saved session valid as far as we
+			 * know: keep it and let the UI retry. LINE's own refusals keep
+			 * it too, but end the attempt so nothing retries by itself.
 			 */
-			if (*error)
+			if (*error && transient_failure(s, *error))
 				(*error)->code = LINE_RETRY;
+			else if (*error)
+				g_prefix_error(
+					error,
+					"LINE refused this desktop session. Choose sign in to try again. ");
 			return NULL;
 		}
 		const char *mid = strfield(profile, "1"),
@@ -416,6 +479,38 @@ static J *open_conversation(struct line_worker *w, J *row)
 	return chat;
 }
 
+/*
+ * Refuses an action that would come too soon after the previous ones. The
+ * message says how long to wait, so the user is never left guessing.
+ */
+static gboolean paced(struct line_pace *pace, const struct line_pace_rule *rule,
+		      GError **error)
+{
+	gint64 wait = line_pace_wait(pace, rule, g_get_monotonic_time());
+
+	if (!wait)
+		return TRUE;
+	if (wait < 60)
+		g_set_error(
+			error, LINE_ERROR, LINE_RATE_LIMITED,
+			"To keep your account safe, wait %lld seconds before trying again.",
+			(long long)wait);
+	else
+		g_set_error(
+			error, LINE_ERROR, LINE_RATE_LIMITED,
+			"To keep your account safe, wait %lld minutes before trying again.",
+			(long long)((wait + 59) / 60));
+	return FALSE;
+}
+
+/* Counts an attempt that reached LINE, and pauses if LINE said too many. */
+static void count_attempt(struct line_pace *pace,
+			  const struct line_pace_rule *rule, GError *error)
+{
+	line_pace_record(pace, rule, g_get_monotonic_time(),
+			 g_error_matches(error, LINE_ERROR, LINE_RATE_LIMITED));
+}
+
 static J *find_friend(struct line_worker *w, const char *query, GError **error)
 {
 	clear_lookup(w);
@@ -427,7 +522,11 @@ static J *find_friend(struct line_worker *w, const char *query, GError **error)
 	const char *kind = strstr(value, "://") ? "link" :
 			   value[0] == '+'	? "phone" :
 						  "id";
+	if (!paced(&w->lookup_pace, &line_lookup_pace, error))
+		return NULL;
 	J *row = line_friend_lookup(&w->session, kind, value, error);
+
+	count_attempt(&w->lookup_pace, &line_lookup_pace, row ? NULL : *error);
 
 	if (!row)
 		return NULL;
@@ -451,12 +550,16 @@ static J *add_friend(struct line_worker *w, const char *token, GError **error)
 			"Search for this person again before adding them.");
 	if (!json_object_get_boolean(field(w->lookup_result, "canAdd")))
 		return problem(error, "This profile cannot be added.");
+	if (!paced(&w->add_pace, &line_add_pace, error))
+		return NULL;
 	gint32 seq = reserve_sequence(w, error);
 
 	if (!seq)
 		return NULL;
 	J *row = line_friend_add(&w->session, w->lookup_result, w->lookup_kind,
 				 w->lookup_query, seq, error);
+
+	count_attempt(&w->add_pace, &line_add_pace, row ? NULL : *error);
 	clear_lookup(w);
 	if (row)
 		remember_friend(w, row);
@@ -597,6 +700,16 @@ static J *find_messages(struct line_worker *w, const char *chat, J *params,
 	return page;
 }
 
+enum {
+	HISTORY_CACHE_CHATS = 24
+};
+
+struct cached_history {
+	J *rows, *raw;
+	guint64 cleared_through;
+	gboolean stale;
+};
+
 static J *find_all_messages(struct line_worker *w, J *params, GError **error)
 {
 	const char *query = strfield(params, "query");
@@ -635,8 +748,17 @@ static J *find_all_messages(struct line_worker *w, J *params, GError **error)
 
 		if (!id || !g_hash_table_contains(w->chats, id))
 			continue;
+		/*
+		 * A chat opened recently is already in memory and current; reuse
+		 * it rather than asking LINE for the same page again.
+		 */
+		struct cached_history *cached =
+			g_hash_table_lookup(w->history_cache, id);
 		g_autoptr(GError) failure = NULL;
-		g_autoptr(J) rows = recent_history(w, id, NULL, &failure);
+		g_autoptr(J) rows =
+			cached && !cached->stale ?
+				json_object_get(cached->rows) :
+				recent_history(w, id, NULL, &failure);
 
 		if (rows)
 			append_matches(matches, rows, w->global_query, chat);
@@ -794,9 +916,15 @@ static J *add_recommendation(struct line_worker *w, const char *id,
 	if (!id || !field(w->recommendations, id))
 		return problem(error,
 			       "Choose a person from the recommendations.");
+	if (!paced(&w->add_pace, &line_add_pace, error))
+		return NULL;
 	gint32 seq = reserve_sequence(w, error);
 	J *row = seq ? line_add_recommendation(&w->session, id, seq, error) :
 		       NULL;
+
+	if (seq)
+		count_attempt(&w->add_pace, &line_add_pace,
+			      row ? NULL : *error);
 
 	if (row) {
 		json_object_object_del(w->recommendations, id);
@@ -848,14 +976,6 @@ static J *answer_group(struct line_worker *w, J *params, gboolean join,
 	json_object_object_del(w->invited_groups, id);
 	return result;
 }
-
-enum { HISTORY_CACHE_CHATS = 24 };
-
-struct cached_history {
-	J *rows, *raw;
-	guint64 cleared_through;
-	gboolean stale;
-};
 
 static void cached_history_free(gpointer data)
 {
@@ -1172,13 +1292,17 @@ static J *profile_action(struct line_worker *w, const char *method, J *params,
 		ensure(&w->opened_chats);
 		return open_conversation(w, row);
 	}
+	gboolean adding = !strcmp(method, "addProfileFriend");
+
+	if (adding && !paced(&w->add_pace, &line_add_pace, error))
+		return NULL;
 	gint32 seq = reserve_sequence(w, error);
 
 	if (!seq)
 		return NULL;
 	J *updated;
 
-	if (!strcmp(method, "addProfileFriend")) {
+	if (adding) {
 		const char *chat = strfield(params, "chat");
 
 		updated = line_friend_add_from(s, row,
@@ -1186,6 +1310,8 @@ static J *profile_action(struct line_worker *w, const char *method, J *params,
 						       LINE_FROM_GROUP :
 						       LINE_FROM_STRANGER,
 					       seq, error);
+		count_attempt(&w->add_pace, &line_add_pace,
+			      updated ? NULL : *error);
 	} else {
 		J *flag = field(params, "blocked");
 
@@ -1967,6 +2093,11 @@ static void handle(struct line_worker *w, const char *line)
 		json_object_object_add(reply, "retry",
 				       json_object_new_boolean(TRUE));
 	line_emit(reply);
+	/* A request LINE answered with an auth refusal ends the session. */
+	if (w->ready && w->session.denied) {
+		end_session(w);
+		return;
+	}
 	if (w->revalidate) {
 		g_autofree char *chat = g_steal_pointer(&w->revalidate);
 
@@ -2254,6 +2385,27 @@ static void live_operations(struct line_worker *w)
 	}
 	g_free(batch.access);
 	g_free(batch.access_from);
+	if (batch.denied) {
+		/*
+		 * The long poll's token was refused. Confirm once with getProfile,
+		 * as LINE's client does: a renewed session restarts the long poll
+		 * from the maintenance timer, a refused one signs out.
+		 */
+		json_object_put(batch.ops);
+		g_clear_pointer(&w->live, line_live_sync_stop);
+		w->live_failing = FALSE;
+		w->live_failing_since = 0;
+		g_autoptr(GError) error = NULL;
+		g_autoptr(J) profile = checked_profile(s, &error);
+
+		if (!profile && session_rejected(s, error))
+			end_session(w);
+		else
+			wake_after(w, profile			  ? 1 :
+				      transient_failure(s, error) ? 15 :
+								    300);
+		return;
+	}
 	size_t count = batch.ops ? json_object_array_length(batch.ops) : 0;
 	gboolean other = batch.reload;
 	g_autofree char *open_chat = NULL;
@@ -2288,9 +2440,29 @@ static void live_operations(struct line_worker *w)
 		line_event("changed", NULL, NULL);
 	else if (open_chat)
 		revalidate_history(w, open_chat);
-	if (batch.failing && !w->live_failing)
+	if (batch.failing && !w->live_failing) {
+		w->live_failing_since = g_get_monotonic_time();
 		wake_after(w, 1);
+	}
+	if (!batch.failing)
+		w->live_failing_since = 0;
 	w->live_failing = batch.failing;
+}
+
+/*
+ * Seconds until the next fallback revision check. A short long-poll outage
+ * is covered at once; a long one is checked less often, so a client whose
+ * long poll keeps failing never keeps up a one-second probe for hours.
+ */
+static int fallback_interval(const struct line_worker *w, gboolean catch_up)
+{
+	gint64 since = w->live_failing_since;
+
+	if (catch_up)
+		return 1;
+	if (since && g_get_monotonic_time() - since >= 120 * G_USEC_PER_SEC)
+		return 15;
+	return w->foreground ? 1 : 3;
 }
 
 static void sync_revision(struct line_worker *w)
@@ -2342,13 +2514,9 @@ static void sync_revision(struct line_worker *w)
 			line_event("changed", NULL, NULL);
 		w->displayed_revision = MAX(w->displayed_revision, current);
 		if (!w->live || w->live_failing)
-			wake_after(w, catch_up || w->foreground ? 1 : 3);
+			wake_after(w, fallback_interval(w, catch_up));
 	} else if (session_rejected(s, error)) {
-		g_autoptr(GError) removal = NULL;
-		forget(w, &removal);
-		line_event("signed_out", "message",
-			   removal ? removal->message :
-				     "LINE ended this desktop session.");
+		end_session(w);
 	} else {
 		if (w->displayed_revision != -2)
 			line_event(

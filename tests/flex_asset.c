@@ -83,6 +83,9 @@ CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO name, ...)
 	case CURLINFO_CONTENT_TYPE:
 		*va_arg(args, const char **) = "image/png";
 		break;
+	case CURLINFO_RETRY_AFTER:
+		*va_arg(args, curl_off_t *) = 120;
+		break;
 	default:
 		g_assert_not_reached();
 	}
@@ -348,6 +351,35 @@ static void fallbacks(void)
 	g_clear_pointer(&requested, g_ptr_array_unref);
 }
 
+/*
+ * "Slow down" from an imagemap host is never answered with the plain-base
+ * retry, and the host gets no request at all until its Retry-After passes.
+ */
+static void slow_down(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_autoptr(GError) error = NULL;
+	static const long busy[] = { 429, 200 };
+
+	requested = g_ptr_array_new_with_free_func(g_free);
+	run_script(busy, 2);
+	g_assert_null(line_flex_image_download(
+		"https://vos.line-scdn.net/rich/base/700", &error));
+	g_assert_cmpuint(requested->len, ==, 1);
+	g_clear_error(&error);
+	g_assert_null(line_flex_image_download(
+		"https://vos.line-scdn.net/rich/other/700", &error));
+	g_assert_error(error, LINE_ERROR, LINE_RATE_LIMITED);
+	g_assert_cmpuint(requested->len, ==, 1);
+	g_assert_cmpint(line_cooldown_seconds("https://vos.line-scdn.net/"), >=,
+			119);
+	g_ptr_array_unref(requested);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -355,5 +387,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/flex-assets/bounded-anonymous-transfer",
 			transfer_policy);
 	g_test_add_func("/flex-assets/redirects-widths-and-webp", fallbacks);
+	g_test_add_func("/flex-assets/slow-down", slow_down);
 	return g_test_run();
 }

@@ -145,7 +145,7 @@ endpoint ของการเข้าสู่ระบบด้วยอี�
 POST /S4 HTTP/2
 Host: legy.line-apps.com
 x-line-application: DESKTOPWIN	9.7.0.3556	WINDOWS	10.0.0-NT-x64
-x-lal: en_US
+x-lal: <locale>                        (th_TH, ja_JP…; en_US for C/POSIX)
 x-lpv: 1
 x-lhm: POST
 x-line-access: <access token>          (เมื่อลงชื่อเข้าใช้แล้ว)
@@ -156,7 +156,7 @@ Accept-Encoding: gzip
 User-Agent: Line/9.7.0.3556
 ```
 
-ฟิลด์ของ `x-line-application` คั่นด้วยอักขระแท็บ `x-lst` บอก LINE ว่าถือคำขอ long poll ไว้ได้นานเท่าไร การรอยืนยันบน `/LF1` ใช้ `x-lhm: GET` และ `Accept: application/json` แทน
+ฟิลด์ของ `x-line-application` คั่นด้วยอักขระแท็บ `LINE_APP_HEADER` และ `LINE_USER_AGENT` ใน `line.h` เก็บตัวตนของไคลเอนต์ไว้ที่เดียว ทุกคำขอ (RPC, object storage, อัลบั้มและโน้ต) จึงระบุเวอร์ชันไคลเอนต์เดียวกัน `x-lal` คือ locale ของเดสก์ท็อปจาก `line_language_tag()` ใน `line.h` ซึ่งเป็นแท็กเดียวกับที่ LIFF ส่งเป็น `lang` เดสก์ท็อปภาษาไทยจึงส่ง `th_TH` ทุกที่ เหมือนไคลเอนต์ของ LINE เอง `x-lst` บอก LINE ว่าถือคำขอ long poll ไว้ได้นานเท่าไร การรอยืนยันบน `/LF1` ใช้ `x-lhm: GET` และ `Accept: application/json` แทน
 
 ### กฎของการขนส่ง
 
@@ -183,7 +183,8 @@ User-Agent: Line/9.7.0.3556
 | `LINE_ASSET_NOT_FOUND` (6) | HTTP 404 จาก CDN หรือ OBS | ไม่มีภาพตัวอย่างหรือแอนิเมชัน |
 | `LINE_OWN_KEY_MISSING` (7) | อุปกรณ์นี้ไม่มีกุญแจ Letter Sealing รุ่นที่ต้องใช้ | ข้อความเก่าบนอุปกรณ์ใหม่ |
 | `LINE_RETRY` (8) | เซสชันที่บันทึกไว้ติดต่อ LINE ไม่ได้ | ออฟไลน์ตอนเปิดแอป: เก็บเซสชันไว้แล้วลองใหม่ |
-| `LINE_RATE_LIMITED` (9) | LINE ขอให้รอ | HTTP 429 หรือ 503 |
+| `LINE_RATE_LIMITED` (9) | LINE ขอให้รอ | HTTP 429 หรือ 503, TalkException 4, 58 หรือ 101 หรือโฮสต์ที่ยังอยู่ในช่วงพัก |
+| `LINE_ACCESS_DENIED` (10) | LINE ปฏิเสธข้อมูลยืนยันตัวตนของคำขอ | HTTP 401 หรือ 403 |
 
 แยกต่างหาก `s->service_code` เก็บ **หมายเลขข้อผิดพลาดของ LINE เอง** จากฟิลด์ 1 ของ exception ในคำตอบล่าสุด หรือ -1 ผู้เรียกตรวจค่านี้สำหรับกรณีเฉพาะ รหัส TalkException ที่ไคลเอนต์ใช้
 
@@ -200,7 +201,23 @@ User-Agent: Line/9.7.0.3556
 
 ## การจำกัดอัตรา
 
-เมื่อ LINE ตอบ HTTP 429 หรือ 503 `record_retry_after()` จะอ่านเฮดเดอร์ `Retry-After` (ค่าเริ่มต้น 30 วินาที) แล้วตั้งเส้นตายสำหรับทั้งโปรเซส ก่อนถึงเวลานั้น `exchange()` ทุกครั้งจะล้มเหลวทันทีด้วย `LINE_RATE_LIMITED` พร้อมเวลาที่เหลือ ตัวจับเวลาบำรุงรักษาของ worker ก็เคารพค่านี้ (`sync_revision()`) และเธรด long poll รออย่างน้อยเท่านั้นก่อนลองใหม่
+ทุกเส้นทาง HTTP ที่ไปถึง LINE ใช้ตาราง **ช่วงพักแยกตามโฮสต์** ร่วมกัน (`line_cooldown_*()` ใน [`http_tune.c`](../../src/http_tune.c)) ได้แก่ RPC ใน `transport.c`, object storage และ CDN ใน `obs_http.c`, อัลบั้มและโน้ตใน `shared_content.c` และภาพของการ์ดใน `flex_asset.c`
+
+- **การเริ่มช่วงพัก** HTTP 429 หรือ 503 ตั้งช่วงพักให้โฮสต์นั้นตาม `Retry-After` หรือ 30 วินาทีถ้าไม่มี (`line_cooldown_note()`) TalkException `EXCESSIVE_ACCESS` (4), `CONGESTION_CONTROL` (58) หรือ `SERVER_BUSY` (101) บน `/S4` หรือ `/SYNC4` ตั้ง 30 วินาทีให้ `legy.line-apps.com`
+- **การเคารพช่วงพัก** ก่อนหมดช่วงพัก คำขอทุกตัวไปยังโฮสต์นั้นจะล้มเหลวทันทีด้วย `LINE_RATE_LIMITED` โดยไม่แตะเครือข่ายเลย (`line_cooldown_check()`) โฮสต์อื่นทำงานต่อได้ object storage ที่ยุ่งจึงไม่ทำให้แชตหยุด
+- **ใครต้องรอ** ตัวจับเวลาบำรุงรักษา (`sync_revision()`) และเธรด long poll รออย่างน้อยเท่ากับช่วงพักของ legy (`line_transport_retry_after()`) ไม่มีอะไรส่งคำขอที่ถูกปฏิเสธซ้ำเองอัตโนมัติ ผู้ใช้ลองใหม่ได้เมื่อหมดเวลาแล้ว
+- **ไม่ "ลองทางอื่นแทน"** ภาพ imagemap ที่ได้ 429 จะไม่ถูกตามด้วยการลอง URL ธรรมดาแทน (`line_flex_image_download()`)
+
+ทั้งหมดนี้ทำตาม LINE สำหรับ Android 26.x: interceptor ของ HTTP (`ti0.d`) ลอง 429 ซ้ำเฉพาะเมื่อ `Retry-After` น้อยกว่า 5 วินาที และไคลเอนต์ object storage (`a14.g`) ลองซ้ำครั้งเดียว และเฉพาะหลัง 401 หรือ 503
+
+## เมื่อ LINE ปฏิเสธเซสชัน
+
+LINE สำหรับ Android ออกจากระบบอุปกรณ์ที่เชื่อมทันทีเมื่อได้ TalkException `AUTHENTICATION_FAILED` (1), `NOT_AVAILABLE_USER` (7) หรือ `NOT_AUTHORIZED_DEVICE` (8) ครั้งแรก (`ac5.e`, `ac5.b`) และหลังจากนั้นปฏิเสธในเครื่องที่จะส่งอะไรด้วยโทเค็นนั้นอีก (`getClient()` ในไคลเอนต์ Thrift ของมัน) Avernella ทำแบบเดียวกัน
+
+- **ตัวล็อก** เมื่อคำขอ `/S4` หรือ `/SYNC4` ที่ใช้โทเค็นของเซสชันเองได้รหัสใน `line_auth_rejected()` (1, 7, 8, 14, 17) หรือ refresh token ถูกปฏิเสธ `exchange()` จะตั้ง `s->denied` หลังจากนั้นคำขอใดที่ใช้โทเค็นนั้นจะล้มเหลวในเครื่องด้วย `LINE_SESSION_EXPIRED` การเรียกระหว่างจับคู่ซึ่งใช้โทเค็นชั่วคราวของตัวเองไม่ได้รับผลกระทบ
+- **การออกจากระบบ** หลังคำขอแต่ละครั้ง `handle()` ใน `main.c` เห็นตัวล็อกแล้วเรียก `end_session()`: ลืมเซสชัน ส่ง `signed_out` และพาหน้าต่างกลับไปหน้าลงชื่อเข้าใช้ หน้าต่างไม่ลงชื่อเข้าใช้ใหม่เองเด็ดขาด
+- **long poll** เธรด `line-sync` มีสำเนาโทเค็นของตัวเอง เมื่อถูกปฏิเสธ หรือได้ HTTP 401 หรือ 403 มันจะรายงาน `denied` ครั้งเดียวแล้วหยุด poll worker ยืนยันครั้งเดียวด้วย `checked_profile()`: เซสชันที่ยังใช้ได้จะเริ่ม long poll ใหม่ เซสชันที่ถูกปฏิเสธจะออกจากระบบ ส่วนกรณีอื่นจะรอ 15 วินาที (เครือข่าย) หรือ 5 นาที (คำตอบอื่นจาก LINE) ก่อนตรวจครั้งถัดไป
+- **HTTP 401 หรือ 403** แบบเดียวกับ interceptor ของ LINE `checked_profile()` ต่ออายุโทเค็นครั้งเดียวแล้วถามอีกครั้งเดียว ไม่วนซ้ำ
 
 ## การต่ออายุโทเค็น
 

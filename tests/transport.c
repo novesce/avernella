@@ -15,6 +15,9 @@ static gint64 refresh_duration, refresh_issued;
 static long http_code = 200;
 static curl_off_t retry_after;
 static gboolean reject_replay;
+static GPtrArray *sent_headers;
+/* When nonnegative, every reply is this TalkException code. */
+static int forced_code = -1;
 
 CURLcode __wrap_curl_easy_setopt(CURL *easy, CURLoption option, ...)
 {
@@ -26,6 +29,14 @@ CURLcode __wrap_curl_easy_setopt(CURL *easy, CURLoption option, ...)
 		receive_body = va_arg(values, curl_write_callback);
 	if (option == CURLOPT_WRITEDATA)
 		receive_data = va_arg(values, void *);
+	if (option == CURLOPT_HTTPHEADER) {
+		if (!sent_headers)
+			sent_headers = g_ptr_array_new_with_free_func(g_free);
+		g_ptr_array_set_size(sent_headers, 0);
+		for (struct curl_slist *h = va_arg(values, struct curl_slist *);
+		     h; h = h->next)
+			g_ptr_array_add(sent_headers, g_strdup(h->data));
+	}
 	va_end(values);
 	return CURLE_OK;
 }
@@ -50,11 +61,12 @@ CURLcode __wrap_curl_easy_perform(CURL *easy)
 {
 	(void)easy;
 	requests++;
-	gboolean refresh = requests == 2;
+	gboolean refresh = requests == 2 && forced_code < 0;
 
 	if (refresh && refresh_code < 0)
 		return CURLE_OPERATION_TIMEDOUT;
-	gint code = refresh			   ? refresh_code :
+	gint code = forced_code >= 0		   ? forced_code :
+		    refresh			   ? refresh_code :
 		    requests == 1 || reject_replay ? 119 :
 						     0;
 	g_autoptr(J) fields = obj();
@@ -269,6 +281,113 @@ static void rate_limit(void)
 	line_transport_release();
 }
 
+static gboolean sent(const char *header)
+{
+	for (guint i = 0; sent_headers && i < sent_headers->len; i++)
+		if (!strcmp(g_ptr_array_index(sent_headers, i), header))
+			return TRUE;
+	return FALSE;
+}
+
+/* One identity on every request, with the desktop's own language tag. */
+static void identity_headers(void)
+{
+	Line client = { .access = (char *)"fixture" };
+	g_autoptr(GError) error = NULL;
+	const char *const cases[][2] = { { "th_TH.UTF-8", "x-lal: th_TH" },
+					 { "ja_JP", "x-lal: ja_JP" },
+					 { "C", "x-lal: en_US" } };
+
+	http_code = 500;
+	for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+		g_setenv("LANGUAGE", cases[i][0], TRUE);
+		g_assert_null(line_call(&client, "/S4", "getProfile", NULL,
+					client.access, 0, &error));
+		g_clear_error(&error);
+		g_assert_true(sent(LINE_APP_HEADER));
+		g_assert_true(sent(cases[i][1]));
+	}
+	g_unsetenv("LANGUAGE");
+	http_code = 200;
+	line_transport_release();
+}
+
+/* HTTP 401 and 403 are LINE refusing the credentials, not a network fault. */
+static void access_denied(void)
+{
+	Line client = { .access = (char *)"fixture" };
+	g_autoptr(GError) error = NULL;
+
+	http_code = 403;
+	requests = 0;
+	g_assert_null(line_rpc(&client, "/S4", "getProfile", NULL, &error));
+	g_assert_error(error, LINE_ERROR, LINE_ACCESS_DENIED);
+	g_assert_cmpint(client.http_status, ==, 403);
+	g_assert_cmpint(requests, ==, 1);
+	http_code = 200;
+	line_transport_release();
+}
+
+/*
+ * After NOT_AUTHORIZED_DEVICE nothing more goes out with that token, as in
+ * LINE's own client; other tokens (a pairing session) are unaffected.
+ */
+static void denial_latch(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	Line client = { .access = (char *)"fixture" };
+	g_autoptr(GError) error = NULL;
+
+	forced_code = 8;
+	requests = 0;
+	g_assert_null(line_rpc(&client, "/S4", "getProfile", NULL, &error));
+	g_assert_true(client.denied);
+	g_assert_cmpint(requests, ==, 1);
+	g_clear_error(&error);
+	g_assert_null(line_rpc(&client, "/S4", "getProfile", NULL, &error));
+	g_assert_error(error, LINE_ERROR, LINE_SESSION_EXPIRED);
+	g_assert_cmpint(requests, ==, 1);
+	g_clear_error(&error);
+	g_assert_null(line_call(&client, "/acct/lp/lgn/sq/v1",
+				"checkQrCodeVerified", NULL, "pairing", 1,
+				&error));
+	g_assert_cmpint(requests, ==, 2);
+	line_transport_release();
+}
+
+/* EXCESSIVE_ACCESS pauses every RPC to legy, but not other hosts. */
+static void busy_cooldown(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	Line client = { .access = (char *)"fixture" };
+	g_autoptr(GError) error = NULL;
+
+	forced_code = 4;
+	requests = 0;
+	g_assert_null(line_rpc(&client, "/S4", "getProfile", NULL, &error));
+	g_assert_false(client.denied);
+	g_assert_cmpint(line_transport_retry_after(), >=, 29);
+	g_clear_error(&error);
+	g_assert_null(line_rpc(&client, "/S4", "getProfile", NULL, &error));
+	g_assert_error(error, LINE_ERROR, LINE_RATE_LIMITED);
+	g_assert_cmpint(requests, ==, 1);
+	g_assert_cmpint(line_cooldown_seconds("https://obs.line-apps.com/r"),
+			==, 0);
+	/* A cooldown is per host and ignores the path and letter case. */
+	line_cooldown_set("https://OBS.line-apps.com/r/talk/m/1", 60);
+	g_assert_cmpint(line_cooldown_seconds("https://obs.line-apps.com/x"),
+			>=, 59);
+	line_transport_release();
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -278,6 +397,10 @@ int main(int argc, char **argv)
 			refresh_failure_keeps_session);
 	g_test_add_func("/transport/renewal-schedule", renewal_schedule);
 	g_test_add_func("/transport/qr-poll-timeout", poll_timeout);
+	g_test_add_func("/transport/identity-headers", identity_headers);
+	g_test_add_func("/transport/access-denied", access_denied);
+	g_test_add_func("/transport/denial-latch", denial_latch);
+	g_test_add_func("/transport/busy-cooldown", busy_cooldown);
 	g_test_add_func("/transport/retry-after", rate_limit);
 	return g_test_run();
 }

@@ -52,6 +52,18 @@ Adding someone from elsewhere uses other arms of the same tracking union (`line_
 
 **Your own invite.** `friendInvite` calls `getUserTicket` on `/S4` and builds your personal `https://line.me/ti/p/<ticket>` link, which the UI shows as a QR code.
 
+## Pacing searches and adds
+
+Searching many LINE IDs or phone numbers in a short time, or adding many people at once, is what LINE treats as account enumeration or spam, and it is the most likely reason for LINE to restrict an account. The worker therefore paces these actions itself (`line_pace_wait()` and `line_pace_record()` in `friends.c`, applied by `paced()` in `main.c`):
+
+| Action | Rule (`line_lookup_pace`, `line_add_pace`) |
+| ------ | ------------------------------------------- |
+| `findFriend` (LINE ID, link or phone lookup) | At least 3 seconds apart, and at most 10 in any 10 minutes |
+| `addFriend`, `addRecommendation`, `addProfileFriend` | At most 10 in any 10 minutes. Add right after a search is fine. |
+| Either, after LINE answers RelationService reason 4 ("temporarily limited") | Nothing more for an hour. `relation()` returns that reason as `LINE_RATE_LIMITED`. |
+
+A refused action tells the user how long to wait ("To keep your account safe, wait 3 minutes before trying again."). The limits are well above what a person does by hand, so ordinary use never meets them. They reset when the app restarts.
+
 ## Managing friends
 
 `friend_action()` in `main.c` checks that the friend is in the worker's roster, reserves a sequence, and calls `line_friend_rename()`, `line_friend_favorite()`, `line_friend_visibility()` or `line_friend_block()`. All take `{1: {1: reqSeq, 2: mid, 3: value}}` on `/RE4`:

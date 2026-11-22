@@ -16,6 +16,58 @@ static J *fail(GError **error, const char *message)
 	return NULL;
 }
 
+/*
+ * A person searches for a friend or two at a time, not dozens a minute. These
+ * limits stay well clear of that while never slowing ordinary use.
+ */
+const struct line_pace_rule line_lookup_pace = {
+	.gap_us = (gint64)3 * G_USEC_PER_SEC,
+	.burst = 10,
+	.window_us = (gint64)10 * 60 * G_USEC_PER_SEC,
+	.cooldown_us = (gint64)60 * 60 * G_USEC_PER_SEC,
+};
+const struct line_pace_rule line_add_pace = {
+	.gap_us = 0,
+	.burst = 10,
+	.window_us = (gint64)10 * 60 * G_USEC_PER_SEC,
+	.cooldown_us = (gint64)60 * 60 * G_USEC_PER_SEC,
+};
+
+gint64 line_pace_wait(const struct line_pace *p, const struct line_pace_rule *r,
+		      gint64 now)
+{
+	gint64 until = p->blocked_until;
+	guint burst = MIN(r->burst, (guint)LINE_PACE_SLOTS);
+	guint used = 0;
+	gint64 newest = 0, oldest = G_MAXINT64;
+
+	for (guint i = 0; i < LINE_PACE_SLOTS; i++) {
+		gint64 t = p->recent[i];
+
+		if (!t || now - t >= r->window_us)
+			continue;
+		used++;
+		newest = MAX(newest, t);
+		oldest = MIN(oldest, t);
+	}
+	if (newest && r->gap_us)
+		until = MAX(until, newest + r->gap_us);
+	if (burst && used >= burst)
+		until = MAX(until, oldest + r->window_us);
+	if (until <= now)
+		return 0;
+	return (until - now + G_USEC_PER_SEC - 1) / G_USEC_PER_SEC;
+}
+
+void line_pace_record(struct line_pace *p, const struct line_pace_rule *r,
+		      gint64 now, gboolean limited)
+{
+	p->recent[p->next] = now;
+	p->next = (p->next + 1) % LINE_PACE_SLOTS;
+	if (limited)
+		p->blocked_until = MAX(p->blocked_until, now + r->cooldown_us);
+}
+
 static J *child(J *parent, const char *key)
 {
 	J *node = obj();
@@ -158,8 +210,13 @@ static J *relation(Line *s, const char *method, J *args, GError **error)
 		"LINE requires this person's QR invitation for this request."
 	};
 	if (g_error_matches(original, LINE_ERROR, 1) && reason > 0 &&
-	    (guint)reason < G_N_ELEMENTS(reasons))
-		return fail(error, reasons[reason]);
+	    (guint)reason < G_N_ELEMENTS(reasons)) {
+		/* Reason 4 is LINE's own rate limit: the worker pauses on it. */
+		g_set_error_literal(error, LINE_ERROR,
+				    reason == 4 ? LINE_RATE_LIMITED : 1,
+				    reasons[reason]);
+		return NULL;
+	}
 	if (original)
 		g_propagate_error(error, g_steal_pointer(&original));
 	else

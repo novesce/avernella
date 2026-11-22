@@ -30,7 +30,7 @@ Implemented in `pair_with_key()` in [`pair.c`](../../src/pair.c). All calls are 
 2. **Create a session.** `createSession()` with no arguments. Reply field 1 is the pairing session ID.
 3. **Get the QR link.** `createQrCodeForSecure({1: {1: session}})`. Reply field 1 is a `line://` or `https://line.me/` link, field 2 the number of poll rounds, field 3 the seconds per round, and field 4 a nonce.
 4. **Add the key to the link.** The client appends `secret=<base64 public key, URL-escaped>&e2eeVersion=1` to the link and emits it as a `qr` event. That URL *is* the QR code the phone scans. This is how the phone learns the desktop's public key.
-5. **Wait for the scan.** `poll_approval()` calls `checkQrCodeVerified` on the long-poll path, with the pairing session ID as the `x-line-access` header and `x-lst` set to the seconds per round. Each round either succeeds or times out (`LINE_TIMEOUT`), up to the given number of rounds (at most 12, at most 60 s each). Running out of rounds gives "The QR code expired".
+5. **Wait for the scan.** `poll_approval()` calls `checkQrCodeVerified` on the long-poll path, with the pairing session ID as the `x-line-access` header and `x-lst` set to the seconds per round. Each round either succeeds or times out (`LINE_TIMEOUT`), up to the given number of rounds (at most 12, at most 120 s each, LINE for Android's own default in `dc5.p`). A round that LINE ends early, such as an immediate 408, 410 or 504, still lasts its full length before the next poll, so an early answer never becomes a rapid loop. Running out of rounds gives "The QR code expired".
 6. **Check whether a PIN is needed.** `verifyCertificate` with the same arguments. A fresh pairing has no device certificate, so LINE usually answers service code 1 or 2. Then:
    - `createPinCode` returns a 4 to 12 digit PIN in field 1. The client emits a `pin` event, and the user types the PIN on the phone.
    - `poll_approval()` waits again, with `checkPinCodeVerified`.
@@ -73,8 +73,9 @@ Implemented in [`password_login.c`](../../src/password_login.c). These endpoints
 
 ## Staying signed in
 
-- **Launch without network.** If `getProfile` fails with anything other than a rejection, `login()` returns `LINE_RETRY`. The UI keeps the session and retries (`retry_login()` in `ui.c`) after 5, 10, 20… seconds, at most every five minutes, showing "Still signed in".
-- **Rejection.** `session_rejected()` in `main.c` treats `LINE_SESSION_EXPIRED` and TalkException codes 1, 7, 8, 14 and 17 as "LINE ended this session". The worker forgets the session (`forget()`), and the UI returns to sign-in with the reason.
+- **Launch without network.** `login()` returns `LINE_RETRY` only when `transient_failure()` says a network could have caused the failure: no HTTP answer at all, HTTP 408, 429 or 5xx, or a local cooldown. The UI then keeps the session and retries (`retry_login()` in `ui.c`) after 5, 10, 20… seconds, at most every five minutes, showing "Still signed in". During a cooldown those retries fail locally without a request.
+- **LINE's own refusals stop the retries.** Any TalkException, or an HTTP 4xx such as 401 or 403, ends the attempt with "LINE refused this desktop session". The session stays saved, but nothing retries until the user chooses sign in. A 401 or 403 first gets one token renewal and one more `getProfile` (`checked_profile()`).
+- **Rejection.** `session_rejected()` in `main.c` treats the latch (`s->denied`), `LINE_SESSION_EXPIRED` and TalkException codes 1, 7, 8, 14 and 17 as "LINE ended this session". The worker forgets the session (`forget()`), and the UI returns to sign-in with the reason. See [Protocol basics](protocol-basics.md#when-line-refuses-the-session).
 - **Renewal** is described in [Protocol basics](protocol-basics.md#token-renewal).
 - **Another desktop signing in** may make LINE end this one. That arrives as a rejection on the next request or revision check.
 

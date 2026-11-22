@@ -21,19 +21,6 @@ enum {
 	LIFF_ID_FEDERATION_REQUIRED = 10,
 };
 
-/* LINE's language tag, as in the x-lal header: en_US, ja_JP. */
-static char *liff_lang(void)
-{
-	const char *const *names = g_get_language_names();
-	const char *name = names && names[0] ? names[0] : "C";
-	gsize n = strcspn(name, ".@");
-
-	if (!n || !g_ascii_isalpha(name[0]) || !strncmp(name, "C", n) ||
-	    !strncmp(name, "POSIX", n) || n > 16)
-		return g_strdup("en_US");
-	return g_strndup(name, n);
-}
-
 static void put_str(J *o, const char *key, const char *value)
 {
 	json_object_object_add(o, key, json_object_new_string(value));
@@ -167,7 +154,9 @@ J *line_liff_view(Line *s, const char *url, const char *chat, GError **error)
 				    "This is not a LINE app link.");
 		return NULL;
 	}
-	g_autofree char *lang = liff_lang();
+	char lang[17];
+
+	line_language_tag(lang);
 	J *request = obj(), *context = obj();
 
 	put_str(request, "1:str", liff_id);

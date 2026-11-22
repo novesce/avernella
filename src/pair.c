@@ -8,6 +8,15 @@
 #define QR_SERVICE "/acct/lgn/sq/v1"
 #define QR_POLL "/acct/lp/lgn/sq/v1"
 
+/*
+ * LINE for Android waits up to 120 s for each approval poll when LINE gives
+ * no time of its own (dc5.p.h, secondary-device QR login, LINE 26.x).
+ */
+enum {
+	QR_ROUND_MAX_SECONDS = 120,
+	QR_ROUNDS_MAX = 12,
+};
+
 static gboolean fail(GError **e, const char *why)
 {
 	g_set_error_literal(e, LINE_ERROR, 1, why);
@@ -21,14 +30,27 @@ static gboolean poll_approval(Line *s, const char *method, const char *session,
 			  (gint64)rounds * seconds * G_USEC_PER_SEC;
 	for (int i = 0; i < rounds && g_get_monotonic_time() < deadline; i++) {
 		g_autoptr(GError) failure = NULL;
+		gint64 started = g_get_monotonic_time();
 		g_autoptr(J) response = line_call(s, QR_POLL, method, args,
 						  session, seconds, &failure);
+
 		if (response)
 			return TRUE;
 		if (!g_error_matches(failure, LINE_ERROR, LINE_TIMEOUT)) {
 			g_propagate_error(error, g_steal_pointer(&failure));
 			return FALSE;
 		}
+		/*
+		 * Each round is one long poll. When LINE ends it early (an
+		 * immediate 408, 410 or 504), wait out the round before asking
+		 * again, so an early answer never turns into a rapid loop.
+		 */
+		gint64 round_end = MIN(
+			started + (gint64)seconds * G_USEC_PER_SEC, deadline);
+		gint64 left = round_end - g_get_monotonic_time();
+
+		if (left > 0)
+			g_usleep(left);
 	}
 	return fail(
 		error,
@@ -74,13 +96,13 @@ static gboolean pair_with_key(Line *s, const guint8 secret[32],
 		g_strdup_printf("%s%csecret=%s&e2eeVersion=1", link,
 				strchr(link, '?') ? '&' : '?', escaped);
 	line_event("qr", "url", url);
-	int rounds = field(qr, "2") ?
-			     CLAMP(json_object_get_int(field(qr, "2")), 1, 12) :
-			     12;
-	int seconds =
-		field(qr, "3") ?
-			CLAMP(json_object_get_int(field(qr, "3")), 1, 60) :
-			30;
+	int rounds = field(qr, "2") ? CLAMP(json_object_get_int(field(qr, "2")),
+					    1, QR_ROUNDS_MAX) :
+				      QR_ROUNDS_MAX;
+	int seconds = field(qr, "3") ?
+			      CLAMP(json_object_get_int(field(qr, "3")), 1,
+				    QR_ROUND_MAX_SECONDS) :
+			      30;
 	if (!poll_approval(s, "checkQrCodeVerified", session, args, rounds,
 			   seconds, error))
 		return FALSE;

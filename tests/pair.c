@@ -197,10 +197,16 @@ static void exercise(gconstpointer data)
 	Line s = { 0 };
 
 	g_autoptr(GError) error = NULL;
+	gint64 started = g_get_monotonic_time();
+
 	if (outcome == APPROVE || outcome == CERT_ACCEPTED) {
 		g_assert_true(line_pair(&s, &error));
 		g_assert_no_error(error);
 		g_assert_cmpuint(polls, ==, outcome == APPROVE ? 2 : 1);
+		/* The fixture's instant timeout still costs a whole 1 s round. */
+		if (outcome == APPROVE)
+			g_assert_cmpint(g_get_monotonic_time() - started, >=,
+					G_USEC_PER_SEC - 20000);
 		g_assert_cmpuint(certificates, ==, 1);
 		g_assert_cmpuint(pins, ==, outcome == APPROVE);
 		g_assert_cmpuint(imports, ==, 1);
@@ -222,8 +228,12 @@ static void exercise(gconstpointer data)
 	g_assert_cmpuint(revocations, ==, outcome == BAD_KEYCHAIN);
 	if (outcome == BAD_LINK)
 		g_assert_cmpuint(scans, ==, 0);
-	if (outcome == EXPIRE)
+	if (outcome == EXPIRE) {
+		/* Two early answers never become a burst: two rounds, ~2 s. */
 		g_assert_cmpuint(polls, ==, 2);
+		g_assert_cmpint(g_get_monotonic_time() - started, >=,
+				2 * G_USEC_PER_SEC - 40000);
+	}
 }
 
 int main(int argc, char **argv)

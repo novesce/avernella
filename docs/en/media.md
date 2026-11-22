@@ -74,7 +74,7 @@ Uploading doesn't give anyone access. Recipients can find and decrypt the object
 
 Video posters come from `<sid>/<oid>/ud-preview` (falling back to `<oid>__ud-preview`), with a 6-second timeout. Legacy unencrypted media use `m/<message ID>` and `/preview`.
 
-If OBS rejects the token (`LINE_OBS_UNAUTHORIZED`), the worker forgets it and gets a new one next time.
+If OBS rejects the token (`LINE_OBS_UNAUTHORIZED`), the worker forgets it and tries once more with a new one, as LINE's own OBS client does. A 429 or 503 starts that host's cooldown, and requests to it fail locally until it passes (see [Protocol basics](protocol-basics.md#rate-limits)).
 
 ### Getting bytes to the window
 
@@ -180,6 +180,7 @@ Flex and rich-message artwork can come from **any HTTPS host** the sender choose
 - A custom socket callback (`asset_socket()`) checks the resolved address and refuses private, loopback, link-local and other non-public IPv4 and IPv6 addresses, so a message can't make the client probe your local network.
 - Redirects are followed only to other allowed HTTPS URLs.
 - Only JPEG, PNG or WebP is accepted, up to 64 MiB, a limit that only guards against a server that never stops sending.
+- A host that answers 429 or 503 gets no further request until its `Retry-After` passes, and the imagemap plain-URL fallback is skipped.
 - `LINE_DEBUG_MEDIA=1` reports each failure: address, HTTP status and decode error.
 
 ## Albums, notes and polls

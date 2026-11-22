@@ -145,7 +145,7 @@ The email login endpoints (`/api/v3/TalkService.do` and `/api/v3p/rs`) use the o
 POST /S4 HTTP/2
 Host: legy.line-apps.com
 x-line-application: DESKTOPWIN	9.7.0.3556	WINDOWS	10.0.0-NT-x64
-x-lal: en_US
+x-lal: <locale>                        (th_TH, ja_JP…; en_US for C/POSIX)
 x-lpv: 1
 x-lhm: POST
 x-line-access: <access token>          (when signed in)
@@ -156,7 +156,7 @@ Accept-Encoding: gzip
 User-Agent: Line/9.7.0.3556
 ```
 
-The fields of `x-line-application` are separated by tab characters. `x-lst` tells LINE how long it may hold a long-poll request open. The `/LF1` approval wait uses `x-lhm: GET` and `Accept: application/json` instead.
+The fields of `x-line-application` are separated by tab characters. `LINE_APP_HEADER` and `LINE_USER_AGENT` in `line.h` hold the client identity, so every request (RPCs, object storage, albums and notes) names the same client version. `x-lal` is the desktop locale from `line_language_tag()` in `line.h`, the same tag LIFF views send as their `lang`, so a Thai desktop says `th_TH` everywhere, as LINE's own client does. `x-lst` tells LINE how long it may hold a long-poll request open. The `/LF1` approval wait uses `x-lhm: GET` and `Accept: application/json` instead.
 
 ### Transport rules
 
@@ -183,7 +183,8 @@ A reply may carry the header `x-line-next-access: <token>`. That is LINE rotatin
 | `LINE_ASSET_NOT_FOUND` (6) | HTTP 404 from a CDN or OBS | A missing preview or animation |
 | `LINE_OWN_KEY_MISSING` (7) | This device lacks a Letter Sealing key generation | Old message, new device |
 | `LINE_RETRY` (8) | A saved session couldn't reach LINE | Offline at launch: keep the session and retry |
-| `LINE_RATE_LIMITED` (9) | LINE asked to wait | HTTP 429 or 503 |
+| `LINE_RATE_LIMITED` (9) | LINE asked to wait | HTTP 429 or 503, TalkException 4, 58 or 101, or a host still cooling down |
+| `LINE_ACCESS_DENIED` (10) | LINE refused the request's credentials | HTTP 401 or 403 |
 
 Separately, `s->service_code` holds **LINE's own error number** from the last reply's exception field 1, or -1. Callers inspect it for specific cases. Some TalkException codes the client relies on:
 
@@ -200,7 +201,23 @@ Other services, such as RelationService, ShopService and the refresh endpoint, h
 
 ## Rate limits
 
-When LINE answers HTTP 429 or 503, `record_retry_after()` reads the `Retry-After` header (default 30 s) and sets a process-wide deadline. Until it passes, every `exchange()` fails immediately with `LINE_RATE_LIMITED` and the time left. The worker's maintenance timer respects it too (`sync_revision()`), and the long-poll thread waits at least that long before retrying.
+Every HTTP path that reaches LINE shares one table of **per-host cooldowns** (`line_cooldown_*()` in [`http_tune.c`](../../src/http_tune.c)): RPCs in `transport.c`, object storage and the CDNs in `obs_http.c`, albums and notes in `shared_content.c`, and card artwork in `flex_asset.c`.
+
+- **Starting one.** An HTTP 429 or 503 sets a cooldown for that host from `Retry-After`, or 30 s without it (`line_cooldown_note()`). A TalkException `EXCESSIVE_ACCESS` (4), `CONGESTION_CONTROL` (58) or `SERVER_BUSY` (101) on `/S4` or `/SYNC4` sets 30 s for `legy.line-apps.com`.
+- **Honoring it.** Until it passes, every request to that host fails at once with `LINE_RATE_LIMITED`, without touching the network (`line_cooldown_check()`). Other hosts carry on: a busy object store doesn't stop chat.
+- **Who waits.** The maintenance timer (`sync_revision()`) and the long-poll thread wait at least as long as legy's cooldown (`line_transport_retry_after()`). Nothing retries a refused request automatically; the user can try again once the time has passed.
+- **No "try something else".** A 429 on an imagemap picture is not followed by the plain-URL fallback (`line_flex_image_download()`).
+
+This follows LINE for Android 26.x: its HTTP interceptor (`ti0.d`) retries a 429 only when `Retry-After` is under 5 s, and its object-storage client (`a14.g`) retries once, and only after a 401 or 503.
+
+## When LINE refuses the session
+
+LINE for Android signs a linked device out on the first TalkException `AUTHENTICATION_FAILED` (1), `NOT_AVAILABLE_USER` (7) or `NOT_AUTHORIZED_DEVICE` (8) (`ac5.e`, `ac5.b`), and afterwards refuses locally to send anything with that token (`getClient()` in its Thrift client). Avernella does the same:
+
+- **The latch.** When a `/S4` or `/SYNC4` request made with the session's own token gets one of `line_auth_rejected()`'s codes (1, 7, 8, 14, 17), or the refresh token is refused, `exchange()` sets `s->denied`. From then on any request with that token fails locally with `LINE_SESSION_EXPIRED`. Pairing calls, which use their own temporary token, are unaffected.
+- **Signing out.** After a request, `handle()` in `main.c` sees the latch and calls `end_session()`: forget the session, send `signed_out`, return the window to sign-in. The window never signs in again on its own.
+- **The long poll.** The `line-sync` thread has its own copy of the token. On a refusal, or HTTP 401 or 403, it reports `denied` once and stops polling. The worker confirms once with `checked_profile()`: a working session restarts the long poll, a refused one signs out, and anything else waits 15 s (network) or 5 minutes (another LINE answer) before the next check.
+- **HTTP 401 or 403.** As LINE's interceptor does, `checked_profile()` renews the token once and asks once more. It never loops.
 
 ## Token renewal
 

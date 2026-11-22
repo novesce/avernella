@@ -21,6 +21,7 @@ struct line_live_sync {
 	guint64 access_generation;
 	J *ops;
 	gboolean reload;
+	gboolean denied; /* LINE refused the token: no more requests */
 	gint64 revision;
 	guint failures;
 	struct line_talk_sync sync; /* owned by the thread */
@@ -93,6 +94,25 @@ static gpointer run(gpointer data)
 		gboolean idle_timeout =
 			took >= LONG_POLL_SECONDS * (gint64)G_USEC_PER_SEC &&
 			g_error_matches(error, LINE_ERROR, LINE_TIMEOUT);
+		if (session.denied ||
+		    g_error_matches(error, LINE_ERROR, LINE_ACCESS_DENIED)) {
+			/*
+			 * LINE refused this token. As in LINE's own client, no
+			 * further request goes out with it: report it once and
+			 * wait for the worker to confirm and stop this thread.
+			 */
+			g_mutex_lock(&l->lock);
+			l->denied = TRUE;
+			g_mutex_unlock(&l->lock);
+			if (session.access)
+				memset(session.access, 0,
+				       strlen(session.access));
+			g_free(session.access);
+			notify(l);
+			while (pause_for(l, (gint64)3600 * G_USEC_PER_SEC))
+				;
+			break;
+		}
 		g_autoptr(J) ops = json_object_new_array();
 		gboolean reload = FALSE, more = FALSE;
 
@@ -244,6 +264,7 @@ void line_live_sync_take(struct line_live_sync *l,
 	batch->access_from = g_steal_pointer(&l->rotated_from);
 	batch->revision = l->revision;
 	batch->failing = l->failures >= 2;
+	batch->denied = l->denied;
 	l->reload = FALSE;
 	g_mutex_unlock(&l->lock);
 }

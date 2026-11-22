@@ -151,6 +151,10 @@ static GBytes *transfer(Line *s, enum channel channel, const char *path,
 	if (!plain(s->access, 16384) || !chat_id(s->mid))
 		return fail(e, "The LINE session is unavailable.");
 	g_autofree char *url = g_strconcat(origin, path, NULL);
+
+	/* Albums and notes share legy's cooldown with every RPC. */
+	if (line_cooldown_check(url, e))
+		return NULL;
 	g_autofree char *auth = g_strconcat("x-line-access: ", s->access, NULL);
 	g_autofree char *ch = g_strconcat("x-line-channeltoken: ", token, NULL);
 	g_autofree char *mid =
@@ -163,16 +167,20 @@ static GBytes *transfer(Line *s, enum channel channel, const char *path,
 		album ? g_strconcat("x-line-album: ", album, NULL) : NULL;
 	g_autofree char *method_header =
 		g_strconcat("x-lhm: ", logical_method, NULL);
+	char tag[17];
+
+	line_language_tag(tag);
+	g_autofree char *language = g_strconcat("x-lal: ", tag, NULL);
 	const char *const headers[] = {
 		auth,
 		ch,
 		mid,
 		method_header,
-		"x-line-application: DESKTOPWIN\t9.7.0.3556\tWINDOWS\t10.0.0-NT-x64",
+		LINE_APP_HEADER,
 		"accept: application/json",
 		"content-type: application/json; charset=UTF-8",
 		"x-lpv: 1",
-		"x-lal: en_US",
+		language,
 		room,
 		album_header
 	};
@@ -211,7 +219,7 @@ static GBytes *transfer(Line *s, enum channel channel, const char *path,
 	SET(CURLOPT_TIMEOUT, 30L);
 	SET(CURLOPT_NOSIGNAL, 1L);
 	SET(CURLOPT_ACCEPT_ENCODING, "");
-	SET(CURLOPT_USERAGENT, "Line/9.7.0.3556");
+	SET(CURLOPT_USERAGENT, LINE_USER_AGENT);
 	SET(CURLOPT_POSTFIELDS, body ? json_object_to_json_string_ext(
 					       body, JSON_C_TO_STRING_PLAIN) :
 				       "");
@@ -221,6 +229,8 @@ static GBytes *transfer(Line *s, enum channel channel, const char *path,
 	rc = curl_easy_perform(curl);
 	if (!rc)
 		rc = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &status);
+	if (!rc)
+		line_cooldown_note(url, curl, status);
 out:
 	curl_easy_cleanup(curl);
 	curl_slist_free_all(list);
@@ -234,7 +244,9 @@ out:
 			    "Shared-content transfer failed: %s.",
 			    curl_easy_strerror(rc));
 	else
-		g_set_error(e, LINE_ERROR, 1,
+		g_set_error(e, LINE_ERROR,
+			    status == 429 || status == 503 ? LINE_RATE_LIMITED :
+							     1,
 			    "LINE shared content returned HTTP %ld.", status);
 	return NULL;
 }

@@ -84,3 +84,101 @@ gboolean line_curl_tune(CURL *handle, gboolean pooled)
 		curl_easy_setopt(handle, CURLOPT_SHARE, sh);
 	return TRUE;
 }
+
+/*
+ * One deadline per host, so a cooldown on obs.line-apps.com doesn't stop
+ * chat RPCs and the reverse. The table stays small: expired entries are
+ * dropped whenever a new host is added.
+ */
+enum {
+	COOLDOWN_DEFAULT_SECONDS = 30,
+	COOLDOWN_MAX_SECONDS = 24 * 60 * 60,
+	COOLDOWN_HOSTS = 64,
+};
+
+static GMutex cooldown_lock;
+static GHashTable *cooldowns; /* lowercase host → monotonic µs deadline */
+
+static char *cooldown_host(const char *url)
+{
+	g_autoptr(GUri) uri = url ? g_uri_parse(url, G_URI_FLAGS_NONE, NULL) :
+				    NULL;
+	const char *host = uri ? g_uri_get_host(uri) : NULL;
+
+	return host && *host ? g_ascii_strdown(host, -1) : NULL;
+}
+
+static gboolean expired(gpointer key, gpointer value, gpointer now)
+{
+	(void)key;
+	return *(gint64 *)value <= *(gint64 *)now;
+}
+
+int line_cooldown_seconds(const char *url)
+{
+	g_autofree char *host = cooldown_host(url);
+	gint64 now = g_get_monotonic_time(), until = 0;
+
+	if (!host)
+		return 0;
+	g_mutex_lock(&cooldown_lock);
+	gint64 *found = cooldowns ? g_hash_table_lookup(cooldowns, host) : NULL;
+
+	if (found)
+		until = *found;
+	g_mutex_unlock(&cooldown_lock);
+	if (until <= now)
+		return 0;
+	return (until - now + G_USEC_PER_SEC - 1) / G_USEC_PER_SEC;
+}
+
+void line_cooldown_set(const char *url, int seconds)
+{
+	g_autofree char *host = cooldown_host(url);
+
+	if (!host || seconds <= 0)
+		return;
+	gint64 now = g_get_monotonic_time();
+	gint64 until = now + (gint64)MIN(seconds, COOLDOWN_MAX_SECONDS) *
+				     G_USEC_PER_SEC;
+
+	g_mutex_lock(&cooldown_lock);
+	if (!cooldowns)
+		cooldowns = g_hash_table_new_full(g_str_hash, g_str_equal,
+						  g_free, g_free);
+	gint64 *found = g_hash_table_lookup(cooldowns, host);
+
+	if (found) {
+		*found = MAX(*found, until);
+	} else {
+		g_hash_table_foreach_remove(cooldowns, expired, &now);
+		if (g_hash_table_size(cooldowns) < COOLDOWN_HOSTS)
+			g_hash_table_insert(cooldowns, g_steal_pointer(&host),
+					    g_memdup2(&until, sizeof(until)));
+	}
+	g_mutex_unlock(&cooldown_lock);
+}
+
+void line_cooldown_note(const char *url, CURL *handle, long status)
+{
+	if (status != 429 && status != 503)
+		return;
+	curl_off_t seconds = 0;
+
+	if (!handle ||
+	    curl_easy_getinfo(handle, CURLINFO_RETRY_AFTER, &seconds) ||
+	    seconds <= 0)
+		seconds = COOLDOWN_DEFAULT_SECONDS;
+	line_cooldown_set(url, (int)MIN(seconds, (curl_off_t)G_MAXINT));
+}
+
+gboolean line_cooldown_check(const char *url, GError **error)
+{
+	int wait = line_cooldown_seconds(url);
+
+	if (!wait)
+		return FALSE;
+	g_set_error(error, LINE_ERROR, LINE_RATE_LIMITED,
+		    "LINE asked to wait. Try again in %d seconds.", wait);
+	return TRUE;
+}

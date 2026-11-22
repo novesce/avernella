@@ -68,7 +68,7 @@ The long poll can't start until the client knows where "now" is. Otherwise, on f
 
 1. **Baseline.** The first time, it calls `getLastOpRevision` on `/S4` and sets the cursor to the answer. Nothing before it is applied. Then it starts the long-poll thread.
 2. **While the long poll works,** the timer fires every 2 seconds only for maintenance: expiring unanswered call invitations (`line_voice_tick()`), renewing tokens (`maintain_tokens()`) and saving a rotated token.
-3. **While the long poll is failing,** the timer falls back to the cheap revision check. If `getLastOpRevision` is higher than the cursor, it runs one ordinary `sync` call (with a 2-second poll, `poll_call_operations()`) to pick up the operations, and sends `changed` to the UI. It checks every second while the window is focused or there is more to fetch, otherwise every 3 seconds.
+3. **While the long poll is failing,** the timer falls back to the cheap revision check. If `getLastOpRevision` is higher than the cursor, it runs one ordinary `sync` call (with a 2-second poll, `poll_call_operations()`) to pick up the operations, and sends `changed` to the UI. It checks every second while the window is focused or there is more to fetch, otherwise every 3 seconds. Once the long poll has been failing for two minutes, it checks every 15 seconds instead (`fallback_interval()`), so a long outage never turns into hours of one-second probes.
 4. **When the network is down,** it shows "Automatic chat refresh is unavailable" once and backs off: 3, 6, 12, 24, then every 30 seconds.
 5. **When LINE rejects the session,** it forgets it and sends `signed_out`.
 
