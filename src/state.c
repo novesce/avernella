@@ -10,7 +10,12 @@
 
 #define SESSION "session.json"
 #define TEMP "session.new"
-#define LEGACY_STATE_DIR "kitatide"
+/*
+ * Earlier names of this client's state directory, newest first: kitatide,
+ * and line-linux before it. Their session and chat-preference files have
+ * the same format as Avernella's.
+ */
+static const char *const legacy_dirs[] = { "kitatide", "line-linux" };
 #define STORE_DIR_FLAGS (O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY)
 #define MAX_SESSION_SIZE ((size_t)8 * 1024 * 1024)
 
@@ -94,16 +99,29 @@ static gboolean load(int dir, Line *s, GError **error)
 	return TRUE;
 }
 
+static gboolean has_session(const char *base, const char *name)
+{
+	g_autofree char *session = g_build_filename(base, name, SESSION, NULL);
+
+	return g_file_test(session, G_FILE_TEST_IS_REGULAR);
+}
+
+/*
+ * An existing Avernella directory decides on its own, even when signed out.
+ * Only without one does an earlier client's saved session count.
+ */
 gboolean line_store_has_session(void)
 {
 	const char *base = g_get_user_state_dir();
 	g_autofree char *current = g_build_filename(base, LINE_STATE_DIR, NULL);
 	GFileTest exists = G_FILE_TEST_EXISTS | G_FILE_TEST_IS_SYMLINK;
-	const char *name = g_file_test(current, exists) ? LINE_STATE_DIR :
-							  LEGACY_STATE_DIR;
-	g_autofree char *session = g_build_filename(base, name, SESSION, NULL);
 
-	return g_file_test(session, G_FILE_TEST_IS_REGULAR);
+	if (g_file_test(current, exists))
+		return has_session(base, LINE_STATE_DIR);
+	for (gsize i = 0; i < G_N_ELEMENTS(legacy_dirs); i++)
+		if (has_session(base, legacy_dirs[i]))
+			return TRUE;
+	return FALSE;
 }
 
 static gboolean lock_store(int dir, const char *name, GError **error)
@@ -131,25 +149,48 @@ static gboolean lock_store(int dir, const char *name, GError **error)
 	return FALSE;
 }
 
+/*
+ * Runs only when Avernella has no state directory yet. Moves the newest
+ * earlier client's directory into place as a unit, session and chat
+ * preferences together. A directory whose session this version cannot
+ * read is left where it is, so it never stands in the way of signing in.
+ */
 static gboolean migrate_store(int root, GError **error)
 {
-	int dir = openat(root, LEGACY_STATE_DIR, STORE_DIR_FLAGS);
+	for (gsize i = 0; i < G_N_ELEMENTS(legacy_dirs); i++) {
+		const char *name = legacy_dirs[i];
+		int dir = openat(root, name, STORE_DIR_FLAGS);
 
-	if (dir < 0)
-		return errno == ENOENT || io_failure("open", error);
-	gboolean ok = lock_store(dir, LEGACY_STATE_DIR, error);
+		if (dir < 0) {
+			if (errno == ENOENT)
+				continue;
+			return io_failure("open", error);
+		}
+		if (!lock_store(dir, name, error)) {
+			close(dir);
+			return FALSE;
+		}
+		g_autoptr(GError) unreadable = NULL;
+		Line probe = { .service_code = -1 };
+		gboolean usable = load(dir, &probe, &unreadable);
 
-	if (ok) {
-		/* Move the locked directory as a unit, including chat preferences. */
-		if (renameat2(root, LEGACY_STATE_DIR, root, LINE_STATE_DIR,
+		line_session_clear(&probe);
+		if (!usable) {
+			close(dir);
+			continue;
+		}
+		gboolean ok;
+
+		if (renameat2(root, name, root, LINE_STATE_DIR,
 			      RENAME_NOREPLACE) == 0)
 			ok = fsync(root) == 0 || io_failure("sync", error);
 		else
 			ok = errno == EEXIST || errno == ENOENT ||
 			     io_failure("move", error);
+		close(dir);
+		return ok;
 	}
-	close(dir);
-	return ok;
+	return TRUE;
 }
 
 int line_store_open(Line *s, GError **error)

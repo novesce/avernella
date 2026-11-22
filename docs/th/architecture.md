@@ -197,7 +197,7 @@ Avernella เก็บข้อมูลน้อยมาก ข้อควา
 | `$XDG_CONFIG_HOME/avernella/layout` (ค่าเริ่มต้น `~/.config/avernella/`) | UI, [`ui_theme.c`](../../src/ui_theme.c) | `avernella\n` หมายถึงเลือกธีม Avernella ค่าอื่นหรือไม่มีไฟล์หมายถึงธีม LINE ซึ่งเป็นค่าเริ่มต้น |
 | `$XDG_CONFIG_HOME/avernella/` | UI, [`ui_lang.c`](../../src/ui_lang.c) | ภาษาของส่วนติดต่อที่เลือก |
 | `$XDG_RUNTIME_DIR/avernella/` | UI, [`clipboard_paste.c`](../../src/clipboard_paste.c) | รูปที่วางเพื่อเตรียมส่ง ลบทิ้งหลังส่งหรือเมื่อปิดหน้าตัวอย่าง |
-| `~/.cache/kitatide/liff`, `~/.local/share/kitatide/liff` | โปรแกรมเบราว์เซอร์ | แคช HTTP และคุกกี้ของ WebKit สำหรับแอป LINE |
+| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | โปรแกรมเบราว์เซอร์ | แคช HTTP และคุกกี้ของ WebKit สำหรับแอป LINE |
 
 กฎที่ผู้เขียนไฟล์ทุกตัวทำตาม
 
@@ -208,7 +208,10 @@ Avernella เก็บข้อมูลน้อยมาก ข้อควา
 
 ### การย้ายจากชื่อเก่า
 
-Avernella เคยชื่อ *kitatide* ตอนใช้ครั้งแรก `line_store_open()` จะย้ายไดเรกทอรี `$XDG_STATE_HOME/kitatide` ที่มีอยู่ไปเป็น `avernella` ด้วย `renameat2(RENAME_NOREPLACE)` ภายใต้ล็อกของไดเรกทอรีนั้น เซสชันและการตั้งค่าแชตจึงตามมาด้วย ส่วนพาธแคชของเบราว์เซอร์ยังใช้ชื่อเก่า
+Avernella เคยชื่อ *kitatide* และเริ่มต้นมาจาก *line-linux* ไฟล์ของทั้งสองมีรูปแบบเดียวกัน ข้อมูลจึงย้ายมาได้ แต่จะย้ายก็ต่อเมื่อ Avernella ยังไม่มีข้อมูลของตัวเองเท่านั้น
+
+- **เซสชันและการตั้งค่าแชต** เมื่อยังไม่มี `$XDG_STATE_HOME/avernella` `migrate_store()` ใน `state.c` จะเลือกไดเรกทอรีรุ่นก่อนที่ใหม่ที่สุด คือ `kitatide` แล้วจึง `line-linux` และเปลี่ยนชื่อเป็น `avernella` ทั้งก้อนด้วย `renameat2(RENAME_NOREPLACE)` ภายใต้ล็อกของมัน ไดเรกทอรีที่มี `session.json` ซึ่งเวอร์ชันนี้อ่านไม่ได้จะถูกข้ามและปล่อยไว้ที่เดิม ถ้ามีไดเรกทอรี `avernella` อยู่แล้ว แม้จะออกจากระบบไปแล้ว ก็จะไม่ย้ายอะไรเลย
+- **ข้อมูลเบราว์เซอร์ของแอป LINE** `line_liff_storage_dir()` ใน `liff_url.c` ทำแบบเดียวกันกับ `liff/` ใต้ไดเรกทอรีแคชและไดเรกทอรีข้อมูล ตอนที่เบราว์เซอร์เริ่มทำงานครั้งแรก
 
 ## อะไรอยู่ตรงไหน
 

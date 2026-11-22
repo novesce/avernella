@@ -219,6 +219,6 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `$XDG_STATE_HOME/avernella/` (default `~/.local/state/avernella/`) | `session.json` (tokens, MID, Letter Sealing keys, request sequence) and `lists-<sha256 of your MID>.json` (folders, the selected folder view, pins, mutes, shortcuts, the notification and sound switches, reduced motion) |
 | `$XDG_CONFIG_HOME/avernella/` (default `~/.config/avernella/`) | `layout` (the theme choice) and the interface-language choice |
 | `$XDG_RUNTIME_DIR/avernella/` | Pictures pasted for sending, deleted after use |
-| `~/.cache/kitatide/liff`, `~/.local/share/kitatide/liff` | The in-app browser's HTTP cache and cookies |
+| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | The in-app browser's HTTP cache and cookies |
 
 The details of each file are in [Architecture](architecture.md#files-on-disk).

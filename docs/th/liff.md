@@ -118,7 +118,7 @@ Ctrl+Shift+O เปิดหน้าปัจจุบันในเบรา�
 - ตั้ง timer slack 1 ms (`PR_SET_TIMERSLACK`) ซึ่งโปรเซสของ WebKit สืบทอดไป ตัวจับเวลาของหน้าเว็บจึงรวมกันเป็นการตื่นที่น้อยลง
 - web process ของ WebKit ถูกจำกัดที่ 512 MB และ network process ตัดแคชเมื่อเกิน 128 MB ใช้แคชหน่วยความจำขนาดเล็กและไม่มีแคชหน้าสำหรับย้อนกลับ วิดีโอรอให้คลิกก่อนเล่น
 - sandbox แบบ bubblewrap ของ WebKit ยังเปิดอยู่
-- แคช HTTP และคุกกี้อยู่ใน `~/.cache/kitatide/liff` และ `~/.local/share/kitatide/liff`
+- แคช HTTP และคุกกี้อยู่ใน `~/.cache/avernella/liff` และ `~/.local/share/avernella/liff` ถ้ายังไม่มีไดเรกทอรีเหล่านี้ `line_liff_storage_dir()` ใน `liff_url.c` จะย้ายไดเรกทอรีเดียวกันของไคลเอนต์รุ่นก่อน (`kitatide` แล้วจึง `line-linux`) เข้ามา แอป LINE จึงยังมีคุกกี้เดิม
 
 ## การดีบักแอป LINE
 

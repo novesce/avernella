@@ -118,7 +118,7 @@ The browser protects the chat from heavy pages:
 - It sets a 1 ms timer slack (`PR_SET_TIMERSLACK`), which WebKit's processes inherit, so page timers coalesce into fewer wakeups.
 - WebKit's web processes are capped at 512 MB and the network process trims its caches above 128 MB. It keeps a small memory cache and no back-forward page cache. Videos wait for a click.
 - WebKit's bubblewrap sandbox stays on.
-- HTTP cache and cookies live in `~/.cache/kitatide/liff` and `~/.local/share/kitatide/liff`.
+- HTTP cache and cookies live in `~/.cache/avernella/liff` and `~/.local/share/avernella/liff`. When those don't exist yet, `line_liff_storage_dir()` in `liff_url.c` moves in the same directories of an earlier client (`kitatide`, then `line-linux`), so LINE apps keep their cookies.
 
 ## Debugging a LINE app
 

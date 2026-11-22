@@ -566,10 +566,9 @@ static void add_script(WebKitUserContentManager *content,
 
 static WebKitNetworkSession *network_session(void)
 {
-	g_autofree char *data = g_build_filename(g_get_user_data_dir(),
-						 "kitatide", "liff", NULL);
-	g_autofree char *cache = g_build_filename(g_get_user_cache_dir(),
-						  "kitatide", "liff", NULL);
+	/* Cookies and cache, carried over from kitatide or line-linux. */
+	g_autofree char *data = line_liff_storage_dir(g_get_user_data_dir());
+	g_autofree char *cache = line_liff_storage_dir(g_get_user_cache_dir());
 	WebKitMemoryPressureSettings *memory =
 		webkit_memory_pressure_settings_new();
 

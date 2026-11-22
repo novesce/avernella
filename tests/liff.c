@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "liff.h"
+#include "liff_url.h"
+#include <glib/gstdio.h>
 #include <string.h>
 
 #define LIFF_ID "1661444788-rnvmoOo8"
@@ -193,6 +195,62 @@ static void test_opens_consent_page(void)
 	g_assert_cmpuint(calls, ==, 4);
 }
 
+static char *make_store(const char *base, const char *name, const char *marker)
+{
+	g_autofree char *dir = g_build_filename(base, name, "liff", NULL);
+	g_autofree char *file = g_build_filename(dir, marker, NULL);
+
+	g_assert_cmpint(g_mkdir_with_parents(dir, 0700), ==, 0);
+	g_assert_true(g_file_set_contents(file, "cookie", -1, NULL));
+	return g_steal_pointer(&dir);
+}
+
+/*
+ * The browser's cookies and cache move into avernella/liff only when it has
+ * none yet: kitatide first, then line-linux; existing data always stays.
+ */
+static void test_storage_migration(void)
+{
+	g_autofree char *base = g_dir_make_tmp("liff-store-XXXXXX", NULL);
+	g_autofree char *line_linux = make_store(base, "line-linux", "old");
+	g_autofree char *target = line_liff_storage_dir(base);
+	g_autofree char *moved = g_build_filename(target, "old", NULL);
+
+	g_assert_true(g_str_has_suffix(target, "/avernella/liff"));
+	g_assert_true(g_file_test(moved, G_FILE_TEST_IS_REGULAR));
+	g_assert_false(g_file_test(line_linux, G_FILE_TEST_EXISTS));
+
+	/* Avernella already has data: a later old directory is not merged. */
+	g_autofree char *kitatide = make_store(base, "kitatide", "newer");
+	g_autofree char *again = line_liff_storage_dir(base);
+	g_autofree char *kept = g_build_filename(kitatide, "newer", NULL);
+
+	g_assert_cmpstr(again, ==, target);
+	g_assert_true(g_file_test(kept, G_FILE_TEST_IS_REGULAR));
+	g_assert_true(g_file_test(moved, G_FILE_TEST_IS_REGULAR));
+
+	/* With both old directories present, kitatide (newer) wins. */
+	g_assert_cmpint(g_remove(moved), ==, 0);
+	g_assert_cmpint(g_rmdir(target), ==, 0);
+	g_autofree char *older = make_store(base, "line-linux", "old");
+	g_autofree char *third = line_liff_storage_dir(base);
+	g_autofree char *newer = g_build_filename(third, "newer", NULL);
+	g_autofree char *left = g_build_filename(older, "old", NULL);
+
+	g_assert_true(g_file_test(newer, G_FILE_TEST_IS_REGULAR));
+	g_assert_true(g_file_test(left, G_FILE_TEST_IS_REGULAR));
+	g_assert_cmpint(g_remove(newer), ==, 0);
+	g_assert_cmpint(g_rmdir(third), ==, 0);
+	g_assert_cmpint(g_remove(left), ==, 0);
+	g_assert_cmpint(g_rmdir(older), ==, 0);
+	g_autofree char *parent = g_path_get_dirname(older);
+	g_autofree char *home = g_path_get_dirname(third);
+
+	g_assert_cmpint(g_rmdir(parent), ==, 0);
+	g_assert_cmpint(g_rmdir(home), ==, 0);
+	g_assert_cmpint(g_rmdir(base), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
 	g_setenv("LANGUAGE", "ja_JP.UTF-8", TRUE);
@@ -202,5 +260,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/liff/builds-launch-url", test_builds_launch_url);
 	g_test_add_func("/liff/issues-view", test_issues_view);
 	g_test_add_func("/liff/opens-consent-page", test_opens_consent_page);
+	g_test_add_func("/liff/storage-migration", test_storage_migration);
 	return g_test_run();
 }

@@ -37,5 +37,14 @@ gboolean line_liff_line_scheme(const char *url);
  *   browser -> UI: "O\t<url>" a LINE or LIFF link the page followed,
  *                  "D\t<dialog>\t<a|c>\t<text>" alert or confirm.
  */
+/*
+ * The in-app browser's storage directory under base (the user's data or
+ * cache directory): base/avernella/liff. When it doesn't exist yet, an
+ * earlier client's directory is moved there, newest first (kitatide, then
+ * line-linux), so LINE apps keep their cookies and cache. An existing
+ * Avernella directory is never replaced. Returns a newly allocated path.
+ */
+char *line_liff_storage_dir(const char *base);
+
 #define LINE_LIFF_FD 3
 #define LINE_LIFF_PACKET 16384

@@ -219,6 +219,6 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `$XDG_STATE_HOME/avernella/` (ค่าเริ่มต้น `~/.local/state/avernella/`) | `session.json` (โทเค็น MID กุญแจ Letter Sealing ลำดับคำขอ) และ `lists-<sha256 ของ MID>.json` (โฟลเดอร์ โฟลเดอร์ที่เลือกอยู่ หมุด แชตที่ปิดเสียง ปุ่มลัด สวิตช์การแจ้งเตือนและเสียง โหมดลดการเคลื่อนไหว) |
 | `$XDG_CONFIG_HOME/avernella/` (ค่าเริ่มต้น `~/.config/avernella/`) | `layout` (ธีมที่เลือก) และภาษาของส่วนติดต่อที่เลือก |
 | `$XDG_RUNTIME_DIR/avernella/` | รูปที่วางเพื่อเตรียมส่ง ลบทิ้งหลังใช้ |
-| `~/.cache/kitatide/liff`, `~/.local/share/kitatide/liff` | แคช HTTP และคุกกี้ของเบราว์เซอร์ในแอป |
+| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | แคช HTTP และคุกกี้ของเบราว์เซอร์ในแอป |
 
 รายละเอียดของแต่ละไฟล์อยู่ใน [สถาปัตยกรรม](architecture.md)
