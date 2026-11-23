@@ -1040,6 +1040,10 @@ static void reset_login(const char *message)
 	ui_scroll_reset(&history_scroll, 0);
 	ui.list_cursor = -1;
 	clear_password();
+	ui.saved_session = line_store_has_session();
+	/* Email or QR sign-in pairs a new session; resuming one needs neither. */
+	if (ui.saved_session)
+		ui.email_login = FALSE;
 	focus_on(ui.email_login ? F_LOGIN_PASSWORD : F_LOGIN);
 	set_string(&ui.notice, message);
 	wire.login_failures = 0;
@@ -1156,6 +1160,11 @@ static void logout(void)
 {
 	if (ui.logging_out)
 		return;
+	/* A saved session that is not signed in has no worker running yet. */
+	if (!wire.pid && !start_worker(-1)) {
+		set_string(&ui.notice, g_strerror(errno));
+		return;
+	}
 	ui.logging_out = TRUE;
 	request(LOGOUT, NULL, NULL);
 	set_string(&ui.notice, _("Signing out…"));
@@ -1780,8 +1789,14 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			ui.logging_out = FALSE;
 			set_string(&ui.notice, error);
 		} else {
+			gboolean confirmed = json_object_get_boolean(
+				ui_field(result, "confirmed"));
+
 			ui_liff_close();
-			reset_login(_("Signed out."));
+			reset_login(
+				confirmed ?
+					_("Signed out.") :
+					_("Signed out on this computer. LINE did not confirm it, so check linked devices on your phone."));
 		}
 		break;
 	}
@@ -2068,7 +2083,9 @@ static void key(SDL_KeyboardEvent k)
 				     code == SDLK_KP_ENTER ||
 				     (code == SDLK_SPACE && !edit));
 
-		if (activate && ui.focus == F_LOGIN_MODE)
+		if (activate && ui.focus == F_LOGIN_MODE && ui.saved_session)
+			logout();
+		else if (activate && ui.focus == F_LOGIN_MODE)
 			toggle_sign_in();
 		else if (activate || (code == SDLK_ESCAPE && ui.authenticating))
 			login(FALSE);
@@ -2295,6 +2312,9 @@ static void click(int x, int y)
 	if (!ui.connected) {
 		if (inside(ui.login, x, y))
 			login(FALSE);
+		else if (!ui.authenticating && ui.saved_session &&
+			 inside(ui.login_mode, x, y))
+			logout();
 		else if (!ui.authenticating && inside(ui.login_mode, x, y))
 			toggle_sign_in();
 		else if (!ui.authenticating && ui.email_login &&

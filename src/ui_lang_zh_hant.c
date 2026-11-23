@@ -619,6 +619,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ 回覆\n" },
 	{ "↪ Reply\n%s", "↪ 回覆\n%s" },
 	{ "★ Favorite", "★ 我的最愛" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "已在這台電腦上登出。LINE 未確認，請在手機上檢查已連結的裝置。" },
+	{ "Sign out of the saved session", "登出已儲存的工作階段" },
 };
 
 const struct ui_lang_table ui_lang_zh_hant = {

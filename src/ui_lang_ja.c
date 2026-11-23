@@ -658,6 +658,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ リプライ\n" },
 	{ "↪ Reply\n%s", "↪ リプライ\n%s" },
 	{ "★ Favorite", "★ お気に入り" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "このコンピューターからログアウトしました。LINEで確認できなかったため、スマートフォンの連携済み端末を確認してください。" },
+	{ "Sign out of the saved session", "保存されたセッションからログアウト" },
 };
 
 const struct ui_lang_table ui_lang_ja = {

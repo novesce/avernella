@@ -661,6 +661,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ Ответ\n" },
 	{ "↪ Reply\n%s", "↪ Ответ\n%s" },
 	{ "★ Favorite", "★ Избранное" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "Вы вышли на этом компьютере. LINE не подтвердил выход — проверьте связанные устройства на телефоне." },
+	{ "Sign out of the saved session", "Выйти из сохранённого сеанса" },
 };
 
 const struct ui_lang_table ui_lang_ru = {

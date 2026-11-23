@@ -620,6 +620,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ 回复\n" },
 	{ "↪ Reply\n%s", "↪ 回复\n%s" },
 	{ "★ Favorite", "★ 收藏" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "已在这台电脑上退出登录。LINE 未确认，请在手机上检查已连接的设备。" },
+	{ "Sign out of the saved session", "退出已保存的会话" },
 };
 
 const struct ui_lang_table ui_lang_zh_hans = {

@@ -1398,6 +1398,46 @@ static J *answer_request(struct line_worker *w, const char *id, gboolean accept,
 	return result;
 }
 
+/*
+ * Signing out always ends the session on this computer, whether or not it
+ * is running. LINE is asked to end it too, unless it has already refused
+ * these credentials or asked the client to wait. "confirmed" says whether
+ * LINE ended it, so the window can ask the user to check linked devices
+ * when it couldn't. Only a failure to delete the files keeps the session.
+ */
+static J *sign_out(struct line_worker *w, GError **error)
+{
+	Line *s = &w->session;
+	gboolean confirmed = FALSE;
+
+	if (w->dir < 0) {
+		g_autoptr(GError) unreadable = NULL;
+
+		w->dir = line_store_open(s, &unreadable);
+		/* A session file this version cannot read is removed unread. */
+		if (w->dir < 0 && !line_store_discard(error))
+			return NULL;
+	}
+	if (w->dir >= 0) {
+		g_autoptr(GError) revoke_error = NULL;
+
+		confirmed = s->denied || !s->access;
+		if (!confirmed && !line_transport_retry_after()) {
+			g_autoptr(J) ack = line_rpc(s, "/AS4", "logoutV2", NULL,
+						    &revoke_error);
+
+			confirmed = ack || session_rejected(s, revoke_error);
+		}
+		if (!forget(w, error))
+			return NULL;
+	}
+	J *reply = obj();
+
+	json_object_object_add(reply, "confirmed",
+			       json_object_new_boolean(confirmed));
+	return reply;
+}
+
 static J *dispatch(struct line_worker *w, const char *method, J *params,
 		   GError **error)
 {
@@ -1407,6 +1447,9 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		return problem(error, "Missing request method.");
 	if (!strcmp(method, "login"))
 		return login(w, error);
+	/* A saved session can be signed out before it ever finished signing in. */
+	if (!strcmp(method, "logout"))
+		return sign_out(w, error);
 	if (!w->ready)
 		return problem(error, "Sign in to LINE first.");
 	if (!strcmp(method, "foreground")) {
@@ -1422,13 +1465,6 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		}
 		w->foreground = active;
 		return obj();
-	}
-	if (!strcmp(method, "logout")) {
-		g_autoptr(J) ack = line_rpc(s, "/AS4", "logoutV2", NULL, error);
-		if (!ack && !session_rejected(s, *error))
-			return NULL;
-		g_clear_error(error);
-		return forget(w, error) ? json_object_new_boolean(TRUE) : NULL;
 	}
 	if (!strcmp(method, "chats"))
 		return chat_directory(w, error);

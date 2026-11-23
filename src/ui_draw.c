@@ -927,16 +927,17 @@ static void sign_in(void)
 		ui.login_password.scroll = mask.scroll;
 	}
 	action(ui.login,
-	       ui.authenticating ? _("Cancel") :
-	       ui.email_login	 ? _("Sign in") :
-				   _("Sign in with QR code"),
+	       ui.authenticating		  ? _("Cancel") :
+	       ui.email_login || ui.saved_session ? _("Sign in") :
+						    _("Sign in with QR code"),
 	       !ui.authenticating, ui.focus == F_LOGIN);
 	int bottom = ui.login.y + ui.login.h + 16;
 
 	if (!ui.authenticating) {
 		action(ui.login_mode,
-		       ui.email_login ? _("Use a QR code instead") :
-					_("Sign in with email"),
+		       ui.saved_session ? _("Sign out of the saved session") :
+		       ui.email_login	? _("Use a QR code instead") :
+					  _("Sign in with email"),
 		       FALSE, ui.focus == F_LOGIN_MODE);
 		bottom = ui.login_mode.y + ui.login_mode.h + 12;
 	}

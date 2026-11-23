@@ -649,6 +649,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ Trả lời\n" },
 	{ "↪ Reply\n%s", "↪ Trả lời\n%s" },
 	{ "★ Favorite", "★ Yêu thích" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "Đã đăng xuất trên máy tính này. LINE chưa xác nhận, hãy kiểm tra thiết bị đã liên kết trên điện thoại." },
+	{ "Sign out of the saved session", "Đăng xuất phiên đã lưu" },
 };
 
 const struct ui_lang_table ui_lang_vi = {

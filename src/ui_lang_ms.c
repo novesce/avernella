@@ -655,6 +655,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ Balas\n" },
 	{ "↪ Reply\n%s", "↪ Balas\n%s" },
 	{ "★ Favorite", "★ Kegemaran" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "Telah log keluar pada komputer ini. LINE tidak mengesahkannya, jadi semak peranti terpaut pada telefon anda." },
+	{ "Sign out of the saved session", "Log keluar daripada sesi yang disimpan" },
 };
 
 const struct ui_lang_table ui_lang_ms = {

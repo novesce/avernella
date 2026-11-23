@@ -318,3 +318,18 @@ gboolean line_store_forget(int dir, GError **error)
 		return io_failure("remove", error);
 	return fsync(dir) == 0 || io_failure("remove", error);
 }
+
+gboolean line_store_discard(GError **error)
+{
+	g_autofree char *path =
+		g_build_filename(g_get_user_state_dir(), LINE_STATE_DIR, NULL);
+	int dir = open(path, STORE_DIR_FLAGS);
+
+	if (dir < 0)
+		return errno == ENOENT || io_failure("open", error);
+	gboolean ok = lock_store(dir, LINE_STATE_DIR, error) &&
+		      line_store_forget(dir, error);
+
+	close(dir);
+	return ok;
+}

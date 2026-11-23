@@ -220,6 +220,30 @@ static void unreadable_legacy_skipped(void)
 	remove_legacy("kitatide");
 }
 
+/* Signing out removes a session file this version cannot read. */
+static void unreadable_session_discarded(void)
+{
+	g_autofree char *file =
+		g_build_filename(sandbox, "avernella", "session.json", NULL);
+	g_autoptr(GError) error = NULL;
+	Line broken = { 0 };
+
+	g_assert_true(g_file_set_contents_full(file, "{not json", -1,
+					       G_FILE_SET_CONTENTS_CONSISTENT,
+					       0600, &error));
+	g_assert_true(line_store_has_session());
+	g_assert_cmpint(line_store_open(&broken, &error), ==, -1);
+	g_assert_nonnull(error);
+	g_clear_error(&error);
+	g_assert_true(line_store_discard(&error));
+	g_assert_no_error(error);
+	g_assert_false(line_store_has_session());
+	/* Nothing to remove is not an error either. */
+	g_assert_true(line_store_discard(&error));
+	g_assert_no_error(error);
+	line_session_clear(&broken);
+}
+
 static void large_cache(void)
 {
 	Line a = { 0 }, restored = { 0 };
@@ -274,6 +298,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/state/newest-legacy-first", newest_legacy_first);
 	g_test_add_func("/state/unreadable-legacy-skipped",
 			unreadable_legacy_skipped);
+	g_test_add_func("/state/unreadable-session-discarded",
+			unreadable_session_discarded);
 	g_test_add_func("/state/oversized-cache", large_cache);
 	int result = g_test_run();
 	g_autofree char *sub = g_build_filename(sandbox, "avernella", NULL);

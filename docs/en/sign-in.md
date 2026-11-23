@@ -89,7 +89,9 @@ Email sign-in never retries automatically. A refusal returns to the form and wai
 
 ## Signing out
 
-**Sign out** sends `logout`. The worker calls `logoutV2` on `/AS4` (no arguments) to end the linked-device session at LINE. If that succeeds, or fails with a rejection (the session was already dead), it removes the local session with `line_store_forget()`. The UI closes the browser helper and resets every module.
+**Sign out** sends `logout`. The worker calls `logoutV2` on `/AS4` (no arguments) to end the linked-device session at LINE, then always removes the local session with `line_store_forget()`. Signing out on this computer never depends on LINE's answer. The reply is `{"confirmed": true}` when LINE ended the session, or when it was already dead (a rejection, or `s->denied`). It is `false` when the request failed, for example with no network. During a cooldown from `Retry-After` or a busy signal, the worker skips `logoutV2` and the reply is also `false`. On `false` the window says the session was signed out on this computer and asks the user to check linked devices on their phone. Only a failure to delete the session files keeps the user signed in. The UI closes the browser helper and resets every module.
+
+Signing out doesn't need a running session. When a session is saved but isn't signed in (LINE couldn't be reached, or refused it with a code that doesn't end the session), the sign-in screen's main button reads **Sign in** and resumes the saved session, and the second button becomes **Sign out of the saved session** in place of the QR/email toggle. That button starts a worker if none is running and sends `logout`. The worker handles `logout` before it checks that a session is ready: it opens the store itself, and if the session file can't be read by this version it removes the file unread with `line_store_discard()` and replies `{"confirmed": false}`, since there is no token to revoke. Once the saved session is gone, the screen offers QR and email sign-in again.
 
 ## The session file
 

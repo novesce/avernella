@@ -622,6 +622,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ ตอบกลับ\n" },
 	{ "↪ Reply\n%s", "↪ ตอบกลับ\n%s" },
 	{ "★ Favorite", "★ รายการโปรด" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "ออกจากระบบบนคอมพิวเตอร์นี้แล้ว แต่ LINE ไม่ได้ยืนยัน โปรดตรวจสอบอุปกรณ์ที่เชื่อมต่อในโทรศัพท์ของคุณ" },
+	{ "Sign out of the saved session", "ออกจากระบบเซสชันที่บันทึกไว้" },
 };
 
 const struct ui_lang_table ui_lang_th = {

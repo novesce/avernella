@@ -50,6 +50,11 @@ typedef struct {
 		getting_chats, quitting;
 	gboolean video_dirty;
 	gboolean email_login;
+	/*
+	 * A session is saved on this computer but isn't signed in: the
+	 * sign-in screen offers to resume it or to sign it out.
+	 */
+	gboolean saved_session;
 	gboolean find_messages, friends, friend_invite, groups, emojis,
 		stickers, avatars, photos, files, calls, video_calls,
 		incoming_calls, mute_calls;

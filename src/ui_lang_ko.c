@@ -650,6 +650,9 @@ static const char *const strings[][2] = {
 	{ "↪ Reply\n", "↪ 답장\n" },
 	{ "↪ Reply\n%s", "↪ 답장\n%s" },
 	{ "★ Favorite", "★ 즐겨찾기" },
+	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
+	  "이 컴퓨터에서 로그아웃했습니다. LINE이 확인하지 않았으니 휴대폰에서 연결된 기기를 확인하세요." },
+	{ "Sign out of the saved session", "저장된 세션에서 로그아웃" },
 };
 
 const struct ui_lang_table ui_lang_ko = {
