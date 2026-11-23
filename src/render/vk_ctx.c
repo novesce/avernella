@@ -263,7 +263,16 @@ static VkResult pick_gpu(struct vk_ctx *ctx, uint32_t vendor,
 				continue;
 			uint32_t family =
 				graphics_family(devices[i], ctx->surface);
-			int score = (cpu ? 0 : 2) + heap;
+			/*
+			 * A hardware GPU first, then a discrete one (on a
+			 * hybrid laptop, the NVIDIA or AMD card rather than
+			 * the processor's graphics), then descriptor heaps.
+			 * AVERNELLA_RENDER_NODE picks one explicitly.
+			 */
+			bool discrete = properties.deviceType ==
+					VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
+			int score = (cpu ? 0 : 4) + (discrete ? 2 : 0) + heap;
+
 			if (family == UINT32_MAX || score <= best)
 				continue;
 			best = score;
@@ -279,7 +288,7 @@ static VkResult pick_gpu(struct vk_ctx *ctx, uint32_t vendor,
 						   caps.incremental;
 			ctx->host_image_copy = v14 && f.v14.hostImageCopy;
 			result = VK_SUCCESS;
-			if (best == 3)
+			if (best == 7)
 				break;
 		}
 	}

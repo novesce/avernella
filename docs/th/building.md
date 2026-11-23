@@ -127,7 +127,7 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 
 ### Wayland และ X11
 
-ในเซสชัน Wayland ไคลเอนต์ขอ SDL เป็น `wayland,x11` จึงใช้ Wayland โดยตรงและถอยไปใช้ X11 ถ้าไม่ได้ ตั้ง `SDL_VIDEODRIVER=x11` เพื่อบังคับ X11 บนแล็ปท็อป NVIDIA แบบไฮบริด `SDL_VIDEODRIVER=x11 prime-run ./avernella` จะเลือก GPU ของ NVIDIA ผ่าน X11 หรือ XWayland
+ในเซสชัน Wayland ไคลเอนต์ขอ SDL เป็น `wayland,x11` จึงใช้ Wayland โดยตรงและถอยไปใช้ X11 ถ้าไม่ได้ ตั้ง `SDL_VIDEODRIVER=x11` เพื่อบังคับ X11 บนแล็ปท็อปที่มีสอง GPU โมดูล Vulkan ของ Avernella จะเลือก GPU แยก (การ์ด NVIDIA หรือ AMD) ก่อนกราฟิกในตัวของโปรเซสเซอร์ ไม่ว่า Vulkan loader จะเรียงลำดับอย่างไร และยังตรวจว่า GPU นั้นแสดงผลไปที่หน้าต่างได้ ถ้าต้องการใช้ GPU ในตัวเพื่อประหยัดแบตเตอรี่ ให้ตั้ง `AVERNELLA_RENDER_NODE` เป็น render node ของ GPU นั้น `LINE_RENDER_LOG=1` จะพิมพ์ชื่ออุปกรณ์ที่เลือก ส่วนเมื่อใช้ตัวเรนเดอร์ของ SDL `SDL_VIDEODRIVER=x11 prime-run ./avernella` จะเลือก GPU ของ NVIDIA ผ่าน X11 หรือ XWayland
 
 ## การติดตั้ง
 

@@ -127,7 +127,7 @@ Only one Avernella can use a session at a time: the session directory is locked 
 
 ### Wayland and X11
 
-In a Wayland session the client asks SDL for `wayland,x11`, so it uses native Wayland and falls back to X11. Set `SDL_VIDEODRIVER=x11` to force X11. On a hybrid NVIDIA laptop, `SDL_VIDEODRIVER=x11 prime-run ./avernella` selects the NVIDIA GPU through X11 or XWayland.
+In a Wayland session the client asks SDL for `wayland,x11`, so it uses native Wayland and falls back to X11. Set `SDL_VIDEODRIVER=x11` to force X11. On a laptop with two GPUs, the native Vulkan module prefers the discrete one (an NVIDIA or AMD card) over the processor's integrated graphics, whatever order the Vulkan loader lists them in. It still checks that the GPU can present to the window. To use the integrated GPU instead, for longer battery life, set `AVERNELLA_RENDER_NODE` to its render node. `LINE_RENDER_LOG=1` prints the chosen device. With the SDL renderer, `SDL_VIDEODRIVER=x11 prime-run ./avernella` selects the NVIDIA GPU through X11 or XWayland.
 
 ## Installing
 
