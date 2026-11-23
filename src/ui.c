@@ -323,8 +323,9 @@ static void set_string(char **dest, const char *s);
 
 /*
  * Sign-in pacing that outlives each attempt's worker: the wait LINE asked
- * for, and the run of rejected email passwords, which waits 10 s, 30 s
- * and then 2 minutes before the next try. A success clears the run.
+ * for, and the run of rejected email passwords: after the first two, it
+ * waits 10 s, 30 s and then 2 minutes before the next try. A success
+ * clears the run.
  */
 static int sign_in_wait(void)
 {
@@ -336,7 +337,8 @@ static int sign_in_wait(void)
 
 static void note_sign_in_failure(Json *packet)
 {
-	static const int pause[] = { 0, 0, 10, 30, 120 };
+	/* The first two rejections are free; then 10 s, 30 s and 2 minutes. */
+	static const int pause[] = { 0, 0, 0, 10, 30, 120 };
 	int wait = json_object_get_int(ui_field(packet, "retryAfter"));
 
 	if (json_object_get_int(ui_field(packet, "code")) ==
