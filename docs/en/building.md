@@ -163,7 +163,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | -------- | ------ | ------- |
 | `LINE_DEBUG_TIMING=1` | Prints `line-timing <method> <ms>` for every worker request | `handle()` in `main.c` |
 | `LINE_DEBUG_SYNC=1` | Prints each long-poll round: result, duration, operation count | `live_sync.c` |
-| `LINE_DEBUG_SESSION=1` | Reports token renewals | `maintain_tokens()` in `main.c` |
+| `LINE_DEBUG_SESSION=1` | Reports token renewals and protocol replies it can't decode | `maintain_tokens()` in `main.c`, `line_decode_reply()` in `thrift.c` |
 | `LINE_DEBUG_MEDIA=1` | Reports each Flex or rich-message picture that failed: address, HTTP status, decode error | `flex_asset.c`, `ui_media.c` |
 | `LINE_DEBUG_LIFF=1` | Prints a LINE app page's console and each native-bridge call (never the page address, which carries tokens). Also lets the browser load `http://127.0.0.1:<port>/` pages for local testing. | `liff_browser.c` |
 | `LINE_CALL_DEBUG=1` | Reports call negotiation, control messages, packet counts every five seconds and first-frame milestones | `call.c`, `camera.c`, `ui_media.c` |

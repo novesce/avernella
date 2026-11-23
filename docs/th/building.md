@@ -163,7 +163,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | ------ | -- | ------ |
 | `LINE_DEBUG_TIMING=1` | พิมพ์ `line-timing <method> <ms>` สำหรับทุกคำขอไปยัง worker | `handle()` ใน `main.c` |
 | `LINE_DEBUG_SYNC=1` | พิมพ์ผลของ long poll แต่ละรอบ: ผลลัพธ์ เวลา จำนวน operation | `live_sync.c` |
-| `LINE_DEBUG_SESSION=1` | รายงานการต่ออายุโทเค็น | `maintain_tokens()` ใน `main.c` |
+| `LINE_DEBUG_SESSION=1` | รายงานการต่ออายุโทเค็นและคำตอบโปรโตคอลที่ถอดรหัสไม่ได้ | `maintain_tokens()` ใน `main.c`, `line_decode_reply()` ใน `thrift.c` |
 | `LINE_DEBUG_MEDIA=1` | รายงานรูปใน Flex หรือ rich message ที่โหลดไม่สำเร็จ: ที่อยู่ สถานะ HTTP ข้อผิดพลาดการถอดรหัส | `flex_asset.c`, `ui_media.c` |
 | `LINE_DEBUG_LIFF=1` | พิมพ์ console ของหน้าแอป LINE และการเรียก native bridge ทุกครั้ง (ไม่พิมพ์ที่อยู่หน้าเว็บ เพราะมีโทเค็นอยู่) และยอมให้เบราว์เซอร์โหลดหน้า `http://127.0.0.1:<port>/` สำหรับทดสอบในเครื่อง | `liff_browser.c` |
 | `LINE_CALL_DEBUG=1` | รายงานการต่อรองการโทร ข้อความควบคุม จำนวนแพ็กเก็ตทุกห้าวินาที และจังหวะที่ได้เฟรมแรก | `call.c`, `camera.c`, `ui_media.c` |

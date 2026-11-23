@@ -74,7 +74,7 @@ A **struct** is a list of fields followed by a stop byte `0x00`. Each field star
 
 ### A reply on the wire
 
-The reply starts `0x82`, then `0x41` (REPLY) or `0x61` (EXCEPTION), the sequence ID 0, and the method name, which must match. `line_decode_reply()` checks all four. Then comes the **result struct**:
+The reply starts `0x82`, then `0x41` (REPLY) or `0x61` (EXCEPTION), a sequence ID, and the method name, which must match. `line_decode_reply()` checks the protocol, kind and method. Because each request has its own HTTPS exchange, it accepts any sequence ID, as other Thrift clients do. Then comes the **result struct**:
 
 - **Field 0** holds the success value. A `void` method's success is an empty struct.
 - **Field 1** holds the service's exception, typically a `TalkException` whose field 1 is an error code and field 2 a message. Some services add a payload in field 3.

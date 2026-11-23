@@ -37,6 +37,18 @@ static void replies(void)
 		line_decode_reply("m", reply, sizeof(reply), &code, &error);
 	g_assert_no_error(error);
 	g_assert_cmpint(json_object_get_string_len(field(ok, "1")), ==, 3);
+	{
+		guint8 sequenced[G_N_ELEMENTS(reply)];
+
+		memcpy(sequenced, reply, sizeof(reply));
+		sequenced[2] = 7;
+		g_autoptr(J) accepted = line_decode_reply(
+			"m", sequenced, sizeof(sequenced), &code, &error);
+		g_assert_no_error(error);
+		g_assert_cmpint(
+			json_object_get_string_len(field(accepted, "1")), ==,
+			3);
+	}
 	for (size_t n = 0; n < sizeof(reply); n++) {
 		g_assert_null(line_decode_reply("m", reply, n, &code, &error));
 		g_assert_nonnull(error);

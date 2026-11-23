@@ -587,9 +587,18 @@ J *line_decode_reply(const char *method, const guint8 *bytes, gsize n,
 	struct thrift_reader r = { .p = bytes, .end = bytes + n };
 	guint8 protocol = take(&r), kind = take(&r);
 
-	if (protocol == 0x82 && (kind == 0x41 || kind == 0x61) &&
-	    number(&r) == 0 && reply_name(&r, method))
+	/* One request per HTTPS exchange; method matching correlates the reply. */
+	guint64 sequence = number(&r);
+	gboolean matching = reply_name(&r, method);
+
+	if (protocol == 0x82 && (kind == 0x41 || kind == 0x61) && !r.bad &&
+	    matching)
 		return read_reply(&r, method, kind == 0x61, code, error);
+	if (!g_strcmp0(g_getenv("LINE_DEBUG_SESSION"), "1"))
+		g_printerr(
+			"line-session invalid reply to %s: %zu bytes, protocol 0x%02x, kind 0x%02x, sequence %llu, method match %s\n",
+			method, n, protocol, kind, (unsigned long long)sequence,
+			matching ? "yes" : "no");
 	g_set_error(error, LINE_ERROR, 1, "Unexpected protocol reply to %s.",
 		    method);
 	return NULL;
