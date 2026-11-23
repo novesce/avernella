@@ -97,6 +97,20 @@ Reuse is turned off whenever the visible rows could paint something that changes
 
 With reduced motion, scrolls jump, transitions end immediately and animated pictures show a still frame. `ui_draw.c` keeps small "property tracks" (`struct color_transition`, `struct slide_transition`) for hover fades and slides, and `ui_animation_deadline()` reports when the next one needs a frame.
 
+Motion follows a few rules. Input takes effect on the frame it arrives in, and the animation only shows the change. Every motion is short (40–250 ms), starts fast and eases out, and can be interrupted. A retarget starts from the sampled value, so nothing jumps or queues. When the last motion settles, the deadline drops to zero and the loop waits for input again. What moves today:
+
+| Interaction | Motion | Where |
+| --- | --- | --- |
+| Wheel, touchpad, Page Up/Down | 120 ms ease-out per impulse; notches add up and a reversal follows at once | `ui_scroll_by()` |
+| Up/Down in the chat list | the list eases the selected row into view; a held key retargets from where the list is heading | `ui_scroll_to()`, `highlight()` in `ui.c` |
+| Hover, selection, focus | 110–150 ms colour fade | `track_strength()` |
+| Pressing a button | 40 ms press-in, 145 ms release with one soft overshoot (`ui_press_depth()`): action buttons, header and call buttons, the rail, and the composer's attach, emoji and Send | `button_depth()` |
+| A new message while the history follows its bottom edge | the history glides up over 180 ms instead of jumping; a burst adds to what is left (`UiGlide`) | `follow_bottom()` |
+| Opening a chat | the first page fades in and rises 6 px over 140 ms | `reveal_history()` |
+| Compact pane change, dialogs | 10 px / 8 px slide with a soft settle (`ui_settle()`); the scrim fades | `slide()` |
+
+The new-message glide runs only when the reader is at the bottom and the previous newest row is still there, followed by new rows. Loading an earlier page, a resize, a theme change, or a batch taller than the view snaps instead. While the glide or fade runs, `ui_draw_animation()` repaints only the conversation area, and `reusable_history()` turns scroll reuse off. Message-row hover in the history stays instant, so scroll reuse keeps working while the pointer rests on the history. With reduced motion, every row of the table reaches its end state on the same frame.
+
 ## Themes
 
 [`ui_theme.c`](../../src/ui_theme.c) and [`ui_theme.h`](../../src/ui_theme.h) define two layouts that share one palette.

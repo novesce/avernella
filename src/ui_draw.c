@@ -278,6 +278,21 @@ static struct {
 	gint64 start, end;
 } stage_motion;
 
+/*
+ * Rows appended while the history follows its bottom edge glide up from the
+ * composer instead of jumping, and an opened chat fades in once its first
+ * page arrives. Both read the same frame time as every other track.
+ */
+static struct {
+	char *chat, *last;
+	int width, max;
+	UiGlide glide;
+} follow;
+static struct {
+	char *waiting;
+	UiGlide fade;
+} reveal;
+
 static double remaining(gint64 start, gint64 end)
 {
 	if (frame_us >= end || end <= start || ui_reduce_motion())
@@ -425,6 +440,8 @@ gint64 ui_animation_deadline(gint64 now_us)
 		return 0;
 	gint64 end = MAX(MAX(pane_slide.end, dialog_slide.end),
 			 MAX(stage_motion.end, press.end));
+
+	end = MAX(end, MAX(follow.glide.end_us, reveal.fade.end_us));
 
 	for (guint i = 0; i < G_N_ELEMENTS(tracks); i++)
 		if (tracks[i].kind)
@@ -1951,6 +1968,11 @@ void ui_draw_shutdown(void)
 	ui_draw_reset_renderer();
 	g_clear_pointer(&ui.renderer, SDL_DestroyRenderer);
 	g_clear_pointer(&ui.buffer, SDL_FreeSurface);
+	g_clear_pointer(&follow.chat, g_free);
+	g_clear_pointer(&follow.last, g_free);
+	g_clear_pointer(&reveal.waiting, g_free);
+	memset(&follow, 0, sizeof(follow));
+	memset(&reveal, 0, sizeof(reveal));
 }
 
 /* "Today at 17:13", "Yesterday at 17:13" or a dated stamp, as in Discord. */
@@ -2622,13 +2644,83 @@ static void message_status(const struct message_layout *r, Rect body)
 	paint(status, x, y, UI_SUBTLE);
 }
 
+static const char *row_id(guint i)
+{
+	return ui_string(
+		g_array_index(cache.rows, struct message_layout, i).message,
+		"id", NULL);
+}
+
+/* Glide only for rows added after the newest row of the previous frame. */
+static gboolean appended_after(const char *id)
+{
+	for (guint i = cache.rows->len; id && i-- > 1;)
+		if (!g_strcmp0(row_id(i - 1), id))
+			return TRUE;
+	return FALSE;
+}
+
+static int follow_bottom(Rect area)
+{
+	int max = ui.max_history_offset;
+	const char *last = cache.rows->len ? row_id(cache.rows->len - 1) : NULL;
+	gboolean same = !g_strcmp0(follow.chat, ui.selected) &&
+			follow.width == area.w;
+
+	if (!ui.stick_bottom || !same)
+		follow.glide = (UiGlide){ 0 };
+	else if (max > follow.max && max - follow.max <= area.h &&
+		 g_strcmp0(last, follow.last) && appended_after(follow.last))
+		ui_glide_add(&follow.glide, max - follow.max, 180000, frame_us,
+			     ui_reduce_motion());
+	if (!same) {
+		g_free(follow.chat);
+		follow.chat = g_strdup(ui.selected);
+		follow.width = area.w;
+	}
+	if (g_strcmp0(last, follow.last)) {
+		g_free(follow.last);
+		follow.last = g_strdup(last);
+	}
+	follow.max = max;
+	return (int)(ui_glide_left(&follow.glide, frame_us) + .5);
+}
+
+/* Returns the remaining fade, 0 once the rows are fully shown. */
+static double reveal_history(void)
+{
+	if (!ui.history) {
+		if (g_strcmp0(reveal.waiting, ui.selected)) {
+			g_free(reveal.waiting);
+			reveal.waiting = g_strdup(ui.selected);
+		}
+		reveal.fade = (UiGlide){ 0 };
+		return 0.;
+	}
+	if (reveal.waiting) {
+		if (!g_strcmp0(reveal.waiting, ui.selected))
+			ui_glide_add(&reveal.fade, 1., 140000, frame_us,
+				     ui_reduce_motion());
+		g_clear_pointer(&reveal.waiting, g_free);
+	}
+	return ui_glide_left(&reveal.fade, frame_us);
+}
+
 static void message_rows(Rect area)
 {
 	prepare_bubbles(area);
 	ui.max_history_offset = MAX(0, cache.height - area.h);
-	ui.history_offset = ui.stick_bottom ? ui.max_history_offset :
-					      CLAMP(ui.history_offset, 0,
-						    ui.max_history_offset);
+	int glide = follow_bottom(area);
+	double fade = reveal_history();
+
+	ui.history_offset =
+		ui.stick_bottom ?
+			MAX(0, ui.max_history_offset - glide) :
+			CLAMP(ui.history_offset, 0, ui.max_history_offset);
+	if (fade > 0.) {
+		cairo_push_group(cr);
+		cairo_translate(cr, 0, 6. * fade);
+	}
 	if (cache.intro && ui.history) {
 		if (cache.line_style)
 			centered(_("No messages yet"), area, 14, 400, UI_MUTED);
@@ -2736,6 +2828,10 @@ static void message_rows(Rect area)
 				 _("No messages on this page.") :
 				 _("LINE returned no messages on this device."),
 			 area, 14, 400, UI_MUTED);
+	if (fade > 0.) {
+		cairo_pop_group_to_source(cr);
+		cairo_paint_with_alpha(cr, 1. - fade);
+	}
 }
 
 enum header_icon {
@@ -2879,11 +2975,13 @@ static void line_composer(void)
 	if (ui.emojis || ui.stickers) {
 		Rect e = ui.emoji;
 		double hv = strength(HOVER, e, hovered(e));
+		Rect glyph = { e.x, e.y + (int)(2. * button_depth(e) + .5), e.w,
+			       e.h };
 
 		if (hv > 0.)
 			box(e.x, e.y, e.w, e.h, 8,
 			    blend(UI_SIDEBAR, UI_HOVER, hv));
-		glyph_smile(e, hv > .5 ? UI_HEADING : UI_NAV_INK);
+		glyph_smile(glyph, hv > .5 ? UI_HEADING : UI_NAV_INK);
 		if (hovered(e))
 			tooltip((Rect){ e.x, e.y - 82, e.w, 34 },
 				ui.stickers && ui.emojis ?
@@ -2895,11 +2993,13 @@ static void line_composer(void)
 	if (ui.photos || ui.files) {
 		Rect a = ui.attach;
 		double hv = strength(HOVER, a, hovered(a));
+		Rect glyph = { a.x, a.y + (int)(2. * button_depth(a) + .5), a.w,
+			       a.h };
 
 		if (hv > 0.)
 			box(a.x, a.y, a.w, a.h, 8,
 			    blend(UI_SIDEBAR, UI_HOVER, hv));
-		glyph_clip(a, hv > .5 ? UI_HEADING : UI_NAV_INK);
+		glyph_clip(glyph, hv > .5 ? UI_HEADING : UI_NAV_INK);
 		if (hovered(a))
 			tooltip((Rect){ a.x, a.y - 82, a.w, 34 },
 				_("Upload a File"), FALSE);
@@ -2908,8 +3008,10 @@ static void line_composer(void)
 	gboolean ready = ui.message.value->len && !sending;
 	Rect r = ui.send;
 	double hv = strength(HOVER, r, ready && hovered(r));
+	double depth = ready ? button_depth(r) : 0.;
 
-	box(r.x, r.y, r.w, r.h, r.h / 2,
+	box(r.x + 2. * depth, r.y + 2. * depth, r.w - 4. * depth,
+	    r.h - 3. * depth, (r.h - 3. * depth) / 2,
 	    ready ? blend(UI_ACCENT, UI_ACCENT_HOVER, hv) : UI_INPUT);
 	if (ui.focus == F_SEND)
 		active_ring(r);
@@ -2941,9 +3043,12 @@ static void composer(int s, int w)
 	box(c.x, c.y, c.w, c.h, 8, UI_INPUT);
 	if (ui.photos || ui.files) {
 		Rect a = ui.attach;
-		double cx = a.x + a.w / 2., cy = a.y + a.h / 2.;
+		double depth = button_depth(a);
+		double cx = a.x + a.w / 2., cy = a.y + a.h / 2. + depth;
 
-		dot(cx, cy, 12, hovered(a) ? UI_ACCENT_HOVER : UI_MUTED);
+		dot(cx, cy, 12 - 1.5 * depth,
+		    blend(UI_MUTED, UI_ACCENT_HOVER,
+			  strength(HOVER, a, hovered(a))));
 		icon_plus(cx, cy, 5.5, UI_INPUT, 2.4);
 		if (hovered(a))
 			tooltip((Rect){ a.x, a.y - 82, a.w, 34 },
@@ -2959,8 +3064,10 @@ static void composer(int s, int w)
 		    placeholder ? placeholder : _("Write a message"));
 	if (ui.emojis || ui.stickers) {
 		Rect e = ui.emoji;
-		double x = e.x + e.w / 2., y = e.y + e.h / 2.;
-		guint ink = hovered(e) ? UI_ACCENT_HOVER : UI_MUTED;
+		double x = e.x + e.w / 2.,
+		       y = e.y + e.h / 2. + 2. * button_depth(e);
+		guint ink = blend(UI_MUTED, UI_ACCENT_HOVER,
+				  strength(HOVER, e, hovered(e)));
 
 		color(ink);
 		cairo_new_path(cr);
@@ -2985,10 +3092,12 @@ static void composer(int s, int w)
 
 	if (ui.message.value->len || sending || ui.focus == F_SEND) {
 		Rect r = ui.send;
-		double x = r.x + r.w / 2., y = r.y + r.h / 2.;
-		guint ink = sending    ? UI_SUBTLE :
-			    hovered(r) ? UI_ACCENT_HOVER :
-					 UI_ACCENT;
+		double depth = sending ? 0. : button_depth(r);
+		/* Pressing nudges the arrow forward, the way it will travel. */
+		double x = r.x + r.w / 2. + 2. * depth, y = r.y + r.h / 2.;
+		guint ink = sending ? UI_SUBTLE :
+				      blend(UI_ACCENT, UI_ACCENT_HOVER,
+					    strength(HOVER, r, hovered(r)));
 
 		if (ui.focus == F_SEND)
 			active_ring(r);
@@ -3818,6 +3927,12 @@ void ui_draw_animation(void)
 	    ui_emoji_deadline() || pane_slide.end > frame_us ||
 	    dialog_slide.end > frame_us || stage_motion.end > frame_us)
 		goto full;
+	if (follow.glide.end_us > frame_us || reveal.fade.end_us > frame_us) {
+		SDL_Rect chat = { ui.conversation.x, ui.conversation.y,
+				  ui.conversation.w, ui.conversation.h };
+
+		SDL_UnionRect(&damage, &chat, &damage);
+	}
 	for (guint i = 0; i < G_N_ELEMENTS(tracks); i++) {
 		const struct color_transition *t = &tracks[i];
 		Rect r = t->damage;

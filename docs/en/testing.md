@@ -60,7 +60,7 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-qr-scan` | `qr_scan.c` | ZBar loading and decoding (wrapped `dlopen`) |
 | `test-chat-lists` | `chat_lists.c` | Folders, pins, mutes, shortcuts, file safety |
 | `test-chiptune` | `chiptune.c` | The sound chip and every sound |
-| `test-ui-motion` | `ui_motion.c` | Frame clock and scrolling, including timing at 60, 144 and 240 Hz |
+| `test-ui-motion` | `ui_motion.c` | Frame clock, scrolling and scroll targets, press depth and the glide curve, including timing at 60, 144 and 240 Hz |
 | `test-ui-pixels` | `ui_pixels.c` | Premultiplication, scroll copy maths |
 | `test-ui-apng` | `ui_apng.c` | Animated PNG frames and timing |
 | `test-ui-emoji` | `ui_emoji.c` | Draft tokens and export ranges |
@@ -69,7 +69,7 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-ui-tray` | `ui_tray.c` | Tray item properties and menu |
 | `test-ui-read` | `ui_read.c` | The read-receipt rules in `ui_private.h` |
 | `test-ui-theme` | `ui_theme.c` | Theme file reading and toggling |
-| `test-ui-scroll-scene` | `ui_scroll_scene.c` | Scroll reuse against full redraws |
+| `test-ui-scroll-scene` | `ui_scroll_scene.c` | Scroll reuse against full redraws; the new-message glide and chat fade-in, with and without reduced motion |
 | `test-ui-call-fullscreen` | `ui_call_fullscreen.c` | Full-screen call video |
 | `test-ui-lang` | `ui_lang.c` | Language selection and the translation tables, including printf conversions |
 

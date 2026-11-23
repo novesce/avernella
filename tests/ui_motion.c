@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_motion.h"
 #include <SDL.h>
+#include <math.h>
 #include <stdlib.h>
 
 static void cadence(void)
@@ -95,6 +96,71 @@ static void scrolling(void)
 	ui_scroll_by(&scroll, &offset, -1, 100, 900000, FALSE);
 	g_assert_false(ui_scroll_sample(&scroll, &offset, 100, 930000, FALSE));
 	g_assert_cmpint(offset, ==, 30);
+}
+
+static void targets(void)
+{
+	int offset = 0;
+	UiScroll scroll = { 0 };
+
+	/* Keyboard selection eases to an absolute row and lands exactly. */
+	ui_scroll_to(&scroll, &offset, 300, 1000, 100000, FALSE);
+	g_assert_cmpint(offset, ==, 0);
+	g_assert_true(ui_scroll_sample(&scroll, &offset, 1000, 140000, FALSE));
+	g_assert_cmpint(offset, >, 150);
+	g_assert_cmpint(offset, <, 300);
+	/* A held key retargets from the moving position, never backwards. */
+	int moving = offset;
+
+	ui_scroll_to(&scroll, &offset, 372, 1000, 140000, FALSE);
+	g_assert_true(ui_scroll_sample(&scroll, &offset, 1000, 150000, FALSE));
+	g_assert_cmpint(offset, >=, moving);
+	g_assert_false(ui_scroll_sample(&scroll, &offset, 1000, 260000, FALSE));
+	g_assert_cmpint(offset, ==, 372);
+	ui_scroll_to(&scroll, &offset, 5000, 1000, 300000, FALSE);
+	g_assert_false(ui_scroll_sample(&scroll, &offset, 1000, 420000, FALSE));
+	g_assert_cmpint(offset, ==, 1000);
+	/* Reduced motion reaches the same end state in the same call. */
+	ui_scroll_to(&scroll, &offset, 64, 1000, 500000, TRUE);
+	g_assert_cmpint(offset, ==, 64);
+	g_assert_cmpint(scroll.end_us, ==, 0);
+	ui_scroll_to(&scroll, &offset, NAN, 1000, 510000, FALSE);
+	g_assert_cmpint(offset, ==, 64);
+	g_assert_cmpint(scroll.end_us, ==, 0);
+}
+
+static void glide(void)
+{
+	UiGlide g = { 0 };
+	const gint64 start = 2000000;
+
+	g_assert_cmpfloat(ui_glide_left(&g, start), ==, 0.);
+	/* The first frame still shows the old position: nothing jumps. */
+	ui_glide_add(&g, 60., 180000, start, FALSE);
+	g_assert_cmpfloat(ui_glide_left(&g, start), ==, 60.);
+	double half = ui_glide_left(&g, start + 90000);
+
+	g_assert_cmpfloat(half, >, 0.);
+	g_assert_cmpfloat(half, <, 10.);
+	/* A second message mid-glide keeps what is left and adds its own. */
+	ui_glide_add(&g, 40., 180000, start + 90000, FALSE);
+	g_assert_cmpfloat(ui_glide_left(&g, start + 90000), ==, half + 40.);
+	double previous = half + 40.;
+
+	for (gint64 t = start + 90000; t <= start + 270000; t += 4167) {
+		double left = ui_glide_left(&g, t);
+
+		g_assert_cmpfloat(left, <=, previous);
+		g_assert_cmpfloat(left, >=, 0.);
+		previous = left;
+	}
+	g_assert_cmpfloat(ui_glide_left(&g, start + 270000), ==, 0.);
+	g_assert_cmpint(g.end_us, ==, 0);
+	ui_glide_add(&g, 60., 180000, start, TRUE);
+	g_assert_cmpfloat(ui_glide_left(&g, start), ==, 0.);
+	g_assert_cmpint(g.end_us, ==, 0);
+	ui_glide_add(&g, INFINITY, 180000, start, FALSE);
+	g_assert_cmpint(g.end_us, ==, 0);
 }
 
 static int compare_us(gconstpointer a, gconstpointer b)
@@ -235,6 +301,8 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/motion/clock", cadence);
 	g_test_add_func("/motion/scroll", scrolling);
+	g_test_add_func("/motion/scroll-target", targets);
+	g_test_add_func("/motion/glide", glide);
 	g_test_add_func("/motion/preference", preferences);
 	g_test_add_func("/motion/control-feedback", control_motion);
 	g_test_add_func("/motion/headless-sdl", sdl_timing);

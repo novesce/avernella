@@ -75,6 +75,27 @@ gboolean ui_scroll_sample(UiScroll *scroll, int *offset, int maximum,
 	return scroll->end_us != 0;
 }
 
+static void scroll_start(UiScroll *scroll, int *offset, double to, int maximum,
+			 gint64 now_us, gboolean reduced)
+{
+	if (to == scroll->to)
+		return;
+	scroll->from = scroll->position;
+	scroll->to = to;
+	scroll->start_us = now_us;
+	scroll->end_us = now_us + 120000;
+	ui_scroll_sample(scroll, offset, maximum, now_us, reduced);
+}
+
+void ui_scroll_to(UiScroll *scroll, int *offset, double target, int maximum,
+		  gint64 now_us, gboolean reduced)
+{
+	ui_scroll_sample(scroll, offset, maximum, now_us, reduced);
+	if (isfinite(target))
+		scroll_start(scroll, offset, CLAMP(target, 0, MAX(0, maximum)),
+			     maximum, now_us, reduced);
+}
+
 void ui_scroll_by(UiScroll *scroll, int *offset, double distance, int maximum,
 		  gint64 now_us, gboolean reduced)
 {
@@ -88,15 +109,37 @@ void ui_scroll_by(UiScroll *scroll, int *offset, double distance, int maximum,
 	gboolean reversed = (distance < 0 && scroll->to > scroll->position) ||
 			    (distance > 0 && scroll->to < scroll->position);
 	double base = reversed ? scroll->position : scroll->to;
-	double to = CLAMP(base + distance, 0, MAX(0, maximum));
 
-	if (to == scroll->to)
+	scroll_start(scroll, offset, CLAMP(base + distance, 0, MAX(0, maximum)),
+		     maximum, now_us, reduced);
+}
+
+double ui_glide_left(UiGlide *glide, gint64 now_us)
+{
+	if (!glide->end_us || now_us >= glide->end_us ||
+	    glide->end_us <= glide->start_us) {
+		*glide = (UiGlide){ 0 };
+		return 0.;
+	}
+	double left = CLAMP((double)(glide->end_us - now_us) /
+				    (glide->end_us - glide->start_us),
+			    0., 1.);
+
+	return glide->from * left * left * left;
+}
+
+void ui_glide_add(UiGlide *glide, double distance, gint64 duration_us,
+		  gint64 now_us, gboolean reduced)
+{
+	double from = ui_glide_left(glide, now_us) + distance;
+
+	if (reduced || !isfinite(from) || from == 0. || duration_us <= 0) {
+		*glide = (UiGlide){ 0 };
 		return;
-	scroll->from = scroll->position;
-	scroll->to = to;
-	scroll->start_us = now_us;
-	scroll->end_us = now_us + 120000;
-	ui_scroll_sample(scroll, offset, maximum, now_us, reduced);
+	}
+	*glide = (UiGlide){ .from = from,
+			    .start_us = now_us,
+			    .end_us = now_us + duration_us };
 }
 
 static GSettings *preferences;

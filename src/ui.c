@@ -179,13 +179,8 @@ void ui_theme_changed(int old_row_height)
 	ui.dirty = TRUE;
 }
 
-static void scroll_by(UiScroll *scroll, int *offset, double distance,
-		      int maximum)
+static void scroll_moved(UiScroll *scroll, int *offset, int sampled)
 {
-	int sampled = *offset;
-
-	ui_scroll_by(scroll, &sampled, distance, maximum,
-		     g_get_monotonic_time(), ui_reduce_motion());
 	if (scroll->end_us) {
 		/*
 		 * Keep hit testing on the actually displayed offset until the next
@@ -196,6 +191,25 @@ static void scroll_by(UiScroll *scroll, int *offset, double distance,
 		*offset = sampled;
 		ui.dirty = TRUE;
 	}
+}
+
+static void scroll_by(UiScroll *scroll, int *offset, double distance,
+		      int maximum)
+{
+	int sampled = *offset;
+
+	ui_scroll_by(scroll, &sampled, distance, maximum,
+		     g_get_monotonic_time(), ui_reduce_motion());
+	scroll_moved(scroll, offset, sampled);
+}
+
+static void scroll_to(UiScroll *scroll, int *offset, int target, int maximum)
+{
+	int sampled = *offset;
+
+	ui_scroll_to(scroll, &sampled, target, maximum, g_get_monotonic_time(),
+		     ui_reduce_motion());
+	scroll_moved(scroll, offset, sampled);
 }
 
 static void scroll_history(double distance)
@@ -1322,13 +1336,17 @@ static void highlight(int pos)
 {
 	int row_height = ui_chat_row_height();
 	int top = pos * row_height;
+	/* Held arrow keys retarget from where the list is heading. */
+	int view = list_scroll.end_us ? (int)(list_scroll.to + .5) :
+					ui.list_offset;
 
 	ui.list_cursor = pos;
-	ui_scroll_reset(&list_scroll, ui.list_offset);
-	if (top < ui.list_offset)
-		ui.list_offset = top;
-	else if (top + row_height > ui.list_offset + ui.list_box.h)
-		ui.list_offset = top + row_height - ui.list_box.h;
+	if (top < view)
+		scroll_to(&list_scroll, &ui.list_offset, top,
+			  max_list_scroll());
+	else if (top + row_height > view + ui.list_box.h)
+		scroll_to(&list_scroll, &ui.list_offset,
+			  top + row_height - ui.list_box.h, max_list_scroll());
 	ui.dirty = TRUE;
 }
 

@@ -287,6 +287,125 @@ static void check_row_animation(void)
 	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
 }
 
+static Json *glide_row(int i)
+{
+	Json *row = json_object_new_object();
+	char id[16], text[64];
+
+	g_snprintf(id, sizeof(id), "g%d", i);
+	g_snprintf(text, sizeof(text), "Glide message %d", i);
+	json_object_object_add(row, "id", json_object_new_string(id));
+	json_object_object_add(row, "text", json_object_new_string(text));
+	json_object_object_add(row, "own", json_object_new_boolean(i % 2));
+	json_object_object_add(row, "from", json_object_new_string("Grace"));
+	json_object_object_add(
+		row, "time",
+		json_object_new_int64(1700000000000LL + i * 60000));
+	return row;
+}
+
+static void settle(void)
+{
+	for (int i = 0; i < 60 && ui_animation_deadline(scene_time); i++) {
+		scene_time += 16667;
+		ui_draw_animation();
+	}
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
+}
+
+/* New rows glide up from the composer; an opened chat fades in. */
+static void check_history_motion(void)
+{
+	g_autofree guint8 *saved = g_malloc(sizeof(presented));
+	Json *fixture = ui.history;
+	Json *rows = json_object_new_array();
+
+	for (int i = 0; i < 30; i++)
+		json_object_array_add(rows, glide_row(i));
+	ui.hover_x = ui.hover_y = -1;
+	ui.history = rows;
+	ui.stick_bottom = TRUE;
+	ui_forget_history();
+	ui_draw();
+	scene_time += 300000;
+	ui_draw();
+	settle();
+	int before = ui.history_offset;
+
+	g_assert_cmpint(before, ==, ui.max_history_offset);
+	g_assert_cmpint(before, >, 0);
+	json_object_array_add(rows, glide_row(30));
+	ui_forget_history();
+	ui_draw();
+	g_assert_cmpint(ui.max_history_offset, >, before);
+	g_assert_cmpint(ui.history_offset, ==, before);
+	g_assert_cmpint(ui_animation_deadline(scene_time), >, scene_time);
+	g_assert_cmpint(ui_animation_deadline(scene_time), <=,
+			scene_time + 250000);
+	int previous = before, frames = 0;
+
+	while (ui_animation_deadline(scene_time)) {
+		scene_time += 16667;
+		ui_draw_animation();
+		g_assert_cmpint(ui.history_offset, >=, previous);
+		/* Only the conversation repaints, never the whole window. */
+		g_assert_cmpint(dirty.y, >, 0);
+		g_assert_cmpint(dirty.h, <, H);
+		previous = ui.history_offset;
+		g_assert_cmpint(++frames, <, 20);
+	}
+	g_assert_cmpint(frames, >, 3);
+	g_assert_cmpint(ui.history_offset, ==, ui.max_history_offset);
+	memcpy(saved, presented, sizeof(presented));
+	ui_draw();
+	g_assert_cmpmem(saved, sizeof(presented), presented, sizeof(presented));
+	/* A scrolled-away reader keeps their place: nothing glides. */
+	ui.stick_bottom = FALSE;
+	ui.history_offset = 40;
+	ui_draw();
+	json_object_array_add(rows, glide_row(31));
+	ui_forget_history();
+	ui_draw();
+	g_assert_cmpint(ui.history_offset, ==, 40);
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
+
+	/* Opening a chat: rows fade in once, when the first page arrives. */
+	ui.stick_bottom = TRUE;
+	ui.history = NULL;
+	ui_forget_history();
+	ui_draw();
+	ui.history = rows;
+	ui_draw();
+	g_assert_cmpint(ui_animation_deadline(scene_time), >, scene_time);
+	settle();
+	memcpy(saved, presented, sizeof(presented));
+	ui_draw();
+	g_assert_cmpmem(saved, sizeof(presented), presented, sizeof(presented));
+	ui_draw();
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
+
+	/* Reduced motion: the same end states with no frames scheduled. */
+	g_setenv("LINE_REDUCE_MOTION", "1", TRUE);
+	ui_motion_refresh_preferences();
+	json_object_array_add(rows, glide_row(32));
+	ui_forget_history();
+	ui_draw();
+	g_assert_cmpint(ui.history_offset, ==, ui.max_history_offset);
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
+	ui.history = NULL;
+	ui_draw();
+	ui.history = rows;
+	ui_draw();
+	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
+	g_setenv("LINE_REDUCE_MOTION", "0", TRUE);
+	ui_motion_refresh_preferences();
+	ui.history = fixture;
+	ui_forget_history();
+	json_object_put(rows);
+	ui_draw();
+	settle();
+}
+
 static void history(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -354,11 +473,13 @@ static void history(void)
 	g_setenv("LINE_REDUCE_MOTION", "0", TRUE);
 	ui_motion_refresh_preferences();
 	check_row_animation();
+	check_history_motion();
 	g_assert_true(ui_theme_toggle(&error));
 	g_assert_no_error(error);
 	ui_theme_changed(row_height);
 	check_message_receipts();
 	check_row_animation();
+	check_history_motion();
 	/* Exercise receipt widths with RTL shaping and a compact chat pane. */
 	g_assert_true(ui_lang_set(UI_LANG_AR, &error));
 	g_assert_no_error(error);
@@ -370,6 +491,7 @@ static void history(void)
 	g_assert_no_error(error);
 	ui_theme_changed(row_height);
 	check_message_receipts();
+	check_history_motion();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
 	g_string_free(ui.message.value, TRUE);

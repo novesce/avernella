@@ -60,7 +60,7 @@ make build/test-liff            # build ตัวเดียว
 | `test-qr-scan` | `qr_scan.c` | การโหลด ZBar และการถอดรหัส (ห่อ `dlopen`) |
 | `test-chat-lists` | `chat_lists.c` | โฟลเดอร์ หมุด การปิดเสียง ปุ่มลัด ความปลอดภัยของไฟล์ |
 | `test-chiptune` | `chiptune.c` | ชิปเสียงและเสียงทุกตัว |
-| `test-ui-motion` | `ui_motion.c` | นาฬิกาเฟรมและการเลื่อน รวมถึงจังหวะที่ 60, 144 และ 240 Hz |
+| `test-ui-motion` | `ui_motion.c` | นาฬิกาเฟรม การเลื่อนและเป้าหมายการเลื่อน ความลึกของการกดปุ่ม และเส้นโค้งการ glide รวมถึงจังหวะที่ 60, 144 และ 240 Hz |
 | `test-ui-pixels` | `ui_pixels.c` | premultiply คณิตของการคัดลอกตอนเลื่อน |
 | `test-ui-apng` | `ui_apng.c` | เฟรมและจังหวะของ PNG เคลื่อนไหว |
 | `test-ui-emoji` | `ui_emoji.c` | โทเค็นในฉบับร่างและช่วงที่ส่งออก |
@@ -69,7 +69,7 @@ make build/test-liff            # build ตัวเดียว
 | `test-ui-tray` | `ui_tray.c` | คุณสมบัติและเมนูของไอเทมใน tray |
 | `test-ui-read` | `ui_read.c` | กฎการแจ้งอ่านใน `ui_private.h` |
 | `test-ui-theme` | `ui_theme.c` | การอ่านและสลับไฟล์ธีม |
-| `test-ui-scroll-scene` | `ui_scroll_scene.c` | การใช้ภาพเลื่อนซ้ำเทียบกับการวาดใหม่ทั้งหมด |
+| `test-ui-scroll-scene` | `ui_scroll_scene.c` | การใช้ภาพเลื่อนซ้ำเทียบกับการวาดใหม่ทั้งหมด การเลื่อนรับข้อความใหม่และการค่อย ๆ ปรากฏเมื่อเปิดแชต ทั้งแบบปกติและแบบลดการเคลื่อนไหว |
 | `test-ui-call-fullscreen` | `ui_call_fullscreen.c` | วิดีโอคอลเต็มจอ |
 | `test-ui-lang` | `ui_lang.c` | การเลือกภาษาและตารางคำแปล รวมถึงตัวแปลงรูปแบบของ printf |
 

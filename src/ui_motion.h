@@ -22,6 +22,9 @@ typedef struct {
 void ui_scroll_reset(UiScroll *scroll, int offset);
 void ui_scroll_by(UiScroll *scroll, int *offset, double distance, int maximum,
 		  gint64 now_us, gboolean reduced);
+/* Ease toward an absolute offset, such as keeping a selected row in view. */
+void ui_scroll_to(UiScroll *scroll, int *offset, double target, int maximum,
+		  gint64 now_us, gboolean reduced);
 gboolean ui_scroll_sample(UiScroll *scroll, int *offset, int maximum,
 			  gint64 now_us, gboolean reduced);
 gboolean ui_reduce_motion(void);
@@ -33,6 +36,19 @@ void ui_motion_shutdown(void);
 
 /* Remaining displacement for a short slide with one soft overshoot. */
 double ui_settle(double progress);
+
+/*
+ * A displacement that decays to zero with the scroll curve. Adding while it
+ * runs keeps what is left, so bursts never jump and never queue up.
+ */
+typedef struct {
+	double from;
+	gint64 start_us, end_us;
+} UiGlide;
+
+void ui_glide_add(UiGlide *glide, double distance, gint64 duration_us,
+		  gint64 now_us, gboolean reduced);
+double ui_glide_left(UiGlide *glide, gint64 now_us);
 
 typedef struct {
 	gint64 down, up;
