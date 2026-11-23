@@ -79,3 +79,13 @@ int line_camera_read(struct line_camera *camera,
 
 /* Convert a limited-range I420 frame to native-endian XRGB8888. */
 void line_camera_xrgb(const struct line_camera_frame *frame, guint32 *pixels);
+
+/*
+ * Converts a decoded JPEG's full-range planes to tightly packed
+ * limited-range I420. Each chroma sample covers sx × sy output chroma
+ * pixels' worth of source columns and rows (1 or 2 each). The width and
+ * height must be even.
+ */
+void line_camera_jpeg_to_i420(const guint8 *const planes[3], unsigned int width,
+			      unsigned int height, unsigned int chroma_stride,
+			      unsigned int sx, unsigned int sy, guint8 *out);

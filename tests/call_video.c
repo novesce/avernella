@@ -811,6 +811,147 @@ static void software_video_pixels(void)
 	}
 }
 
+/* The conversion the camera used before it moved to camera_pixels.c. */
+static void reference_jpeg_to_i420(const guint8 *const planes[3],
+				   unsigned int w, unsigned int h,
+				   unsigned int cw, unsigned int sx,
+				   unsigned int sy, guint8 *out)
+{
+	guint8 *u = out + w * h, *v = u + w * h / 4;
+
+	for (gsize i = 0; i < (gsize)w * h; i++)
+		out[i] = 16 + (planes[0][i] * 219 + 127) / 255;
+	for (unsigned int row = 0; row < h / 2; row++)
+		for (unsigned int x = 0; x < w / 2; x++)
+			for (int c = 1; c <= 2; c++) {
+				const guint8 *p = planes[c] +
+						  (gsize)row * sy * cw + x * sx;
+				int sum = 0, avg;
+
+				for (unsigned int dy = 0; dy < sy; dy++)
+					for (unsigned int dx = 0; dx < sx; dx++)
+						sum += p[dy * cw + dx];
+				avg = (sum + sx * sy / 2) / (sx * sy);
+				(c == 1 ? u : v)[row * (w / 2) + x] =
+					128 + ((avg - 128) * 224 +
+					       (avg >= 128 ? 127 : -127)) /
+						      255;
+			}
+}
+
+/* Every camera chroma layout converts exactly as before, only faster. */
+static void camera_jpeg_range(void)
+{
+	enum {
+		CW = 1280,
+		CH = 720
+	};
+	g_autofree guint8 *source = g_malloc(CW * CH * 3);
+	g_autofree guint8 *fast = g_malloc(CW * CH * 3 / 2);
+	g_autofree guint8 *slow = g_malloc(CW * CH * 3 / 2);
+	GRand *rand = g_rand_new_with_seed(7);
+
+	for (gsize i = 0; i < CW * CH * 3; i++)
+		source[i] = i < 256 ? (guint8)i :
+				      (guint8)g_rand_int_range(rand, 0, 256);
+	g_rand_free(rand);
+	for (unsigned int sx = 1; sx <= 2; sx++)
+		for (unsigned int sy = 1; sy <= 2; sy++) {
+			unsigned int cw = CW / 2 * sx, ch = CH / 2 * sy;
+			const guint8 *planes[3] = { source, source + CW * CH,
+						    source + CW * CH +
+							    (gsize)cw * ch };
+
+			line_camera_jpeg_to_i420(planes, CW, CH, cw, sx, sy,
+						 fast);
+			reference_jpeg_to_i420(planes, CW, CH, cw, sx, sy,
+					       slow);
+			g_assert_cmpmem(fast, CW * CH * 3 / 2, slow,
+					CW * CH * 3 / 2);
+			if (!g_test_perf())
+				continue;
+			gdouble before, after;
+
+			g_test_timer_start();
+			for (int i = 0; i < 50; i++)
+				reference_jpeg_to_i420(planes, CW, CH, cw, sx,
+						       sy, slow);
+			before = g_test_timer_elapsed() * 1000 / 50;
+			g_test_timer_start();
+			for (int i = 0; i < 50; i++)
+				line_camera_jpeg_to_i420(planes, CW, CH, cw, sx,
+							 sy, fast);
+			after = g_test_timer_elapsed() * 1000 / 50;
+			g_test_minimized_result(
+				after,
+				"%ux%u chroma, 720p: %.3f ms (was %.3f ms)", sx,
+				sy, after, before);
+		}
+}
+
+/* One step faster when encoding falls behind, back once it catches up. */
+static void encoder_pace(void)
+{
+	/* At 30 fps a frame has 33.3 ms: 60% is 20 ms, 25% is 8.3 ms. */
+	g_assert_cmpint(call_video_pace(-6, -6, 25000, 30), ==, -7);
+	g_assert_cmpint(call_video_pace(-12, -6, 25000, 30), ==, -12);
+	g_assert_cmpint(call_video_pace(-8, -6, 12000, 30), ==, -8);
+	g_assert_cmpint(call_video_pace(-8, -6, 5000, 30), ==, -7);
+	g_assert_cmpint(call_video_pace(-6, -6, 5000, 30), ==, -6);
+	g_assert_cmpint(call_video_pace(-4, -4, 0, 0), ==, -4);
+}
+
+static gboolean discard(const guint8 *wire, gsize size, gpointer data)
+{
+	(void)wire;
+	(void)size;
+	++*(guint *)data;
+	return TRUE;
+}
+
+/* With -m perf: the cost of a 720p camera frame through the call path. */
+static void encode_720p(void)
+{
+	enum {
+		EW = 1280,
+		EH = 720,
+		FRAMES = 90
+	};
+	g_autofree guint8 *pixels = g_malloc(EW * EH * 3 / 2);
+	struct line_camera_frame frame;
+	struct call_video *video;
+	guint packets = 0;
+
+	if (!g_test_perf()) {
+		g_test_skip("Run with -m perf to measure the encoder.");
+		return;
+	}
+	video = call_video_open(key_a, key_b, 96, 1, 2, 1500, 30, NULL);
+	g_assert_nonnull(video);
+	line_camera_i420_frame(&frame, pixels, EW, EH);
+	gdouble seconds = 0;
+
+	for (int i = 0; i < FRAMES; i++) {
+		/* A moving gradient with texture, so every frame changes. */
+		for (unsigned int y = 0; y < EH; y++)
+			for (unsigned int x = 0; x < EW; x++)
+				pixels[y * EW + x] = (x + 3 * y + 7 * i) ^
+						     (x * y >> 6);
+		memset(pixels + EW * EH, 128 + i % 32, EW * EH / 2);
+		g_test_timer_start();
+		g_assert_true(call_video_encode(video, &frame,
+						(gint64)i * G_USEC_PER_SEC / 30,
+						discard, &packets, NULL));
+		seconds += g_test_timer_elapsed();
+	}
+	gdouble ms = seconds * 1000 / FRAMES;
+
+	g_assert_cmpuint(packets, >, FRAMES);
+	g_test_minimized_result(ms, "720p VP8 at 1.5 Mbit/s: %.2f ms a frame",
+				ms);
+	call_video_close(video);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -837,5 +978,8 @@ int main(int argc, char **argv)
 			screen_capture_conversion);
 	g_test_add_func("/video/software-yuv-conversion",
 			software_video_pixels);
+	g_test_add_func("/video/camera-jpeg-range", camera_jpeg_range);
+	g_test_add_func("/video/encoder-pace", encoder_pace);
+	g_test_add_func("/video/encode-720p", encode_720p);
 	return g_test_run();
 }

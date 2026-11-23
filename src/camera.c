@@ -305,17 +305,6 @@ int line_camera_fd(const struct line_camera *camera)
 	return camera ? camera->fd : -1;
 }
 
-/* JFIF uses full-range YCbCr; VP8 and the window expect video range. */
-static guint8 video_luma(guint8 v)
-{
-	return 16 + (v * 219 + 127) / 255;
-}
-
-static guint8 video_chroma(int v)
-{
-	return 128 + ((v - 128) * 224 + (v >= 128 ? 127 : -127)) / 255;
-}
-
 static gboolean decode_jpeg(struct line_camera *camera, const guint8 *data,
 			    gsize size, struct line_camera_frame *frame)
 {
@@ -348,23 +337,8 @@ static gboolean decode_jpeg(struct line_camera *camera, const guint8 *data,
 
 	if (!sx || !sy || sx > 2 || sy > 2)
 		return FALSE;
-	for (gsize i = 0; i < (gsize)w * h; i++)
-		y[i] = video_luma(planes[0][i]);
-	for (unsigned int row = 0; row < h / 2; row++)
-		for (unsigned int x = 0; x < w / 2; x++) {
-			for (int c = 1; c <= 2; c++) {
-				const guint8 *p = planes[c] +
-						  (gsize)row * sy * cw + x * sx;
-				int sum = 0;
-
-				for (unsigned int dy = 0; dy < sy; dy++)
-					for (unsigned int dx = 0; dx < sx; dx++)
-						sum += p[dy * cw + dx];
-				(c == 1 ? u : v)[row * (w / 2) + x] =
-					video_chroma((sum + sx * sy / 2) /
-						     (sx * sy));
-			}
-		}
+	line_camera_jpeg_to_i420((const guint8 *const *)planes, w, h, cw, sx,
+				 sy, y);
 	*frame = (struct line_camera_frame){
 		.plane = { y, u, v },
 		.stride = { (int)w, (int)w / 2, (int)w / 2 },

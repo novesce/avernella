@@ -30,6 +30,13 @@ gboolean call_video_receive_feedback(struct call_video *video,
 void call_video_keyframe(struct call_video *video);
 /* Sets a screen-specific send budget. Zero kbps restores webcam settings. */
 void call_video_screen(struct call_video *video, guint kbps, guint fps);
+
+/*
+ * The VP8 speed (VP8E_SET_CPUUSED) to use after a second of frames that
+ * averaged average_us to encode at fps: one step faster above 60% of the
+ * frame interval, one step back toward base below 25%.
+ */
+int call_video_pace(int speed, int base, gint64 average_us, guint fps);
 void call_video_close(struct call_video *video);
 
 /*

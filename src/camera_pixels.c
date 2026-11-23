@@ -101,3 +101,75 @@ void line_camera_xrgb(const struct line_camera_frame *frame, guint32 *pixels)
 		pixels += width;
 	}
 }
+
+/* JFIF uses full-range YCbCr; VP8 and the window expect video range. */
+/* 16 + round(v × 219 / 255), with an exact division GCC can vectorize. */
+static inline guint8 jpeg_luma(guint8 v)
+{
+	unsigned int x = v * 219u + 127;
+
+	return 16 + ((x + 1 + (x >> 8)) >> 8);
+}
+
+/* 128 + (v - 128) × 224 / 255, rounded half away from the midpoint. */
+static inline guint8 jpeg_chroma(unsigned int v)
+{
+	unsigned int d = v >= 128 ? v - 128 : 128 - v;
+	unsigned int x = d * 224 + 127;
+	unsigned int q = (x + 1 + (x >> 8)) >> 8;
+
+	return v >= 128 ? 128 + q : 128 - q;
+}
+
+/* Inlined once per layout so each loop has constant subsampling. */
+static __always_inline void
+jpeg_chroma_plane(const guint8 *src, unsigned int width, unsigned int rows,
+		  unsigned int stride, unsigned int sx, unsigned int sy,
+		  guint8 *out)
+{
+	for (unsigned int row = 0; row < rows; row++) {
+		const guint8 *a = src + (gsize)row * sy * stride;
+		const guint8 *b = a + (sy - 1) * stride;
+
+		for (unsigned int x = 0; x < width; x++) {
+			unsigned int sum = a[x * sx] + a[x * sx + sx - 1] +
+					   b[x * sx] + b[x * sx + sx - 1];
+			unsigned int count = 4 / (sx * sy);
+
+			/* Duplicated samples keep the original rounding. */
+			out[x] = jpeg_chroma((sum / count + sx * sy / 2) /
+					     (sx * sy));
+		}
+		out += width;
+	}
+}
+
+void line_camera_jpeg_to_i420(const guint8 *const planes[3], unsigned int width,
+			      unsigned int height, unsigned int chroma_stride,
+			      unsigned int sx, unsigned int sy, guint8 *out)
+{
+	gsize luma = (gsize)width * height;
+	unsigned int cw = width / 2, ch = height / 2;
+
+	const guint8 *restrict source = planes[0];
+	guint8 *restrict target = out;
+
+	for (gsize i = 0; i < luma; i++)
+		target[i] = jpeg_luma(source[i]);
+	out += luma;
+	for (int c = 1; c <= 2; c++) {
+		if (sx == 1 && sy == 1)
+			jpeg_chroma_plane(planes[c], cw, ch, chroma_stride, 1,
+					  1, out);
+		else if (sx == 1)
+			jpeg_chroma_plane(planes[c], cw, ch, chroma_stride, 1,
+					  2, out);
+		else if (sy == 1)
+			jpeg_chroma_plane(planes[c], cw, ch, chroma_stride, 2,
+					  1, out);
+		else
+			jpeg_chroma_plane(planes[c], cw, ch, chroma_stride, 2,
+					  2, out);
+		out += (gsize)cw * ch;
+	}
+}

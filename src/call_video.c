@@ -42,9 +42,55 @@ struct video_payload {
 	guint rotation;
 };
 
+/* Encoding time over the last second, for call_video_pace(). */
+struct encode_pace {
+	int base, speed;
+	gint64 spent_us;
+	guint frames;
+};
+
+/* WebRTC's lowest real-time VP8 speed setting for slow machines. */
+enum {
+	FASTEST_SPEED = -12
+};
+
+int call_video_pace(int speed, int base, gint64 average_us, guint fps)
+{
+	gint64 interval = G_USEC_PER_SEC / MAX(fps, 1u);
+
+	if (average_us * 100 > interval * 60)
+		return MAX(speed - 1, FASTEST_SPEED);
+	if (average_us * 100 < interval * 25 && speed < base)
+		return speed + 1;
+	return speed;
+}
+
+static void pace_start(struct encode_pace *p, int speed)
+{
+	*p = (struct encode_pace){ .base = speed, .speed = speed };
+}
+
+/* Records one encode; changes the speed once a second's frames are in. */
+static gboolean pace_encoder(vpx_codec_ctx_t *enc, struct encode_pace *p,
+			     gint64 spent_us, guint fps)
+{
+	p->spent_us += MAX(spent_us, 0);
+	if (++p->frames < fps)
+		return TRUE;
+	int next = call_video_pace(p->speed, p->base, p->spent_us / p->frames,
+				   fps);
+
+	p->spent_us = p->frames = 0;
+	if (next == p->speed)
+		return TRUE;
+	p->speed = next;
+	return vpx_codec_control(enc, VP8E_SET_CPUUSED, next) == VPX_CODEC_OK;
+}
+
 struct call_video {
 	srtp_t tx, rx;
 	vpx_codec_ctx_t enc, dec;
+	struct encode_pace pace;
 	gboolean enc_ready, dec_ready, force_key, need_key;
 	guint width, height, kbps, fps;
 	guint screen_kbps, screen_fps;
@@ -124,7 +170,7 @@ struct call_video *call_video_open(const guint8 tx[30], const guint8 rx[30],
 				   guint kbps, guint fps, GError **e)
 {
 	struct call_video *v = g_new0(struct call_video, 1);
-	vpx_codec_dec_cfg_t cfg = { .threads = 2 };
+	vpx_codec_dec_cfg_t cfg = { .threads = MIN(4, g_get_num_processors()) };
 
 	if (!tx || !rx || pt < 96 || pt > 127 || !kbps || kbps > 8000 || !fps ||
 	    fps > 30 || !call_srtp_open(&v->tx, tx, ssrc_specific, tx_ssrc) ||
@@ -211,6 +257,7 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 			 cfg.g_threads >= 2 ? VP8_TWO_TOKENPARTITION :
 					      VP8_ONE_TOKENPARTITION;
 
+	pace_start(&v->pace, speed);
 	return vpx_codec_control(&v->enc, VP8E_SET_CPUUSED, speed) ==
 		       VPX_CODEC_OK &&
 	       vpx_codec_control(&v->enc, VP8E_SET_SCREEN_CONTENT_MODE,
@@ -359,9 +406,13 @@ gboolean call_video_encode(struct call_video *v,
 		v->epoch = now;
 	pts = ((guint64)(now - v->epoch) / 100) * 9 +
 	      ((guint64)(now - v->epoch) % 100) * 9 / 100;
+	gint64 started = g_get_monotonic_time();
+
 	if (vpx_codec_encode(&v->enc, &img, pts, 90000 / fps,
 			     v->force_key ? VPX_EFLAG_FORCE_KF : 0,
-			     VPX_DL_REALTIME))
+			     VPX_DL_REALTIME) ||
+	    !pace_encoder(&v->enc, &v->pace, g_get_monotonic_time() - started,
+			  fps))
 		goto failed;
 	v->last_encoded = now;
 	v->force_key = FALSE;
@@ -987,6 +1038,7 @@ failed:
  */
 struct call_share_encoder {
 	vpx_codec_ctx_t enc;
+	struct encode_pace pace;
 	gboolean ready, force_key;
 	guint width, height, kbps, fps;
 	guint16 picture;
@@ -1062,10 +1114,10 @@ static gboolean share_encoder_configure(struct call_share_encoder *s, guint w,
 	s->width = w;
 	s->height = h;
 	s->force_key = TRUE;
-	guint pixels = w * h;
+	int speed = w * h > 1280 * 720 ? -8 : -6;
 
-	return vpx_codec_control(&s->enc, VP8E_SET_CPUUSED,
-				 pixels > 1280 * 720 ? -8 : -6) ==
+	pace_start(&s->pace, speed);
+	return vpx_codec_control(&s->enc, VP8E_SET_CPUUSED, speed) ==
 		       VPX_CODEC_OK &&
 	       vpx_codec_control(&s->enc, VP8E_SET_SCREEN_CONTENT_MODE, 1) ==
 		       VPX_CODEC_OK &&
@@ -1149,7 +1201,11 @@ gboolean call_share_encode(struct call_share_encoder *s,
 		goto failed;
 	s->last_encoded = now;
 	s->force_key = FALSE;
-	guint delay = (g_get_monotonic_time() - started) / 1000;
+	gint64 spent = g_get_monotonic_time() - started;
+	guint delay = spent / 1000;
+
+	if (!pace_encoder(&s->enc, &s->pace, spent, s->fps))
+		goto failed;
 	const guint pixels[] = { 19200, 172800, 691200, 2764800, 11059200 };
 	guint resolution = 0;
 
