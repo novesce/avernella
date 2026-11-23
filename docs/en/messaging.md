@@ -105,6 +105,7 @@ Anything else is shown as "other".
 | `STKID`, `STKPKGID`, `STKVER`, `STKTXT`, `STKOPT` | Stickers |
 | `FLEX_JSON`, `ALT_TEXT` | Flex Messages |
 | `DOWNLOAD_URL`, `MARKUP_JSON`, `ALT_TEXT` (or their `RICH_…` aliases) | Rich messages |
+| `DOWNLOAD_URL`, `PREVIEW_URL` on an image message | An official account's picture and its smaller copy, see [Media](media.md#downloading) |
 | `displayName` | Contact cards |
 
 ## Reading history

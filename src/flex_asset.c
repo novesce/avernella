@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "flex_asset.h"
+#include "media.h"
 #include <arpa/inet.h>
 #include <curl/curl.h>
 #include <string.h>
@@ -292,5 +293,21 @@ GBytes *line_flex_image_download(const char *url, GError **error)
 	}
 	g_set_error_literal(error, LINE_ERROR, 1,
 			    "Could not load this Flex image.");
+	return NULL;
+}
+
+const char *line_hosted_image_url(J *message)
+{
+	static const char *const keys[] = { "DOWNLOAD_URL", "PREVIEW_URL" };
+	J *meta = field(message, "18");
+
+	if (json_object_get_int(field(message, "15")) != LINE_MEDIA_IMAGE)
+		return NULL;
+	for (gsize i = 0; i < G_N_ELEMENTS(keys); i++) {
+		const char *url = strfield(meta, keys[i]);
+
+		if (url && line_flex_image_allowed(url))
+			return url;
+	}
 	return NULL;
 }

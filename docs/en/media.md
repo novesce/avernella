@@ -74,6 +74,8 @@ Uploading doesn't give anyone access. Recipients can find and decrypt the object
 
 Video posters come from `<sid>/<oid>/ud-preview` (falling back to `<oid>__ud-preview`), with a 6-second timeout. Legacy unencrypted media use `m/<message ID>` and `/preview`.
 
+An image message from an official account often isn't stored in OBS at all. Its metadata carries `DOWNLOAD_URL` (the picture) and `PREVIEW_URL` (a smaller copy), and asking OBS for `m/<message ID>` returns 404. LINE's phone app loads the thumbnail from `PREVIEW_URL` and the picture from `DOWNLOAD_URL` when they are set. `line_hosted_image_url()` picks the first of the two that passes the [arbitrary-host policy](#pictures-from-arbitrary-hosts), and the worker fetches it with `line_flex_image_download()` for both the thumbnail and **Save**.
+
 If OBS rejects the token (`LINE_OBS_UNAUTHORIZED`), the worker forgets it and tries once more with a new one, as LINE's own OBS client does. A 429 or 503 starts that host's cooldown, and requests to it fail locally until it passes (see [Protocol basics](protocol-basics.md#rate-limits)).
 
 ### Getting bytes to the window

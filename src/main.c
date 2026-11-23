@@ -1775,12 +1775,24 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 				error,
 				"Reload this conversation to open the attachment.");
 		g_autoptr(GBytes) bytes = NULL;
+		const char *hosted = line_hosted_image_url(msg);
+
 		if (json_object_get_int(field(msg, "15")) == 7) {
 			g_autofree char *url =
 				line_sticker_message_asset(msg, error);
 
 			if (url)
 				bytes = line_sticker_fetch(url, error);
+		} else if (hosted) {
+			/* An official account's picture, not an OBS object. */
+			bytes = line_flex_image_download(hosted, error);
+			if (!bytes && error && *error &&
+			    !g_error_matches(*error, LINE_ERROR,
+					     LINE_RATE_LIMITED)) {
+				g_clear_error(error);
+				problem(error,
+					"Could not load this image from the official account.");
+			}
 		} else if (!strcmp(method, "photo"))
 			bytes = line_download_image(s, msg, error);
 		else

@@ -15,3 +15,10 @@ gboolean line_flex_image_allowed(const char *url);
  * retried at <base>. LINE_DEBUG_MEDIA=1 reports failures on stderr.
  */
 GBytes *line_flex_image_download(const char *url, GError **error);
+/*
+ * An official account's image message keeps its picture at its own HTTPS
+ * URLs instead of LINE's object storage: DOWNLOAD_URL for the image and
+ * PREVIEW_URL for a smaller copy, as LINE's phone app reads them. Returns
+ * the first allowed one, or NULL for an ordinary photo.
+ */
+const char *line_hosted_image_url(J *message);

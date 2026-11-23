@@ -380,6 +380,49 @@ static void slow_down(void)
 	g_ptr_array_unref(requested);
 }
 
+static J *image_message(int type, const char *download, const char *preview)
+{
+	J *message = obj(), *meta = obj();
+
+	json_object_object_add(message, "15", json_object_new_int(type));
+	json_object_object_add(message, "18", meta);
+	if (download)
+		json_object_object_add(meta, "DOWNLOAD_URL",
+				       json_object_new_string(download));
+	if (preview)
+		json_object_object_add(meta, "PREVIEW_URL",
+				       json_object_new_string(preview));
+	return message;
+}
+
+/* Official account pictures come from their own HTTPS URLs, not OBS. */
+static void hosted_images(void)
+{
+	g_autoptr(J) both = image_message(1, "https://cdn.example.com/full.jpg",
+					  "https://cdn.example.com/small.jpg");
+	g_autoptr(J) preview_only =
+		image_message(1, NULL, "https://cdn.example.com/small.jpg");
+	g_autoptr(J) insecure =
+		image_message(1, "http://cdn.example.com/full.jpg",
+			      "https://cdn.example.com/small.jpg");
+	g_autoptr(J) plain = image_message(1, NULL, NULL);
+	g_autoptr(J) file =
+		image_message(14, "https://cdn.example.com/a.jpg", NULL);
+	g_autoptr(J) local =
+		image_message(1, "https://127.0.0.1/full.jpg", NULL);
+
+	g_assert_cmpstr(line_hosted_image_url(both), ==,
+			"https://cdn.example.com/full.jpg");
+	g_assert_cmpstr(line_hosted_image_url(preview_only), ==,
+			"https://cdn.example.com/small.jpg");
+	g_assert_cmpstr(line_hosted_image_url(insecure), ==,
+			"https://cdn.example.com/small.jpg");
+	g_assert_null(line_hosted_image_url(plain));
+	g_assert_null(line_hosted_image_url(file));
+	/* A literal local address is refused before any request. */
+	g_assert_null(line_hosted_image_url(local));
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -388,5 +431,6 @@ int main(int argc, char **argv)
 			transfer_policy);
 	g_test_add_func("/flex-assets/redirects-widths-and-webp", fallbacks);
 	g_test_add_func("/flex-assets/slow-down", slow_down);
+	g_test_add_func("/flex-assets/official-account-images", hosted_images);
 	return g_test_run();
 }

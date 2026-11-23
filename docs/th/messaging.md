@@ -105,6 +105,7 @@
 | `STKID`, `STKPKGID`, `STKVER`, `STKTXT`, `STKOPT` | สติกเกอร์ |
 | `FLEX_JSON`, `ALT_TEXT` | Flex Message |
 | `DOWNLOAD_URL`, `MARKUP_JSON`, `ALT_TEXT` (หรือชื่อแฝงที่ขึ้นต้นด้วย `RICH_`) | Rich message |
+| `DOWNLOAD_URL`, `PREVIEW_URL` ในข้อความรูปภาพ | รูปของบัญชีทางการและรูปขนาดเล็ก ดู [มีเดีย](media.md#การดาวน์โหลด) |
 | `displayName` | การ์ดผู้ติดต่อ |
 
 ## การอ่านประวัติ
