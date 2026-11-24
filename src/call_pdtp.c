@@ -12,6 +12,8 @@
 
 enum {
 	RTP_HEADER = 12,
+	GROUP_RTP_HEADER = RTP_HEADER + 4,
+	GROUP_RTP_PROFILE = 0x0240,
 	MAX_DATAGRAM = 4096,
 	/* kPdtpMTU: the largest PDTP payload the engine builds. */
 	PDTP_MTU = 900,
@@ -24,6 +26,8 @@ enum {
 	MAX_SEGMENTS = 4096,
 	MAX_INFLIGHT = 2048,
 	MAX_BUFFERED = 64 << 20,
+	GROUP_MAX_ACK_DELAY_MS = 200,
+	GROUP_SETUP_ATTEMPTS = 6,
 };
 
 #define STREAM_MASK 0x303eu
@@ -84,6 +88,7 @@ struct call_pdtp {
 	srtp_t tx, rx;
 	guint8 pt;
 	guint32 tx_ssrc, rx_ssrc;
+	gboolean group;
 	gboolean trace;
 	call_pdtp_stream_fn on_data;
 	call_pdtp_event_fn on_event;
@@ -105,6 +110,12 @@ struct call_pdtp {
 	struct tx_stream tx_streams[MAX_STREAMS];
 	GArray *inflight; /* struct sent_packet */
 	gint64 srtt, rto;
+	struct {
+		guint64 pn[GROUP_SETUP_ATTEMPTS];
+		gint64 due;
+		guint attempts, sent;
+		gboolean acknowledged;
+	} group_setup;
 	gdouble tokens;
 	gint64 tokens_at;
 	guint64 send_bps;
@@ -205,7 +216,7 @@ static struct rx_stream *rx_stream(struct call_pdtp *d, guint64 id,
 		if (!s->used && !free_slot)
 			free_slot = s;
 	}
-	if (!create || !free_slot)
+	if (!create || !free_slot || d->group)
 		return NULL;
 	*free_slot = (struct rx_stream){ .used = TRUE, .id = id };
 	g_strlcpy(free_slot->service, service, sizeof(free_slot->service));
@@ -263,9 +274,9 @@ void call_pdtp_close(struct call_pdtp *d)
 	g_free(d);
 }
 
-struct call_pdtp *call_pdtp_open(const guint8 tx[30], const guint8 rx[30],
-				 guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
-				 GError **e)
+static struct call_pdtp *pdtp_open(const guint8 tx[30], const guint8 rx[30],
+				   guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
+				   gboolean group, GError **e)
 {
 	struct call_pdtp *d = g_new0(struct call_pdtp, 1);
 	guint16 first;
@@ -284,6 +295,7 @@ struct call_pdtp *call_pdtp_open(const guint8 tx[30], const guint8 rx[30],
 	d->pt = pt;
 	d->tx_ssrc = tx_ssrc;
 	d->rx_ssrc = rx_ssrc;
+	d->group = group;
 	/* The official engine starts its packet numbers at 1. */
 	d->next_pn = 1;
 	(void)first;
@@ -293,6 +305,25 @@ struct call_pdtp *call_pdtp_open(const guint8 tx[30], const guint8 rx[30],
 	d->send_bps = 12000000;
 	d->epoch = -1;
 	return d;
+}
+
+struct call_pdtp *call_pdtp_open(const guint8 tx[30], const guint8 rx[30],
+				 guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
+				 GError **e)
+{
+	return pdtp_open(tx, rx, pt, tx_ssrc, rx_ssrc, FALSE, e);
+}
+
+struct call_pdtp *call_pdtp_open_group(const guint8 tx[30], const guint8 rx[30],
+				       guint8 pt, guint32 tx_ssrc,
+				       guint32 rx_ssrc, GError **e)
+{
+	return pdtp_open(tx, rx, pt, tx_ssrc, rx_ssrc, TRUE, e);
+}
+
+gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *d)
+{
+	return d && d->group_setup.acknowledged;
 }
 
 void call_pdtp_set_trace(struct call_pdtp *d, gboolean trace)
@@ -445,8 +476,17 @@ static void peer_acked(struct call_pdtp *d, guint64 pn, gint64 now)
 	}
 }
 
+static gboolean setup_ack_range(const struct call_pdtp *d, guint64 lo,
+				guint64 hi)
+{
+	for (guint i = 0; i < d->group_setup.sent; i++)
+		if (d->group_setup.pn[i] >= lo && d->group_setup.pn[i] <= hi)
+			return TRUE;
+	return FALSE;
+}
+
 static gboolean parse_ack(struct call_pdtp *d, const guint8 *p,
-			  const guint8 *end, gint64 now)
+			  const guint8 *end, gint64 now, gboolean *setup_acked)
 {
 	guint64 largest, reason, late = 0, delay, pairs;
 
@@ -458,7 +498,10 @@ static gboolean parse_ack(struct call_pdtp *d, const guint8 *p,
 		return FALSE;
 	guint64 pn = largest;
 
-	peer_acked(d, pn, now);
+	if (d->group)
+		*setup_acked = setup_ack_range(d, pn, pn);
+	else
+		peer_acked(d, pn, now);
 	for (guint64 i = 0; i < pairs; i++) {
 		guint64 gap, count;
 
@@ -466,20 +509,27 @@ static gboolean parse_ack(struct call_pdtp *d, const guint8 *p,
 		    !call_pdtp_read_varint(&p, end, &count) || gap + count > pn)
 			return FALSE;
 		pn -= gap;
-		for (guint64 j = 0; j < count; j++)
-			peer_acked(d, --pn, now);
+		if (d->group) {
+			if (count)
+				*setup_acked |=
+					setup_ack_range(d, pn - count, pn - 1);
+			pn -= count;
+		} else
+			for (guint64 j = 0; j < count; j++)
+				peer_acked(d, --pn, now);
 	}
 	if (d->trace && d->traced < 4000)
 		g_printerr("line-call pdtp ack largest=%" G_GUINT64_FORMAT
 			   " reason=%" G_GUINT64_FORMAT
 			   " ranges=%" G_GUINT64_FORMAT " inflight=%u\n",
 			   largest, reason, pairs, d->inflight->len);
-	return TRUE;
+	return !d->group || p == end;
 }
 
 /* Parses one element; returns FALSE if the packet is malformed. */
 static gboolean element(struct call_pdtp *d, guint type, const char *service,
-			const guint8 **pp, const guint8 *end, gint64 now)
+			const guint8 **pp, const guint8 *end, gint64 now,
+			gboolean *setup_acked)
 {
 	const guint8 *p = *pp;
 	guint64 stream = 0, a = 0, b = 0;
@@ -649,14 +699,17 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 	case PDTP_SET_MAX_ACK_DELAY:
 		if (!call_pdtp_read_varint(&p, end, &a))
 			return FALSE;
-		d->ack_delay_ms = CLAMP(a / 4, 5, 50);
+		/* Group D uses a 1 kHz clock. Keep our normal 25 ms target
+		 * unless the peer asks for a shorter maximum.
+		 */
+		d->ack_delay_ms = d->group ? MIN(a, 25) : CLAMP(a / 4, 5, 50);
 		break;
 	case PDTP_INCLUDE_RETRANS:
 		if (!call_pdtp_read_varint(&p, end, &a))
 			return FALSE;
 		break;
 	case PDTP_ACK:
-		if (!parse_ack(d, p, end, now))
+		if (!parse_ack(d, p, end, now, setup_acked))
 			return FALSE;
 		p = end;
 		break;
@@ -720,8 +773,10 @@ static gboolean parse_packet(struct call_pdtp *d, const guint8 *p, gsize n,
 	p = nul + 1;
 	guint mask = read16(p);
 
+	if (d->group && (mask & 0x8000))
+		return FALSE;
 	p += 2;
-	gboolean eliciting = FALSE;
+	gboolean eliciting = FALSE, setup_acked = FALSE;
 	gboolean presentation = (mask & 1) && !strcmp(service, "PLANET");
 
 	for (guint type = 15; type >= 1; type--) {
@@ -752,11 +807,18 @@ static gboolean parse_packet(struct call_pdtp *d, const guint8 *p, gsize n,
 		if (type != PDTP_ACK && type != PDTP_WINDOW_UPDATE)
 			eliciting = TRUE;
 		for (guint64 i = 0; i < count && p < group_end; i++)
-			if (!element(d, type, service, &p, group_end, now))
+			if (!element(d, type, service, &p, group_end, now,
+				     &setup_acked))
 				return FALSE;
 		/* Counted groups end after their last element, see above. */
 		if (!counted)
 			p = group_end;
+	}
+	if (d->group && p != end)
+		return FALSE;
+	if (setup_acked) {
+		d->group_setup.acknowledged = TRUE;
+		d->group_setup.due = G_MAXINT64;
 	}
 	note_packet(d, pn, now);
 	if (eliciting) {
@@ -792,10 +854,11 @@ gboolean call_pdtp_receive(struct call_pdtp *d, const guint8 *packet,
 		return FALSE;
 	if (d->trace && d->traced++ < 400)
 		trace_bytes("rx", buf + pos, plain - pos);
-	if (!parse_packet(d, buf + pos, plain - pos, read16(buf + 2), now) &&
-	    d->trace)
+	if (parse_packet(d, buf + pos, plain - pos, read16(buf + 2), now))
+		return TRUE;
+	if (d->trace)
 		trace_bytes("rx malformed", buf + pos, plain - pos);
-	return TRUE;
+	return !d->group;
 }
 
 /* ---- Sending ---- */
@@ -832,8 +895,9 @@ static gboolean emit(struct call_pdtp *d, struct builder *b, gint64 now,
 		     call_pdtp_send_fn send, gpointer data,
 		     struct sent_packet *record)
 {
-	guint8 packet[RTP_HEADER + PDTP_MTU + 64 + SRTP_MAX_TRAILER_LEN];
-	gsize pos = RTP_HEADER;
+	guint8 packet[GROUP_RTP_HEADER + PDTP_MTU + 64 + SRTP_MAX_TRAILER_LEN];
+	gsize rtp_header = d->group ? GROUP_RTP_HEADER : RTP_HEADER;
+	gsize pos = rtp_header;
 	guint mask = 0;
 	guint64 pn = d->next_pn++;
 	guint8 number[8];
@@ -870,13 +934,17 @@ static gboolean emit(struct call_pdtp *d, struct builder *b, gint64 now,
 	}
 	if (d->epoch < 0)
 		d->epoch = now;
-	packet[0] = 0x80;
+	packet[0] = d->group ? 0x90 : 0x80;
 	packet[1] = 0x80 | d->pt;
 	write16(packet + 2, (guint16)pn);
 	write32(packet + 4, d->ts_base + (guint32)((now - d->epoch) / 1000));
 	write32(packet + 8, d->tx_ssrc);
+	if (d->group) {
+		write16(packet + RTP_HEADER, GROUP_RTP_PROFILE);
+		write16(packet + RTP_HEADER + 2, 0);
+	}
 	if (d->trace && d->traced++ < 4000)
-		trace_bytes("tx", packet + RTP_HEADER, pos - RTP_HEADER);
+		trace_bytes("tx", packet + rtp_header, pos - rtp_header);
 	int n = pos;
 
 	if (srtp_protect(d->tx, packet, &n) != srtp_err_status_ok ||
@@ -896,6 +964,30 @@ static gboolean emit(struct call_pdtp *d, struct builder *b, gint64 now,
 	memset(b->len, 0, sizeof(b->len));
 	b->total = 0;
 	return TRUE;
+}
+
+static void send_group_setup(struct call_pdtp *d, gint64 now,
+			     call_pdtp_send_fn send, gpointer data)
+{
+	g_autofree struct builder *b = g_new0(struct builder, 1);
+	guint8 value[8];
+	gsize len = call_pdtp_varint(value, GROUP_MAX_ACK_DELAY_MS);
+	guint64 pn = d->next_pn;
+
+	add(b, PDTP_SET_MAX_ACK_DELAY, value, len);
+	if (d->group_setup.sent) {
+		/* Every retry identifies the first transmitted packet. */
+		len = call_pdtp_varint(value, d->group_setup.pn[0]);
+		add(b, PDTP_INCLUDE_RETRANS, value, len);
+	}
+	if (emit(d, b, now, send, data, NULL))
+		d->group_setup.pn[d->group_setup.sent++] = pn;
+	gint64 delay = MIN(d->rto << d->group_setup.attempts, 8000000);
+
+	if (++d->group_setup.attempts == GROUP_SETUP_ATTEMPTS)
+		d->group_setup.due = G_MAXINT64;
+	else
+		d->group_setup.due = now + delay;
 }
 
 static gboolean send_ack(struct call_pdtp *d, gint64 now,
@@ -984,7 +1076,8 @@ static gboolean send_windows(struct call_pdtp *d, gint64 now,
 gboolean call_pdtp_stream_open(struct call_pdtp *d, guint64 id,
 			       const char *service, guint flags)
 {
-	if (!d || tx_stream(d, id) || strlen(service) >= MAX_SERVICE)
+	if (!d || d->group || tx_stream(d, id) ||
+	    strlen(service) >= MAX_SERVICE)
 		return FALSE;
 	for (guint i = 0; i < MAX_STREAMS; i++) {
 		struct tx_stream *s = &d->tx_streams[i];
@@ -1314,12 +1407,15 @@ gint64 call_pdtp_poll(struct call_pdtp *d, gint64 now, call_pdtp_send_fn send,
 {
 	if (!d)
 		return G_MAXINT64;
+	if (d->group && d->group_setup.attempts < GROUP_SETUP_ATTEMPTS &&
+	    now >= d->group_setup.due)
+		send_group_setup(d, now, send, data);
 	detect_loss(d, now);
 	if (d->ack_pending && now >= d->ack_due)
 		send_ack(d, now, send, data);
 	send_windows(d, now, send, data);
 	send_streams(d, now, send, data);
-	gint64 next = G_MAXINT64;
+	gint64 next = d->group ? d->group_setup.due : G_MAXINT64;
 
 	if (d->ack_pending)
 		next = MIN(next, d->ack_due);

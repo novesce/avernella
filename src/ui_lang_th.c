@@ -3,6 +3,10 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Waiting for incoming media…", "กำลังรอเสียงหรือวิดีโอจากผู้ร่วมสาย…" },
+	{ "Waiting for playback…", "กำลังรอเริ่มเล่น…" },
+	{ "LINE sees this account in a call on another device. End that call before joining here.",
+	  "LINE ตรวจพบบัญชีนี้กำลังโทรอยู่บนอุปกรณ์อื่น โปรดวางสายบนอุปกรณ์นั้นก่อนเข้าร่วมจากเครื่องนี้" },
 	{ "%-m/%-d", "%-d/%-m" },
 	{ "%B %e, %Y", "%e %B %Y" },
 	{ "%Y/%-m/%-d", "%-d/%-m/%Y" },
@@ -571,6 +575,7 @@ static const char *const strings[][2] = {
 	{ "View invitation", "ดูคำเชิญ" },
 	{ "Wait %d seconds before signing in again.",
 	  "รอ %d วินาทีก่อนลงชื่อเข้าใช้อีกครั้ง" },
+	{ "Waiting for others to join", "กำลังรอให้คนอื่นเข้าร่วม" },
 	{ "Waiting for video…", "กำลังรอวิดีโอ…" },
 	{ "Welcome to Avernella", "ยินดีต้อนรับสู่ Avernella" },
 	{ "Welcome to the beginning of %s.", "ยินดีต้อนรับสู่จุดเริ่มต้นของ %s" },

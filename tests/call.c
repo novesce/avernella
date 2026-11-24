@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call.h"
 #include "call_audio.h"
+#include "call_group.h"
 #include "call_pdtp.h"
 #include "call_srtp.h"
 #include "call_schema.h"
@@ -21,6 +22,8 @@
 
 static const char self[] = "u11111111111111111111111111111111";
 static const char peer[] = "u22222222222222222222222222222222";
+static const char group[] = "c33333333333333333333333333333333";
+static const char other[] = "u44444444444444444444444444444444";
 static GAsyncQueue *events;
 static int server_fd, server_port, rpc_count;
 static EVP_PKEY *relay_key;
@@ -29,7 +32,8 @@ static gint playback_frames;
 static gint audio_devices;
 static gboolean bad_route, video_fixture, voice_fallback, migrate_media;
 static gboolean start_with_camera_off;
-static gboolean share_fixture;
+static gboolean share_fixture, group_fixture, camera_unavailable;
+static guint fixture_camera_width = 160;
 static gint cameras_opened;
 static gint peer_video_ready;
 static int test_camera_fd = -1, preview_fd = -1;
@@ -40,6 +44,55 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args, GError **e)
 	(void)e;
 	g_assert_cmpstr(s->mid, ==, self);
 	g_assert_cmpstr(path, ==, "/V4");
+	if (group_fixture) {
+		g_assert_cmpstr(strfield(args, "2:str"), ==, group);
+		J *reply = obj();
+
+		if (++rpc_count == 1) {
+			g_assert_cmpstr(method, ==, "getGroupCall");
+			json_object_object_add(reply, "1",
+					       json_object_new_boolean(TRUE));
+			json_object_object_add(reply, "2",
+					       json_object_new_string(group));
+			return reply;
+		}
+		g_assert_cmpint(rpc_count, ==, 2);
+		g_assert_cmpstr(method, ==, "acquireGroupCallRoute");
+		g_assert_cmpint(json_object_get_int(field(args, "3:i32")), ==,
+				video_fixture ? 2 : 1);
+		J *caps = field(args, "5:list:str");
+
+		g_assert_cmpuint(json_object_array_length(caps), ==,
+				 video_fixture ? 2 : 1);
+		if (video_fixture)
+			g_assert_cmpstr(
+				json_object_get_string(
+					json_object_array_get_idx(caps, 1)),
+				==, "VIDEO");
+		g_assert_false(json_object_get_boolean(field(args, "4:bool")));
+		g_autofree char *pub = g_base64_encode(relay_public, 33);
+		g_autofree char *config =
+			g_strdup_printf("{\"mpkey\":\"%s\"}", pub);
+		const char *const paths[] = {
+			"1",  "fixture-group-token",
+			"7",  "127.0.0.1",
+			"10", "zone-a",
+			"11", config,
+			"12", "127.0.0.1",
+			"14", "zone-b",
+			"15", "127.0.0.1",
+		};
+
+		for (size_t i = 0; i < G_N_ELEMENTS(paths); i += 2)
+			json_object_object_add(
+				reply, paths[i],
+				json_object_new_string(paths[i + 1]));
+		json_object_object_add(reply, "8",
+				       json_object_new_int(server_port));
+		json_object_object_add(reply, "13",
+				       json_object_new_int(server_port));
+		return reply;
+	}
 	g_assert_cmpstr(method, ==, "acquireCallRoute");
 	g_assert_cmpstr(strfield(args, "2:str"), ==, peer);
 	g_assert_cmpint(json_object_get_int(field(args, "3:i32")), ==,
@@ -79,10 +132,25 @@ void line_emit(J *event)
 {
 	const char *type = strfield(event, "event");
 
-	g_assert_cmpstr(strfield(event, "chat"), ==, peer);
+	g_assert_cmpstr(strfield(event, "chat"), ==,
+			group_fixture ? group : peer);
 	if (!g_strcmp0(type, "call_incoming"))
 		line_event(type, "chat", peer);
-	else if (!g_strcmp0(type, "call_share")) {
+	else if (!g_strcmp0(type, "call_reception")) {
+		g_assert_true(group_fixture);
+		int stage = json_object_get_int(field(event, "stage"));
+
+		g_assert_true(stage == LINE_MEDIA_RECEIVING ||
+			      stage == LINE_MEDIA_PLAYABLE);
+		line_event(type, "stage",
+			   stage == LINE_MEDIA_RECEIVING ? "receiving" :
+							   "playable");
+	} else if (!g_strcmp0(type, "call_video_peer")) {
+		g_assert_true(group_fixture && video_fixture);
+		g_assert_cmpint(
+			json_object_get_int64(field(event, "changedAt")), >, 0);
+		line_event(type, "id", strfield(event, "id"));
+	} else if (!g_strcmp0(type, "call_share")) {
 		gboolean sharing =
 			json_object_get_boolean(field(event, "selfSharing"));
 
@@ -101,7 +169,11 @@ void line_emit(J *event)
 						field(event, "cameraEnabled")),
 					==,
 					video_fixture && !voice_fallback &&
-						!start_with_camera_off);
+						!start_with_camera_off &&
+						!camera_unavailable);
+			if (camera_unavailable)
+				g_assert_cmpstr(strfield(event, "message"), ==,
+						"The test camera is busy.");
 			if (voice_fallback)
 				g_assert_nonnull(strfield(event, "message"));
 		}
@@ -125,6 +197,11 @@ struct line_camera *line_camera_open(unsigned int max_width,
 
 	g_assert_true(video_fixture);
 	g_assert_false(voice_fallback);
+	if (camera_unavailable) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "The test camera is busy.");
+		return NULL;
+	}
 	test_camera_fd =
 		timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	g_assert_cmpint(test_camera_fd, >=, 0);
@@ -148,9 +225,9 @@ int line_camera_fd(const struct line_camera *camera)
 	return test_camera_fd;
 }
 
-static void synthetic_frame(struct line_camera_frame *frame)
+static void synthetic_frame(struct line_camera_frame *frame, guint width)
 {
-	static guint8 y[160 * 120], u[80 * 60], v[80 * 60];
+	static guint8 y[640 * 480], u[320 * 240], v[320 * 240];
 
 	static gsize initialized;
 
@@ -161,10 +238,10 @@ static void synthetic_frame(struct line_camera_frame *frame)
 		g_once_init_leave(&initialized, 1);
 	}
 	*frame = (struct line_camera_frame){
-		.width = 160,
-		.height = 120,
+		.width = width,
+		.height = width * 3 / 4,
 		.plane = { y, u, v },
-		.stride = { 160, 80, 80 },
+		.stride = { width, width / 2, width / 2 },
 	};
 }
 
@@ -178,7 +255,7 @@ int line_camera_read(struct line_camera *camera,
 	if (read(test_camera_fd, &n, sizeof(n)) != sizeof(n) ||
 	    !g_atomic_int_get(&peer_video_ready))
 		return 0;
-	synthetic_frame(frame);
+	synthetic_frame(frame, fixture_camera_width);
 	return 1;
 }
 
@@ -355,6 +432,7 @@ static void init_server(CallWire *w, const guint8 client_pub[33])
 struct fake_relay {
 	CallWire wire;
 	CallInfo info;
+	Pb camera_start;
 	struct sockaddr_in remote;
 	socklen_t remote_len;
 };
@@ -497,7 +575,9 @@ static void send_audio(int fd, const struct sockaddr_in *client, srtp_t ctx,
 		opus_encoder_create(48000, 1, OPUS_APPLICATION_VOIP, &rc);
 	guint8 packet[2048] = { 0x80, pt, seq >> 8, seq };
 	guint32 id = htonl(ssrc);
+	guint32 stamp = htonl((guint32)seq * 960);
 
+	memcpy(packet + 4, &stamp, sizeof(stamp));
 	memcpy(packet + 8, &id, sizeof(id));
 	g_assert_cmpint(rc, ==, OPUS_OK);
 	opus_int16 tone[960];
@@ -525,6 +605,581 @@ static void expect_playback(int before)
 	       g_get_monotonic_time() < end)
 		g_usleep(1000);
 	g_assert_cmpint(g_atomic_int_get(&playback_frames), >, before);
+}
+
+/* Exercise the relay's media channel before testing the user's microphone. */
+static void group_audio_control(struct fake_relay *r, guint choice,
+				guint action, guint32 rx, guint32 tx)
+{
+	guint8 control[24] = {
+		[1] = 1, [5] = 16, [9] = action, [11] = 1, [15] = 1
+	};
+	guint32 id = htonl(tx);
+	Pb request = { 0 }, plain = { 0 }, wire = { 0 };
+	guint msg = choice == 9			  ? 0x3185 :
+		    choice == 11		  ? 0x3186 :
+		    choice == CALL_GROUP_STRM_REQ ? CALL_GROUP_STRM_REQ_ID :
+						    0x3189;
+
+	memcpy(control + 20, &id, sizeof(id));
+	if (choice == CALL_GROUP_STRM_REQ)
+		call_group_stream_request(&request, self, tx, 0, TRUE, 1);
+	if (choice == CALL_GROUP_DATA_REQ) {
+		pb_uint(&request, 3, 2);
+		pb_bytes(&request, 4, (Slice){ control, sizeof(control) });
+	}
+	g_assert_true(call_envelope(&plain, &r->info, 4, choice, msg, &request,
+				    (Slice){ 0 }));
+	Slice transaction = pb_data(pb_data(PB_SLICE(plain), 1), 4);
+
+	g_assert_true(call_wire_pack(&r->wire, &plain, FALSE, FALSE, &wire));
+	g_assert_cmpint(sendto(server_fd, wire.p, wire.n, 0,
+			       (const void *)&r->remote, r->remote_len),
+			==, (ssize_t)wire.n);
+	gint64 deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+
+	while (readable_until(server_fd, deadline)) {
+		Pb packet = receive_packet(r), reply = { 0 };
+
+		if (!call_wire_open(&r->wire, PB_SLICE(packet), &reply))
+			continue;
+		Slice scope = pb_data(PB_SLICE(reply), 4);
+		Slice body = pb_data(pb_data(scope, 2), choice + 1);
+		Slice hdr = pb_data(PB_SLICE(reply), 1);
+		Slice echoed = pb_data(hdr, 4);
+
+		if (!body.n || echoed.n != transaction.n ||
+		    memcmp(echoed.p, transaction.p, echoed.n))
+			continue;
+		g_assert_cmpuint(pb_number(hdr, 2, 0), ==, msg + 0x100);
+		if (choice == CALL_GROUP_STRM_REQ) {
+			g_assert_cmpuint(pb_number(body, 1, 1), ==, 0);
+			g_assert_cmpuint(pb_number(body, 2, 1), ==, 0);
+			g_assert_null(pb_data(body, 4).p);
+		} else if (choice == CALL_GROUP_DATA_REQ) {
+			Slice ack = pb_data(body, 5);
+
+			g_assert_cmpmem(ack.p, ack.n, control, sizeof(control));
+		} else {
+			Slice spec = pb_data(body, 17);
+
+			g_assert_cmpuint(pb_number(pb_data(spec, 1), 1, 0), ==,
+					 rx);
+			g_assert_cmpuint(pb_number(pb_data(spec, 6), 1, 0), ==,
+					 tx);
+		}
+		return;
+	}
+	g_error("No group audio control reply for %u", msg);
+}
+
+static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
+				 const guint8 *remote, guint8 pt,
+				 guint32 tx_ssrc, gboolean trial,
+				 guint32 accepted_ssrc,
+				 enum call_video_rtp_extension format);
+static void expect_camera_control(struct fake_relay *relay, guint action,
+				  guint32 tx_ssrc, gboolean expect_report);
+
+static void assert_tx_paused(Slice report, guint32 ssrc, gboolean paused)
+{
+	PbField stream;
+
+	g_assert_cmpuint(report.n, >=, 8);
+	g_assert_cmpuint(report.p[1], ==, 2);
+	guint length = report.p[4] * 256u + report.p[5];
+
+	g_assert_cmpuint(length, <=, report.n - 8);
+	Slice spec = { report.p + 8, length };
+
+	while (spec.n) {
+		g_assert_true(pb_next(&spec, &stream));
+		if (stream.field == 6 && pb_number(stream.data, 1, 0) == ssrc) {
+			g_assert_cmpuint(pb_number(pb_data(stream.data, 2), 1,
+						   2),
+					 ==, paused);
+			return;
+		}
+	}
+	g_error("No transmit state for the fixture source");
+}
+
+/* A group relay sends data control independently of microphone activity.
+ * Check both feedback transports over the call's actual UDP socket. */
+static void group_data_exchange(struct fake_relay *r, const guint8 *local,
+				const guint8 *remote, guint8 pt,
+				guint32 rx_ssrc, guint32 tx_ssrc)
+{
+	static const guint8 open[] = { 0x80, 0,	   'L',	 'I',  'N',  'E',
+				       0,    0x02, 0x08, 2,    0x40, 0xc8,
+				       5,    1,	   0x40, 0x6e, 0x12, 0 };
+	guint8 tx[30], rx[30], packet[2048] = { 0x90, 0x80 | pt, 0, 42 };
+	guint32 source = htonl(rx_ssrc);
+	gboolean ack = FALSE, feedback = FALSE;
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+	int n = 16 + sizeof(open);
+
+	call_group_media_key("DATA", local, rx);
+	call_group_media_key("DATA", remote, tx);
+	srtp_t relay_tx = peer_context(tx, TRUE),
+	       relay_rx = peer_context(rx, FALSE);
+
+	memcpy(packet + 8, &source, 4);
+	packet[12] = 2;
+	packet[13] = 0x40;
+	memcpy(packet + 16, open, sizeof(open));
+	g_assert_cmpint(srtp_protect(relay_tx, packet, &n), ==,
+			srtp_err_status_ok);
+	g_assert_cmpint(sendto(server_fd, packet, n, 0,
+			       (const void *)&r->remote, r->remote_len),
+			==, n);
+	while ((!ack || !feedback) && readable_until(server_fd, end)) {
+		n = recv(server_fd, packet, sizeof(packet), 0);
+		if (n >= 32 && packet[0] == 0x8b && packet[1] == 205) {
+			g_assert_cmpmem(packet + 4, 8,
+					"\x00\x00\x00\x51\x00\x00\x00\x51", 8);
+			int off = 20;
+
+			while (off + 8 <= n) {
+				guint count = (packet[off + 4] << 8) |
+					      packet[off + 5];
+				guint16 first = (packet[off + 6] << 8) |
+						packet[off + 7];
+				guint32 id;
+				memcpy(&id, packet + off, 4);
+				off += 8;
+				for (guint j = 0; j < count; j++) {
+					g_assert_cmpint(off, <, n);
+					if (id == source &&
+					    (guint16)(first + j) == 42 &&
+					    !(packet[off] & 1))
+						feedback = TRUE;
+					off += 1 + !!(packet[off] & 2);
+				}
+				off = (off + 3) & ~3;
+			}
+		} else if (n >= 26 && packet[0] == 0x90 &&
+			   (packet[1] & 127) == pt) {
+			guint32 id;
+
+			g_assert_cmpint(srtp_unprotect(relay_rx, packet, &n),
+					==, srtp_err_status_ok);
+			memcpy(&id, packet + 8, 4);
+			g_assert_cmpuint(ntohl(id), ==, tx_ssrc);
+			g_assert_cmpint(n, >=, 21);
+			g_assert_cmpmem(packet + 12, 4, "\x02\x40\x00\x00", 4);
+			/* Other reliable D-channel packets can precede our ACK. */
+			if (packet[19] != 0x40 || packet[20] != 0)
+				continue;
+			g_assert_cmpint(n, >=, 26);
+			g_assert_cmpint(packet[22], ==, 42);
+			ack = TRUE;
+		}
+	}
+	g_assert_true(ack);
+	g_assert_true(feedback);
+	srtp_dealloc(relay_tx);
+	srtp_dealloc(relay_rx);
+}
+
+static Pb expect_group_release(struct fake_relay *relay, guint media)
+{
+	gint64 end = g_get_monotonic_time() + G_USEC_PER_SEC;
+
+	while (readable_until(server_fd, end)) {
+		guint8 packet[2048];
+		int n = recv(server_fd, packet, sizeof(packet), 0);
+		Pb decoded = { 0 };
+
+		if (n <= 0 || !call_wire_open(&relay->wire,
+					      (Slice){ packet, n }, &decoded))
+			continue;
+		Slice plain = PB_SLICE(decoded), cc = pb_data(plain, 3);
+		Slice release = pb_data(pb_data(cc, 2), 7);
+
+		if (!release.p)
+			continue;
+		Slice releaser = pb_data(release, 3);
+
+		g_assert_cmpuint(pb_number(pb_data(plain, 1), 2, 0), ==,
+				 0x2145);
+		g_assert_cmpuint(pb_number(release, 1, 0), ==, 1);
+		g_assert_cmpmem(releaser.p, releaser.n, "participant", 11);
+		g_assert_cmpuint(pb_number(release, 4, 0), ==, media);
+		g_assert_cmpuint(pb_number(release, 6, 1), ==, 0);
+		g_assert_cmpuint(pb_number(release, 51, 1), ==, 0);
+		return decoded;
+	}
+	g_error("Fixture relay did not receive the group release request");
+}
+
+static void group_release_ack(struct fake_relay *relay, Slice request,
+			      guint result, guint release)
+{
+	Pb body = { 0 }, plain = { 0 }, wire = { 0 };
+
+	pb_uint(&body, 1, result);
+	if (release)
+		pb_uint(&body, 2, release);
+	g_assert_true(call_envelope(&plain, &relay->info, 3, 8, 0x2245, &body,
+				    request));
+	g_assert_true(
+		call_wire_pack(&relay->wire, &plain, FALSE, FALSE, &wire));
+	g_assert_cmpint(sendto(server_fd, wire.p, wire.n, 0,
+			       (void *)&relay->remote, relay->remote_len),
+			==, (int)wire.n);
+}
+
+static void group_call(gconstpointer args)
+{
+	guint mode = GPOINTER_TO_UINT(args);
+
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 10000000, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	enum {
+		RX_SSRC = 501,
+		TX_SSRC = 601,
+		RTP_PT = 110
+	};
+	Line session = { .mid = (char *)self };
+	struct fake_relay relay = { 0 };
+	g_autoptr(GError) error = NULL;
+
+	g_assert_true(line_group_voice_enabled());
+	g_setenv("LINE_EXPERIMENTAL_GROUP_CALLS", "0", TRUE);
+	g_assert_false(line_group_voice_enabled());
+	g_assert_null(line_call_start(&session, group, FALSE, &error));
+	g_assert_cmpint(rpc_count, ==, 0);
+	g_clear_error(&error);
+	g_unsetenv("LINE_EXPERIMENTAL_GROUP_CALLS");
+	g_unsetenv("LINE_EXPERIMENTAL_VIDEO");
+	g_setenv("LINE_EXPERIMENTAL_GROUP_VIDEO", "0", TRUE);
+	g_assert_false(line_group_video_enabled());
+	g_assert_null(line_call_start(&session, group, TRUE, &error));
+	g_assert_cmpint(rpc_count, ==, 0);
+	g_clear_error(&error);
+	g_unsetenv("LINE_EXPERIMENTAL_GROUP_VIDEO");
+	g_assert_true(line_group_video_enabled());
+	group_fixture = TRUE;
+	gboolean trial = mode == 3 || mode == 4;
+	enum call_video_rtp_extension format = CALL_VIDEO_RTP_EXT_NONE;
+	guint map = CALL_GROUP_VIDEO_VP8;
+	if (mode == 8) {
+		format = CALL_VIDEO_RTP_EXT_VED;
+		map = CALL_GROUP_VIDEO_SVC;
+	} else if (mode == 9) {
+		format = CALL_VIDEO_RTP_EXT_VFD;
+		map = CALL_GROUP_VIDEO_SVC_SW;
+	}
+	video_fixture = mode != 0 && mode != 3;
+	voice_fallback = mode == 2;
+	camera_unavailable = mode == 6;
+	fixture_camera_width = mode == 8 ? 640 : 160;
+	if (trial)
+		g_setenv("LINE_EXPERIMENTAL_GROUP_UPLINK", "1", TRUE);
+	else
+		g_unsetenv("LINE_EXPERIMENTAL_GROUP_UPLINK");
+	setup_server();
+	g_autoptr(J) started =
+		line_call_start(&session, group, video_fixture, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(started, "state"), ==, "connecting");
+	g_assert_cmpint(rpc_count, ==, 2);
+	Pb wire = receive_packet(&relay), plain = { 0 };
+
+	init_server(&relay.wire, wire.p + 24);
+	g_assert_true(call_wire_open(&relay.wire, PB_SLICE(wire), &plain));
+	Slice header = pb_data(PB_SLICE(plain), 1);
+	Slice scope = pb_data(PB_SLICE(plain), 3);
+	Slice chan = pb_data(scope, 1), cid = pb_data(chan, 1);
+	Slice req = pb_data(pb_data(scope, 2), CALL_GROUP_PARTICIPATE_REQ);
+	Slice offer = pb_data(req, 11);
+	Slice local_key = pb_data(pb_data(pb_data(offer, 2), 2), 1);
+
+	g_assert_cmpuint(pb_number(header, 2, 0), ==,
+			 CALL_GROUP_PARTICIPATE_ID);
+	g_assert_cmpuint(pb_number(req, 9, 0), ==, video_fixture ? 3 : 1);
+	g_assert_cmpuint(local_key.n, ==, 30);
+	g_assert_false(audio_active);
+	relay.info.cid = g_strndup((const char *)cid.p, cid.n);
+	relay.info.local = (char *)peer;
+	relay.info.local_channel = 101;
+	relay.info.local_media = 102;
+	relay.info.remote_channel = pb_number(chan, 2, 0);
+	relay.info.remote_nonce = pb_number(header, 6, 0);
+	relay.info.nonce = 103;
+	relay.info.have_session = TRUE;
+	memset(relay.info.session, 0xaf, sizeof(relay.info.session));
+
+	Pb provisional = { 0 };
+	emit_peer(&relay, CALL_GROUP_PARTICIPATE_RSP, 0x224e, &provisional,
+		  TRUE);
+	g_assert_false(
+		readable_until(server_fd, g_get_monotonic_time() + 40000));
+	g_assert_false(audio_active);
+	if (mode == 5) {
+		Pb refusal = { 0 };
+
+		pb_uint(&refusal, 1, 1);
+		pb_uint(&refusal, 2, 6);
+		emit_peer(&relay, CALL_GROUP_PARTICIPATE_RSP, 0x224e, &refusal,
+			  FALSE);
+		expect_event(
+			"call_error LINE sees this account in a call on another device. End that call before joining here.");
+		expect_event("call ended");
+		line_voice_close();
+		g_assert_false(audio_active);
+		g_assert_cmpint(cameras_opened, ==, 0);
+		g_free(relay.info.cid);
+		EVP_PKEY_free(relay_key);
+		close(server_fd);
+		return;
+	}
+	static const guint8 remote_key[30] = { 1, 7, 12 };
+	Pb response = { 0 }, desc = { 0 }, security = { 0 }, secret = { 0 };
+	const char *const labels[] = { "A", "V", "D" };
+
+	for (guint i = 0; i < G_N_ELEMENTS(labels); i++) {
+		Pb stream = { 0 }, codec = { 0 }, path = { 0 };
+
+		pb_text(&codec, 1, labels[i]);
+		if (!video_fixture && i == 0) {
+			Pb recv = { 0 }, send = { 0 }, feature = { 0 };
+
+			pb_uint(&recv, 1, 67);
+			pb_uint(&recv, 2, 0x51);
+			pb_uint(&send, 1, 67);
+			pb_uint(&send, 2, 0x52);
+			pb_msg(&path, 12, &recv);
+			pb_msg(&path, 62, &send);
+			pb_uint(&feature, 1, 0);
+			pb_uint(&feature, 2, 3);
+			pb_msg(&desc, 3, &feature);
+		}
+		if (i == 2) {
+			pb_uint(&codec, 2, 3);
+			pb_uint(&codec, 3, !voice_fallback);
+			pb_uint(&codec, 50, 6);
+		}
+		if (i == 1 && video_fixture && !voice_fallback) {
+			Pb version = { 0 };
+
+			pb_uint(&codec, 2, 3);
+			pb_uint(&codec, 3, 1);
+			pb_uint(&codec, 4, 4000);
+			pb_uint(&codec, 5, 30);
+			pb_uint(&codec, 6, 3);
+			pb_uint(&codec, 50, map);
+			if (format != CALL_VIDEO_RTP_EXT_NONE) {
+				Pb vp8 = { 0 };
+
+				pb_uint(&vp8, 1, 0);
+				pb_uint(&vp8, 2,
+					format == CALL_VIDEO_RTP_EXT_VED ? 2 :
+									   1);
+				pb_msg(&stream, 51, &vp8);
+			}
+			pb_uint(&version, 1, 2);
+			pb_uint(&version, 2, 1);
+			if (mode != 7 && mode != 9)
+				pb_msg(&stream, 51, &version);
+		}
+		pb_uint(&path, 1, RTP_PT + i);
+		pb_uint(&path, 11, RX_SSRC + i);
+		pb_uint(&path, 61, TX_SSRC + i);
+		pb_msg(&stream, 1, &codec);
+		pb_msg(&stream, 2, &path);
+		pb_msg(&desc, 1, &stream);
+	}
+	pb_bytes(&secret, 1, (Slice){ remote_key, sizeof(remote_key) });
+	pb_msg(&security, 2, &secret);
+	pb_msg(&desc, 2, &security);
+	pb_uint(&response, 1, 0);
+	pb_msg(&response, 6, &desc);
+	pb_uint(&response, 7, relay.info.local_media);
+	pb_uint(&response, 102, 5);
+	emit_peer(&relay, CALL_GROUP_PARTICIPATE_RSP, 0x224e, &response, FALSE);
+	expect_event("call connected");
+	g_assert_true(audio_active);
+
+	Pb registration = receive_packet(&relay), control = { 0 };
+
+	g_assert_true(
+		call_wire_open(&relay.wire, PB_SLICE(registration), &control));
+	Slice media = pb_data(PB_SLICE(control), 4);
+	Slice media_channel = pb_data(media, 1);
+	Slice registration_body =
+		pb_data(pb_data(media, 2), CALL_GROUP_DATA_REQ);
+
+	g_assert_cmpuint(pb_number(media_channel, 3, 0), ==,
+			 relay.info.local_media);
+	g_assert_nonnull(registration_body.p);
+	Slice initial_report = pb_data(registration_body, 4);
+	gboolean camera_running = video_fixture && !voice_fallback &&
+				  !camera_unavailable;
+
+	assert_tx_paused(initial_report, TX_SSRC, FALSE);
+	assert_tx_paused(initial_report, TX_SSRC + 1, !camera_running);
+	relay.info.remote_media = pb_number(media_channel, 2, 0);
+	if (camera_running)
+		expect_camera_control(&relay, 1, TX_SSRC + 1, FALSE);
+	group_audio_control(&relay, 9, 0, RX_SSRC, TX_SSRC);
+	group_audio_control(&relay, 11, 0, RX_SSRC, TX_SSRC);
+	group_audio_control(&relay, CALL_GROUP_STRM_REQ, 1, RX_SSRC, TX_SSRC);
+	group_audio_control(&relay, CALL_GROUP_DATA_REQ, 1, RX_SSRC, TX_SSRC);
+	group_audio_control(&relay, CALL_GROUP_DATA_REQ, 4, RX_SSRC, TX_SSRC);
+	Pb query = { 0 }, query_plain = { 0 }, query_wire = { 0 };
+
+	pb_uint(&query, 3, 2);
+	g_assert_true(call_envelope(&query_plain, &relay.info, 4,
+				    CALL_GROUP_DATA_REQ, CALL_GROUP_DATA_ID,
+				    &query, (Slice){ 0 }));
+	g_assert_true(call_wire_pack(&relay.wire, &query_plain, FALSE, FALSE,
+				     &query_wire));
+	g_assert_cmpint(sendto(server_fd, query_wire.p, query_wire.n, 0,
+			       (void *)&relay.remote, relay.remote_len),
+			==, (int)query_wire.n);
+
+	guint8 tx[30], rx[30], packet[2048];
+	call_group_media_key("AUDIO", local_key.p, tx);
+	call_group_media_key("AUDIO", remote_key, rx);
+	srtp_t sink = peer_context(tx, FALSE), source = peer_context(rx, TRUE);
+	gboolean heard = FALSE, acknowledged = FALSE;
+	gint64 end = g_get_monotonic_time() + 2000000;
+
+	while ((!heard || !acknowledged) && readable_until(server_fd, end)) {
+		int n = recv(server_fd, packet, sizeof(packet), 0);
+
+		if (n <= 24)
+			continue;
+		if (packet[0] != 0x90 || (packet[1] & 127) != RTP_PT) {
+			Pb decoded = { 0 };
+
+			if (!call_wire_open(&relay.wire, (Slice){ packet, n },
+					    &decoded))
+				continue;
+			Slice mc = pb_data(PB_SLICE(decoded), 4);
+			Slice ack =
+				pb_data(pb_data(mc, 2), CALL_GROUP_DATA_RSP);
+
+			if (ack.p) {
+				g_assert_cmpuint(pb_number(ack, 1, 1), ==, 0);
+				g_assert_cmpuint(pb_number(ack, 4, 0), ==, 2);
+				acknowledged = TRUE;
+			}
+			continue;
+		}
+		g_assert_cmpint(srtp_unprotect(sink, packet, &n), ==,
+				srtp_err_status_ok);
+		guint32 ssrc;
+
+		memcpy(&ssrc, packet + 8, sizeof(ssrc));
+		g_assert_cmpuint(ntohl(ssrc), ==, TX_SSRC);
+		g_assert_cmpuint(packet[25] & 3, ==, 3);
+		heard = TRUE;
+	}
+	g_assert_true(heard);
+	g_assert_true(acknowledged);
+	int before = g_atomic_int_get(&playback_frames);
+
+	if (!mode) {
+		/* This packet authenticates but carries no decodable EAS2 frame. */
+		guint8 empty[64] = { 0x80, RTP_PT };
+		guint32 id = htonl(RX_SSRC);
+		int size = 13;
+
+		memcpy(empty + 8, &id, sizeof(id));
+		g_assert_cmpint(srtp_protect(source, empty, &size), ==,
+				srtp_err_status_ok);
+		g_assert_cmpint(sendto(server_fd, empty, size, 0,
+				       (const void *)&relay.remote,
+				       relay.remote_len),
+				==, size);
+		expect_event("call_reception receiving");
+		g_assert_cmpint(g_atomic_int_get(&playback_frames), ==, before);
+	}
+	send_audio(server_fd, &relay.remote, source, RTP_PT, RX_SSRC, 1, FALSE);
+	expect_playback(before);
+	expect_event("call_reception playable");
+	int mixer = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	g_assert_cmpint(mixer, >=, 0);
+	before = g_atomic_int_get(&playback_frames);
+	send_audio(mixer, &relay.remote, source, RTP_PT, RX_SSRC, 2, TRUE);
+	g_assert_false(readable_until(mixer, g_get_monotonic_time() + 60000));
+	g_assert_cmpint(g_atomic_int_get(&playback_frames), ==, before);
+	send_audio(mixer, &relay.remote, source, RTP_PT, RX_SSRC, 3, FALSE);
+	expect_playback(before);
+	g_assert_false(readable_until(mixer, g_get_monotonic_time() + 60000));
+	close(mixer);
+	if (!video_fixture)
+		group_data_exchange(&relay, local_key.p, remote_key, RTP_PT + 2,
+				    RX_SSRC + 2, TX_SSRC + 2);
+	if (video_fixture && !voice_fallback && !camera_unavailable)
+		group_video_exchange(&relay, local_key.p, remote_key,
+				     RTP_PT + 1, TX_SSRC + 1, trial,
+				     mode == 7 ? RX_SSRC + 1 : TX_SSRC + 1,
+				     format);
+	g_autoptr(J) muted = line_voice_mute(TRUE, &error);
+	g_assert_no_error(error);
+	g_assert_true(json_object_get_boolean(field(muted, "muted")));
+	g_assert_null(line_call_share(TRUE, &error));
+	g_clear_error(&error);
+	gint64 leaving = g_get_monotonic_time();
+	g_autoptr(J) left = line_voice_hangup(&error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(left, "state"), ==, "ended");
+	expect_event("call ended");
+	g_assert_false(audio_active);
+	guint media_mask = 1;
+
+	if (!voice_fallback)
+		media_mask |= 4 | (video_fixture ? 2 : 0);
+	Pb request = expect_group_release(&relay, media_mask);
+	Slice release_header = pb_data(PB_SLICE(request), 1);
+
+	if (mode == 0) {
+		/* An authenticated response for another transaction must not end this one. */
+		Slice txn = pb_data(release_header, 4);
+		guint8 other[16];
+		Pb wrong = { 0 };
+
+		g_assert_cmpuint(txn.n, ==, sizeof(other));
+		memcpy(other, txn.p, sizeof(other));
+		other[0] ^= 1;
+		pb_bytes(&wrong, 4, (Slice){ other, sizeof(other) });
+		pb_uint(&wrong, 5, pb_number(release_header, 5, 0));
+		send_audio(server_fd, &relay.remote, source, RTP_PT, RX_SSRC, 4,
+			   FALSE);
+		group_release_ack(&relay, PB_SLICE(wrong), 0, 0);
+		group_release_ack(&relay, release_header, 1, 0);
+		group_release_ack(&relay, release_header, 0, 1);
+		Pb retry = expect_group_release(&relay, media_mask);
+
+		g_assert_cmpmem(request.p, request.n, retry.p, retry.n);
+	}
+	g_assert_cmpint(g_get_monotonic_time() - leaving, <, G_USEC_PER_SEC);
+	if (mode != 2)
+		group_release_ack(&relay, release_header, 0, 0);
+	line_voice_close();
+	gint64 elapsed = g_get_monotonic_time() - leaving;
+
+	if (mode == 2) {
+		/* The local devices were closed before the unreachable relay timed out. */
+		g_assert_cmpint(elapsed, >=, 1900000);
+		g_assert_cmpint(elapsed, <, 2700000);
+	} else {
+		g_assert_cmpint(elapsed, <, 1400000);
+	}
+	srtp_dealloc(sink);
+	srtp_dealloc(source);
+	g_free(relay.info.cid);
+	EVP_PKEY_free(relay_key);
+	close(server_fd);
 }
 
 static void media_exchange(int media_fd, const struct sockaddr_in *client,
@@ -572,6 +1227,7 @@ static void media_exchange(int media_fd, const struct sockaddr_in *client,
 struct video_peer {
 	int fd;
 	const struct sockaddr_in *client;
+	guint expected_width;
 	gboolean got_frame;
 };
 
@@ -588,9 +1244,409 @@ static void peer_display(const struct line_camera_frame *frame, gpointer data)
 {
 	struct video_peer *endpoint = data;
 
-	g_assert_cmpuint(frame->width, ==, 160);
-	g_assert_cmpuint(frame->height, ==, 120);
+	guint width = endpoint->expected_width ? endpoint->expected_width :
+						 fixture_camera_width;
+
+	g_assert_cmpuint(frame->width, ==, width);
+	g_assert_cmpuint(frame->height, ==, width * 3 / 4);
 	endpoint->got_frame = TRUE;
+}
+
+static void fixture_video_member(Pb *presence, const char *mid, guint32 ssrc)
+{
+	Pb member = { 0 }, source = { 0 };
+
+	pb_text(&member, 1, mid);
+	pb_uint(&member, 2, 3);
+	pb_uint(&member, 3, 1);
+	pb_text(&source, 1, "V");
+	pb_uint(&source, 2, ssrc);
+	pb_msg(&member, 10, &source);
+	pb_msg(presence, 50, &member);
+}
+
+static void expect_subscription(struct fake_relay *relay, guint32 ssrc,
+				gboolean start)
+{
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+
+	while (readable_until(server_fd, end)) {
+		Pb packet = receive_packet(relay), control = { 0 };
+
+		if (!call_wire_open(&relay->wire, PB_SLICE(packet), &control))
+			continue;
+		Slice media = pb_data(PB_SLICE(control), 4);
+		Slice request = pb_data(pb_data(media, 2), CALL_GROUP_STRM_REQ);
+		Slice stream = pb_data(request, 1);
+
+		if (!stream.p)
+			continue;
+		g_assert_cmpuint(pb_number(stream, 1, 0), ==, start);
+		g_assert_cmpuint(pb_number(stream, 3, 0), ==, ssrc);
+		g_assert_cmpuint(pb_number(stream, 7, 0), ==, 0);
+		if (start) {
+			Pb reply = { 0 }, state = { 0 }, plain = { 0 };
+			Slice header = pb_data(PB_SLICE(control), 1);
+
+			pb_uint(&state, 1, CALL_GROUP_STREAM_RESUME);
+			pb_uint(&state, 3, ssrc);
+			pb_uint(&reply, 1, 0);
+			pb_msg(&reply, 4, &state);
+			g_assert_true(call_envelope(&plain, &relay->info, 4,
+						    CALL_GROUP_STRM_RSP, 0x328d,
+						    &reply, header));
+			g_assert_true(call_wire_pack(&relay->wire, &plain,
+						     FALSE, FALSE, &packet));
+			g_assert_cmpint(sendto(server_fd, packet.p, packet.n, 0,
+					       (const void *)&relay->remote,
+					       relay->remote_len),
+					==, (ssize_t)packet.n);
+		}
+		return;
+	}
+	g_error("No subscription request for the fixture camera");
+}
+
+static void expect_camera_control(struct fake_relay *relay, guint action,
+				  guint32 tx_ssrc, gboolean expect_report)
+{
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+	gboolean reported = FALSE;
+
+	while (readable_until(server_fd, end)) {
+		Pb packet = receive_packet(relay), control = { 0 };
+
+		if (!call_wire_open(&relay->wire, PB_SLICE(packet), &control))
+			continue;
+		Slice media = pb_data(PB_SLICE(control), 4);
+		Slice request = pb_data(pb_data(media, 2), CALL_GROUP_DATA_REQ);
+		Slice frame = pb_data(request, 4);
+
+		if (frame.n >= 8 && frame.p[1] == 2) {
+			g_assert_true(expect_report);
+			g_assert_false(reported);
+			assert_tx_paused(frame, tx_ssrc, action != 1);
+			reported = TRUE;
+			continue;
+		}
+		if (frame.n < 28 || frame.p[1] != 1)
+			continue;
+		guint32 source;
+
+		memcpy(&source, frame.p + 24, sizeof(source));
+		g_assert_cmpuint(frame.p[9], ==, action);
+		g_assert_cmpuint(frame.p[15], ==, 2);
+		g_assert_cmpuint(ntohl(source), ==, tx_ssrc);
+		g_assert_cmpint(reported, ==, expect_report);
+		if (action == 1) {
+			Slice header = pb_data(PB_SLICE(control), 1);
+
+			memcpy(relay->camera_start.p, header.p, header.n);
+			relay->camera_start.n = header.n;
+		}
+		return;
+	}
+	g_error("No stream control request for the local camera");
+}
+
+static gboolean group_camera_keyframe(struct fake_relay *relay,
+				      const guint8 *key, guint8 pt,
+				      guint32 tx_ssrc, gint64 duration)
+{
+	struct call_video *receiver =
+		call_video_open_group_rx(key, pt, tx_ssrc, NULL);
+	struct video_peer endpoint = { 0 };
+	gint64 end = g_get_monotonic_time() + duration;
+
+	g_assert_nonnull(receiver);
+	while (!endpoint.got_frame && readable_until(server_fd, end)) {
+		Pb packet = receive_packet(relay);
+
+		call_video_receive(receiver, packet.p, packet.n, peer_display,
+				   &endpoint);
+	}
+	g_assert_cmpuint(call_video_authenticated_packets(receiver), >, 0);
+	call_video_close(receiver);
+	return endpoint.got_frame;
+}
+
+static void camera_start_reply(struct fake_relay *relay, Slice header,
+			       guint32 accepted, guint32 code)
+{
+	Pb body = { 0 }, plain = { 0 }, wire = { 0 };
+	guint8 ack[24] = { [1] = 1, [5] = 16, [9] = 1, [11] = 1, [15] = 2 };
+
+	accepted = htonl(accepted);
+	code = htonl(code);
+	memcpy(ack + 16, &code, sizeof(code));
+	memcpy(ack + 20, &accepted, sizeof(accepted));
+	pb_uint(&body, 1, 0);
+	pb_uint(&body, 2, 0);
+	pb_uint(&body, 4, 2);
+	pb_bytes(&body, 5, (Slice){ ack, sizeof(ack) });
+	g_assert_true(call_envelope(&plain, &relay->info, 4,
+				    CALL_GROUP_DATA_RSP, 0x3289, &body,
+				    header));
+	g_assert_true(
+		call_wire_pack(&relay->wire, &plain, FALSE, FALSE, &wire));
+	g_assert_cmpint(sendto(server_fd, wire.p, wire.n, 0,
+			       (void *)&relay->remote, relay->remote_len),
+			==, (ssize_t)wire.n);
+}
+
+static void assert_camera_map(const Pb *packet,
+			      enum call_video_rtp_extension format)
+{
+	g_assert_cmpuint(!!(packet->p[0] & 0x10), ==,
+			 format != CALL_VIDEO_RTP_EXT_NONE);
+	if (format != CALL_VIDEO_RTP_EXT_NONE) {
+		g_assert_cmpuint(packet->n, >=, 16);
+		g_assert_cmphex(packet->p[12], ==, 2);
+		g_assert_cmphex(packet->p[13], ==, 0);
+	}
+	if (format == CALL_VIDEO_RTP_EXT_VFD) {
+		g_assert_cmpuint(packet->n, >=, 24);
+		g_assert_cmpuint(packet->p[15], ==, 2);
+		g_assert_cmpuint(packet->p[16], ==, 2);
+		g_assert_cmpuint(packet->p[17], ==, 3);
+		g_assert_cmpuint(packet->p[20], ==, 3);
+	} else if (format == CALL_VIDEO_RTP_EXT_VED) {
+		const guint8 *p = packet->p;
+
+		g_assert_cmpuint(packet->n, >=, 32);
+		g_assert_cmpuint(p[16], ==, 4); /* VED element */
+		g_assert_cmpuint(p[24] & 0x1f, ==, 4); /* VP8A layer */
+		gboolean first_key = (p[26] & 2) && (p[23] & 2);
+
+		g_assert_cmpuint(p[15], ==, first_key ? 5 : 4);
+		g_assert_cmpuint(p[17], ==, first_key ? 8 : 6);
+		if (first_key) {
+			g_assert_cmpuint(packet->n, >=, 36);
+			g_assert_cmphex(p[30], ==, 0xa1);
+			g_assert_cmpuint(p[32], >, 0);
+		}
+	}
+}
+
+static void expect_group_camera_restart(struct fake_relay *relay,
+					const guint8 *key, guint8 pt,
+					guint32 ssrc, guint encoding,
+					enum call_video_rtp_extension format)
+{
+	struct video_peer decoded = { 0 };
+	Pb stream = { 0 }, request = { 0 }, plain = { 0 }, wire = { 0 };
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+	struct call_video *receiver =
+		call_video_open_group_rx(key, pt, ssrc, NULL);
+	gboolean acknowledged = FALSE;
+
+	g_assert_nonnull(receiver);
+	pb_uint(&stream, 1, 1); /* START */
+	pb_uint(&stream, 3, ssrc);
+	pb_uint(&stream, 6, encoding);
+	if (format == CALL_VIDEO_RTP_EXT_VED) {
+		/* Android requested a class-1 VP8A camera after the relay
+		 * acknowledged the laptop's stream in the live group call. */
+		Pb layer = { 0 };
+
+		pb_uint(&layer, 1, 1);
+		pb_uint(&layer, 2, 1);
+		pb_msg(&stream, 8, &layer);
+		pb_uint(&request, 2, encoding);
+		decoded.expected_width = 320;
+	}
+	pb_msg(&request, 1, &stream);
+	g_assert_true(call_envelope(&plain, &relay->info, 4,
+				    CALL_GROUP_STRM_REQ, CALL_GROUP_STRM_REQ_ID,
+				    &request, (Slice){ 0 }));
+	g_assert_true(
+		call_wire_pack(&relay->wire, &plain, FALSE, FALSE, &wire));
+	g_assert_cmpint(sendto(server_fd, wire.p, wire.n, 0,
+			       (const void *)&relay->remote, relay->remote_len),
+			==, (ssize_t)wire.n);
+	while (!decoded.got_frame && readable_until(server_fd, end)) {
+		Pb packet = receive_packet(relay), control = { 0 };
+
+		if (!acknowledged) {
+			if (call_wire_open(&relay->wire, PB_SLICE(packet),
+					   &control)) {
+				Slice media = pb_data(PB_SLICE(control), 4);
+				Slice reply = pb_data(pb_data(media, 2),
+						      CALL_GROUP_STRM_RSP);
+
+				acknowledged = reply.n &&
+					       !pb_number(reply, 1, 1);
+			}
+			continue;
+		}
+		if (call_video_receive(receiver, packet.p, packet.n,
+				       peer_display, &decoded)) {
+			assert_camera_map(&packet, format);
+			if (format == CALL_VIDEO_RTP_EXT_VED) {
+				/* The Android receive filter resolves class 1 from
+				 * spatial and temporal IDs 1/1 on each fragment. */
+				g_assert_cmphex(packet.p[22] & 0xfc, ==, 0x24);
+				g_assert_cmphex(packet.p[26] & 0xfc, ==, 0x24);
+				g_assert_cmpuint(packet.p[23] >> 5, ==, 1);
+				g_assert_cmpuint(packet.p[25], ==, 15);
+				if ((packet.p[26] & 2) && (packet.p[23] & 2))
+					g_assert_cmphex(packet.p[31], ==, 0x24);
+			}
+		}
+	}
+	call_video_close(receiver);
+	g_assert_true(acknowledged);
+	g_assert_true(decoded.got_frame);
+}
+
+static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
+				 const guint8 *remote, guint8 pt,
+				 guint32 tx_ssrc, gboolean trial,
+				 guint32 accepted_ssrc,
+				 enum call_video_rtp_extension format)
+{
+	enum {
+		FIRST_CAMERA = 701,
+		SECOND_CAMERA = 702
+	};
+	g_autoptr(GError) error = NULL;
+	g_autoptr(GBytes) image = NULL;
+	Pb presence = { 0 }, push = { 0 };
+	guint8 tx[30], rx[30];
+
+	pb_uint(&presence, 1, 1);
+	pb_uint(&presence, 2, 1);
+	fixture_video_member(&presence, self, tx_ssrc);
+	fixture_video_member(&presence, peer, FIRST_CAMERA);
+	fixture_video_member(&presence, other, SECOND_CAMERA);
+	pb_uint(&push, 1, 1);
+	pb_msg(&push, 2, &presence);
+	emit_peer(relay, CALL_GROUP_PUSH_REQ, 0x2150, &push, FALSE);
+	expect_event("call_video_peer u22222222222222222222222222222222");
+	expect_subscription(relay, FIRST_CAMERA, TRUE);
+	call_group_media_key("VIDEO", local, rx);
+	call_group_media_key("VIDEO", remote, tx);
+	struct call_video *sender =
+		call_video_open_group_tx(tx, pt, FIRST_CAMERA, 400, 10, &error);
+	struct call_video *receiver =
+		call_video_open_group_rx(rx, pt, tx_ssrc, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(sender);
+	g_assert_nonnull(receiver);
+	/* The mixer's forwarded stream may be layered while our uplink is baseline. */
+	call_video_set_group_format(sender, CALL_VIDEO_RTP_EXT_VED, TRUE);
+	int mixer = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+
+	g_assert_cmpint(mixer, >=, 0);
+	struct video_peer endpoint = { .fd = mixer, .client = &relay->remote };
+	struct line_camera_frame frame;
+
+	synthetic_frame(&frame, 160);
+	g_atomic_int_set(&peer_video_ready, TRUE);
+	g_assert_true(call_video_encode(sender, &frame, g_get_monotonic_time(),
+					send_peer_video, &endpoint, &error));
+	g_assert_no_error(error);
+	expect_event("call_frame c33333333333333333333333333333333");
+	int width, height, rotation;
+	gboolean camera;
+
+	image = line_call_take_frame(group, &width, &height, &rotation,
+				     &camera);
+	g_assert_nonnull(image);
+	g_assert_cmpint(width, ==, 160);
+	g_assert_cmpint(height, ==, 120);
+	g_assert_true(camera);
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+
+	while (!endpoint.got_frame && readable_until(server_fd, end)) {
+		Pb packet = receive_packet(relay);
+
+		if (call_video_receive(receiver, packet.p, packet.n,
+				       peer_display, &endpoint)) {
+			assert_camera_map(&packet, format);
+		}
+	}
+	g_assert_true(endpoint.got_frame);
+
+	guint8 fir[28] = { 0x91, 206, 0, 6 };
+	guint32 sender_id = htonl(FIRST_CAMERA), target_id = htonl(tx_ssrc);
+	Slice feedback = { fir, sizeof(fir) };
+	Pb request = { 0 }, plain = { 0 }, wire = { 0 };
+
+	memcpy(fir + 4, &sender_id, sizeof(sender_id));
+	memcpy(fir + 8, &target_id, sizeof(target_id));
+	g_assert_cmpint(sendto(mixer, fir, sizeof(fir), 0,
+			       (const void *)&relay->remote, relay->remote_len),
+			==, sizeof(fir));
+	/* An unrelated transaction must not restart our camera encoder. */
+	camera_start_reply(relay, (Slice){ 0 }, tx_ssrc, 0);
+	g_assert_false(group_camera_keyframe(relay, rx, pt, tx_ssrc, 350000));
+	Slice start = PB_SLICE(relay->camera_start);
+	gboolean accept_camera = accepted_ssrc == tx_ssrc;
+
+	g_assert_nonnull(pb_data(start, 4).p);
+	camera_start_reply(relay, start, accepted_ssrc,
+			   trial || !accept_camera ? 203 : 0);
+	gint64 timeout = accept_camera ? G_USEC_PER_SEC : 350000;
+
+	g_assert_cmpint(group_camera_keyframe(relay, rx, pt, tx_ssrc, timeout),
+			==, accept_camera);
+	camera_start_reply(relay, start, tx_ssrc, 0);
+	g_assert_false(group_camera_keyframe(relay, rx, pt, tx_ssrc, 350000));
+	if (trial) {
+		pb_uint(&request, 3, 1);
+		pb_bytes(&request, 4, feedback);
+		g_assert_true(call_envelope(
+			&plain, &relay->info, 4, CALL_GROUP_DATA_REQ,
+			CALL_GROUP_DATA_ID, &request, (Slice){ 0 }));
+		g_assert_true(call_wire_pack(&relay->wire, &plain, FALSE, FALSE,
+					     &wire));
+		feedback = PB_SLICE(wire);
+	}
+	g_assert_cmpint(sendto(server_fd, feedback.p, feedback.n, 0,
+			       (const void *)&relay->remote, relay->remote_len),
+			==, (ssize_t)feedback.n);
+	g_assert_true(
+		group_camera_keyframe(relay, rx, pt, tx_ssrc, G_USEC_PER_SEC));
+	expect_group_camera_restart(relay, rx, pt, tx_ssrc, 1, format);
+	expect_group_camera_restart(relay, rx, pt, tx_ssrc, 2, format);
+
+	g_autoptr(J) focused = line_call_video_focus(group, other, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(focused);
+	expect_event("call_video_peer u44444444444444444444444444444444");
+	expect_subscription(relay, FIRST_CAMERA, FALSE);
+	expect_subscription(relay, SECOND_CAMERA, TRUE);
+	call_video_close(sender);
+	sender = call_video_open_group_tx(tx, pt, SECOND_CAMERA, 400, 10,
+					  &error);
+	g_assert_no_error(error);
+	g_assert_nonnull(sender);
+	g_autoptr(J) disabled = line_call_camera(FALSE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(disabled);
+	expect_camera_control(relay, 2, tx_ssrc, TRUE);
+	g_assert_true(call_video_encode(sender, &frame, g_get_monotonic_time(),
+					send_peer_video, &endpoint, &error));
+	g_assert_no_error(error);
+	expect_event("call_frame c33333333333333333333333333333333");
+	g_clear_pointer(&image, g_bytes_unref);
+	image = line_call_take_frame(group, &width, &height, &rotation,
+				     &camera);
+	g_assert_nonnull(image);
+	g_assert_false(camera);
+	g_autoptr(J) enabled = line_call_camera(TRUE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(enabled);
+	expect_camera_control(relay, 1, tx_ssrc, TRUE);
+	g_assert_false(readable_until(mixer, g_get_monotonic_time() + 30000));
+	close(mixer);
+	call_video_close(sender);
+	call_video_close(receiver);
 }
 
 static GBytes *direct_video(int *width, int *height, int *rotation,
@@ -756,7 +1812,7 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	if (!endpoint.got_frame) {
 		g_test_message("Authenticated camera packets: %u",
 			       call_video_authenticated_packets(video));
-		call_video_report(video);
+		call_video_report(video, FALSE);
 	}
 	g_assert_true(endpoint.got_frame);
 	/* The same captured frames feed the window's local preview. */
@@ -1724,6 +2780,7 @@ static void pdtp_varints(void)
 int main(int argc, char **argv)
 {
 	g_setenv("LINE_EXPERIMENTAL_VIDEO", "0", TRUE);
+	g_unsetenv("LINE_EXPERIMENTAL_GROUP_CALLS");
 	g_setenv("SDL_AUDIODRIVER", "dummy", TRUE);
 	g_test_init(&argc, &argv, NULL);
 	events = g_async_queue_new_full(g_free);
@@ -1732,6 +2789,26 @@ int main(int argc, char **argv)
 	g_test_add_func("/call/pdtp-loopback", pdtp_loopback);
 	g_test_add_func("/call/pdtp-official-packets", pdtp_official_packets);
 	g_test_add_func("/call/outgoing", outgoing);
+	g_test_add_data_func("/call/group-voice", GUINT_TO_POINTER(0),
+			     group_call);
+	g_test_add_data_func("/call/group-video", GUINT_TO_POINTER(1),
+			     group_call);
+	g_test_add_data_func("/call/group-video-software-svc",
+			     GUINT_TO_POINTER(8), group_call);
+	g_test_add_data_func("/call/group-video-legacy-svc",
+			     GUINT_TO_POINTER(9), group_call);
+	g_test_add_data_func("/call/group-video-no-packet-version",
+			     GUINT_TO_POINTER(7), group_call);
+	g_test_add_data_func("/call/group-voice-native-uplink",
+			     GUINT_TO_POINTER(3), group_call);
+	g_test_add_data_func("/call/group-video-native-uplink",
+			     GUINT_TO_POINTER(4), group_call);
+	g_test_add_data_func("/call/group-camera-unavailable",
+			     GUINT_TO_POINTER(6), group_call);
+	g_test_add_data_func("/call/group-another-device", GUINT_TO_POINTER(5),
+			     group_call);
+	g_test_add_data_func("/call/group-video-voice-fallback",
+			     GUINT_TO_POINTER(2), group_call);
 	g_test_add_func("/call/authenticated-media-migration", media_migration);
 	g_test_add_func("/call/video-outgoing", video_outgoing);
 	g_test_add_func("/call/voice-then-video", voice_then_video);

@@ -5,6 +5,7 @@
 #include "friends.h"
 #include "groups.h"
 #include "call.h"
+#include "call_group.h"
 #include "emoji.h"
 #include "flex_asset.h"
 #include "media.h"
@@ -59,6 +60,8 @@ struct line_worker {
 	/* Retry deadlines use monotonic microseconds; renewal uses Unix seconds. */
 	gint64 refresh_retry, save_retry, armed_renewal;
 	guint refresh_failures;
+	J *group_call_members;
+	gint64 group_roster_due;
 	/* Chat IDs map to borrowed chat_snapshot rows, or NULL before first sync. */
 	GHashTable *chats;
 	GHashTable *leases, *left_groups;
@@ -121,7 +124,8 @@ void line_emit(J *packet)
 			first++;
 		}
 		if (first < (int)G_N_ELEMENTS(parts)) {
-			parts[first].iov_base = (char *)parts[first].iov_base + sent;
+			parts[first].iov_base =
+				(char *)parts[first].iov_base + sent;
 			parts[first].iov_len -= sent;
 		}
 	}
@@ -182,6 +186,8 @@ static void clear_global_search(struct line_worker *w)
 static void clear_view(struct line_worker *w)
 {
 	line_voice_close();
+	g_clear_pointer(&w->group_call_members, json_object_put);
+	w->group_roster_due = 0;
 	line_shared_clear(&w->session);
 	g_clear_pointer(&w->stickers, line_stickers_free);
 	g_clear_pointer(&w->history_chat, g_free);
@@ -454,6 +460,12 @@ static J *login(struct line_worker *w, GError **error)
 				       json_object_new_boolean(TRUE));
 	json_object_object_add(caps, "videoCalls",
 			       json_object_new_boolean(line_video_enabled()));
+	json_object_object_add(
+		caps, "groupVoiceCalls",
+		json_object_new_boolean(line_group_voice_enabled()));
+	json_object_object_add(
+		caps, "groupVideoCalls",
+		json_object_new_boolean(line_group_video_enabled()));
 	json_object_object_add(who, "capabilities", caps);
 	return who;
 }
@@ -703,10 +715,9 @@ static J *find_messages(struct line_worker *w, const char *chat, J *params,
 	g_autoptr(J) raw = NULL;
 	gboolean more = FALSE;
 
-	g_autoptr(J) rows =
-		token ? previous_history(w, chat, w->find_boundary, &raw, &more,
-					 error) :
-			recent_history(w, chat, &raw, error);
+	g_autoptr(J) rows = token ? previous_history(w, chat, w->find_boundary,
+						     &raw, &more, error) :
+				    recent_history(w, chat, &raw, error);
 	if (!rows)
 		return NULL;
 	size_t count = json_object_array_length(rows);
@@ -1069,7 +1080,8 @@ static J *fetch_history(struct line_worker *w, const char *chat, J **raw,
 			continue;
 		g_autoptr(GError) ignored = NULL;
 		g_autofree char *name = line_attachment_filename(
-			&w->session, field(*raw, strfield(row, "id")), &ignored);
+			&w->session, field(*raw, strfield(row, "id")),
+			&ignored);
 		if (name)
 			json_object_object_add(row, "filename",
 					       json_object_new_string(name));
@@ -1174,7 +1186,8 @@ static void revalidate_history(struct line_worker *w, const char *chat)
 		return;
 	g_autoptr(J) event = obj();
 
-	json_object_object_add(event, "event", json_object_new_string("history"));
+	json_object_object_add(event, "event",
+			       json_object_new_string("history"));
 	json_object_object_add(event, "chat", json_object_new_string(chat));
 	json_object_object_add(event, "messages", json_object_get(rows));
 	line_emit(event);
@@ -1438,6 +1451,48 @@ static J *sign_out(struct line_worker *w, GError **error)
 	return reply;
 }
 
+static J *group_roster(struct line_worker *w, J *members)
+{
+	Line *s = &w->session;
+	g_autoptr(J) names = obj();
+	J *roster = json_object_new_array();
+	size_t count = members ? json_object_array_length(members) : 0;
+
+	/* Resolve the visible tiles in one batch and retain the full count. */
+	for (size_t i = 0; i < MIN(count, 12); i++) {
+		const char *id = json_object_get_string(
+			json_object_array_get_idx(members, i));
+
+		if (g_strcmp0(id, s->mid))
+			json_object_object_add(names, id,
+					       json_object_new_string(""));
+	}
+	line_resolve_names(s, names, 'u');
+	for (size_t i = 0; i <= count; i++) {
+		const char *id = i == 0 ? s->mid :
+					  json_object_get_string(
+						  json_object_array_get_idx(
+							  members, i - 1));
+
+		if (i && !g_strcmp0(id, s->mid))
+			continue;
+		const char *name = i ? strfield(names, id) : w->name;
+		const char *avatar = strfield(s->pictures, id);
+		J *member = obj();
+
+		json_object_object_add(member, "id",
+				       json_object_new_string(id));
+		if (name && *name)
+			json_object_object_add(member, "name",
+					       json_object_new_string(name));
+		if (avatar)
+			json_object_object_add(member, "avatarKey",
+					       json_object_new_string(avatar));
+		json_object_array_add(roster, member);
+	}
+	return roster;
+}
+
 static J *dispatch(struct line_worker *w, const char *method, J *params,
 		   GError **error)
 {
@@ -1453,7 +1508,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!w->ready)
 		return problem(error, "Sign in to LINE first.");
 	if (!strcmp(method, "foreground")) {
-		gboolean active = json_object_get_boolean(field(params, "active"));
+		gboolean active =
+			json_object_get_boolean(field(params, "active"));
 
 		if (active && !w->foreground && !w->sync_failures &&
 		    (!w->live || w->live_failing) && w->timer >= 0) {
@@ -1574,13 +1630,16 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			json_object_get_boolean(field(params, "enabled")),
 			error);
 	if (!strcmp(method, "callPreview")) {
-		line_call_preview(chat, json_object_get_boolean(field(params, "visible")));
+		line_call_preview(chat, json_object_get_boolean(
+						field(params, "visible")));
 		return obj();
 	}
 	if (!strcmp(method, "callCamera"))
 		return line_call_camera(
 			json_object_get_boolean(field(params, "enabled")),
 			error);
+	if (!strcmp(method, "callVideoFocus"))
+		return line_call_video_focus(chat, id, error);
 	if (!strcmp(method, "callAccept"))
 		return line_voice_answer(chat, error);
 	if (!strcmp(method, "callDecline"))
@@ -1686,10 +1745,24 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	}
 	if (!strcmp(method, "findMessages"))
 		return find_messages(w, chat, params, error);
-	if (!strcmp(method, "callStart"))
-		return line_call_start(
+	if (!strcmp(method, "callStart")) {
+		J *result = line_call_start(
 			s, chat,
 			json_object_get_boolean(field(params, "video")), error);
+		if (result && call_group_id(chat)) {
+			json_object_put(w->group_call_members);
+			w->group_call_members = json_object_get(
+				field(result, "participantMids"));
+			json_object_object_del(result, "participantMids");
+			if (w->group_call_members)
+				json_object_object_add(
+					result, "participants",
+					group_roster(w, w->group_call_members));
+			w->group_roster_due =
+				g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+		}
+		return result;
+	}
 	gboolean older = !strcmp(method, "olderHistory");
 
 	if (!strcmp(method, "history") || older)
@@ -2143,15 +2216,15 @@ static void handle(struct line_worker *w, const char *line)
 		 !g_strcmp0(method, "emoji") || !g_strcmp0(method, "sticker")) {
 		if (queue_image(w, req, sticker_msg, method, &error))
 			return;
-	} else
-	{
+	} else {
 		gint64 started = g_get_monotonic_time();
 
 		value = dispatch(w, method, params, &error);
 		if (!g_strcmp0(g_getenv("LINE_DEBUG_TIMING"), "1"))
-			g_printerr("line-timing %s %lld ms\n", method,
-				   (long long)((g_get_monotonic_time() -
-						started) / 1000));
+			g_printerr(
+				"line-timing %s %lld ms\n", method,
+				(long long)((g_get_monotonic_time() - started) /
+					    1000));
 	}
 	if (g_error_matches(error, LINE_ERROR, LINE_OBS_UNAUTHORIZED)) {
 		g_clear_pointer(&w->session.obs_token, g_free);
@@ -2299,6 +2372,71 @@ static gint64 earlier_deadline(gint64 first, gint64 second)
 	return !first || (second && second < first) ? second : first;
 }
 
+static gint64 maintain_group_roster(struct line_worker *w)
+{
+	const char *chat = line_call_group_chat(FALSE);
+
+	if (!chat || !w->group_roster_due)
+		return 0;
+	gint64 now = g_get_monotonic_time();
+
+	if (now < w->group_roster_due)
+		return w->group_roster_due;
+	if (!line_call_group_chat(TRUE))
+		return now + G_USEC_PER_SEC;
+	int cooldown = line_transport_retry_after();
+
+	if (cooldown) {
+		w->group_roster_due = now + (gint64)cooldown * G_USEC_PER_SEC;
+		return w->group_roster_due;
+	}
+	Line *s = &w->session;
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) ids = call_group_members(s, chat, &error);
+
+	if (s->denied) {
+		end_session(w);
+		return 0;
+	}
+	if (!line_call_group_chat(TRUE))
+		return 0;
+	if (g_error_matches(error, LINE_ERROR, LINE_ACCESS_DENIED) ||
+	    (error && !g_error_matches(error, LINE_ERROR, LINE_RATE_LIMITED) &&
+	     !transient_failure(s, error))) {
+		w->group_roster_due = 0;
+		return 0;
+	}
+	if (ids && !json_object_equal(ids, w->group_call_members)) {
+		g_autoptr(J) packet = obj();
+		J *roster = group_roster(w, ids);
+
+		if (s->denied) {
+			json_object_put(roster);
+			end_session(w);
+			return 0;
+		}
+		if (!line_call_group_chat(TRUE)) {
+			json_object_put(roster);
+			return 0;
+		}
+		json_object_object_add(
+			packet, "event",
+			json_object_new_string("call_participants"));
+		json_object_object_add(packet, "chat",
+				       json_object_new_string(chat));
+		json_object_object_add(packet, "participants", roster);
+		json_object_put(w->group_call_members);
+		w->group_call_members = g_steal_pointer(&ids);
+		line_emit(packet);
+	}
+	if (s->token_changed) {
+		line_live_sync_set_access(w->live, s->access);
+		save_rotated_token(w);
+	}
+	w->group_roster_due = g_get_monotonic_time() + 15 * G_USEC_PER_SEC;
+	return w->group_roster_due;
+}
+
 /*
  * With healthy long polling the eventfd announces changes. Renewals use
  * LINE's absolute Unix time so suspend and wall-clock changes are respected.
@@ -2309,6 +2447,7 @@ static int maintenance_wait(struct line_worker *w)
 	Line *s = &w->session;
 	gint64 next = line_voice_tick(), renewal = 0;
 
+	next = earlier_deadline(next, maintain_group_roster(w));
 	if (w->live && !w->live_failing && s->access) {
 		gint64 now = g_get_monotonic_time();
 		gint64 wall = g_get_real_time() / G_USEC_PER_SEC;
@@ -2356,9 +2495,8 @@ static gboolean message_operation(struct line_worker *w, J *op,
 		return FALSE;
 	gboolean mine = !g_strcmp0(from, w->session.mid);
 	/* One-to-one chats are named after the other person. */
-	const char *chat = json_object_get_int(field(msg, "3")) == 0 && !mine ?
-				   from :
-				   to;
+	const char *chat =
+		json_object_get_int(field(msg, "3")) == 0 && !mine ? from : to;
 	g_autoptr(J) event = obj();
 
 	json_object_object_add(event, "event",
@@ -2520,8 +2658,8 @@ static void live_operations(struct line_worker *w)
 		g_hash_table_remove_all(s->profiles);
 	w->sync.revision = MAX(w->sync.revision, batch.revision);
 	if (count || batch.reload)
-		w->displayed_revision = MAX(w->displayed_revision,
-					    batch.revision);
+		w->displayed_revision =
+			MAX(w->displayed_revision, batch.revision);
 	/*
 	 * New messages update the chat list in the window directly and the
 	 * open chat refetches its page; anything else reloads both.
@@ -2596,8 +2734,8 @@ static void sync_revision(struct line_worker *w)
 		}
 		current = MAX(current, w->sync.revision);
 		if (!w->live && s->access)
-			w->live = line_live_sync_start(&w->sync, s->access,
-						       NULL);
+			w->live =
+				line_live_sync_start(&w->sync, s->access, NULL);
 		if (reload || w->displayed_revision == -2 ||
 		    (w->displayed_revision >= 0 &&
 		     current > w->displayed_revision))
@@ -2687,7 +2825,8 @@ static int worker(int credentials_fd)
 			if (n <= 0)
 				break;
 			g_string_append_len(pending, block, n);
-			char *cursor = pending->str, *end = cursor + pending->len;
+			char *cursor = pending->str,
+			     *end = cursor + pending->len;
 			char *newline;
 
 			while ((newline = memchr(cursor, '\n', end - cursor))) {
@@ -2715,6 +2854,7 @@ static int worker(int credentials_fd)
 		}
 		update_peer_reads(&w);
 	}
+	line_voice_close();
 	g_clear_pointer(&w.live, line_live_sync_stop);
 	if (w.image_thread) {
 		g_async_queue_push_front(w.image_requests, &image_stop);

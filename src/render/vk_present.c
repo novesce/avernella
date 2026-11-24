@@ -86,16 +86,22 @@ static VkResult init_frames(struct vk_present *p)
 	VkDevice device = p->ctx.device;
 	VkPhysicalDeviceProperties properties;
 
-	vkGetPhysicalDeviceProperties(p->ctx.gpu, &properties);
-	if (p->log)
+	if (p->log) {
+		vkGetPhysicalDeviceProperties(p->ctx.gpu, &properties);
 		fprintf(stderr,
-			"Vulkan device: %s, API %u.%u.%u, SDL %s, descriptor %s\n",
-			properties.deviceName,
+			"Vulkan device: %s (%04x:%04x%s), API %u.%u.%u, SDL %s, descriptor %s\n",
+			properties.deviceName, properties.vendorID,
+			properties.deviceID,
+			properties.deviceType ==
+					VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU ?
+				", discrete" :
+				"",
 			VK_API_VERSION_MAJOR(properties.apiVersion),
 			VK_API_VERSION_MINOR(properties.apiVersion),
 			VK_API_VERSION_PATCH(properties.apiVersion),
 			SDL_GetCurrentVideoDriver(),
 			p->ctx.descriptor_heap ? "heap" : "buffer");
+	}
 	VkResult result;
 	VkCommandPoolCreateInfo pool = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO,
@@ -152,44 +158,6 @@ static void destroy_swapchain(struct vk_present *p)
 	p->image_count = 0;
 	vkDestroySwapchainKHR(device, p->swapchain, NULL);
 	p->swapchain = VK_NULL_HANDLE;
-}
-
-static VkResult choose_format(const struct vk_ctx *ctx,
-			      VkSurfaceFormatKHR *format)
-{
-	uint32_t count = 0;
-	VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(
-		ctx->gpu, ctx->surface, &count, NULL);
-	if (result != VK_SUCCESS || !count)
-		return result == VK_SUCCESS ? VK_ERROR_FORMAT_NOT_SUPPORTED :
-					      result;
-	VkSurfaceFormatKHR *formats = calloc(count, sizeof(*formats));
-
-	if (!formats)
-		return VK_ERROR_OUT_OF_HOST_MEMORY;
-	result = vkGetPhysicalDeviceSurfaceFormatsKHR(ctx->gpu, ctx->surface,
-						      &count, formats);
-	if (result == VK_SUCCESS) {
-		result = VK_ERROR_FORMAT_NOT_SUPPORTED;
-		/* Cairo pixels are already encoded in the sRGB color space. */
-		for (uint32_t i = 0; i < count; i++) {
-			VkSurfaceFormatKHR candidate = formats[i];
-			if (candidate.colorSpace !=
-			    VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
-				continue;
-			if (count == 1 &&
-			    candidate.format == VK_FORMAT_UNDEFINED)
-				candidate.format = VK_FORMAT_B8G8R8A8_UNORM;
-			if (candidate.format == VK_FORMAT_B8G8R8A8_UNORM ||
-			    candidate.format == VK_FORMAT_R8G8B8A8_UNORM) {
-				*format = candidate;
-				result = VK_SUCCESS;
-				break;
-			}
-		}
-	}
-	free(formats);
-	return result;
 }
 
 static VkResult init_images(struct vk_present *p, VkFormat format)
@@ -281,7 +249,7 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		return VK_ERROR_FORMAT_NOT_SUPPORTED;
 	VkSurfaceFormatKHR format = { 0 };
 
-	result = choose_format(ctx, &format);
+	result = vk_surface_format(ctx->gpu, ctx->surface, &format);
 	if (result != VK_SUCCESS)
 		return result;
 	/* FIFO paces presentation without spinning or tearing. */

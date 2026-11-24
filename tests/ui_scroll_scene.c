@@ -1,9 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "media_io.h"
 #include "ui_private.h"
 #include "ui_gpu.h"
 #include "ui_motion.h"
+#include "ui_sounds.h"
+#include <fcntl.h>
 #include <gmodule.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
 
 enum {
 	W = 910,
@@ -24,6 +29,21 @@ G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
 bool ui_gpu_active(void)
 {
 	return true;
+}
+
+const char *ui_gpu_device_name(void)
+{
+	return NULL;
+}
+
+uint32_t ui_gpu_device_vendor(void)
+{
+	return 0;
+}
+
+int ui_gpu_render_minor(void)
+{
+	return -1;
 }
 
 void ui_gpu_close(void)
@@ -206,6 +226,67 @@ static void check_message_receipts(void)
 	json_object_put(packet);
 }
 
+static void check_chat_event(void)
+{
+	Json *rows = json_tokener_parse(
+		"[{\"id\":\"200\",\"senderId\":\"grace\",\"from\":\"Grace\","
+		"\"time\":1700000000000,\"text\":\"Hello\"},"
+		"{\"id\":\"201\",\"senderId\":\"grace\",\"from\":\"Grace\","
+		"\"time\":1700000001000,\"type\":\"chat_event\",\"own\":true,"
+		"\"readCount\":3,\"text\":\"Grace joined the group call\"},"
+		"{\"id\":\"202\",\"senderId\":\"grace\",\"from\":\"Grace\","
+		"\"time\":1700000002000,\"text\":\"Goodbye\"}]");
+	Json *fixture = ui.history;
+	Json *notice = json_object_array_get_idx(rows, 1);
+	int offset = ui.history_offset;
+	gboolean stick = ui.stick_bottom;
+
+	ui.history = rows;
+	ui.stick_bottom = FALSE;
+	ui.history_offset = 0;
+	ui_forget_history();
+	ui_draw();
+	Rect area = ui.conversation;
+	int center = area.x + area.w / 2, first = -1, last = -1;
+	gboolean rendered = FALSE, sender_after = FALSE;
+
+	for (int y = area.y; y < area.y + area.h; y++) {
+		if (ui_message_at(center, y) == 1) {
+			if (first < 0)
+				first = y;
+			last = y;
+			g_assert_null(ui_sender_at(area.x + 32, y, NULL));
+			g_assert_null(ui_row_at(area.x + 8, y));
+			if (ui_row_at(center, y) == notice)
+				rendered = TRUE;
+		}
+		if (ui_message_at(center, y) == 2)
+			sender_after |= ui_sender_at(area.x + 32, y, NULL) !=
+					NULL;
+	}
+	g_assert_cmpint(first, >=, area.y);
+	g_assert_cmpint(last - first + 1, <, 34);
+	g_assert_true(rendered);
+	g_assert_true(sender_after);
+
+	/* A notice takes no space for an outgoing timestamp or receipt. */
+	g_autofree uint32_t (*before)[W] =
+		g_memdup2(presented, sizeof(presented));
+
+	json_object_object_del(notice, "own");
+	json_object_object_del(notice, "readCount");
+	ui_forget_history();
+	ui_draw();
+	g_assert_cmpmem(before, sizeof(presented), presented,
+			sizeof(presented));
+	ui.history = fixture;
+	ui.history_offset = offset;
+	ui.stick_bottom = stick;
+	ui_forget_history();
+	json_object_put(rows);
+	ui_draw();
+}
+
 static void check_scroll_positions(void)
 {
 	int positions[] = { 0,	 3,   9,   76,	285, 304, 327,
@@ -313,6 +394,139 @@ static void settle(void)
 	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
 }
 
+static gboolean stage_has_avatar(const char *id)
+{
+	int top = (UI_HEADER_H + 1) * H / ui.height;
+	int bottom = (UI_HEADER_H + 1 + ui.stage_h - 76) * H / ui.height;
+	int left = ui.conversation.x * W / ui.width;
+	guint shade = ui_avatar_shade(id);
+
+	for (int y = top; y < bottom; y++)
+		for (int x = left; x < W; x++)
+			if (presented[y][x] == shade)
+				return TRUE;
+	return FALSE;
+}
+
+static void group_picture(const char *chat, gint64 decoded)
+{
+	struct line_preview_frame preview = {
+		.decoded_at = decoded,
+		.width = 2,
+		.height = 2,
+		.source = LINE_PREVIEW_REMOTE,
+	};
+	const guint8 pixels[6] = { 80, 80, 200, 200, 128, 128 };
+	int fd = memfd_create("group-preview", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+
+	g_assert_cmpint(fd, >=, 0);
+	g_assert_cmpint(write(fd, pixels, sizeof(pixels)), ==, sizeof(pixels));
+	g_assert_cmpint(fcntl(fd, F_ADD_SEALS,
+			      F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK),
+			==, 0);
+	g_strlcpy(preview.chat, chat, sizeof(preview.chat));
+	ui_media_preview_frame(&preview, fd);
+	close(fd);
+}
+
+static void group_stage_picture(gboolean present)
+{
+	struct gpu_scene scene = { .width = W, .height = H };
+
+	ui_draw();
+	ui_media_gpu_video(&scene, 0);
+	g_assert_cmpint(scene.video[0].plane[0] != NULL, ==, present);
+}
+
+static void check_group_call_roster(void)
+{
+	static const char group[] = "c00000000000000000000000000000000";
+	static const char ada[] = "u00000000000000000000000000000000";
+	static const char grace[] = "u00000000000000000000000000000001";
+	static const char edsger[] = "u00000000000000000000000000000002";
+	Json *event = json_tokener_parse(
+		"{\"event\":\"call\",\"state\":\"connected\","
+		"\"name\":\"Test group\",\"participants\":["
+		"{\"id\":\"u00000000000000000000000000000000\",\"name\":\"Ada\"},"
+		"{\"id\":\"u00000000000000000000000000000001\",\"name\":\"Grace\"},"
+		"{\"id\":\"u00000000000000000000000000000002\",\"name\":\"Edsger\"}]}");
+	char *prior = ui.selected;
+	Json *participants = ui_field(event, "participants");
+
+	ui.selected = g_strdup(group);
+	json_object_object_add(event, "chat", json_object_new_string(group));
+	ui_media_call_event(event);
+	ui_draw();
+	settle();
+	g_assert_cmpint(ui.stage_h, >, 100);
+	g_assert_true(stage_has_avatar(ada));
+	g_assert_true(stage_has_avatar(grace));
+	g_assert_true(stage_has_avatar(edsger));
+
+	/* Video keeps the full small roster beside the camera tiles. */
+	json_object_object_add(event, "video", json_object_new_boolean(TRUE));
+	json_object_object_add(event, "cameraEnabled",
+			       json_object_new_boolean(TRUE));
+	ui_media_call_event(event);
+	ui_draw();
+	settle();
+	g_assert_true(stage_has_avatar(ada));
+	g_assert_true(stage_has_avatar(grace));
+	g_assert_true(stage_has_avatar(edsger));
+
+	g_autoptr(J) focus = obj();
+	json_object_object_add(focus, "event",
+			       json_object_new_string("call_video_peer"));
+	json_object_object_add(focus, "chat", json_object_new_string(group));
+	json_object_object_add(focus, "id", json_object_new_string(ada));
+	json_object_object_add(focus, "changedAt",
+			       json_object_new_int64(scene_time));
+	ui_media_call_event(focus);
+	group_picture(group, scene_time);
+	group_stage_picture(TRUE);
+
+	scene_time += 2000;
+	json_object_object_add(focus, "id", json_object_new_string(grace));
+	json_object_object_add(focus, "changedAt",
+			       json_object_new_int64(scene_time));
+	ui_media_call_event(focus);
+	group_stage_picture(FALSE);
+	group_picture(group, scene_time - 1);
+	group_stage_picture(FALSE);
+	group_picture(group, scene_time);
+	group_stage_picture(TRUE);
+
+	/* The frame and the matching peer event can arrive on either socket first. */
+	scene_time += 2000;
+	group_picture(group, scene_time);
+	json_object_object_add(focus, "id", json_object_new_string(ada));
+	json_object_object_add(focus, "changedAt",
+			       json_object_new_int64(scene_time - 1));
+	ui_media_call_event(focus);
+	group_stage_picture(TRUE);
+
+	json_object_object_add(event, "event",
+			       json_object_new_string("call_participants"));
+	json_object_object_del(event, "state");
+	json_object_array_del_idx(participants, 2, 1);
+	ui_media_call_event(event);
+	ui_draw();
+	g_assert_true(stage_has_avatar(ada));
+	g_assert_true(stage_has_avatar(grace));
+	g_assert_false(stage_has_avatar(edsger));
+
+	json_object_object_add(event, "event", json_object_new_string("call"));
+	json_object_object_add(event, "state", json_object_new_string("ended"));
+	ui_media_call_event(event);
+	g_clear_pointer(&ui.notice, g_free);
+	g_free(ui.selected);
+	ui.selected = prior;
+	json_object_put(event);
+	ui_draw();
+	settle();
+	g_assert_cmpint(ui.stage_h, ==, 0);
+}
+
 /* New rows glide up from the composer; an opened chat fades in. */
 static void check_history_motion(void)
 {
@@ -413,6 +627,7 @@ static void history(void)
 	ui_theme_init();
 	g_assert_true(ui_theme_is_line());
 	SDL_setenv("SDL_VIDEODRIVER", "dummy", 1);
+	SDL_setenv("SDL_AUDIODRIVER", "dummy", 1);
 	g_setenv("LINE_REDUCE_MOTION", "1", TRUE);
 	g_assert_cmpint(SDL_Init(SDL_INIT_VIDEO), ==, 0);
 	ui.window = SDL_CreateWindow("Fixture", 0, 0, W, H, 0);
@@ -463,6 +678,7 @@ static void history(void)
 	ui.history_offset = 0;
 	check_chat_bubbles();
 	check_message_receipts();
+	check_chat_event();
 	int index = 0, row_height = ui_chat_row_height();
 
 	json_object_array_add(
@@ -474,10 +690,12 @@ static void history(void)
 	ui_motion_refresh_preferences();
 	check_row_animation();
 	check_history_motion();
+	check_group_call_roster();
 	g_assert_true(ui_theme_toggle(&error));
 	g_assert_no_error(error);
 	ui_theme_changed(row_height);
 	check_message_receipts();
+	check_chat_event();
 	check_row_animation();
 	check_history_motion();
 	/* Exercise receipt widths with RTL shaping and a compact chat pane. */
@@ -494,6 +712,7 @@ static void history(void)
 	check_history_motion();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
+	ui_sound_shutdown();
 	g_string_free(ui.message.value, TRUE);
 	g_string_free(ui.search.value, TRUE);
 	g_hash_table_unref(ui.sending);

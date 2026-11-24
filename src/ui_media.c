@@ -107,6 +107,7 @@ struct decode_job {
 
 struct call_picture {
 	void *pixels;
+	gint64 decoded_at;
 	uint64_t generation;
 	size_t size;
 	struct line_camera_frame frame;
@@ -134,12 +135,13 @@ static struct {
 	guint play_event, play_serial, play_overlay;
 	gboolean play_review;
 	char *recorded, *call_error, *call_note;
+	enum line_media_reception reception;
 	GHashTable *uploads;
 	/* A pasted picture's staged file, and those being sent. */
 	char *paste;
 	GHashTable *paste_sent;
 	char *chat, *id, *path, *title, *note, *directory, *call_chat,
-		*call_name, *call_state, *reply_text;
+		*call_name, *call_state, *call_video_peer, *reply_text;
 	gboolean avatar_pick;
 	gboolean friend_qr, save, photo, working, thumb_busy, muted, can_mute,
 		copying, sticker;
@@ -161,13 +163,13 @@ static struct {
 	gboolean peer_sharing, self_sharing, share_working;
 	gboolean share_in_video;
 	gboolean call_working, preview_paused, window_hidden;
-	gint64 call_frames_since, share_ended_at;
-	int focus, first_click_focus;
-	Rect share_button, tile_rect[4], fullscreen_button[4];
+	gint64 call_frames_since, peer_video_since, share_ended_at;
+	int focus, first_click_focus, call_roster_offset, call_roster_rows;
+	Rect share_button, call_roster, tile_rect[4], fullscreen_button[4];
 	enum stage_tile fullscreen_tile, first_click_tile;
 	gboolean window_expanded, saw_fullscreen, ignore_multiclick;
 	Rect call_minimize;
-	Json *row;
+	Json *row, *call_participants;
 } m;
 
 static void reset_picture(struct call_picture *picture)
@@ -222,6 +224,11 @@ static void clear_call_frame(void)
 	m.peer_sharing = m.self_sharing = m.share_working = FALSE;
 	m.share_in_video = FALSE;
 	m.call_frames_since = m.share_ended_at = g_get_monotonic_time();
+	g_clear_pointer(&m.call_video_peer, g_free);
+	m.peer_video_since = 0;
+	m.reception = LINE_MEDIA_WAITING;
+	m.call_roster_offset = m.call_roster_rows = 0;
+	m.call_roster = (Rect){ 0 };
 	m.preview_paused = FALSE;
 	m.focus = 0;
 }
@@ -1150,6 +1157,7 @@ void ui_media_reset(void)
 	g_clear_pointer(&m.call_state, g_free);
 	g_clear_pointer(&m.call_error, g_free);
 	g_clear_pointer(&m.call_note, g_free);
+	g_clear_pointer(&m.call_participants, json_object_put);
 	m.call_serial++;
 	m.call_working = FALSE;
 	clear_call_frame();
@@ -1161,6 +1169,7 @@ void ui_media_reset(void)
 	m.muted = FALSE;
 	ui.avatars = ui.photos = ui.files = ui.calls = ui.video_calls =
 		ui.incoming_calls = ui.mute_calls = FALSE;
+	ui.group_voice_calls = ui.group_video_calls = FALSE;
 }
 
 struct recording_event {
@@ -1208,9 +1217,12 @@ static gboolean play_clip(int fd, gboolean review)
 	m.play_review = review;
 	g_autoptr(GError) error = NULL;
 
-	m.playback = line_video_play(fd, ui.renderer || ui_gpu_active(),
-				     clip_finished,
-				     GUINT_TO_POINTER(m.play_serial), &error);
+	const struct line_video_gpu gpu = { ui_gpu_device_name(),
+					    ui_gpu_device_vendor() };
+
+	m.playback = line_video_play(
+		fd, (ui.renderer || ui_gpu_active()) ? &gpu : NULL,
+		clip_finished, GUINT_TO_POINTER(m.play_serial), &error);
 	if (!m.playback) {
 		set(&m.note, error ? error->message :
 				     _("Could not start the video player."));
@@ -1388,6 +1400,10 @@ void ui_media_login(Json *r)
 	ui.files = json_object_get_boolean(ui_field(c, "files"));
 	ui.video_calls = json_object_get_boolean(ui_field(c, "videoCalls"));
 	ui.calls = json_object_get_boolean(ui_field(c, "calls"));
+	ui.group_voice_calls =
+		json_object_get_boolean(ui_field(c, "groupVoiceCalls"));
+	ui.group_video_calls =
+		json_object_get_boolean(ui_field(c, "groupVideoCalls"));
 	ui.incoming_calls =
 		json_object_get_boolean(ui_field(c, "incomingCalls"));
 	ui.mute_calls = json_object_get_boolean(ui_field(c, "muteCalls"));
@@ -1397,9 +1413,13 @@ void ui_media_login(Json *r)
 						 g_free, thumb_free);
 }
 
-gboolean ui_media_can_call(void)
+gboolean ui_media_can_call(gboolean video)
 {
-	return ui.calls && ui.selected && *ui.selected == 'u' &&
+	if (!ui.selected)
+		return FALSE;
+	if (*ui.selected == 'c')
+		return video ? ui.group_video_calls : ui.group_voice_calls;
+	return ui.calls && (!video || ui.video_calls) && *ui.selected == 'u' &&
 	       g_strcmp0(ui.selected, ui.self_id);
 }
 
@@ -1999,6 +2019,10 @@ enum message_action {
 
 static int actions(enum message_action *out)
 {
+	if (ui_is_chat_event(m.row)) {
+		out[0] = A_COPY;
+		return 1;
+	}
 	int n = 0;
 
 	out[n++] = A_REPLY;
@@ -2132,7 +2156,9 @@ static gboolean call_docked(void)
 	       g_strcmp0(m.call_state, "incoming");
 }
 
-enum { CALL_DOCK_HEIGHT = 56 };
+enum {
+	CALL_DOCK_HEIGHT = 56
+};
 
 /*
  * A connected or dialing call shows as a stage at the top of its chat, and
@@ -2163,11 +2189,19 @@ int ui_media_content_height(void)
 
 static gboolean call_connected(void);
 
+static gboolean group_call(void)
+{
+	const char *chat = m.mode == DIAL ? m.chat : m.call_chat;
+
+	return chat && *chat == 'c';
+}
+
 static void sync_call_preview(void)
 {
 	gboolean paused = m.window_hidden || m.mode != CALL;
 
-	if (!m.call_chat || !call_connected() || m.preview_paused == paused)
+	if (!m.call_chat || !call_connected() ||
+	    (group_call() && !m.video_ready) || m.preview_paused == paused)
 		return;
 	m.preview_paused = paused;
 	if (!paused)
@@ -2195,7 +2229,7 @@ static void show_call(void)
 	if (m.mode == CALL)
 		return;
 	begin(CALL, m.call_chat, NULL, m.call_name);
-	if (m.window_hidden)
+	if (m.window_hidden || (group_call() && !m.video_ready))
 		return;
 	ui_rpc("callFrame", args(m.call_chat, NULL), m.serial);
 	request_self_frame(m.call_chat);
@@ -2232,8 +2266,7 @@ static gboolean call_connected(void)
 /* Screen sharing needs a connected call; the backend checks the rest. */
 static gboolean call_share_available(void)
 {
-	return m.mode == CALL && call_connected() &&
-	       g_strcmp0(m.call_state, "incoming");
+	return m.mode == CALL && call_connected() && !group_call();
 }
 
 /* Either side may turn its camera on once the call negotiated video. */
@@ -2249,7 +2282,7 @@ static void dial(gboolean video)
 		show_call();
 		return;
 	}
-	if (!ui_media_can_call())
+	if (!ui_media_can_call(video))
 		return;
 	const char *peer = ui.selected;
 
@@ -2328,11 +2361,79 @@ static void request_self_frame(const char *chat)
 	ui_rpc("callFrame", self, m.serial);
 }
 
+static gboolean call_member_id(const char *id)
+{
+	return id[0] == 'u' && strlen(id) == 33 &&
+	       strspn(id + 1, "0123456789abcdefABCDEF") == 32;
+}
+
+static void update_call_participants(Json *members)
+{
+	if (!json_object_is_type(members, json_type_array))
+		return;
+	size_t count = MIN(json_object_array_length(members), 500);
+	g_autoptr(GHashTable) seen = g_hash_table_new(g_str_hash, g_str_equal);
+	Json *roster = json_object_new_array_ext((int)count);
+
+	for (size_t i = 0; i < count; i++) {
+		Json *member = json_object_array_get_idx(members, i);
+		const char *id = ui_string(member, "id", "");
+		const char *name = ui_string(member, "name", "");
+
+		if (!call_member_id(id) || !g_utf8_validate(name, -1, NULL) ||
+		    g_hash_table_contains(seen, id))
+			continue;
+		g_hash_table_add(seen, (gpointer)id);
+		json_object_array_add(roster, json_object_get(member));
+	}
+	g_clear_pointer(&m.call_participants, json_object_put);
+	m.call_participants = roster;
+	ui.dirty = TRUE;
+}
+
 void ui_media_call_event(Json *p)
 {
 	const char *event = ui_string(p, "event", "");
 	const char *chat = ui_string(p, "chat", "");
 
+	if (!strcmp(event, "call_reception")) {
+		int stage = json_object_get_int(ui_field(p, "stage"));
+
+		if (call_active() && chat[0] == 'c' &&
+		    !g_strcmp0(m.call_chat, chat) && stage > (int)m.reception &&
+		    stage <= LINE_MEDIA_PLAYABLE) {
+			m.reception = stage;
+			ui.dirty = TRUE;
+		}
+		return;
+	}
+	if (!strcmp(event, "call_participants")) {
+		if (call_active() && chat[0] == 'c' &&
+		    !g_strcmp0(chat, m.call_chat))
+			update_call_participants(ui_field(p, "participants"));
+		return;
+	}
+	if (!strcmp(event, "call_video_peer")) {
+		if (!call_active() || chat[0] != 'c' ||
+		    g_strcmp0(chat, m.call_chat))
+			return;
+		const char *id = ui_string(p, "id", "");
+		const char *peer = *id ? id : NULL;
+		gint64 changed =
+			json_object_get_int64(ui_field(p, "changedAt"));
+
+		if ((peer && !call_member_id(peer)) ||
+		    changed <= m.peer_video_since)
+			return;
+		set(&m.call_video_peer, peer);
+		m.peer_video_since = changed;
+		/* Invalidate pictures and replies still queued for the old source. */
+		m.serial++;
+		if (m.call_frame.decoded_at < changed)
+			stop_picture(&m.call_frame, TILE_PEER);
+		ui.dirty = TRUE;
+		return;
+	}
 	if (!strcmp(event, "call_frame") || !strcmp(event, "call_self_frame")) {
 		if (m.mode == CALL && *chat && !g_strcmp0(chat, m.call_chat)) {
 			if (!strcmp(event, "call_frame"))
@@ -2348,7 +2449,7 @@ void ui_media_call_event(Json *p)
 		return;
 	}
 	if (!strcmp(event, "call_share")) {
-		if (!*chat || g_strcmp0(chat, m.call_chat))
+		if (!*chat || *chat == 'c' || g_strcmp0(chat, m.call_chat))
 			return;
 		Json *peer = ui_field(p, "peerSharing"),
 		     *self = ui_field(p, "selfSharing");
@@ -2403,7 +2504,8 @@ void ui_media_call_event(Json *p)
 			return;
 		m.camera_enabled = FALSE;
 		stop_picture(&m.self_frame, TILE_SELF);
-		set(&m.call_note, ui_string(p, "message", "The camera stopped."));
+		set(&m.call_note,
+		    ui_string(p, "message", "The camera stopped."));
 		ui.dirty = TRUE;
 		return;
 	}
@@ -2415,8 +2517,8 @@ void ui_media_call_event(Json *p)
 		   *who = ui_string(p, "name", chat);
 	if (!strcmp(ui_string(p, "event", ""), "call_error")) {
 		set(&m.call_error,
-		    ui_string(p, "message",
-			      ui_string(p, "error", "Call failed.")));
+		    _(ui_string(p, "message",
+				ui_string(p, "error", "Call failed."))));
 		set(&m.call_note, m.call_error);
 		m.call_working = FALSE;
 		ui_status(m.call_note);
@@ -2432,6 +2534,7 @@ void ui_media_call_event(Json *p)
 		set(&m.call_state, NULL);
 		set(&m.call_chat, NULL);
 		set(&m.call_note, NULL);
+		g_clear_pointer(&m.call_participants, json_object_put);
 		m.call_working = FALSE;
 		m.call_serial++;
 		clear_call_frame();
@@ -2462,6 +2565,7 @@ void ui_media_call_event(Json *p)
 			m.call_serial++;
 		g_clear_pointer(&m.call_error, g_free);
 		clear_call_frame();
+		g_clear_pointer(&m.call_participants, json_object_put);
 		m.video_call = video_ready;
 		m.video_ready = FALSE;
 		m.camera_enabled = m.video_call;
@@ -2498,6 +2602,8 @@ void ui_media_call_event(Json *p)
 	set(&m.call_name, who);
 	set(&m.call_chat, chat);
 	set(&m.call_state, state);
+	if (chat[0] == 'c')
+		update_call_participants(ui_field(p, "participants"));
 	if (ui_field(p, "muted"))
 		m.muted = json_object_get_boolean(ui_field(p, "muted"));
 	else if (new_call)
@@ -2534,7 +2640,7 @@ void ui_media_call_event(Json *p)
 
 static void update_call_picture(int fd, int width, int height, int rotation,
 				gboolean self, gboolean share,
-				gboolean camera_enabled)
+				gboolean camera_enabled, gint64 decoded_at)
 {
 	if (m.window_hidden)
 		return;
@@ -2567,6 +2673,7 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	if (picture->frame.rotation != (unsigned int)rotation)
 		picture->view.w = 0;
 	picture->pixels = pixels;
+	picture->decoded_at = decoded_at;
 	static uint64_t generation;
 
 	picture->generation = ++generation;
@@ -2617,11 +2724,14 @@ void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
 
 	if (m.mode != CALL || g_strcmp0(frame->chat, m.call_chat) ||
 	    frame->decoded_at < m.call_frames_since ||
+	    (!self && frame->decoded_at < m.peer_video_since) ||
+	    (share && group_call()) ||
 	    (share && frame->decoded_at < m.share_ended_at) ||
 	    (self && (!m.camera_enabled || m.share_in_video)))
 		return;
 	update_call_picture(fd, frame->width, frame->height, frame->rotation,
-			    self, share, frame->camera_enabled);
+			    self, share, frame->camera_enabled,
+			    frame->decoded_at);
 }
 
 static void video_frame(Json *result, gboolean self, gboolean share)
@@ -2640,7 +2750,7 @@ static void video_frame(Json *result, gboolean self, gboolean share)
 	update_call_picture(
 		fd, width, height,
 		json_object_get_int(ui_field(result, "rotation")), self, share,
-		json_object_get_boolean(ui_field(result, "cameraEnabled")));
+		json_object_get_boolean(ui_field(result, "cameraEnabled")), 0);
 	close(fd);
 }
 
@@ -2767,6 +2877,26 @@ static Rect fullscreen_exit(void)
 	return (Rect){ ui.width - w - 6, 4, w, FULLSCREEN_BAR_H - 8 };
 }
 
+static const char *video_peer_name(void)
+{
+	if (!group_call())
+		return m.call_name;
+	size_t count = m.call_participants ?
+			       json_object_array_length(m.call_participants) :
+			       0;
+
+	for (size_t i = 0; m.call_video_peer && i < count; i++) {
+		Json *member =
+			json_object_array_get_idx(m.call_participants, i);
+		const char *id = ui_string(member, "id", "");
+		const char *name = ui_string(member, "name", "");
+
+		if (!strcmp(id, m.call_video_peer) && *name)
+			return name;
+	}
+	return m.call_frame.pixels ? _("Video call") : _("Waiting for video…");
+}
+
 void ui_media_draw_fullscreen(void)
 {
 	struct call_picture *picture = tile_picture(m.fullscreen_tile);
@@ -2777,7 +2907,7 @@ void ui_media_draw_fullscreen(void)
 				   (ui.name ? ui.name : _("You")) :
 			   m.fullscreen_tile == TILE_PEER_SCREEN ?
 				   _("Shared screen") :
-				   m.call_name;
+				   video_peer_name();
 
 	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
 	ui_draw_box((Rect){ 0, 0, ui.width, ui.height }, 0);
@@ -2796,8 +2926,25 @@ static const char *call_state_label(void)
 {
 	if (m.mode == DIAL)
 		return m.call_working ? _("Calling…") : "";
-	if (call_connected())
+	if (call_connected()) {
+		if (group_call() && ui.self_id && *ui.self_id &&
+		    m.call_participants &&
+		    json_object_array_length(m.call_participants)) {
+			if (json_object_array_length(m.call_participants) ==
+			    1) {
+				Json *member = json_object_array_get_idx(
+					m.call_participants, 0);
+				if (!strcmp(ui_string(member, "id", ""),
+					    ui.self_id))
+					return _("Waiting for others to join");
+			}
+			if (m.reception == LINE_MEDIA_WAITING)
+				return _("Waiting for incoming media…");
+			if (m.reception == LINE_MEDIA_RECEIVING)
+				return _("Waiting for playback…");
+		}
 		return _("Connected");
+	}
 	if (!g_strcmp0(m.call_state, "incoming"))
 		return m.video_call ? _("Incoming Video Call…") :
 				      _("Incoming Call…");
@@ -2834,8 +2981,8 @@ void ui_media_draw_call_dock(void)
 {
 	if (!call_docked())
 		return;
-	Rect dock = { 0, ui.height - CALL_DOCK_HEIGHT,
-		      ui.width, CALL_DOCK_HEIGHT };
+	Rect dock = { 0, ui.height - CALL_DOCK_HEIGHT, ui.width,
+		      CALL_DOCK_HEIGHT };
 	Rect open = dock_open();
 	int x = open.x + 44, width = open.w - 52;
 
@@ -2960,6 +3107,154 @@ static void draw_incoming_card(Rect area)
 			     0x248046, 0xffffff, _("Accept (Alt+A)"));
 }
 
+static void draw_group_call(Rect stage, int controls_y)
+{
+	int count = m.call_participants ?
+			    json_object_array_length(m.call_participants) :
+			    0;
+	Rect status = { stage.x + 12, controls_y - 24, stage.w - 24, 20 };
+	int top = stage.y + (m.call_note && *m.call_note ? 38 : 12);
+	int height = MAX(1, status.y - top);
+	int center = stage.x + stage.w / 2;
+
+	if (!count) {
+		const char *name = m.mode == DIAL ? m.title : m.call_name;
+		const char *chat = m.mode == DIAL ? m.chat : m.call_chat;
+		int side = CLAMP(height - 24, 0, 54);
+		int y = top + (height - side - 20) / 2;
+
+		if (side >= 18)
+			ui_draw_avatar(name, chat,
+				       (Rect){ center - side / 2, y, side,
+					       side });
+		ui_draw_centered(name,
+				 (Rect){ status.x, y + side + 2, status.w, 18 },
+				 14, 600, UI_HEADING);
+		ui_draw_centered(call_state_label(), status, 14, 500,
+				 UI_SUBTLE);
+		return;
+	}
+	int columns = MIN(count, CLAMP((stage.w - 24) / 74, 1, 6));
+	int cells = MIN(count, columns * (height >= 106 ? 2 : 1));
+	gboolean overflow = cells > 1 && count > cells;
+	int shown = cells - overflow;
+	int rows = (cells + columns - 1) / columns;
+	int cell = MIN(104, MAX(1, stage.w - 24) / columns);
+	int row_h = height / rows;
+	int side = MAX(0, MIN(56, MIN(cell - 8, row_h - 22)));
+
+	for (int i = 0; i < cells; i++) {
+		int row = i / columns;
+		int cols_in_row = MIN(columns, cells - row * columns);
+		int x = center - cols_in_row * cell / 2 + i % columns * cell;
+		int y = top + row * row_h + MAX(0, (row_h - side - 20) / 2);
+		Rect face = { x + (cell - side) / 2, y, side, side };
+
+		if (i == shown) {
+			char more[16];
+
+			g_snprintf(more, sizeof(more), "+%d", count - shown);
+			ui_draw_rounded(face, side / 2, UI_RAISED);
+			ui_draw_centered(more, face, 13, 600, UI_HEADING);
+			break;
+		}
+		Json *member =
+			json_object_array_get_idx(m.call_participants, i);
+		const char *name = ui_string(member, "name", "LINE");
+
+		if (side >= 18)
+			ui_draw_profile(member, face);
+		ui_draw_centered(*name ? name : "LINE",
+				 (Rect){ x, y + side + 2, cell, 18 }, 12, 500,
+				 UI_HEADING);
+	}
+	g_autofree char *label =
+		g_strdup_printf("%s · %d", call_state_label(), count);
+
+	ui_draw_centered(label, status, 14, 500, UI_SUBTLE);
+}
+
+enum {
+	CALL_ROSTER_ROW = 32
+};
+
+static int call_roster_count(void)
+{
+	return m.call_participants ?
+		       (int)json_object_array_length(m.call_participants) :
+		       0;
+}
+
+static void draw_group_video_roster(Rect panel)
+{
+	int count = call_roster_count();
+	int rows = MIN(count, panel.h / CALL_ROSTER_ROW);
+
+	if (rows <= 0)
+		return;
+	m.call_roster_offset = MIN(m.call_roster_offset, count - rows);
+	m.call_roster_rows = rows;
+	m.call_roster =
+		(Rect){ panel.x, panel.y, panel.w, rows * CALL_ROSTER_ROW };
+	ui_draw_rounded(m.call_roster, 6, UI_SIDEBAR);
+
+	for (int i = 0; i < rows; i++) {
+		Json *member = json_object_array_get_idx(
+			m.call_participants, m.call_roster_offset + i);
+		const char *id = ui_string(member, "id", "");
+		const char *name = ui_string(member, "name", "");
+		gboolean focused = !g_strcmp0(id, m.call_video_peer);
+		Rect row = { panel.x, panel.y + i * CALL_ROSTER_ROW,
+			     panel.w - 5, CALL_ROSTER_ROW };
+
+		if (focused || at(row, ui.hover_x, ui.hover_y))
+			ui_draw_rounded(row, 5, UI_SELECTED);
+		ui_draw_profile(member, (Rect){ row.x + 4, row.y + 4, 24, 24 });
+		ui_draw_label(*name ? name : "LINE",
+			      (Rect){ row.x + 34, row.y, row.w - 36, row.h },
+			      12, focused ? 700 : 500, UI_HEADING, FALSE);
+	}
+	if (rows < count) {
+		int h = m.call_roster.h;
+		int thumb_h = MAX(6, h * rows / count);
+		int y = panel.y +
+			(h - thumb_h) * m.call_roster_offset / (count - rows);
+
+		ui_draw_rounded((Rect){ panel.x + panel.w - 4, y, 3, thumb_h },
+				2, UI_MUTED);
+	}
+}
+
+static void draw_group_video(Rect stage, int controls_y, const char *self)
+{
+	int gap = 12, top = stage.y + 44;
+	int width = stage.w - 2 * gap;
+	int roster_w = call_roster_count() ? CLAMP(width / 3, 96, 210) : 0;
+	int tiles_w = width - roster_w - gap * (roster_w ? 2 : 1);
+	int peer_w = tiles_w *
+		     (m.focus == TILE_PEER ? 3 :
+		      m.focus == TILE_SELF ? 1 :
+					     2) /
+		     4;
+	int height = MAX(0, controls_y - top - 28);
+	int left = stage.x + gap;
+
+	if (peer_w > 0 && tiles_w > peer_w && height > 0) {
+		m.tile_rect[0] = (Rect){ left, top, peer_w, height };
+		m.tile_rect[1] = (Rect){ left + peer_w + gap, top,
+					 tiles_w - peer_w, height };
+		call_tile(0, &m.call_frame, video_peer_name(),
+			  m.call_video_peer, m.call_frame.pixels != NULL,
+			  FALSE);
+		call_tile(1, &m.self_frame, self, ui.self_id,
+			  m.self_frame.pixels != NULL, FALSE);
+	}
+	if (roster_w)
+		draw_group_video_roster(
+			(Rect){ stage.x + stage.w - gap - roster_w, top,
+				roster_w, MAX(0, controls_y - top - 6) });
+}
+
 /*
  * Discord shows a direct-message call as a black stage above the chat:
  * a tile per participant and a row of round controls underneath.
@@ -2972,6 +3267,8 @@ static void draw_call_stage(void)
 
 	m.primary = m.secondary = m.third = (Rect){ 0 };
 	m.call_minimize = (Rect){ 0 };
+	m.call_roster = (Rect){ 0 };
+	m.call_roster_rows = 0;
 	m.items = m.up = (Rect){ 0 };
 	if (m.mode == CALL && !g_strcmp0(m.call_state, "incoming")) {
 		m.dialog = area;
@@ -2989,14 +3286,18 @@ static void draw_call_stage(void)
 	/* Fill in the tiles and controls once the stage finished growing. */
 	if (ui.stage_h > 0 && ui.stage_h + 2 < ui_media_stage_height())
 		return;
-	if (m.call_note && *m.call_note)
-		ui_draw_centered(m.call_note,
+	const char *status = m.call_note;
+
+	if ((!status || !*status) && group_call() && video)
+		status = call_state_label();
+	if (status && *status)
+		ui_draw_centered(status,
 				 (Rect){ stage.x + 16, stage.y + 10,
 					 stage.w - 104, 24 },
 				 13, 500, UI_SUBTLE);
 	if (call_active()) {
-		m.call_minimize = (Rect){ stage.x + stage.w - 48,
-					  stage.y + 10, 36, 36 };
+		m.call_minimize =
+			(Rect){ stage.x + stage.w - 48, stage.y + 10, 36, 36 };
 		ui_draw_round_button(m.call_minimize, UI_GLYPH_MINIMIZE,
 				     UI_RAISED, UI_HEADING,
 				     _("Minimize call (Esc)"));
@@ -3006,7 +3307,11 @@ static void draw_call_stage(void)
 
 	memset(m.tile_rect, 0, sizeof(m.tile_rect));
 	memset(m.fullscreen_button, 0, sizeof(m.fullscreen_button));
-	if (video) {
+	if (group_call() && video) {
+		draw_group_video(stage, controls_y, self);
+	} else if (group_call()) {
+		draw_group_call(stage, controls_y);
+	} else if (video) {
 		/*
 		 * Tiles: 0 the peer, 1 you, 2 your screen, 3 the peer's screen.
 		 * Without a focus they share a grid; a focused tile fills the
@@ -3462,6 +3767,11 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		/* The worker can publish a newer call state before its command reply. */
 		if (!strcmp(method, "callPreview") || tag != m.call_serial)
 			return;
+		if (!strcmp(method, "callVideoFocus")) {
+			if (error)
+				ui_status(error);
+			return;
+		}
 		if (error) {
 			m.call_working = FALSE;
 			if (!strcmp(method, "callShare"))
@@ -3478,7 +3788,8 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			m.muted = json_object_get_boolean(
 				ui_field(result, "muted"));
 			if (m.muted != was)
-				ui_sound_play(m.muted ? CHIP_MUTE : CHIP_UNMUTE);
+				ui_sound_play(m.muted ? CHIP_MUTE :
+							CHIP_UNMUTE);
 		}
 		if (!strcmp(method, "callCamera") &&
 		    ui_field(result, "cameraEnabled")) {
@@ -3558,7 +3869,8 @@ static void record_now(void)
 		return;
 	}
 	g_autoptr(GError) e = NULL;
-	if (!line_record_start(record_finished, GUINT_TO_POINTER(m.serial),
+	if (!line_record_start(ui_gpu_device_vendor(), ui_gpu_render_minor(),
+			       record_finished, GUINT_TO_POINTER(m.serial),
 			       &e)) {
 		set(&m.note, e ? e->message : _("Could not open the camera."));
 		return;
@@ -3873,6 +4185,18 @@ static void click_overlay(int x, int y, int clicks)
 			call_rpc("callShare");
 		return;
 	}
+	if (m.mode == CALL && at(m.call_roster, x, y)) {
+		int row = (y - m.call_roster.y) / CALL_ROSTER_ROW;
+		Json *member = json_object_array_get_idx(
+			m.call_participants, m.call_roster_offset + row);
+		const char *id = ui_string(member, "id", "");
+
+		if (*id && g_strcmp0(id, ui.self_id) &&
+		    g_strcmp0(id, m.call_video_peer))
+			ui_rpc("callVideoFocus", args(m.call_chat, id),
+			       m.call_serial);
+		return;
+	}
 	/* Clicking a tile focuses it; clicking the focused tile unfocuses. */
 	for (int i = 0; m.mode == CALL && i < 4; i++)
 		if (m.tile_rect[i].w && at(m.tile_rect[i], x, y)) {
@@ -4100,12 +4424,28 @@ gboolean ui_media_event(SDL_Event *e)
 	if (call_stage_inline()) {
 		int x = -1, y = -1;
 
-		if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP)
+		if (e->type == SDL_MOUSEBUTTONDOWN ||
+		    e->type == SDL_MOUSEBUTTONUP)
 			x = e->button.x, y = e->button.y;
 		else if (e->type == SDL_MOUSEMOTION)
 			x = e->motion.x, y = e->motion.y;
-		else if (e->type == SDL_MOUSEWHEEL)
+		else if (e->type == SDL_MOUSEWHEEL) {
 			SDL_GetMouseState(&x, &y);
+			if (m.mode == CALL && at(m.call_roster, x, y)) {
+				int steps = CLAMP(e->wheel.y, -8, 8);
+				int limit = call_roster_count() -
+					    m.call_roster_rows;
+
+				if (e->wheel.direction ==
+				    SDL_MOUSEWHEEL_FLIPPED)
+					steps = -steps;
+				m.call_roster_offset =
+					CLAMP(m.call_roster_offset - steps, 0,
+					      MAX(0, limit));
+				ui.dirty = TRUE;
+				return TRUE;
+			}
+		}
 		if (e->type == SDL_TEXTINPUT || e->type == SDL_TEXTEDITING ||
 		    (x >= 0 && !at(m.dialog, x, y))) {
 			if (e->type == SDL_MOUSEMOTION &&
@@ -4135,9 +4475,14 @@ gboolean ui_media_event(SDL_Event *e)
 				};
 				int x = e->motion.x, y = e->motion.y;
 
-				for (guint i = 0; i < G_N_ELEMENTS(controls); i++)
+				if (at(m.call_roster, x, y) ||
+				    at(m.call_roster, ui.hover_x, ui.hover_y))
+					ui.dirty = TRUE;
+				for (guint i = 0; i < G_N_ELEMENTS(controls);
+				     i++)
 					if (at(controls[i], x, y) !=
-					    at(controls[i], ui.hover_x, ui.hover_y))
+					    at(controls[i], ui.hover_x,
+					       ui.hover_y))
 						ui.dirty = TRUE;
 				ui.hover_x = x;
 				ui.hover_y = y;
@@ -4191,12 +4536,11 @@ gboolean ui_media_event(SDL_Event *e)
 			open_picker(FALSE, NULL, FALSE);
 			return TRUE;
 		}
-		if (ui_media_can_call() && at(ui.call, x, y)) {
+		if (ui_media_can_call(FALSE) && at(ui.call, x, y)) {
 			dial(FALSE);
 			return TRUE;
 		}
-		if (ui.video_calls && ui_media_can_call() &&
-		    at(ui.video, x, y)) {
+		if (ui_media_can_call(TRUE) && at(ui.video, x, y)) {
 			dial(TRUE);
 			return TRUE;
 		}

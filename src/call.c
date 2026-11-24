@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call.h"
 #include "call_audio.h"
+#include "call_group.h"
 #include "call_pdtp.h"
 #include "screencast.h"
 #include "call_schema.h"
@@ -23,6 +24,8 @@ enum {
 	MID_LENGTH = 33,
 	MEDIA_CONTROL_HEADER = 8,
 	MEDIA_CONTROL_STREAMS = MEDIA_CONTROL_HEADER + 12,
+	GROUP_RELEASE_TIMEOUT_US = 2 * G_USEC_PER_SEC,
+	GROUP_RELEASE_RETRY_US = 500 * 1000,
 };
 
 /* A worker owns at most one call. Receiving a message cannot initiate a call. */
@@ -30,11 +33,13 @@ struct call_task {
 	GThread *thread;
 	int wake;
 	gint done, muted, camera_enabled, video_ready, preview_visible;
-	gboolean video;
+	gint group_joined;
+	gboolean video, group;
 	char *incoming_id, *caller;
 	char *target;
 	GMutex frame_lock;
 	GBytes *frame, *self_frame, *share_frame;
+	char video_focus[MID_LENGTH + 1];
 	gint64 frame_notified, self_notified, share_notified;
 	int width, height, rotation, self_width, self_height;
 	int share_width, share_height, share_rotation;
@@ -116,9 +121,30 @@ struct media_route {
 	gboolean reported_mismatch;
 };
 
+struct group_video {
+	struct call_video *receiver;
+	GArray *members;
+	GBytes *camera_report;
+	struct call_group_member peer;
+	gint64 retry_at, last_rtp;
+	guint32 version, sequence, request_sequence;
+	guint32 layer_sequence;
+	guint attempts;
+	guint8 rx_key[30], request_id[16];
+	guint8 camera_start_id[16];
+	guint32 camera_start_sequence;
+	gboolean camera_start_pending, vp8a;
+};
+
 struct voice_call {
+	enum line_media_reception reception;
 	struct call_task *task;
 	CallInfo info;
+	struct call_group_route group_route;
+	GBytes *group_report;
+	struct call_group_feedback *feedback;
+	gint64 next_group_feedback;
+	struct group_video *conference_video;
 	CallWire wire;
 	EVP_PKEY *media_key;
 	LineAudio *audio;
@@ -156,13 +182,27 @@ struct voice_call {
 		guint packets, other_ssrc, frames;
 		gboolean enabled;
 	} video_trace;
+	/* Aggregate group diagnostics, enabled only for a requested test call. */
+	struct {
+		gint64 next;
+		guint audio_sent, audio_active, audio_played, video_packets;
+		guint frames, controls, data_packets, camera_sent;
+		guint rtcp, audio_reports, video_reports, relay_media;
+		guint ccfs_audio, ccfs_camera, feedback_formats,
+			rejected_controls;
+		guint feedback_sent, data_accepted, data_sent;
+		guint mic_acknowledged, camera_acknowledged;
+		guint mic_retransmits_requested, camera_retransmits_requested;
+		guint rtcp_types, feedback_other_slots, rtcp_other_port;
+		guint udp_received, control_opened, unclassified_relay;
+	} stats;
 	struct call_endpoint relay, media;
 	struct media_route audio_route, video_route, data_route;
 	int fd;
 	gint64 deadline, next_ka, next_capture;
 	guint ka_seconds;
 	gboolean invited, ringing, remote_end, muted, incoming, decline,
-		verified, media_control;
+		verified, media_control, group;
 	guint8 expected_id[16];
 	guint64 expected_seq;
 	Pb peer_offer;
@@ -346,7 +386,10 @@ static gboolean send_control_to(struct voice_call *c,
 		memcpy(c->expected_id, transaction.p, 16);
 		c->expected_seq = pb_number(hdr, 5, G_MAXUINT64);
 	}
-	return send_plain(c, to, &plain, id == 0x2141 || id == 0x2142, FALSE);
+	return send_plain(c, to, &plain,
+			  id == 0x2141 || id == 0x2142 ||
+				  id == CALL_GROUP_PARTICIPATE_ID,
+			  FALSE);
 }
 
 static gboolean send_control(struct voice_call *c, guint plane, guint choice,
@@ -370,6 +413,18 @@ static void free_call(struct voice_call *c)
 	if (c->fd >= 0)
 		close(c->fd);
 	call_wire_clear(&c->wire);
+	call_group_route_clear(&c->group_route);
+	g_clear_pointer(&c->group_report, g_bytes_unref);
+	g_free(c->feedback);
+	if (c->conference_video) {
+		struct group_video *v = c->conference_video;
+
+		call_video_close(v->receiver);
+		g_array_unref(v->members);
+		g_clear_pointer(&v->camera_report, g_bytes_unref);
+		OPENSSL_cleanse(v, sizeof(*v));
+		g_free(v);
+	}
 	EVP_PKEY_free(c->media_key);
 	CallInfo *s = &c->info;
 
@@ -488,14 +543,25 @@ static gboolean send_video_packet(const guint8 *data, gsize size, gpointer user)
 {
 	struct voice_call *c = user;
 
-	return send_to(c, &c->video_route.current, (Slice){ data, size });
+	gboolean sent =
+		send_to(c, &c->video_route.current, (Slice){ data, size });
+
+	if (sent && c->stats.next && size >= 12 &&
+	    (data[1] & 127) == c->video_pt)
+		c->stats.camera_sent++;
+	return sent;
 }
 
 static gboolean send_data_packet(const guint8 *data, gsize size, gpointer user)
 {
 	struct voice_call *c = user;
 
-	return send_to(c, &c->data_route.current, (Slice){ data, size });
+	gboolean sent =
+		send_to(c, &c->data_route.current, (Slice){ data, size });
+
+	if (sent && c->stats.next)
+		c->stats.data_sent++;
+	return sent;
 }
 
 static GBytes *pack_i420(const struct line_camera_frame *image);
@@ -989,6 +1055,22 @@ static GBytes *pack_i420(const struct line_camera_frame *image)
 	return g_bytes_new_take(pixels, size);
 }
 
+static void group_reception(struct voice_call *c,
+			    enum line_media_reception state)
+{
+	if (!c->group || state <= c->reception)
+		return;
+	c->reception = state;
+	g_autoptr(J) event = obj();
+
+	json_object_object_add(event, "event",
+			       json_object_new_string("call_reception"));
+	json_object_object_add(event, "chat",
+			       json_object_new_string(c->info.target));
+	json_object_object_add(event, "stage", json_object_new_int(state));
+	line_emit(event);
+}
+
 static void display_video(const struct line_camera_frame *image, gpointer user)
 {
 	struct voice_call *c = user;
@@ -997,9 +1079,12 @@ static void display_video(const struct line_camera_frame *image, gpointer user)
 
 	if (!line_camera_frame_size_valid(width, height))
 		return;
+	group_reception(c, LINE_MEDIA_PLAYABLE);
 	c->video_start_retry = 0;
 	if (c->video_trace.enabled && ++c->video_trace.frames == 1)
 		g_printerr("line-call video first frame decoded\n");
+	if (c->stats.next)
+		c->stats.frames++;
 	if (!g_atomic_int_get(&task->preview_visible))
 		return;
 	gint64 now = g_get_monotonic_time();
@@ -1077,7 +1162,9 @@ static void activate_video(struct voice_call *c);
 static void send_stream_spec(struct voice_call *c,
 			     const struct call_endpoint *to);
 
-static void camera_state(struct voice_call *c)
+static gboolean group_camera_state(struct voice_call *c, gboolean streaming);
+
+static void update_camera_capture(struct voice_call *c)
 {
 	gboolean enabled = c->video && !share_is_video(c) &&
 			   g_atomic_int_get(&c->task->camera_enabled);
@@ -1098,14 +1185,28 @@ static void camera_state(struct voice_call *c)
 			call_video_keyframe(c->video);
 		} else {
 			g_atomic_int_set(&c->task->camera_enabled, FALSE);
-			line_event("call_camera_error", "message",
-				   error->message);
+			/* The group UI learns video readiness in the connected event. */
+			if (c->group &&
+			    !g_atomic_int_get(&c->task->group_joined))
+				c->video_notice = g_strdup(error->message);
+			else
+				line_event("call_camera_error", "message",
+					   error->message);
 		}
 	}
+}
+
+static void camera_state(struct voice_call *c)
+{
+	update_camera_capture(c);
 	int streaming = c->camera != NULL || share_is_video(c);
 
 	if (!c->audio || !c->video || streaming == c->reported_video)
 		return;
+	if (c->group) {
+		group_camera_state(c, streaming);
+		return;
+	}
 	/*
 	 * The official app reports its streams again before starting its
 	 * camera. The peer otherwise keeps showing this side's video as paused.
@@ -1335,11 +1436,13 @@ static void video_unavailable(struct voice_call *c)
 	g_atomic_int_set(&c->task->camera_enabled, FALSE);
 }
 
-/* MC stream control START for one media kind: 2 video, 4 PDTP data. */
-static void start_streams(struct voice_call *c, const struct call_endpoint *to,
-			  guint kind, guint32 rx, guint32 tx)
+/* MC stream control for one media kind: 2 video, 4 PDTP data. */
+static void control_streams(struct voice_call *c,
+			    const struct call_endpoint *to, guint kind,
+			    guint32 rx, guint32 tx, gboolean start)
 {
-	Pb request = { 0 };
+	Pb request = { 0 }, plain = { 0 };
+	struct group_video *v = kind == 2 ? c->conference_video : NULL;
 	const guint32 streams[] = { GUINT32_TO_BE(rx), GUINT32_TO_BE(tx) };
 
 	enum {
@@ -1349,7 +1452,7 @@ static void start_streams(struct voice_call *c, const struct call_endpoint *to,
 	guint8 control[SENDER + 2 + MID_LENGTH + 1] = {
 		[1] = 1, /* Stream control */
 		[5] = sizeof(control) - MEDIA_CONTROL_HEADER,
-		[9] = 1, /* START */
+		[9] = start ? 1 : 2, /* START or STOP */
 		[11] = G_N_ELEMENTS(streams),
 		[15] = kind,
 		[SENDER + 1] = MID_LENGTH + 1,
@@ -1361,20 +1464,39 @@ static void start_streams(struct voice_call *c, const struct call_endpoint *to,
 	pb_uint(&request, 2, 0);
 	pb_uint(&request, 3, 2);
 	pb_bytes(&request, 4, (Slice){ control, sizeof(control) });
-	gboolean sent =
-		send_control_to(c, to, 4, 16, 0x3189, &request, (Slice){ 0 });
+	gboolean sent = call_envelope(&plain, &c->info, 4, CALL_GROUP_DATA_REQ,
+				      CALL_GROUP_DATA_ID, &request,
+				      (Slice){ 0 }) &&
+			send_plain(c, to, &plain, FALSE, FALSE);
+
+	if (v) {
+		/* A subsequent STOP or START supersedes the previous request. */
+		v->camera_start_pending = FALSE;
+		if (start && sent) {
+			Slice header = pb_data(PB_SLICE(plain), 1);
+			Slice id = pb_data(header, 4);
+
+			if (id.n == sizeof(v->camera_start_id)) {
+				memcpy(v->camera_start_id, id.p, id.n);
+				v->camera_start_sequence =
+					pb_number(header, 5, 0);
+				v->camera_start_pending = TRUE;
+			}
+		}
+	}
 
 	if (c->video_trace.enabled)
-		g_printerr("line-call stream start kind=%u route=%s sent=%d\n",
-			   kind, to == &c->relay ? "signaling" : "media", sent);
+		g_printerr("line-call stream %s kind=%u route=%s sent=%d\n",
+			   start ? "start" : "stop", kind,
+			   to == &c->relay ? "signaling" : "media", sent);
 }
 
 static void start_video_streams(struct voice_call *c,
 				const struct call_endpoint *to)
 {
-	start_streams(c, to, 2, c->video_rx, c->video_tx);
+	control_streams(c, to, 2, c->video_rx, c->video_tx, TRUE);
 	if (c->data)
-		start_streams(c, to, 4, c->data_rx, c->data_tx);
+		control_streams(c, to, 4, c->data_rx, c->data_tx, TRUE);
 }
 
 static void activate_video(struct voice_call *c)
@@ -1386,19 +1508,30 @@ static void activate_video(struct voice_call *c)
 		c->video_start_retry = g_get_monotonic_time() + G_USEC_PER_SEC;
 }
 
-static gboolean ack_video_start(struct voice_call *c, Slice req, Pb *rsp)
+static gboolean ack_stream_start(struct voice_call *c, Slice req, Pb *rsp)
 {
 	Slice control = pb_data(req, 4);
 	const guint8 *p = control.p;
 
-	if (!c->video || pb_number(req, 3, 0) != 2 ||
-	    control.n < MEDIA_CONTROL_STREAMS || p[0] || p[1] != 1 || p[8] ||
-	    (p[9] != 1 && p[9] != 4) || p[12] || p[13] || p[14] ||
-	    (p[15] != 2 && (p[15] != 4 || !c->data)))
+	if (pb_number(req, 3, 0) != 2 || control.n < MEDIA_CONTROL_STREAMS ||
+	    p[0] || p[1] != 1 || p[8] || (p[9] != 1 && p[9] != 4) || p[12] ||
+	    p[13] || p[14])
 		return FALSE;
 	guint kind = p[15];
-	guint32 rx_id = kind == 4 ? c->data_rx : c->video_rx,
-		tx_id = kind == 4 ? c->data_tx : c->video_tx;
+	guint32 rx_id, tx_id;
+
+	if (kind == 1 && c->audio) {
+		rx_id = c->audio_rx;
+		tx_id = c->audio_tx;
+	} else if (kind == 2 && c->video) {
+		rx_id = c->video_rx;
+		tx_id = c->video_tx;
+	} else if (kind == 4 && c->data) {
+		rx_id = c->data_rx;
+		tx_id = c->data_tx;
+	} else {
+		return FALSE;
+	}
 	guint bytes = ((guint)p[4] << 8) | p[5];
 	guint count = ((guint)p[10] << 8) | p[11];
 
@@ -1564,15 +1697,22 @@ static void send_stream_spec(struct voice_call *c,
 			to == &c->relay ? "signaling" : "media", sent);
 }
 
+static Slice group_report(const struct voice_call *c, gboolean streaming)
+{
+	GBytes *bytes = streaming ? c->conference_video->camera_report :
+				    c->group_report;
+	Slice report;
+
+	report.p = g_bytes_get_data(bytes, &report.n);
+	return report;
+}
+
 static gboolean mc_request(struct voice_call *c,
 			   const struct call_endpoint *source, guint choice,
 			   Slice req, Slice header)
 {
-	Pb spec = { 0 }, rsp = { 0 };
+	Pb rsp = { 0 };
 
-	call_stream_spec(&spec, c->audio_rx, c->audio_tx, c->video_rx,
-			 c->video_tx, c->data_rx, c->data_tx,
-			 video_requested(c));
 	pb_uint(&rsp, 1, 0);
 	if (choice == 16 && c->video_trace.enabled) {
 		Slice data = pb_data(req, 4);
@@ -1587,15 +1727,29 @@ static gboolean mc_request(struct voice_call *c,
 	if (choice == 16) {
 		pb_uint(&rsp, 2, 0);
 		pb_uint(&rsp, 4, pb_number(req, 3, 0));
-		if (ack_video_start(c, req, &rsp))
+		if (ack_stream_start(c, req, &rsp))
 			return send_control_to(c, source, 4, 17, 0x3289, &rsp,
 					       header);
-		guint8 data[sizeof(spec.p) + 12];
+	}
 
-		pb_bytes(&rsp, 5, stream_spec_data(c, data, sizeof(data)));
+	guint8 data[sizeof(rsp.p) + 12];
+	Slice report = c->group ? group_report(c, c->conference_video &&
+							  c->reported_video) :
+				  stream_spec_data(c, data, sizeof(data));
+
+	if (choice == 16) {
+		pb_bytes(&rsp, 5, report);
 		return send_control_to(c, source, 4, 17, 0x3289, &rsp, header);
 	}
-	pb_msg(&rsp, 17, &spec);
+	/* The report wraps StrmSpec in an 8-byte MCMMD header and padding. */
+	if (report.n < MEDIA_CONTROL_HEADER)
+		return FALSE;
+	Slice spec = { report.p + MEDIA_CONTROL_HEADER,
+		       ((guint)report.p[4] << 8) | report.p[5] };
+
+	if (spec.n > report.n - MEDIA_CONTROL_HEADER)
+		return FALSE;
+	pb_bytes(&rsp, 17, spec);
 	if (choice == 11)
 		return send_control_to(c, source, 4, 12, 0x3286, &rsp, header);
 	if (!send_control_to(c, source, 4, 10, 0x3285, &rsp, header))
@@ -1608,15 +1762,758 @@ static gboolean mc_request(struct voice_call *c,
 
 	pb_fixed64(&token, 1, bepi_token);
 	pb_msg(&nested, 3, &token);
-	pb_msg(&rpt, 17, &spec);
+	pb_bytes(&rpt, 17, spec);
 	return send_control_to(c, source, 2, 2, 0x1102, &nested,
 			       (Slice){ 0 }) &&
 	       send_control_to(c, source, 4, 13, 0x3287, &rpt, (Slice){ 0 });
 }
 
+static gboolean group_camera_state(struct voice_call *c, gboolean streaming)
+{
+	Pb request = { 0 };
+
+	pb_uint(&request, 1, 0);
+	pb_uint(&request, 2, 0);
+	pb_uint(&request, 3, 2);
+	pb_bytes(&request, 4, group_report(c, streaming));
+	gboolean sent = send_control(c, 4, CALL_GROUP_DATA_REQ,
+				     CALL_GROUP_DATA_ID, &request,
+				     (Slice){ 0 });
+
+	/* Send STOP only for a previously active camera. */
+	if (sent && c->conference_video && (streaming || c->reported_video > 0))
+		control_streams(c, &c->relay, 2, c->video_rx, c->video_tx,
+				streaming);
+	c->reported_video = streaming;
+	return sent;
+}
+
+static void group_camera_start_reply(struct voice_call *c, Slice header,
+				     Slice body)
+{
+	struct group_video *v = c->conference_video;
+	Slice id = pb_data(header, 4);
+
+	if (!v || !v->camera_start_pending ||
+	    id.n != sizeof(v->camera_start_id) ||
+	    memcmp(id.p, v->camera_start_id, id.n) ||
+	    pb_number(header, 5, G_MAXUINT64) != v->camera_start_sequence)
+		return;
+	v->camera_start_pending = FALSE;
+
+	Slice data = pb_data(body, 5);
+	const guint8 *p = data.p;
+	guint64 result = pb_number(body, 1, G_MAXUINT64);
+	guint64 release = pb_number(body, 2, 0);
+	guint64 dispatch = pb_number(body, 4, 0);
+	guint count = 0, code = 0;
+	gboolean valid = FALSE, rx = FALSE, tx = FALSE;
+
+	if (data.n >= MEDIA_CONTROL_STREAMS) {
+		guint len = p[4] * 256u + p[5];
+		guint32 kind, status;
+
+		count = p[10] * 256u + p[11];
+		memcpy(&kind, p + 12, sizeof(kind));
+		memcpy(&status, p + 16, sizeof(status));
+		code = ntohl(status);
+		valid = !p[0] && p[1] == 1 && !p[2] && !p[3] && !p[8] &&
+			p[9] == 1 && ntohl(kind) == 2 &&
+			len >= 12 + count * 4 &&
+			data.n == MEDIA_CONTROL_HEADER + ((len + 3) & ~3u);
+		/* Some replies have no sender after the list of accepted SSRCs. */
+		if (valid && len != 12 + count * 4) {
+			guint at = MEDIA_CONTROL_STREAMS + count * 4;
+			guint trailing = len - 12 - count * 4;
+
+			valid = trailing > 2 &&
+				p[at] * 256u + p[at + 1] == trailing - 2 &&
+				!p[at + trailing - 1];
+		}
+		for (guint i = 0; valid && i < count; i++) {
+			guint32 ssrc;
+
+			memcpy(&ssrc, p + MEDIA_CONTROL_STREAMS + i * 4,
+			       sizeof(ssrc));
+			rx |= ntohl(ssrc) == c->video_rx;
+			tx |= ntohl(ssrc) == c->video_tx;
+		}
+	}
+	if (c->stats.next)
+		g_printerr(
+			"group-stats camera-start-reply result=%" G_GINT64_FORMAT
+			" release=%" G_GUINT64_FORMAT
+			" dispatch=%" G_GUINT64_FORMAT
+			" bytes=%zu type=%d valid=%d code=%u sources=%u rx=%d tx=%d\n",
+			(gint64)result, release, dispatch, data.n,
+			data.n >= 2 ? p[0] * 256 + p[1] : -1, valid, code,
+			count, rx, tx);
+	/* 203 means at least one start failed. Only successful sources are
+	 * listed, so a partial reply can still accept the transmitter. */
+	if (!result && !release && dispatch == 2 && valid && tx &&
+	    (!code || code == 203))
+		call_video_keyframe(c->video);
+}
+
+static void setup_group_video(struct voice_call *c,
+			      const struct call_group_answer *answer)
+{
+	g_autoptr(GError) error = NULL;
+	guint8 tx[30];
+
+	if (!c->info.video)
+		return;
+	if (answer->video_supported) {
+		choose_send_limits(c, answer->description);
+		call_group_media_key("VIDEO", c->info.media_secret, tx);
+		c->video = call_video_open_group_tx(tx, answer->video_payload,
+						    answer->video_tx,
+						    c->send_kbps, c->send_fps,
+						    &error);
+		OPENSSL_cleanse(tx, sizeof(tx));
+	}
+	if (!c->video) {
+		if (c->video_trace.enabled && error)
+			g_printerr("line-call group video: %s\n",
+				   error->message);
+		video_unavailable(c);
+		return;
+	}
+	/* The selected payload map fixes camera framing for this session.
+	 * A viewer START can change resolution, but cannot change the map. */
+	if (answer->video_map != CALL_GROUP_VIDEO_VP8)
+		call_video_set_group_format(c->video,
+					    answer->video_packet_version ?
+						    CALL_VIDEO_RTP_EXT_VED :
+						    CALL_VIDEO_RTP_EXT_VFD,
+					    answer->video_vp8a);
+	struct group_video *v = g_new0(struct group_video, 1);
+	Pb request = { 0 };
+
+	call_group_register(&request, answer, TRUE);
+	Slice report = pb_data(PB_SLICE(request), 4);
+
+	v->members =
+		g_array_new(FALSE, FALSE, sizeof(struct call_group_member));
+	v->camera_report = g_bytes_new(report.p, report.n);
+	v->vp8a = answer->video_vp8a;
+	call_group_media_key("VIDEO", answer->secret.p, v->rx_key);
+	c->conference_video = v;
+	c->video_rx = answer->video_rx;
+	c->video_tx = answer->video_tx;
+	c->video_pt = answer->video_payload;
+	c->video_route.current = c->relay;
+	c->reported_video = FALSE;
+	if (c->video_trace.enabled)
+		c->video_trace.report_at =
+			g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+	g_atomic_int_set(&c->task->video_ready, TRUE);
+}
+
+static gboolean group_peer_matches(const struct call_group_member *a,
+				   const struct call_group_member *b)
+{
+	return a->ssrc == b->ssrc && a->channel == b->channel &&
+	       !strcmp(a->mid, b->mid);
+}
+
+static void group_clear_frame(struct voice_call *c, const char *mid)
+{
+	g_autoptr(J) event = obj();
+	struct call_task *task = c->task;
+
+	g_mutex_lock(&task->frame_lock);
+	g_clear_pointer(&task->frame, g_bytes_unref);
+	g_mutex_unlock(&task->frame_lock);
+	json_object_object_add(event, "event",
+			       json_object_new_string("call_video_peer"));
+	json_object_object_add(event, "chat",
+			       json_object_new_string(c->info.target));
+	json_object_object_add(event, "id", json_object_new_string(mid));
+	json_object_object_add(event, "changedAt",
+			       json_object_new_int64(g_get_monotonic_time()));
+	line_emit(event);
+}
+
+static void group_stream_request(struct voice_call *c, gboolean start)
+{
+	struct group_video *v = c->conference_video;
+	Pb request = { 0 }, plain = { 0 };
+
+	call_group_stream_request(&request, v->peer.mid, v->peer.ssrc,
+				  v->peer.channel, start, ++v->sequence);
+	if (!call_envelope(&plain, &c->info, 4, CALL_GROUP_STRM_REQ,
+			   CALL_GROUP_STRM_REQ_ID, &request, (Slice){ 0 }))
+		return;
+	if (start) {
+		Slice header = pb_data(PB_SLICE(plain), 1);
+		Slice id = pb_data(header, 4);
+
+		if (id.n != sizeof(v->request_id))
+			return;
+		memcpy(v->request_id, id.p, sizeof(v->request_id));
+		v->request_sequence = pb_number(header, 5, 0);
+	}
+	send_plain(c, &c->relay, &plain, FALSE, FALSE);
+	if (c->video_trace.enabled)
+		g_printerr(
+			"line-call group video subscription start=%d ssrc=%u\n",
+			start, v->peer.ssrc);
+}
+
+static void group_select_video(struct voice_call *c)
+{
+	struct group_video *v = c->conference_video;
+	const struct call_group_member *first = NULL, *selected = NULL;
+	char focus[MID_LENGTH + 1];
+
+	g_mutex_lock(&c->task->frame_lock);
+	memcpy(focus, c->task->video_focus, sizeof(focus));
+	g_mutex_unlock(&c->task->frame_lock);
+	for (guint i = 0; i < v->members->len; i++) {
+		const struct call_group_member *m =
+			&g_array_index(v->members, struct call_group_member, i);
+
+		if (!m->active || !m->ssrc || m->ssrc == c->video_tx ||
+		    m->ssrc == c->audio_rx || !strcmp(m->mid, c->info.local))
+			continue;
+		if (!first)
+			first = m;
+		if (!strcmp(m->mid, focus)) {
+			selected = m;
+			break;
+		}
+		if (group_peer_matches(m, &v->peer))
+			selected = m;
+	}
+	if (!selected)
+		selected = first;
+	if (selected && group_peer_matches(selected, &v->peer))
+		return;
+	if (!selected && !v->peer.ssrc)
+		return;
+	if (v->peer.ssrc) {
+		group_stream_request(c, FALSE);
+		if (c->feedback) {
+			call_group_feedback_forget(c->feedback, v->peer.ssrc);
+			if (!c->feedback->active_streams)
+				c->next_group_feedback = 0;
+		}
+	}
+	g_clear_pointer(&v->receiver, call_video_close);
+	v->retry_at = 0;
+	v->last_rtp = 0;
+	c->next_video_feedback = 0;
+	v->peer = (struct call_group_member){ 0 };
+	if (selected) {
+		v->receiver = call_video_open_group_rx(v->rx_key, c->video_pt,
+						       selected->ssrc, NULL);
+		if (v->receiver) {
+			v->peer = *selected;
+			v->attempts = 0;
+			v->retry_at = g_get_monotonic_time();
+		}
+	}
+	group_clear_frame(c, v->peer.mid);
+}
+
+static void group_presence(struct voice_call *c, Slice body, guint choice)
+{
+	struct group_video *v = c->conference_video;
+	struct call_group_presence presence;
+
+	if (!v || !call_group_presence(body, choice, &presence))
+		return;
+	if (c->stats.next) {
+		guint cameras = 0;
+		for (guint i = 0; i < presence.members->len; i++)
+			cameras += g_array_index(presence.members,
+						 struct call_group_member, i)
+					   .active;
+		g_printerr(
+			"group-stats roster rows=%u wire=%u reported=%u cameras=%u unmapped=%u subgroup=%d full=%d\n",
+			presence.members->len, presence.wire_members,
+			presence.reported_members, cameras,
+			presence.unmapped_cameras, !!presence.channel,
+			presence.full);
+	}
+	g_autoptr(GArray) updates = presence.members;
+
+	/* Camera subscriptions currently cover the main conference. */
+	if (presence.channel || (presence.version && v->version &&
+				 (gint32)(presence.version - v->version) <= 0))
+		return;
+	if (presence.version)
+		v->version = presence.version;
+	if (presence.full)
+		g_array_set_size(v->members, 0);
+	for (guint i = 0; i < updates->len; i++) {
+		struct call_group_member *m =
+			&g_array_index(updates, struct call_group_member, i);
+		guint j;
+
+		for (j = 0; j < v->members->len; j++) {
+			struct call_group_member *old = &g_array_index(
+				v->members, struct call_group_member, j);
+
+			if (!strcmp(old->mid, m->mid)) {
+				*old = *m;
+				break;
+			}
+		}
+		if (j == v->members->len && j < 500)
+			g_array_append_val(v->members, *m);
+	}
+	group_select_video(c);
+}
+
+/* The mixer can request a transmit stream again when a viewer joins. */
+static gboolean group_tx_request(struct voice_call *c, Slice body, Slice header)
+{
+	Pb reply = { 0 };
+	PbField field;
+	guint starts = 0, stops = 0, video = 0, audio = 0, other = 0;
+	guint camera_modes = 0, requested_classes = 0;
+	int selected = CALL_GROUP_LAYER_UNCHANGED;
+	guint32 sequence = 0;
+
+	while (body.n) {
+		if (!pb_next(&body, &field))
+			return TRUE;
+		if (field.field == 2) {
+			if (field.type || field.value > G_MAXUINT32)
+				return TRUE;
+			sequence = field.value;
+			continue;
+		}
+		if (field.field != 1)
+			continue;
+		if (field.type != 2)
+			return TRUE;
+		guint64 action = pb_number(field.data, 1, 0);
+		guint64 source = pb_number(field.data, 3, 0);
+
+		if (action == 1)
+			starts++;
+		else if (!action)
+			stops++;
+		if (source && source == c->video_tx) {
+			video++;
+			if (action == 1 && c->conference_video) {
+				guint64 encoding = pb_number(field.data, 6, 0);
+				guint classes;
+				int layer = call_group_camera_resolution(
+					field.data, c->video_tx,
+					c->conference_video->vp8a, &classes);
+
+				requested_classes |= classes;
+				if (layer != CALL_GROUP_LAYER_UNCHANGED)
+					selected = layer;
+				camera_modes |= 1u << MIN(encoding, 31);
+				/* START requests a fresh picture. Its encoding option
+				 * controls simulcast, not the negotiated RTP format. */
+				if (c->camera)
+					call_video_keyframe(c->video);
+			}
+		} else if (source && source == c->audio_tx) {
+			audio++;
+		} else {
+			other++;
+		}
+	}
+	if (selected != CALL_GROUP_LAYER_UNCHANGED) {
+		struct group_video *v = c->conference_video;
+
+		if (sequence >= v->layer_sequence) {
+			v->layer_sequence = sequence;
+			call_video_set_group_resolution(c->video, selected);
+		} else {
+			selected = CALL_GROUP_LAYER_UNCHANGED;
+		}
+	}
+	if (c->stats.next && c->stats.controls <= 100)
+		g_printerr(
+			"group-stats tx-request starts=%u stops=%u camera=%u audio=%u other=%u camera-modes=%x requested-classes=%x selected-class=%d descriptor=%u\n",
+			starts, stops, video, audio, other, camera_modes,
+			requested_classes, selected,
+			c->video ? (guint)call_video_group_rtp_extension(
+					   c->video) :
+				   0);
+	/* The native reply acknowledges the request transaction, including
+	 * repeats. It carries no per-source receive-state records. */
+	pb_uint(&reply, 1, 0);
+	pb_uint(&reply, 2, 0);
+	return send_control(c, 4, CALL_GROUP_STRM_RSP, CALL_GROUP_STRM_RSP_ID,
+			    &reply, header);
+}
+
+static void group_stream_updates(struct voice_call *c, Slice body, guint choice,
+				 Slice header)
+{
+	struct group_video *v = c->conference_video;
+
+	if (!v || !v->peer.ssrc)
+		return;
+	if (choice == CALL_GROUP_STRM_RSP) {
+		Slice id = pb_data(header, 4);
+
+		if (id.n != sizeof(v->request_id) ||
+		    memcmp(id.p, v->request_id, sizeof(v->request_id)) ||
+		    pb_number(header, 5, G_MAXUINT64) != v->request_sequence)
+			return;
+	}
+	g_autoptr(GArray) updates = call_group_stream_updates(body, choice);
+
+	for (guint i = 0; updates && i < updates->len; i++) {
+		const struct call_group_stream *stream =
+			&g_array_index(updates, struct call_group_stream, i);
+
+		if (stream->ssrc != v->peer.ssrc ||
+		    stream->channel != v->peer.channel ||
+		    (stream->mid[0] && strcmp(stream->mid, v->peer.mid)))
+			continue;
+		v->retry_at = 0;
+		if (stream->state != CALL_GROUP_STREAM_RESUME)
+			group_clear_frame(c, v->peer.mid);
+		break;
+	}
+}
+
+static gboolean join_group(struct voice_call *c,
+			   const struct call_group_answer *answer, GError **e)
+{
+	Pb request = { 0 };
+	guint8 tx[30], rx[30];
+
+	if (c->stats.next) {
+		PbField record;
+		Slice description = answer->description;
+
+		while (description.n && pb_next(&description, &record)) {
+			if (record.field != 1 || record.type != 2)
+				continue;
+			Slice head = pb_data(record.data, 1),
+			      name = pb_data(head, 1);
+			if (name.n != 1 || !strchr("AVD", *name.p) || !*name.p)
+				continue;
+			if (*name.p == 'V') {
+				PbField item;
+				Slice session = record.data;
+				while (session.n && pb_next(&session, &item)) {
+					if (item.field != 51 || item.type != 2)
+						continue;
+					guint64 type = pb_number(item.data, 1,
+								 G_MAXUINT64);
+					if (type == 0 || type == 2)
+						g_printerr(
+							"group-stats video-feature type=%u value=%u\n",
+							(guint)type,
+							(guint)pb_number(
+								item.data, 2,
+								0));
+				}
+			}
+			g_printerr(
+				"group-stats session=%c state=%u direction=%u map=%u pt=%u\n",
+				*name.p, (guint)pb_number(head, 3, 0),
+				(guint)pb_number(head, 2, 0),
+				(guint)pb_number(head, 50, 0),
+				(guint)pb_number(pb_data(record.data, 2), 1,
+						 0));
+		}
+		g_printerr(
+			"group-stats joined video-requested=%d compatible=%d shared-material=%d\n",
+			c->info.video, answer->video_supported,
+			CRYPTO_memcmp(c->info.media_secret, answer->secret.p,
+				      30) == 0);
+	}
+	c->data_pt = answer->data_payload;
+	/* The negotiated data channel carries reliable conference control. */
+	if (answer->data_supported) {
+		call_group_media_key("DATA", c->info.media_secret, tx);
+		call_group_media_key("DATA", answer->secret.p, rx);
+		c->data = call_pdtp_open_group(tx, rx, answer->data_payload,
+					       answer->data_tx, answer->data_rx,
+					       e);
+		OPENSSL_cleanse(tx, sizeof(tx));
+		OPENSSL_cleanse(rx, sizeof(rx));
+		if (!c->data)
+			return FALSE;
+		c->data_route.current = c->relay;
+	}
+	/* The local receive agent reports arrivals for the negotiated source. */
+	if (answer->feedback_version == 3 && answer->feedback_rx &&
+	    g_strcmp0(g_getenv("LINE_EXPERIMENTAL_GROUP_UPLINK"), "0")) {
+		c->feedback = g_new0(struct call_group_feedback, 1);
+		call_group_feedback_init(c->feedback, answer);
+	}
+	setup_group_video(c, answer);
+	/* Cache the paused report for camera-off joins and later toggles. */
+	call_group_register(&request, answer, FALSE);
+	Slice report = pb_data(PB_SLICE(request), 4);
+
+	if (request.overflow || !report.n) {
+		set_error(e, "Could not construct the group media report.");
+		return FALSE;
+	}
+	c->group_report = g_bytes_new(report.p, report.n);
+	c->info.remote_media = answer->media_channel;
+	/* The relay's first report reflects whether capture actually opened. */
+	update_camera_capture(c);
+	if (!group_camera_state(c, c->camera != NULL)) {
+		set_error(e, "Could not register media with the group call.");
+		return FALSE;
+	}
+	if (c->stats.next)
+		g_printerr("group-stats initial-report camera-active=%d\n",
+			   c->reported_video);
+
+	/* The offer seeds the participant's SRTP sender. The conference
+	 * answer seeds its receiver, independently of the control transport.
+	 */
+	call_group_media_key("AUDIO", c->info.media_secret, tx);
+	call_group_media_key("AUDIO", answer->secret.p, rx);
+	c->audio = line_audio_open_group(tx, rx, answer->audio_payload,
+					 answer->audio_payload,
+					 answer->audio_tx, answer->audio_rx, e);
+	OPENSSL_cleanse(tx, sizeof(tx));
+	OPENSSL_cleanse(rx, sizeof(rx));
+	OPENSSL_cleanse(c->info.media_secret, sizeof(c->info.media_secret));
+	if (!c->audio)
+		return FALSE;
+	if (c->stats.next)
+		line_audio_enable_diagnostics(c->audio);
+	c->audio_rx = answer->audio_rx;
+	c->audio_tx = answer->audio_tx;
+	c->audio_route.current = c->relay;
+	c->ka_seconds = answer->keepalive;
+	c->next_capture = g_get_monotonic_time();
+	c->deadline = c->next_capture + 90 * G_USEC_PER_SEC;
+	c->muted = g_atomic_int_get(&c->task->muted);
+	line_audio_mute(c->audio, c->muted);
+	if (!pinholes(c) || !keepalive(c))
+		return FALSE;
+	camera_state(c);
+	g_atomic_int_set(&c->task->group_joined, TRUE);
+	call_connected(c);
+	return TRUE;
+}
+
+/* Group calls use the conference relay and its assigned media streams. */
+static void group_camera_feedback(struct voice_call *c, Slice packet)
+{
+	struct group_video *v = c->conference_video;
+	guint32 sender;
+
+	if (!v || !c->camera || packet.n < 12)
+		return;
+	memcpy(&sender, packet.p + 4, sizeof(sender));
+	sender = ntohl(sender);
+	if (!sender || sender == c->video_tx)
+		return;
+	if (sender != c->video_rx &&
+	    (!c->feedback || sender != c->feedback->ssrc)) {
+		guint i;
+
+		for (i = 0; i < v->members->len; i++) {
+			const struct call_group_member *member = &g_array_index(
+				v->members, struct call_group_member, i);
+
+			if (member->ssrc == sender && !member->channel)
+				break;
+		}
+		if (i == v->members->len)
+			return;
+	}
+	call_video_receive_group_feedback(c->video, packet.p, packet.n, sender,
+					  g_get_monotonic_time());
+}
+
+static gboolean handle_group(struct voice_call *c,
+			     const struct call_endpoint *source, Slice plain,
+			     GError **e)
+{
+	CallInfo *s = &c->info;
+	Slice hdr = pb_data(plain, 1), session = pb_data(hdr, 3);
+	Slice scope = pb_data(plain, 3);
+	gboolean media = !scope.p;
+
+	if (media)
+		scope = pb_data(plain, 4);
+	Slice channel = pb_data(scope, 1);
+	Slice cid = pb_data(channel, 1), choice = pb_data(scope, 2);
+	guint64 remote = pb_number(channel, 2, 0);
+	guint64 local = pb_number(channel, 3, 0);
+	guint64 expected_local = media ? s->local_media : s->local_channel;
+	guint64 expected_remote = media ? s->remote_media : s->remote_channel;
+	guint64 nonce = pb_number(hdr, 6, 0);
+	guint64 echo = pb_number(hdr, 7, 0);
+	PbField message;
+
+	if (c->stats.next && c->stats.rejected_controls < 32) {
+		guint64 id = pb_number(hdr, 2, 0);
+		if (id && (!scope.p || (s->have_session &&
+					(remote != expected_remote ||
+					 (local && local != expected_local) ||
+					 (echo && echo != s->nonce) ||
+					 nonce != s->remote_nonce)))) {
+			g_printerr(
+				"group-stats other-control id=%u plane=%u source-match=%d target-match=%d\n",
+				(guint)id,
+				!scope.p ? 2 :
+				media	 ? 4 :
+					   3,
+				remote == expected_remote,
+				local == expected_local);
+			c->stats.rejected_controls++;
+		}
+	}
+	if (cid.n != strlen(s->cid) || memcmp(cid.p, s->cid, cid.n) ||
+	    !remote || (local && local != expected_local) ||
+	    pb_data(hdr, 4).n != 16 || (echo && echo != s->nonce) ||
+	    !pb_next(&choice, &message) || message.type != 2 || choice.n)
+		return TRUE;
+	if (s->have_session &&
+	    (session.n != sizeof(s->session) ||
+	     memcmp(session.p, s->session, sizeof(s->session)) ||
+	     nonce != s->remote_nonce || remote != expected_remote))
+		return TRUE;
+
+	if (c->stats.next && c->stats.controls++ < 100)
+		g_printerr("group-stats plane=%u control=%u id=%u result=%u\n",
+			   media ? 4 : 3, message.field,
+			   (guint)pb_number(hdr, 2, 0),
+			   media && (message.field == 17 ||
+				     message.field == 56) ?
+				   (guint)pb_number(message.data, 1, 0) :
+				   0);
+	if (media) {
+		if (!c->audio)
+			return TRUE;
+		Pb reply = { 0 };
+
+		if (message.field == CALL_GROUP_DATA_RSP) {
+			if (pb_number(hdr, 2, 0) == 0x3289 &&
+			    equal_address(source, &c->relay))
+				group_camera_start_reply(c, hdr, message.data);
+			return TRUE;
+		}
+		/* Dispatch 1 carries stream control and requires no reply. */
+		if (message.field == CALL_GROUP_DATA_REQ &&
+		    pb_number(message.data, 3, 0) == 1) {
+			if (s->have_session && equal_address(source, &c->relay))
+				group_camera_feedback(c,
+						      pb_data(message.data, 4));
+			return TRUE;
+		}
+		if (message.field == CALL_GROUP_STRM_REQ &&
+		    pb_number(hdr, 2, 0) == CALL_GROUP_STRM_REQ_ID)
+			return group_tx_request(c, message.data, hdr);
+		if (message.field == CALL_GROUP_STRM_RSP ||
+		    message.field == CALL_GROUP_NOTIFY_REQ) {
+			group_stream_updates(c, message.data, message.field,
+					     hdr);
+			if (message.field == CALL_GROUP_STRM_RSP)
+				return TRUE;
+			pb_uint(&reply, 1, 0);
+			return send_control(c, 4, CALL_GROUP_NOTIFY_RSP,
+					    CALL_GROUP_NOTIFY_RSP_ID, &reply,
+					    hdr);
+		}
+		if (message.field == 9 || message.field == 11 ||
+		    message.field == CALL_GROUP_DATA_REQ)
+			return mc_request(c, &c->relay, message.field,
+					  message.data, hdr);
+		return TRUE;
+	}
+	if (message.field == CALL_GROUP_PARTICIPATE_RSP && !c->audio) {
+		struct call_group_answer answer;
+		enum call_group_result result =
+			call_group_answer(message.data, &answer);
+
+		if (c->stats.next && result != CALL_GROUP_JOINED)
+			g_printerr(
+				"group-stats participation state=%u result=%u release=%u description=%d channel=%d\n",
+				result, (guint)pb_number(message.data, 1, 0),
+				(guint)pb_number(message.data, 2, 0),
+				!!answer.description.n, !!answer.media_channel);
+		if (result == CALL_GROUP_PENDING)
+			return TRUE;
+		if (result != CALL_GROUP_JOINED) {
+			if (result == CALL_GROUP_REJECTED &&
+			    pb_number(message.data, 2, 0) ==
+				    CALL_GROUP_RELEASE_MULTIDEV_IN_USE) {
+				set_error(
+					e,
+					"LINE sees this account in a call on another device. End that call before joining here.");
+			} else if (result == CALL_GROUP_REJECTED)
+				g_set_error(
+					e, LINE_ERROR, 1,
+					"LINE declined the group call (result %u, release %u).",
+					(guint)pb_number(message.data, 1, 0),
+					(guint)pb_number(message.data, 2, 0));
+			else
+				set_error(
+					e,
+					"The group call returned an unsupported media answer.");
+			return FALSE;
+		}
+		if (!nonce || session.n != sizeof(s->session)) {
+			set_error(
+				e,
+				"LINE did not confirm the group call session.");
+			return FALSE;
+		}
+		memcpy(s->session, session.p, sizeof(s->session));
+		s->have_session = TRUE;
+		s->remote_nonce = nonce;
+		s->remote_channel = remote;
+		c->invited = TRUE;
+		if (c->stats.next)
+			g_printerr(
+				"group-stats joined role-present=%d stops-present=%d ptt=%d feedback-version=%u feedback-directions=%d/%d data=%d\n",
+				!!pb_data(message.data, 13).n,
+				!!pb_data(message.data, 103).n,
+				!!pb_number(message.data, 105, 0),
+				answer.feedback_version, !!answer.feedback_tx,
+				!!answer.feedback_rx, answer.data_supported);
+		if (!join_group(c, &answer, e))
+			return FALSE;
+		group_presence(c, message.data, message.field);
+		return TRUE;
+	}
+	if (s->have_session && (message.field == CALL_GROUP_PUSH_REQ ||
+				message.field == CALL_GROUP_SUBPUSH_REQ)) {
+		Pb reply = { 0 };
+		gboolean sub = message.field == CALL_GROUP_SUBPUSH_REQ;
+
+		group_presence(c, message.data, message.field);
+		pb_uint(&reply, 1, 0);
+		if (sub)
+			pb_uint(&reply, 5, pb_number(message.data, 1, 0));
+		return send_control(c, 3,
+				    sub ? CALL_GROUP_SUBPUSH_RSP :
+					  CALL_GROUP_PUSH_RSP,
+				    sub ? CALL_GROUP_SUBPUSH_RSP_ID :
+					  CALL_GROUP_PUSH_RSP_ID,
+				    &reply, hdr);
+	}
+	if (message.field == 7 && s->have_session) {
+		Pb reply = { 0 };
+
+		pb_uint(&reply, 1, 0);
+		send_control(c, 3, 8, 0x2245, &reply, hdr);
+		c->remote_end = TRUE;
+		return FALSE;
+	}
+	return TRUE;
+}
+
 static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 		       Slice plain, GError **e)
 {
+	if (c->group)
+		return handle_group(c, source, plain, e);
 	Slice hdr = pb_data(plain, 1), sess = pb_data(hdr, 3),
 	      channel = pb_data(plain, 3);
 	guint plane = 3;
@@ -1917,14 +2814,152 @@ static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 
 static void report_video(const struct voice_call *c)
 {
+	const struct call_video *video =
+		c->conference_video ? c->conference_video->receiver : c->video;
+
 	if (c->data)
 		call_pdtp_report(c->data);
 	g_printerr(
 		"line-call video matched=%u other-ssrc=%u authenticated=%u frames=%u\n",
 		c->video_trace.packets, c->video_trace.other_ssrc,
-		call_video_authenticated_packets(c->video),
+		video ? call_video_authenticated_packets(video) : 0,
 		c->video_trace.frames);
-	call_video_report(c->video);
+	if (video)
+		call_video_report(video, FALSE);
+}
+
+/* CCFS congestion feedback describes RTP packet sequence ranges. Format 11
+ * represents each sequence slot with a one- or two-byte packet element. */
+static void group_feedback_blocks(struct voice_call *c, const guint8 *p,
+				  gsize size, guint fmt)
+{
+	gsize offset = 20;
+
+	while (offset + 8 <= size) {
+		guint32 id;
+		guint received = 0;
+		guint count = (p[offset + 4] << 8) | p[offset + 5];
+		gsize bytes = 0;
+
+		memcpy(&id, p + offset, sizeof(id));
+		id = GUINT32_FROM_BE(id);
+		offset += 8;
+		if (fmt == 9) {
+			bytes = (gsize)count * 2;
+			if (bytes > size - offset)
+				return;
+			/* Fixed-length FMT9 sets bit zero for received packets. */
+			for (guint i = 0; i < count; i++)
+				received += p[offset + 2 * i] & 1;
+		} else {
+			for (guint i = 0; i < count; i++) {
+				if (bytes >= size - offset)
+					return;
+				received += !(p[offset + bytes] & 1);
+				bytes += 1 + !!(p[offset + bytes] & 2);
+			}
+		}
+		bytes = (bytes + 3) & ~(gsize)3;
+		if (bytes > size - offset)
+			return;
+		if (id && id == c->audio_tx) {
+			c->stats.ccfs_audio += count;
+			c->stats.mic_acknowledged += received;
+		}
+		if (id && id == c->video_tx) {
+			c->stats.ccfs_camera += count;
+			c->stats.camera_acknowledged += received;
+		}
+		if (id != c->audio_tx && id != c->video_tx)
+			c->stats.feedback_other_slots += count;
+		offset += bytes;
+	}
+}
+
+/* Handle negotiated conference feedback from the assigned relay. */
+static void group_rtcp(struct voice_call *c, Slice packet, gint64 arrival)
+{
+	if (c->stats.next)
+		c->stats.rtcp++;
+	while (packet.n >= 4 && (packet.p[0] >> 6) == 2) {
+		const guint8 *p = packet.p;
+		gsize len = 4u * (1 + (((guint)p[2] << 8) | p[3]));
+		gsize offset = p[1] == 200 ? 28 : 8;
+		guint blocks = p[0] & 31;
+
+		if (len > packet.n)
+			return;
+		if (c->stats.next && p[1] >= 192 && p[1] <= 223)
+			c->stats.rtcp_types |= 1u << (p[1] - 192);
+		if (c->feedback && p[1] == 205 && blocks == 12) {
+			guint8 reply[24];
+			gboolean changed;
+			gsize n = call_group_feedback_control(
+				c->feedback, (Slice){ p, len }, arrival,
+				g_get_monotonic_time(), reply, &changed);
+
+			if (changed) {
+				guint ms = c->feedback->interval_ms;
+				c->next_group_feedback =
+					ms && c->feedback->active_streams ?
+						arrival + ms * 1000 :
+						0;
+			}
+			if (n)
+				send_to(c, &c->relay, (Slice){ reply, n });
+		}
+		if (c->stats.next && p[1] == 205) {
+			c->stats.feedback_formats |= 1u << blocks;
+			if (blocks == 5) {
+				guint32 target = 0;
+				guint count = call_group_retransmit_request(
+					(Slice){ p, len }, &target);
+
+				if (target == c->video_tx)
+					c->stats.camera_retransmits_requested +=
+						count;
+				else if (target == c->audio_tx)
+					c->stats.mic_retransmits_requested +=
+						count;
+			}
+			if ((blocks == 9 || blocks == 11) && len >= 20)
+				group_feedback_blocks(c, p, len, blocks);
+		}
+		if (c->stats.next && (p[1] == 200 || p[1] == 201) &&
+		    offset + blocks * 24 <= len) {
+			for (guint i = 0; i < blocks; i++, offset += 24) {
+				guint32 id;
+
+				memcpy(&id, p + offset, sizeof(id));
+				id = GUINT32_FROM_BE(id);
+				c->stats.audio_reports += id &&
+							  id == c->audio_tx;
+				c->stats.video_reports += id &&
+							  id == c->video_tx;
+			}
+		}
+		packet.p += len;
+		packet.n -= len;
+	}
+}
+
+/* Record outer RTP only after the stream has authenticated it. */
+static void group_packet_received(struct voice_call *c, const guint8 *packet,
+				  gint64 now)
+{
+	guint16 sequence;
+	guint32 timestamp, ssrc;
+
+	c->deadline = now + 90 * G_USEC_PER_SEC;
+	if (!c->feedback || !c->feedback->interval_ms)
+		return;
+	memcpy(&sequence, packet + 2, sizeof(sequence));
+	memcpy(&timestamp, packet + 4, sizeof(timestamp));
+	memcpy(&ssrc, packet + 8, sizeof(ssrc));
+	call_group_feedback_receive(c->feedback, ntohl(ssrc), ntohs(sequence),
+				    ntohl(timestamp), now);
+	if (!c->next_group_feedback && c->feedback->active_streams)
+		c->next_group_feedback = now + 1000 * c->feedback->interval_ms;
 }
 
 static gboolean run_call(struct voice_call *c, GError **e)
@@ -1933,18 +2968,39 @@ static gboolean run_call(struct voice_call *c, GError **e)
 
 	c->video_trace.enabled = c->info.video_capable &&
 				 !g_strcmp0(g_getenv("LINE_CALL_DEBUG"), "1");
-	if (c->incoming)
+	if (c->group) {
+		if (!g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1")) {
+			c->stats.next =
+				g_get_monotonic_time() + 3 * G_USEC_PER_SEC;
+			g_printerr("group-stats joining video=%d\n",
+				   c->info.video);
+		}
+		call_group_participate(&setup, &c->info, &c->group_route);
+		call_group_route_clear(&c->group_route);
+	} else if (c->incoming)
 		call_verify(&setup, &c->info);
 	else
 		call_setup(&setup, &c->info);
-	OPENSSL_cleanse(c->info.token, strlen(c->info.token));
-	g_clear_pointer(&c->info.token, g_free);
+	if (c->info.token) {
+		OPENSSL_cleanse(c->info.token, strlen(c->info.token));
+		g_clear_pointer(&c->info.token, g_free);
+	}
 	if (g_atomic_int_get(&c->task->done))
 		return TRUE;
-	if (!send_control(c, 3, c->incoming ? 3 : 1,
-			  c->incoming ? 0x2142 : 0x2141, &setup, (Slice){ 0 }))
+	guint choice = c->group	   ? CALL_GROUP_PARTICIPATE_REQ :
+		       c->incoming ? 3 :
+				     1;
+	guint id = c->group    ? CALL_GROUP_PARTICIPATE_ID :
+		   c->incoming ? 0x2142 :
+				 0x2141;
+
+	gboolean sent = !setup.overflow &&
+			send_control(c, 3, choice, id, &setup, (Slice){ 0 });
+
+	OPENSSL_cleanse(&setup, sizeof(setup));
+	if (!sent)
 		return FALSE;
-	c->invited = !c->incoming;
+	c->invited = !c->group && !c->incoming;
 	c->deadline = g_get_monotonic_time() + 10 * G_USEC_PER_SEC;
 	struct pollfd fds[] = { { .fd = c->task->wake, .events = POLLIN },
 				{ .fd = c->fd, .events = POLLIN },
@@ -1983,18 +3039,84 @@ static gboolean run_call(struct voice_call *c, GError **e)
 				     !send_to(c, &c->audio_route.current,
 					      (Slice){ data, (gsize)size })))
 					return FALSE;
+				if (c->stats.next && size > 0) {
+					c->stats.audio_sent++;
+					/* Clear RTP extension has the capture level in -dBov. */
+					c->stats.audio_active += size > 20 &&
+								 data[20] < 60;
+				}
 				/* Avoid accumulating the poll timeout's rounding error. */
 				c->next_capture =
 					size ? MAX(now + 4000,
-						   c->next_capture + 20000) :
+						   c->next_capture +
+							   (c->group ? 40000 :
+								       20000)) :
 					       now + 4000;
 			}
 			if (!mute)
 				next = MIN(next, c->next_capture);
 			gint64 playout = line_audio_playout(c->audio, now);
 
+			if (c->group && c->reception != LINE_MEDIA_PLAYABLE)
+				group_reception(c,
+						line_audio_reception(c->audio));
+
 			next = MIN(next, playout);
 		}
+		if (c->next_group_feedback) {
+			if (now >= c->next_group_feedback) {
+				guint8 packet[1200];
+				gsize n = call_group_feedback_report(
+					c->feedback, now, packet,
+					sizeof(packet));
+				if (n &&
+				    send_to(c, &c->relay,
+					    (Slice){ packet, n }) &&
+				    c->stats.next)
+					c->stats.feedback_sent++;
+				c->next_group_feedback =
+					n ? now + 1000 * c->feedback->interval_ms :
+					    0;
+			}
+			if (c->next_group_feedback)
+				next = MIN(next, c->next_group_feedback);
+		}
+		if (c->stats.next && now >= c->stats.next) {
+			struct group_video *v = c->conference_video;
+			g_printerr(
+				"group-stats mic-packets=%u mic-above-noise=%u audio-rx=%u video-rtp=%u video-auth=%u frames=%u subscribed=%d muted=%d camera-tx=%u data-rtp=%u\n",
+				c->stats.audio_sent, c->stats.audio_active,
+				c->stats.audio_played, c->stats.video_packets,
+				v && v->receiver ?
+					call_video_authenticated_packets(
+						v->receiver) :
+					0,
+				c->stats.frames, !!(v && v->peer.ssrc),
+				c->muted, c->stats.camera_sent,
+				c->stats.data_packets);
+			g_printerr(
+				"group-stats transport relay-rtp=%u rtcp=%u mic-rr=%u camera-rr=%u fmt-mask=%x mic-fb-slots=%u camera-fb-slots=%u reports-tx=%u data-accepted=%u data-tx=%u data-setup-acked=%d mic-fb-received=%u camera-fb-received=%u other-fb-slots=%u rtcp-type-mask=%x rtcp-other-port=%u udp-rx=%u control-open=%u unclassified-relay=%u mic-rrr-seqs=%u camera-rrr-seqs=%u\n",
+				c->stats.relay_media, c->stats.rtcp,
+				c->stats.audio_reports, c->stats.video_reports,
+				c->stats.feedback_formats, c->stats.ccfs_audio,
+				c->stats.ccfs_camera, c->stats.feedback_sent,
+				c->stats.data_accepted, c->stats.data_sent,
+				call_pdtp_group_setup_acknowledged(c->data),
+				c->stats.mic_acknowledged,
+				c->stats.camera_acknowledged,
+				c->stats.feedback_other_slots,
+				c->stats.rtcp_types, c->stats.rtcp_other_port,
+				c->stats.udp_received, c->stats.control_opened,
+				c->stats.unclassified_relay,
+				c->stats.mic_retransmits_requested,
+				c->stats.camera_retransmits_requested);
+			line_audio_report(c->audio);
+			if (v && v->receiver)
+				call_video_report(v->receiver, TRUE);
+			c->stats.next = now + 3 * G_USEC_PER_SEC;
+		}
+		if (c->stats.next)
+			next = MIN(next, c->stats.next);
 		share_state(c);
 		camera_state(c);
 		if (c->share_video_repeat && now >= c->share_video_repeat) {
@@ -2016,12 +3138,38 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			else
 				next = MIN(next, c->next_video);
 		}
-		if (c->video && call_video_needs_keyframe(c->video) &&
-		    (c->info.video || c->camera || share_is_video(c) ||
-		     call_video_authenticated_packets(c->video))) {
+		struct group_video *group_video = c->conference_video;
+
+		if (group_video && group_video->retry_at) {
+			if (now >= group_video->retry_at) {
+				group_stream_request(c, TRUE);
+				guint attempt = ++group_video->attempts;
+
+				group_video->retry_at =
+					attempt < 4 ? now + (G_USEC_PER_SEC
+							     << (attempt - 1)) :
+						      0;
+			}
+			if (group_video->retry_at)
+				next = MIN(next, group_video->retry_at);
+		}
+		struct call_video *rx_video =
+			group_video ? group_video->receiver : c->video;
+		gboolean receiving =
+			group_video ? group_video->last_rtp &&
+					      now - group_video->last_rtp <
+						      3 * G_USEC_PER_SEC :
+				      c->info.video || c->camera ||
+					      share_is_video(c) ||
+					      call_video_authenticated_packets(
+						      rx_video);
+
+		if (receiving && call_video_needs_keyframe(rx_video)) {
 			if (now >= c->next_video_feedback) {
-				call_video_send_feedback(c->video,
-							 send_video_packet, c);
+				call_video_send_peer_feedback(c->video,
+							      rx_video,
+							      send_video_packet,
+							      c);
 				c->next_video_feedback = now + G_USEC_PER_SEC;
 			}
 			next = MIN(next, c->next_video_feedback);
@@ -2055,6 +3203,8 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		if (fds[0].revents) {
 			eventfd_t n;
 			(void)eventfd_read(c->task->wake, &n);
+			if (group_video && !g_atomic_int_get(&c->task->done))
+				group_select_video(c);
 			continue;
 		}
 		if (fds[3].revents & POLLIN)
@@ -2087,24 +3237,51 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			continue;
 		Slice pkt = { data, (gsize)n };
 
+		if (c->stats.next)
+			c->stats.udp_received++;
 		if (c->audio && n >= 12 && (data[0] & 0xc0) == 0x80) {
 			guint32 ssrc;
 
 			if (data[1] >= 192 && data[1] <= 223) {
-				if (c->video && call_video_receive_feedback(
-							c->video, data, n))
+				if (c->stats.next &&
+				    !equal_address(&source, &c->relay))
+					c->stats.rtcp_other_port++;
+				if (c->group &&
+				    equal_address(&source, &c->relay)) {
+					if (c->feedback || c->stats.next)
+						group_rtcp(
+							c, pkt,
+							g_get_monotonic_time());
+					group_camera_feedback(c, pkt);
+				} else if (!c->group && c->video &&
+					   call_video_receive_feedback(c->video,
+								       data, n))
 					media_received(c, &c->video_route,
 						       &source);
 				continue;
 			}
+			if (c->stats.next && equal_address(&source, &c->relay))
+				c->stats.relay_media++;
 			memcpy(&ssrc, data + 8, sizeof(ssrc));
+			if (c->stats.next && (data[1] & 127) == c->data_pt)
+				c->stats.data_packets++;
 			if (c->data && call_pdtp_matches(c->data, data, n)) {
+				gint64 arrival = g_get_monotonic_time();
+
 				if (call_pdtp_receive(c->data, data, n,
-						      g_get_monotonic_time()))
-					media_received(c, &c->data_route,
-						       &source);
-				else if (c->video_trace.enabled &&
-					 c->data_traced++ < 100)
+						      arrival)) {
+					if (c->group) {
+						group_packet_received(c, data,
+								      arrival);
+						if (c->stats.next)
+							c->stats.data_accepted++;
+					} else {
+						media_received(c,
+							       &c->data_route,
+							       &source);
+					}
+				} else if (c->video_trace.enabled &&
+					   c->data_traced++ < 100)
 					g_printerr(
 						"line-call pdtp rx unauthenticated bytes=%zd\n",
 						n);
@@ -2118,24 +3295,56 @@ static gboolean run_call(struct voice_call *c, GError **e)
 					"line-call rtp other pt=%u ssrc=%u bytes=%zd\n",
 					data[1] & 127, GUINT32_FROM_BE(ssrc),
 					n);
-			gboolean video = c->video &&
+			struct call_video *receiver =
+				group_video ? group_video->receiver : c->video;
+			guint32 video_ssrc = group_video ?
+						     group_video->peer.ssrc :
+						     c->video_rx;
+			gboolean video = receiver &&
 					 (data[1] & 127) == c->video_pt &&
-					 GUINT32_FROM_BE(ssrc) == c->video_rx;
+					 GUINT32_FROM_BE(ssrc) == video_ssrc;
 			if (c->video_trace.enabled && c->video &&
 			    (data[1] & 127) == c->video_pt) {
 				c->video_trace.packets += video;
 				c->video_trace.other_ssrc += !video;
 			}
+			guint before = video && group_video ?
+					       call_video_authenticated_packets(
+						       receiver) :
+					       0;
 			gboolean ok =
-				video ? call_video_receive(c->video, data, n,
+				video ? call_video_receive(receiver, data, n,
 							   display_video, c) :
 					line_audio_receive(c->audio, data, n);
 
-			if (ok)
-				media_received(c,
-					       video ? &c->video_route :
-						       &c->audio_route,
-					       &source);
+			if (video && group_video &&
+			    call_video_authenticated_packets(receiver) !=
+				    before) {
+				group_reception(c, LINE_MEDIA_RECEIVING);
+				group_video->last_rtp = g_get_monotonic_time();
+				group_packet_received(c, data,
+						      group_video->last_rtp);
+				group_video->retry_at = 0;
+			}
+			if (c->stats.next && group_video &&
+			    (data[1] & 127) == c->video_pt)
+				c->stats.video_packets++;
+			if (ok) {
+				if (c->stats.next && !video)
+					c->stats.audio_played++;
+				/* Receive authenticated mixer media from any port. The
+				 * microphone and camera use the assigned conference relay. */
+				if (c->group) {
+					if (!video)
+						group_packet_received(
+							c, data,
+							g_get_monotonic_time());
+				} else
+					media_received(c,
+						       video ? &c->video_route :
+							       &c->audio_route,
+						       &source);
+			}
 			continue;
 		}
 		if (!equal_address(&source, &c->relay)) {
@@ -2151,8 +3360,13 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		}
 		Pb plain = { 0 };
 
-		if (!call_wire_open(&c->wire, pkt, &plain))
+		if (!call_wire_open(&c->wire, pkt, &plain)) {
+			if (c->stats.next)
+				c->stats.unclassified_relay++;
 			continue;
+		}
+		if (c->stats.next)
+			c->stats.control_opened++;
 		if (c->audio)
 			c->deadline =
 				g_get_monotonic_time() + 90 * G_USEC_PER_SEC;
@@ -2160,6 +3374,95 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			return c->remote_end || (c->decline && c->verified);
 	}
 	return TRUE;
+}
+
+static gboolean group_release_reply(struct voice_call *c, Slice plain,
+				    Slice request)
+{
+	const CallInfo *info = &c->info;
+	Slice header = pb_data(plain, 1), scope = pb_data(plain, 3);
+	Slice channel = pb_data(scope, 1), body = pb_data(scope, 2);
+	Slice cid = pb_data(channel, 1), session = pb_data(header, 3),
+	      transaction = pb_data(header, 4);
+	Slice expected = pb_data(request, 4);
+	PbField message;
+
+	return pb_number(header, 2, 0) == 0x2245 &&
+	       session.n == sizeof(info->session) &&
+	       !memcmp(session.p, info->session, session.n) &&
+	       transaction.n == expected.n &&
+	       !memcmp(transaction.p, expected.p, transaction.n) &&
+	       pb_number(header, 5, G_MAXUINT64) == pb_number(request, 5, 0) &&
+	       pb_number(header, 6, 0) == info->remote_nonce &&
+	       pb_number(header, 7, info->nonce) == info->nonce &&
+	       cid.n == strlen(info->cid) && !memcmp(cid.p, info->cid, cid.n) &&
+	       pb_number(channel, 2, 0) == info->remote_channel &&
+	       pb_number(channel, 3, 0) == info->local_channel &&
+	       pb_next(&body, &message) && !body.n && message.field == 8 &&
+	       message.type == 2 &&
+	       pb_number(message.data, 1, G_MAXUINT64) == 0 &&
+	       pb_number(message.data, 2, 0) == 0;
+}
+
+static void release_group(struct voice_call *c, guint media)
+{
+	Pb release = { 0 }, plain = { 0 };
+	struct pollfd ready = { .fd = c->fd, .events = POLLIN };
+
+	pb_uint(&release, 1, 1);
+	pb_text(&release, 3, "participant");
+	pb_uint(&release, 4, media);
+	pb_uint(&release, 6, 0);
+	pb_uint(&release, 51, 0);
+	if (!call_envelope(&plain, &c->info, 3, 7, 0x2145, &release,
+			   (Slice){ 0 }))
+		return;
+
+	Slice request = pb_data(PB_SLICE(plain), 1);
+	gint64 now = g_get_monotonic_time();
+	gint64 deadline = now + GROUP_RELEASE_TIMEOUT_US;
+	gint64 retry = now + GROUP_RELEASE_RETRY_US;
+	guint attempts = 1;
+	gboolean confirmed = FALSE;
+
+	send_plain(c, &c->relay, &plain, FALSE, FALSE);
+	while ((now = g_get_monotonic_time()) < deadline) {
+		if (now >= retry) {
+			/* Preserve the Cassini transaction but use a fresh wire counter. */
+			send_plain(c, &c->relay, &plain, FALSE, FALSE);
+			attempts++;
+			retry = deadline;
+		}
+		int result = poll(&ready, 1, (retry - now + 999) / 1000);
+
+		if (result < 0 && errno == EINTR)
+			continue;
+		if (result < 0 ||
+		    ready.revents & (POLLERR | POLLHUP | POLLNVAL))
+			break;
+		if (!(ready.revents & POLLIN))
+			continue;
+		guint8 packet[2048];
+		struct call_endpoint from = { .len = sizeof(from.addr) };
+		ssize_t size = recvfrom(c->fd, packet, sizeof(packet),
+					MSG_DONTWAIT, (void *)&from.addr,
+					&from.len);
+		Pb decoded = { 0 };
+
+		/* A release response uses the regular encrypted control framing. */
+		if (size >= 22 && (packet[0] & 0xf0) == 0xd0 &&
+		    (packet[4] & 0xf8) == 0x18 &&
+		    equal_address(&from, &c->relay) &&
+		    call_wire_open(&c->wire, (Slice){ packet, size },
+				   &decoded) &&
+		    group_release_reply(c, PB_SLICE(decoded), request)) {
+			confirmed = TRUE;
+			break;
+		}
+	}
+	if (c->stats.next)
+		g_printerr("group-stats leave confirmed=%d attempts=%u\n",
+			   confirmed, attempts);
 }
 
 static gpointer voice_thread(gpointer data)
@@ -2174,7 +3477,17 @@ static gpointer voice_thread(gpointer data)
 
 	if (c->video_trace.enabled && c->video)
 		report_video(c);
-	if (c->invited && !c->remote_end) {
+	gboolean group_leave = c->group && c->invited && !c->remote_end;
+	guint group_media = 0;
+
+	if (group_leave) {
+		group_media = (c->audio ? 1 : 0) | (c->video ? 2 : 0) |
+			      (c->data ? 4 : 0);
+		g_clear_pointer(&c->audio, line_audio_close);
+		g_clear_pointer(&c->camera, line_camera_close);
+		g_clear_pointer(&c->video, call_video_close);
+		g_clear_pointer(&c->data, call_pdtp_close);
+	} else if (c->invited && !c->remote_end) {
 		Pb rel = { 0 };
 
 		pb_uint(&rel, 1, c->incoming ? 1 : 2);
@@ -2188,11 +3501,16 @@ static gpointer voice_thread(gpointer data)
 			NULL;
 	g_autofree char *chat = g_strdup(c->info.target);
 
-	free_call(c);
+	if (!group_leave)
+		free_call(c);
 	if (reason)
 		line_event("call_error", "message", reason);
 	g_atomic_int_set(&task->done, 1);
 	call_state(chat, "ended", reason, task->video);
+	if (group_leave) {
+		release_group(c, group_media);
+		free_call(c);
+	}
 	return NULL;
 }
 
@@ -2283,7 +3601,12 @@ static J *result_state(const char *state)
 J *line_voice_hangup(GError **e)
 {
 	(void)e;
-	line_voice_close();
+	if (active && active->group) {
+		g_atomic_int_set(&active->done, 1);
+		signal_task(active);
+	} else {
+		line_voice_close();
+	}
 	return result_state("ended");
 }
 
@@ -2305,6 +3628,11 @@ J *line_call_share(gboolean enabled, GError **error)
 {
 	if (!active || g_atomic_int_get(&active->done)) {
 		set_error(error, "There is no active call.");
+		return NULL;
+	}
+	if (active->group) {
+		set_error(error,
+			  "Screen sharing is unavailable in group calls.");
 		return NULL;
 	}
 	g_atomic_int_set(&active->share_wanted, enabled);
@@ -2335,11 +3663,30 @@ J *line_call_camera(gboolean enabled, GError **error)
 	return out;
 }
 
+J *line_call_video_focus(const char *chat, const char *id, GError **error)
+{
+	if (!active || !active->group || g_strcmp0(chat, active->target) ||
+	    !g_atomic_int_get(&active->video_ready) ||
+	    g_atomic_int_get(&active->done) || !valid_mid(id)) {
+		set_error(error, "There is no active group video call.");
+		return NULL;
+	}
+	g_mutex_lock(&active->frame_lock);
+	memcpy(active->video_focus, id, MID_LENGTH + 1);
+	g_mutex_unlock(&active->frame_lock);
+	signal_task(active);
+	return obj();
+}
+
 void line_call_preview(const char *chat, gboolean visible)
 {
 	if (active && !g_strcmp0(chat, active->target))
 		g_atomic_int_set(&active->preview_visible, visible);
 }
+
+static gboolean setup_relay(struct voice_call *c, const char *host,
+			    const char *host6, int port, const guint8 pub[33],
+			    GError **e);
 
 static gboolean setup_route(struct voice_call *c, J *route, GError **e)
 {
@@ -2372,8 +3719,21 @@ static gboolean setup_route(struct voice_call *c, J *route, GError **e)
 		set_error(e, "LINE returned an invalid relay key.");
 		return FALSE;
 	}
+	CallInfo *s = &c->info;
+
+	s->token = g_strdup(token);
+	s->i_zone = g_strdup(strfield(route, "6"));
+	s->r_zone = g_strdup(strfield(route, "7"));
+	s->stid = g_strdup(strfield(route, "13"));
+	return setup_relay(c, host, strfield(route, "17"), port, pub, e);
+}
+
+static gboolean setup_relay(struct voice_call *c, const char *host,
+			    const char *host6, int port, const guint8 pub[33],
+			    GError **e)
+{
 	for (int pass = 0; pass < 2 && !c->relay.len; pass++) {
-		const char *hosts = pass ? strfield(route, "17") : host;
+		const char *hosts = pass ? host6 : host;
 
 		if (!hosts || strlen(hosts) > 4096)
 			continue;
@@ -2396,15 +3756,11 @@ static gboolean setup_route(struct voice_call *c, J *route, GError **e)
 	}
 	CallInfo *s = &c->info;
 
-	s->token = g_strdup(token);
-	s->i_zone = g_strdup(strfield(route, "6"));
-	s->r_zone = g_strdup(strfield(route, "7"));
-	s->stid = g_strdup(strfield(route, "13"));
 	s->cid = g_uuid_string_random();
 	guint32 ids[5];
 
 	if (!call_wire_init(&c->wire, pub) ||
-	    !call_keygen(&c->media_key, s->pub) ||
+	    (!c->group && !call_keygen(&c->media_key, s->pub)) ||
 	    RAND_bytes((guint8 *)ids, sizeof(ids)) != 1 ||
 	    RAND_bytes(s->media_nonce, sizeof(s->media_nonce)) != 1 ||
 	    RAND_bytes(s->media_secret, sizeof(s->media_secret)) != 1 ||
@@ -2416,8 +3772,13 @@ static gboolean setup_route(struct voice_call *c, J *route, GError **e)
 		ids[i] = (ids[i] & 0x1fffffff) | 0x20000000;
 	s->media_id = ids[0];
 	s->nonce = ids[1];
-	s->local_channel = ids[2];
 	s->transaction = ids[3];
+	if (c->group) {
+		s->local_channel = (ids[2] & 0x07ffffff) | 0x08000000;
+		s->local_media = (ids[4] & 0x1fffffff) | 0x40000000;
+		return TRUE;
+	}
+	s->local_channel = ids[2];
 	if (c->incoming || s->video_capable) {
 		s->local_media = ids[4];
 		if (s->local_media == s->local_channel)
@@ -2430,11 +3791,13 @@ static gboolean setup_route(struct voice_call *c, J *route, GError **e)
 static J *launch_call(struct voice_call *c, GError **e)
 {
 	g_autofree char *chat = g_strdup(c->info.target);
+	g_autoptr(J) members = g_steal_pointer(&c->group_route.members);
 	struct call_task *task = g_new0(struct call_task, 1);
 
 	g_mutex_init(&task->frame_lock);
 	task->target = g_strdup(chat);
 	task->video = c->info.video;
+	task->group = c->group;
 	task->camera_enabled = c->info.video;
 	task->preview_visible = TRUE;
 	task->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
@@ -2467,6 +3830,9 @@ static J *launch_call(struct voice_call *c, GError **e)
 	json_object_object_add(out, "chat", json_object_new_string(chat));
 	json_object_object_add(out, "video",
 			       json_object_new_boolean(task->video));
+	if (members)
+		json_object_object_add(out, "participantMids",
+				       g_steal_pointer(&members));
 	return out;
 }
 
@@ -2477,17 +3843,49 @@ gboolean line_video_enabled(void)
 	return !setting || !strcmp(setting, "1");
 }
 
+gboolean line_group_voice_enabled(void)
+{
+	const char *setting = g_getenv("LINE_EXPERIMENTAL_GROUP_CALLS");
+
+	return !setting || !strcmp(setting, "1");
+}
+
+gboolean line_group_video_enabled(void)
+{
+	const char *setting = g_getenv("LINE_EXPERIMENTAL_GROUP_VIDEO");
+
+	return line_group_voice_enabled() && line_video_enabled() &&
+	       (!setting || !strcmp(setting, "1"));
+}
+
+const char *line_call_group_chat(gboolean connected)
+{
+	return active && active->group && !g_atomic_int_get(&active->done) &&
+			       (!connected ||
+				g_atomic_int_get(&active->group_joined)) ?
+		       active->target :
+		       NULL;
+}
+
 J *line_call_start(Line *s, const char *chat, gboolean video, GError **e)
 {
-	if (video && !line_video_enabled()) {
+	gboolean group = call_group_id(chat);
+
+	if (group && !line_group_voice_enabled()) {
+		set_error(e, "Experimental group calls are disabled.");
+		return NULL;
+	}
+	if (group && video && !line_group_video_enabled()) {
+		set_error(e, "Experimental group video calls are disabled.");
+		return NULL;
+	}
+	if (!group && video && !line_video_enabled()) {
 		set_error(e, "Experimental video calls are disabled.");
 		return NULL;
 	}
-	if (!s || !valid_mid(s->mid) || !valid_mid(chat) ||
+	if (!s || !valid_mid(s->mid) || (!group && !valid_mid(chat)) ||
 	    !strcmp(s->mid, chat)) {
-		set_error(
-			e,
-			"Select a one-to-one conversation with another LINE user.");
+		set_error(e, "Select a LINE user or group to call.");
 		return NULL;
 	}
 	if (active && !g_atomic_int_get(&active->done)) {
@@ -2500,6 +3898,27 @@ J *line_call_start(Line *s, const char *chat, gboolean video, GError **e)
 		return NULL;
 	}
 	line_voice_close();
+	if (group) {
+		struct voice_call *c = g_new0(struct voice_call, 1);
+		struct call_group_route *route = &c->group_route;
+
+		c->fd = -1;
+		c->group = TRUE;
+		c->info.video = video;
+		c->info.video_capable = video;
+		c->info.local = g_strdup(s->mid);
+		c->info.target = g_strdup(chat);
+		if (!call_group_acquire(s, chat, video, route, e) ||
+		    !setup_relay(c, route->relay, route->relay6,
+				 route->relay_port, route->relay_key, e)) {
+			free_call(c);
+			return NULL;
+		}
+		c->info.token = g_steal_pointer(&route->token);
+		c->info.i_zone = g_steal_pointer(&route->i_zone);
+		c->info.r_zone = g_steal_pointer(&route->r_zone);
+		return launch_call(c, e);
+	}
 	g_autoptr(J) args = obj();
 	J *env = obj();
 

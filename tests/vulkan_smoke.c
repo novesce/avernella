@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "render/vk_canvas.h"
+#include "render/vk_adapter.h"
 #include "render/vk_frame.h"
 #include "render/vk_tex.h"
 #include <errno.h>
@@ -7,6 +8,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <sys/sysmacros.h>
 
 #define WIDTH 96
 #define HEIGHT 48
@@ -524,6 +527,36 @@ static void finish(struct render_test *test)
 	vk_ctx_destroy(ctx);
 }
 
+static bool adapter_selection(void)
+{
+	struct vk_adapter list[] = {
+		{ .type = VK_PHYSICAL_DEVICE_TYPE_CPU, .heap = true },
+		{ .type = VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU,
+		  .heap = true },
+		{ .type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+		  .vendor = 0x1002 },
+		{ .type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+		  .vendor = 0x1002,
+		  .heap = true },
+		{ .type = VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU,
+		  .vendor = 0x10de },
+	};
+	const unsigned int order[] = { 4, 3, 2, 1, 0 };
+	const uint32_t count = sizeof(list) / sizeof(list[0]);
+
+	for (uint32_t i = 0; i < count; i++)
+		list[i].gpu = (VkPhysicalDevice)&list[i];
+	for (uint32_t i = 0; i < count; i++) {
+		struct vk_adapter *next = vk_preferred_adapter(list, count);
+
+		if (next != &list[order[i]])
+			return false;
+		/* The preferred card failed to open, or cannot present. */
+		next->gpu = VK_NULL_HANDLE;
+	}
+	return !vk_preferred_adapter(list, count);
+}
+
 int main(int argc, char **argv)
 {
 	char *end = NULL;
@@ -535,6 +568,11 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	struct render_test test = { 0 };
+
+	if (!adapter_selection()) {
+		fputs("Vulkan adapter preference check failed\n", stderr);
+		return 1;
+	}
 	VkResult result = vk_ctx_init(&test.ctx, (uint32_t)vendor, NULL);
 
 	if (result != VK_SUCCESS) {
@@ -544,10 +582,23 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	VkPhysicalDeviceProperties properties;
+	const char *node = getenv("AVERNELLA_RENDER_NODE");
+	struct stat st;
+
+	if (node && *node &&
+	    (stat(node, &st) || test.ctx.render_minor < 0 ||
+	     minor(st.st_rdev) != (unsigned)test.ctx.render_minor)) {
+		fputs("Vulkan adapter reported a different DRM render node\n",
+		      stderr);
+		vk_ctx_destroy(&test.ctx);
+		return 1;
+	}
 
 	vkGetPhysicalDeviceProperties(test.ctx.gpu, &properties);
-	printf("%s (descriptor %s)\n", properties.deviceName,
-	       test.ctx.descriptor_heap ? "heap" : "buffer");
+	printf("%s (descriptor %s, DRM render minor %d)\n",
+	       properties.deviceName,
+	       test.ctx.descriptor_heap ? "heap" : "buffer",
+	       test.ctx.render_minor);
 	result = init_test(&test);
 	for (uint64_t frame = 0; frame < 3 && result == VK_SUCCESS; frame++) {
 		result = draw(&test, frame);

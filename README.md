@@ -87,6 +87,10 @@ Incoming text supports Letter Sealing v1 and v2. A message encrypted to a key ge
 - Open the chat's **⋯** menu for announcements and shared content. You can browse albums and open their photos, read and post group text notes, and find polls referenced by group notes. Choose **Take screenshot** to open your desktop's screenshot picker and review the result as an attachment. A compatible XDG Screenshot portal is required.
 - In a one-to-one chat, the handset dials a voice call and the video button dials with your camera on. Both open a call stage at the top of that chat, and its messages and message bar stay usable underneath. Opening another chat shrinks the call to a bar at the bottom of the window; open the call's chat again, or press **Escape** and **Alt+C**, to switch between the two. Use **Mute** or **Unmute** to toggle your microphone, or press **Alt+M**. Use **Alt+V** for the camera. When either side turns a camera on, the stage shows a video tile for each person. Incoming calls ring as a card with green accept (**Alt+A**) and red decline (**Alt+D**) buttons. Voice uses native SDL audio, Opus and SRTP. Before your voice is encoded, RNNoise, a small neural noise suppressor, removes fan noise, wind and the hiss some laptop microphones pick up when the webcam beside them turns on, as LINE's own apps do. It costs about 0.5% of one CPU core. Set `LINE_NOISE_SUPPRESSION=0` to send the raw microphone.
 
+## Experimental group calls
+
+Open a group chat and click the handset or camera to start or join a call. The call stage shows the participant roster and lets you keep browsing chats. In a video call, select a participant to focus their camera. Group calls are enabled by default. Set `LINE_EXPERIMENTAL_GROUP_VIDEO=0` to hide the group camera button or `LINE_EXPERIMENTAL_GROUP_CALLS=0` to disable group calls. Group video uses LINE’s EVS3 VP8 format. Live group tests with the official Android app confirmed voice in both directions and Android camera video on Linux. Display of the Linux camera on Android is still unconfirmed. A local relay fixture also exercises camera transmission and switching between two remote cameras.
+
 ## Experimental video calls
 
 Experimental video is enabled by default. To disable it, launch the client with this setting.
@@ -125,7 +129,7 @@ The authenticated worker uses LINE’s operation revision to establish a fresh s
 
 The window follows the display’s refresh rate while something is moving. Once the UI settles, it waits for input, new messages or the next media frame. It suspends drawing while minimized or hidden in the tray. On an older machine, `AVERNELLA_MAX_FPS=30 avernella` caps window redraws at 30 fps. Chat input, call audio and network events keep their usual timing.
 
-A chat-row highlight can repaint just that row. On supported Vulkan displays, the renderer also reuses the unchanged parts of each swapchain image. Call video uses libvpx on the CPU to decode VP8 and the native Vulkan renderer to convert and display the decoded pixels. To see which renderer is active, run `LINE_RENDER_LOG=1 avernella`.
+A chat-row highlight can repaint just that row. On supported Vulkan displays, the renderer also reuses the unchanged parts of each swapchain image. Incoming call cameras and shared screens use NVIDIA NVDEC or the selected AMD or Intel GPU’s VA-API driver when it supports VP8. The worker copies decoded frames into the existing I420 display path. Libvpx handles outgoing VP8 encoding and software decoding. The native Vulkan renderer converts and displays the pixels. To see which renderer is active, run `LINE_RENDER_LOG=1 avernella`.
 
 Decoded thumbnails share a 12 MiB cache target. Recent pictures and pending downloads can use up to 32 MiB. Minimizing the window or hiding it in the tray releases cold decoded pictures. Animation frames have a separate 32 MiB budget.
 
@@ -143,7 +147,7 @@ paru -S avernella-bin
 
 ## Build and test
 
-Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, and pkg-config. Development libraries include SDL2, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Sharing your screen also needs a running `xdg-desktop-portal` with a ScreenCast backend. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. Video playback and clip review use the system `ffplay` executable. The recording and playback tests use generated audio and video.
+Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, and pkg-config. Development libraries include SDL2, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Sharing your screen also needs a running `xdg-desktop-portal` with a ScreenCast backend. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. On NVIDIA, video messages use H.264 NVENC when the driver and encoder initialize. Video playback and clip review use the system `ffplay` executable, with NVDEC on NVIDIA or Vulkan Video on supported AMD and Intel drivers. The recording and playback tests use generated audio and video.
 
 Install the packages on CachyOS or Arch Linux. The first command is enough to build and run the client.
 
@@ -171,7 +175,7 @@ Screen sharing and screenshots go through the XDG desktop portal. Install it wit
 sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-gtk
 ```
 
-Install FFmpeg for video playback, camera recording and the media tests.
+Install FFmpeg before compiling to enable hardware call decoding, attachment playback and camera recording. On Ubuntu the optional build packages are `libavcodec-dev` and `libavutil-dev`. Use `make CALL_HWDECODE=0` for a libvpx-only call decoder.
 
 ```sh
 sudo pacman -S --needed ffmpeg
@@ -205,7 +209,7 @@ The size-optimized build omits unwind tables. For an unstripped diagnostic build
 
 The native Vulkan renderer composites the window, scrolls cached chat content and converts planar call video on the GPU. It prefers descriptor heaps and uses descriptor buffers on compatible Vulkan 1.3 drivers. Cairo and Pango rasterize new controls, text and images. The renderer reuses those pixels and uploads changed regions. When the native backend is unavailable, Avernella tries SDL Vulkan and then the software window surface.
 
-The client prefers native Wayland in a Wayland session and falls back to X11 if Wayland is unavailable. It uses logical window coordinates for layout and input and draws at the drawable's pixel resolution. To select X11 explicitly, run `SDL_VIDEODRIVER=x11 ./avernella`. On a laptop with two GPUs, the native Vulkan renderer prefers the discrete GPU. Set `AVERNELLA_RENDER_NODE` to the integrated GPU's render node to use that instead. With the SDL renderer on a hybrid NVIDIA laptop, `SDL_VIDEODRIVER=x11 prime-run ./avernella` selects the NVIDIA GPU through X11 or XWayland.
+The client prefers native Wayland in a Wayland session and falls back to X11 if Wayland is unavailable. It uses logical window coordinates for layout and input and draws at the drawable's pixel resolution. To select X11 explicitly, run `SDL_VIDEODRIVER=x11 ./avernella`. On a hybrid laptop, the native Vulkan renderer tries a compatible NVIDIA discrete GPU first, then other discrete GPUs and integrated graphics. The media worker receives the chosen adapter’s DRM render node. Set `AVERNELLA_RENDER_NODE` to the integrated GPU's render node to use that instead. With the SDL renderer on a hybrid NVIDIA laptop, `SDL_VIDEODRIVER=x11 prime-run ./avernella` selects the NVIDIA GPU through X11 or XWayland.
 
 Profile and emoji downloads run independently of message sends. The image worker passes sealed Linux memory files to the UI. Decode workers can map those bytes directly. The optimized PNG pixel loop produces exact premultiplied colors and lets GCC vectorize across pixels. Letter Sealing caches recently verified shared secrets in session memory. The chat UI starts the network worker on the first sign-in attempt. The two processes communicate through a Unix socket pair. glibc starts the worker with `posix_spawn`. Linux `eventfd` wakes the I/O thread when there is outbound data. During healthy long polling, the worker sleeps until input arrives, a call invitation expires, or token maintenance is due. Separate one-shot timers track token renewal and fallback revision checks. On glibc 2.34 and newer, the spawn file actions close inherited descriptors above stderr.
 

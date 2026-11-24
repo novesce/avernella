@@ -36,6 +36,7 @@ struct vk_ctx {
 	VkDevice device;
 	VkQueue queue;
 	uint32_t family;
+	int render_minor;
 	VkPhysicalDeviceMemoryProperties memory;
 	VkImageLayout texture_layout;
 	bool descriptor_heap, host_image_copy, incremental_present;
@@ -47,6 +48,8 @@ struct vk_ctx {
 VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		     const struct vk_surface_config *surface);
 void vk_ctx_destroy(struct vk_ctx *ctx);
+VkResult vk_surface_format(VkPhysicalDevice gpu, VkSurfaceKHR surface,
+			   VkSurfaceFormatKHR *format);
 uint32_t vk_memory_type(const struct vk_ctx *ctx, uint32_t bits,
 			VkMemoryPropertyFlags required,
 			VkMemoryPropertyFlags preferred);

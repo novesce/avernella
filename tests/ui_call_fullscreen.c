@@ -267,9 +267,56 @@ static void peer_fullscreen(void)
 	SDL_Quit();
 }
 
+static void group_call_capabilities(void)
+{
+	static const char group[] = "c00000000000000000000000000000000";
+	static const char peer[] = "u00000000000000000000000000000001";
+	static const char self[] = "u00000000000000000000000000000002";
+	g_autoptr(J) login = obj();
+	J *caps = obj();
+
+	json_object_object_add(login, "capabilities", caps);
+	json_object_object_add(login, "selfId", json_object_new_string(self));
+	json_object_object_add(caps, "calls", json_object_new_boolean(TRUE));
+	json_object_object_add(caps, "videoCalls",
+			       json_object_new_boolean(TRUE));
+	ui.selected = g_strdup(group);
+	ui_media_login(login);
+	g_assert_false(ui_media_can_call(FALSE));
+	g_assert_false(ui_media_can_call(TRUE));
+
+	json_object_object_add(caps, "groupVoiceCalls",
+			       json_object_new_boolean(TRUE));
+	ui_media_login(login);
+	g_assert_true(ui_media_can_call(FALSE));
+	g_assert_false(ui_media_can_call(TRUE));
+	json_object_object_add(caps, "groupVideoCalls",
+			       json_object_new_boolean(TRUE));
+	ui_media_login(login);
+	g_assert_true(ui_media_can_call(FALSE));
+	g_assert_true(ui_media_can_call(TRUE));
+	json_object_object_del(caps, "groupVoiceCalls");
+	ui_media_login(login);
+	g_assert_false(ui_media_can_call(FALSE));
+	g_assert_true(ui_media_can_call(TRUE));
+	g_free(ui.selected);
+	ui.selected = g_strdup(peer);
+	g_assert_true(ui_media_can_call(FALSE));
+	g_assert_true(ui_media_can_call(TRUE));
+	g_free(ui.selected);
+	ui.selected = g_strdup(self);
+	g_assert_false(ui_media_can_call(FALSE));
+	g_assert_false(ui_media_can_call(TRUE));
+
+	g_clear_pointer(&ui.selected, g_free);
+	ui_media_shutdown();
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
+	g_test_add_func("/call/group-call-capabilities",
+			group_call_capabilities);
 	g_test_add_func("/call/fullscreen-peer", peer_fullscreen);
 	return g_test_run();
 }

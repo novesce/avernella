@@ -13,3 +13,17 @@ struct gpu_backend {
 	/* 1 presented, 0 temporarily unavailable, -1 device/surface failure. */
 	int (*draw)(void *state, const struct gpu_scene *scene);
 };
+
+/* Optional export, independent of the original backend dispatch table. */
+struct gpu_device_info {
+	char name[256];
+	uint32_t vendor;
+};
+
+struct gpu_device_query {
+	void (*get)(void *state, struct gpu_device_info *device);
+};
+
+struct gpu_drm_query {
+	int (*render_minor)(void *state);
+};

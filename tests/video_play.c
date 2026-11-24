@@ -111,7 +111,8 @@ static void play_mp4(void)
 	g_assert_cmpint(g_unlink(path), ==, 0);
 	g_assert_cmpint(g_rmdir(dir), ==, 0);
 	struct playback_result result = { 0 };
-	LineVideoPlayback *play = line_video_play(clip_fd(bytes, size), TRUE,
+	const struct line_video_gpu gpu = { "Test GPU", 0x8086 };
+	LineVideoPlayback *play = line_video_play(clip_fd(bytes, size), &gpu,
 						  finished, &result, &error);
 
 	g_assert_no_error(error);
@@ -123,7 +124,7 @@ static void play_mp4(void)
 
 	struct playback_result stopped = { 0 };
 
-	play = line_video_play(clip_fd(bytes, size), FALSE, finished, &stopped,
+	play = line_video_play(clip_fd(bytes, size), NULL, finished, &stopped,
 			       &error);
 	g_assert_no_error(error);
 	g_assert_nonnull(play);
@@ -151,7 +152,7 @@ static void invalid_clip(void)
 		g_autoptr(GError) error = NULL;
 		int fd = clip_fd(malformed[i], strlen(malformed[i]));
 		LineVideoPlayback *play =
-			line_video_play(fd, FALSE, finished, &result, &error);
+			line_video_play(fd, NULL, finished, &result, &error);
 
 		g_assert_no_error(error);
 		g_assert_nonnull(play);
@@ -167,7 +168,7 @@ static void invalid_descriptor(void)
 	g_autoptr(GError) error = NULL;
 	int fd = clip_fd("", 0);
 
-	g_assert_null(line_video_play(fd, FALSE, NULL, NULL, &error));
+	g_assert_null(line_video_play(fd, NULL, NULL, NULL, &error));
 	g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
 	g_assert_cmpint(fcntl(fd, F_GETFD), ==, -1);
 	g_assert_cmpint(errno, ==, EBADF);
@@ -180,7 +181,7 @@ static void invalid_descriptor(void)
 
 	g_assert_cmpint(read_only, >=, 0);
 	close(fd);
-	g_assert_null(line_video_play(read_only, FALSE, NULL, NULL, &error));
+	g_assert_null(line_video_play(read_only, NULL, NULL, NULL, &error));
 	g_assert_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT);
 }
 
@@ -191,7 +192,7 @@ static void missing_player(void)
 		g_autoptr(GError) error = NULL;
 		int fd = clip_fd("x", 1);
 
-		g_assert_null(line_video_play(fd, FALSE, NULL, NULL, &error));
+		g_assert_null(line_video_play(fd, NULL, NULL, NULL, &error));
 		g_assert_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND);
 		g_assert_nonnull(strstr(error->message, "FFplay"));
 		g_assert_cmpint(fcntl(fd, F_GETFD), ==, -1);
@@ -201,6 +202,80 @@ static void missing_player(void)
 	g_test_trap_subprocess(NULL, 5 * G_USEC_PER_SEC,
 			       G_TEST_SUBPROCESS_DEFAULT);
 	g_test_trap_assert_passed();
+}
+
+static void startup_fallback(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 8 * G_USEC_PER_SEC,
+				       G_TEST_SUBPROCESS_DEFAULT);
+		g_test_trap_assert_passed();
+		return;
+	}
+	static const char script[] =
+		"#!/bin/sh\n"
+		"read scenario < /proc/self/fd/3\n"
+		"case \" $* \" in *' -hwaccel '*) mode=hw;; "
+		"*' -enable_vulkan '*) mode=vk;; *) mode=sdl;; esac\n"
+		"echo \"$mode\" >> \"$RUN_LOG\"\n"
+		"test \"$mode\" = hw || exit 0\n"
+		"case \"$scenario\" in\n"
+		"recover|short|decode) echo '[error] Failed setup for format cuda' >&2;;\n"
+		"window) echo '[fatal] Failed to create window' >&2; exit 0;;\n"
+		"early) exit 23;;\n"
+		"esac\n"
+		"case \"$scenario\" in\n"
+		"recover|late|terminal) printf '  0.02 M-V:  0.000 fd=   0 aq=    0KB vq=    0KB\\r' >&2;;\n"
+		"short) echo '[ffplay_buffer @ 123] [verbose] w:96 h:64 pixfmt:yuv420p' >&2;;\n"
+		"esac\n"
+		"test \"$scenario\" != terminal || echo '[fatal] Video renderer stopped' >&2\n"
+		"test \"$scenario\" != late || exit 23\n"
+		"exit 0\n";
+	static const struct {
+		const char *scenario, *attempts;
+		gboolean success;
+	} cases[] = {
+		{ "recover", "hw\n", TRUE },	 { "short", "hw\n", TRUE },
+		{ "early", "hw\nvk\n", TRUE },	 { "decode", "hw\nvk\n", TRUE },
+		{ "window", "hw\nsdl\n", TRUE }, { "late", "hw\n", FALSE },
+		{ "terminal", "hw\n", FALSE },
+	};
+	const struct line_video_gpu gpu = { "Test GPU", 0x10de };
+
+	g_autoptr(GError) error = NULL;
+	g_autofree char *dir = g_dir_make_tmp("line-player.XXXXXX", &error);
+
+	g_assert_no_error(error);
+	g_autofree char *player = g_build_filename(dir, "ffplay", NULL);
+	g_autofree char *log = g_build_filename(dir, "runs", NULL);
+
+	g_assert_true(g_file_set_contents(player, script, -1, &error));
+	g_assert_no_error(error);
+	g_assert_cmpint(g_chmod(player, 0700), ==, 0);
+	g_setenv("PATH", dir, TRUE);
+	g_setenv("RUN_LOG", log, TRUE);
+	for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+		struct playback_result result = { 0 };
+		int fd = clip_fd(cases[i].scenario, strlen(cases[i].scenario));
+		LineVideoPlayback *play =
+			line_video_play(fd, &gpu, finished, &result, &error);
+
+		g_assert_no_error(error);
+		g_assert_nonnull(play);
+		await_exit(&result);
+		g_assert_cmpint(!result.error, ==, cases[i].success);
+		line_video_play_free(play);
+		g_autofree char *attempts = NULL;
+
+		g_assert_true(
+			g_file_get_contents(log, &attempts, NULL, &error));
+		g_assert_no_error(error);
+		g_assert_cmpstr(attempts, ==, cases[i].attempts);
+		g_assert_cmpint(g_unlink(log), ==, 0);
+		clear_result(&result);
+	}
+	g_assert_cmpint(g_unlink(player), ==, 0);
+	g_assert_cmpint(g_rmdir(dir), ==, 0);
 }
 
 int main(int argc, char **argv)
@@ -213,5 +288,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/video-play/invalid-media-and-playlist", invalid_clip);
 	g_test_add_func("/video-play/invalid-descriptor", invalid_descriptor);
 	g_test_add_func("/video-play/ffplay-missing", missing_player);
+	g_test_add_func("/video-play/startup-fallback", startup_fallback);
 	return g_test_run();
 }

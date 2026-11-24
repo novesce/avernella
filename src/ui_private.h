@@ -57,7 +57,8 @@ typedef struct {
 	gboolean saved_session;
 	gboolean find_messages, friends, friend_invite, groups, emojis,
 		stickers, avatars, photos, files, calls, video_calls,
-		incoming_calls, mute_calls;
+		group_voice_calls, group_video_calls, incoming_calls,
+		mute_calls;
 	char *self_id, *reply_id, *reply_chat;
 	char *name, *notice, *selected, *pin, *composition;
 	QRcode *qr;
@@ -250,6 +251,12 @@ gboolean ui_message_is_read(Json *message);
 void ui_message_reads(Json *packet);
 Json *ui_field(Json *obj, const char *key);
 const char *ui_string(Json *obj, const char *key, const char *fallback);
+
+static inline gboolean ui_is_chat_event(Json *row)
+{
+	return !g_strcmp0(ui_string(row, "type", NULL), "chat_event");
+}
+
 gboolean ui_draw_init(void);
 void ui_draw(void);
 void ui_draw_region(Rect logical);
@@ -305,7 +312,7 @@ void ui_media_gpu_video(struct gpu_scene *scene, double y_offset);
 void ui_media_reset_renderer(void);
 void ui_media_thumb(Json *row, Rect area);
 void ui_media_select_chat(void);
-gboolean ui_media_can_call(void);
+gboolean ui_media_can_call(gboolean video);
 void ui_media_reply_sent(const char *chat);
 Json *ui_row_at(int x, int y);
 const char *ui_flex_link_at(int x, int y);

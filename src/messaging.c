@@ -528,16 +528,29 @@ J *line_peer_read_counts(const char *self, const char *chat, J *messages,
 
 static const char *content_label(gint64 n)
 {
-	static const char *const labels[] = {
-		"[Empty message]", "[Photo]",	    "[Video]",
-		"[Audio]",	   "[HTML]",	    "[PDF]",
-		"[Call]",	   "[Sticker]",	    "[Presence]",
-		"[Gift]",	   "[Group post]",  "[App link]",
-		"[Link]",	   "[Contact]",	    "[File]",
-		"[Location]",	   "[Post]",	    "[Rich message]",
-		"[Chat event]",	   "[Music]",	    "[Payment]",
-		"[Photo]",	   "[Flex message]"
-	};
+	static const char *const labels[] = { "[Empty message]",
+					      "[Photo]",
+					      "[Video]",
+					      "[Audio]",
+					      "[HTML]",
+					      "[PDF]",
+					      "Call",
+					      "[Sticker]",
+					      "[Presence]",
+					      "[Gift]",
+					      "[Group post]",
+					      "[App link]",
+					      "[Link]",
+					      "[Contact]",
+					      "[File]",
+					      "[Location]",
+					      "[Post]",
+					      "[Rich message]",
+					      "Chat activity",
+					      "[Music]",
+					      "[Payment]",
+					      "[Photo]",
+					      "[Flex message]" };
 	return n >= 0 && n < (gint64)G_N_ELEMENTS(labels) ?
 		       labels[n] :
 		       "[Unsupported message]";
@@ -593,6 +606,252 @@ static const char *exact_text(J *item, const char *key)
 					 field(item, key)) ?
 		       p :
 		       NULL;
+}
+
+enum chat_action {
+	CHAT_UNKNOWN,
+	CHAT_JOIN,
+	CHAT_LEAVE,
+	CHAT_INVITE,
+	CHAT_CANCEL_INVITE,
+	CHAT_REMOVE,
+	CHAT_CREATE,
+	CHAT_RENAME,
+	CHAT_PHOTO,
+	CHAT_LINK_ON,
+	CHAT_LINK_OFF,
+	CHAT_ANNOUNCE,
+	CHAT_ALBUM_RENAME,
+	CHAT_ALBUM_REMOVE,
+	CHAT_ALBUM_PHOTOS_REMOVE,
+	CHAT_INVITE_LIMIT,
+	CHAT_INVITE_ENABLED,
+	CHAT_TRANSFER_FAILED,
+};
+
+/* LINE Android 26.18.2, km8.s.d and rr8.f. */
+static enum chat_action chat_action(J *metadata)
+{
+	const char *key = exact_text(metadata, "LOC_KEY");
+	static const struct {
+		const char *key;
+		enum chat_action action;
+	} formats[] = {
+		{ "C_MJ", CHAT_JOIN },
+		{ "A_MJ", CHAT_JOIN },
+		{ "C_ML", CHAT_LEAVE },
+		{ "A_ML", CHAT_LEAVE },
+		{ "C_MI", CHAT_INVITE },
+		{ "C_GI", CHAT_INVITE },
+		{ "A_MI", CHAT_INVITE },
+		{ "C_IC", CHAT_CANCEL_INVITE },
+		{ "A_IC", CHAT_CANCEL_INVITE },
+		{ "C_MR", CHAT_REMOVE },
+		{ "A_MR", CHAT_REMOVE },
+		{ "A_MC", CHAT_CREATE },
+		{ "C_PN", CHAT_RENAME },
+		{ "C_PI", CHAT_PHOTO },
+		{ "C_SN", CHAT_LINK_ON },
+		{ "C_SP", CHAT_LINK_OFF },
+		{ "C_MA", CHAT_ANNOUNCE },
+		{ "BB", CHAT_ALBUM_RENAME },
+		{ "BD", CHAT_ALBUM_REMOVE },
+		{ "BO", CHAT_ALBUM_PHOTOS_REMOVE },
+		{ "C_OL", CHAT_INVITE_LIMIT },
+		{ "C_BG", CHAT_INVITE_ENABLED },
+		{ "S_NC", CHAT_TRANSFER_FAILED },
+	};
+
+	for (size_t i = 0; key && i < G_N_ELEMENTS(formats); i++)
+		if (!strcmp(key, formats[i].key))
+			return formats[i].action;
+	return CHAT_UNKNOWN;
+}
+
+static char **chat_action_args(J *metadata)
+{
+	const char *text = exact_text(metadata, "LOC_ARGS");
+
+	return text && strlen(text) <= 4096 && g_utf8_validate(text, -1, NULL) ?
+		       g_strsplit(text, "\x1e", 6) :
+		       g_new0(char *, 1);
+}
+
+static void add_notice_names(Line *s, J *names, const char *ids)
+{
+	if (!ids)
+		return;
+	g_auto(GStrv) members = g_strsplit(ids, "\x1f", 6);
+
+	for (size_t i = 0; members[i]; i++)
+		if (talk_id(members[i]) && *members[i] == 'u' &&
+		    g_strcmp0(members[i], s->mid))
+			put(names, members[i], string(""));
+}
+
+static char *notice_names(Line *s, J *names, const char *ids,
+			  const char *fallback)
+{
+	g_auto(GStrv) members = ids ? g_strsplit(ids, "\x1f", 6) : NULL;
+	g_autoptr(GString) text = g_string_new(NULL);
+
+	for (size_t i = 0; members && members[i]; i++) {
+		const char *id = members[i];
+
+		if (!talk_id(id) || *id != 'u')
+			continue;
+		const char *name = !g_strcmp0(s->mid, id) ? "You" :
+							    nonempty(names, id);
+
+		if (text->len)
+			g_string_append(text, ", ");
+		g_string_append(text, name ? name : "A member");
+	}
+	return text->len ? g_string_free(g_steal_pointer(&text), FALSE) :
+			   g_strdup(fallback);
+}
+
+static gboolean has_target_list(enum chat_action action)
+{
+	return action == CHAT_INVITE || action == CHAT_CANCEL_INVITE ||
+	       action == CHAT_REMOVE;
+}
+
+static char *chat_notice(Line *s, J *names, J *meta, const char *sender,
+			 const char *fallback)
+{
+	enum chat_action action = chat_action(meta);
+	g_auto(GStrv) args = chat_action_args(meta);
+	const char *second = args[0] ? args[1] : NULL;
+	g_autofree char *actor = notice_names(s, names, args[0], sender);
+	g_autofree char *targets =
+		has_target_list(action) ?
+			notice_names(s, names, second, "a member") :
+			NULL;
+
+	switch (action) {
+	case CHAT_JOIN:
+		return g_strdup_printf("%s joined the group", actor);
+	case CHAT_LEAVE:
+		return g_strdup_printf("%s left the group", actor);
+	case CHAT_INVITE:
+		return g_strdup_printf("%s invited %s to the group", actor,
+				       targets);
+	case CHAT_CANCEL_INVITE:
+		return g_strdup_printf("%s canceled the invitation for %s",
+				       actor, targets);
+	case CHAT_REMOVE:
+		return g_strdup_printf("%s removed %s from the group", actor,
+				       targets);
+	case CHAT_CREATE:
+		return g_strdup_printf("%s created the group", actor);
+	case CHAT_RENAME:
+		return second && *second ?
+			       g_strdup_printf("%s renamed the group to %s",
+					       actor, second) :
+			       g_strdup_printf("%s renamed the group", actor);
+	case CHAT_PHOTO:
+		return g_strdup_printf("%s changed the group photo", actor);
+	case CHAT_LINK_ON:
+		return g_strdup_printf("%s enabled the group invite link",
+				       actor);
+	case CHAT_LINK_OFF:
+		return g_strdup_printf("%s disabled the group invite link",
+				       actor);
+	case CHAT_ANNOUNCE:
+		return g_strdup_printf("%s posted an announcement", actor);
+	case CHAT_ALBUM_RENAME:
+		return args[0] && *args[0] && second && *second ?
+			       g_strdup_printf("%s renamed the album %s to %s",
+					       sender, args[0], second) :
+			       g_strdup_printf("%s renamed an album", sender);
+	case CHAT_ALBUM_REMOVE:
+		return args[0] && *args[0] ?
+			       g_strdup_printf("%s removed the album %s",
+					       sender, args[0]) :
+			       g_strdup_printf("%s removed an album", sender);
+	case CHAT_ALBUM_PHOTOS_REMOVE:
+		return g_strdup_printf("%s removed photos from an album",
+				       sender);
+	case CHAT_INVITE_LIMIT:
+		return g_strdup("The group invitation limit was reached");
+	case CHAT_INVITE_ENABLED:
+		return g_strdup("Group invitations were enabled");
+	case CHAT_TRANSFER_FAILED:
+		return g_strdup("LINE could not transfer this message");
+	default:
+		return g_strdup(fallback ? fallback : "Chat activity");
+	}
+}
+
+static const char *call_field(J *meta, const char *key, const char *legacy)
+{
+	const char *value = exact_text(meta, key);
+
+	return value ? value : exact_text(meta, legacy);
+}
+
+static char *call_record(J *meta, gboolean own, gboolean *notice,
+			 const char *fallback)
+{
+	const char *type = call_field(meta, "TYPE", "voipType");
+
+	if (!g_strcmp0(type, "G")) {
+		const char *event =
+			call_field(meta, "GC_EVT_TYPE", "voipGcEventType");
+		const char *media =
+			call_field(meta, "GC_MEDIA_TYPE", "voipGcMediaType");
+		const char *group =
+			!g_strcmp0(media, "VIDEO") ? "Group video call" :
+			!g_strcmp0(media, "LIVE")  ? "Group live call" :
+						     "Group voice call";
+
+		*notice = TRUE;
+		if (!g_strcmp0(event, "S"))
+			return g_strdup_printf("%s started", group);
+		if (!g_strcmp0(event, "E"))
+			return g_strdup_printf("%s ended", group);
+		if (!g_strcmp0(event, "I"))
+			return g_strdup_printf("%s invitation", group);
+		return g_strdup(fallback ? fallback : group);
+	}
+	const char *kind = !g_strcmp0(type, "V") ? "Video call" :
+			   !g_strcmp0(type, "A") ? "Voice call" :
+			   !g_strcmp0(type, "P") ? "Phone call" :
+						   "Call";
+	const char *result = call_field(meta, "RESULT", "voipResult");
+
+	if (!g_strcmp0(result, "NORMAL")) {
+		const char *duration =
+			call_field(meta, "DURATION", "voipDuration");
+		guint64 ms;
+
+		if (duration &&
+		    g_ascii_string_to_unsigned(duration, 10, 1, G_MAXINT32, &ms,
+					       NULL)) {
+			unsigned int seconds = ms / 1000;
+
+			if (seconds >= 3600)
+				return g_strdup_printf("%s · %u:%02u:%02u",
+						       kind, seconds / 3600,
+						       seconds / 60 % 60,
+						       seconds % 60);
+			return g_strdup_printf("%s · %u:%02u", kind,
+					       seconds / 60, seconds % 60);
+		}
+		return g_strdup(kind);
+	}
+	const char *status = !g_strcmp0(result, "NO_RESPONSE") ?
+				     (own ? "No answer" : "Missed") :
+			     !g_strcmp0(result, "CANCELED") ? "Canceled" :
+			     !g_strcmp0(result, "REJECTED") ? "Declined" :
+			     !g_strcmp0(result, "BUSY")	    ? "Busy" :
+			     !g_strcmp0(result, "FAIL")	    ? "Failed" :
+							      NULL;
+
+	if (status)
+		return g_strdup_printf("%s · %s", kind, status);
+	return g_strdup(fallback ? fallback : kind);
 }
 
 static J *emoji_ranges(const char *text, J *resources, gboolean sending,
@@ -780,11 +1039,25 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 		return NULL;
 	}
 	for (size_t i = 0; i < length(reply); i++) {
-		const char *mid = nonempty(at(reply, i), "1");
+		J *message = at(reply, i);
+		const char *mid = nonempty(message, "1");
 
 		if (talk_id(mid) && mid[0] == 'u' &&
 		    g_strcmp0(mid, s->mid) != 0)
 			put(names, mid, string(""));
+		J *meta = field(message, "18");
+
+		if (json_object_get_int(field(message, "15")) == 18) {
+			enum chat_action action = chat_action(meta);
+
+			if (action >= CHAT_JOIN && action <= CHAT_ANNOUNCE) {
+				g_auto(GStrv) args = chat_action_args(meta);
+
+				add_notice_names(s, names, args[0]);
+				if (args[0] && has_target_list(action))
+					add_notice_names(s, names, args[1]);
+			}
+		}
 	}
 	line_resolve_names(s, names, 'u');
 	J *rows = array();
@@ -797,6 +1070,7 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 		gboolean own = sender && g_strcmp0(sender, s->mid) == 0;
 		gint64 type = json_object_get_int64(field(msg, "15"));
 		const char *text = nonempty(msg, "10");
+		gboolean notice = type == 18;
 
 		g_autoptr(J) decrypted = NULL, unsealed_replace = NULL;
 		if (type == 0) {
@@ -829,11 +1103,11 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 				put(row, "emojis", emojis);
 		}
 		static const char *const kinds[] = {
-			"text",	    "photo",	     "video", "audio",
-			"html",	    "pdf",	     "call",  "sticker",
-			"presence", "gift",	     "board", "app",
-			"link",	    "contact",	     "file",  "location",
-			"post",	    "rich",	     "event", "music",
+			"text",	    "photo",	     "video",	   "audio",
+			"html",	    "pdf",	     "call",	   "sticker",
+			"presence", "gift",	     "board",	   "app",
+			"link",	    "contact",	     "file",	   "location",
+			"post",	    "rich",	     "chat_event", "music",
 			"payment",  "externalImage", "flex"
 		};
 		J *metadata = field(msg, "18");
@@ -847,8 +1121,20 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 			if (rich)
 				put(row, "rich", rich);
 		}
+		g_autofree char *event = NULL;
 
-		if (alt)
+		if (type == 18)
+			event = chat_notice(s, names, metadata,
+					    own	 ? "You" :
+					    name ? name :
+						   "A member",
+					    text);
+		else if (type == 6)
+			event = call_record(metadata, own, &notice, text);
+
+		if (event)
+			text = event;
+		else if (alt)
 			text = alt;
 		const char *filename = nonempty(metadata, "FILE_NAME"),
 			   *related = nonempty(msg, "21");
@@ -867,19 +1153,20 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 			put(row, "filename", string(filename));
 		if (related && json_object_get_int(field(msg, "22")) == 3)
 			put(row, "replyTo", string(related));
-		if (sender && talk_id(sender)) {
+		if (!notice && sender && talk_id(sender)) {
 			put(row, "senderId", string(sender));
 			const char *pic = strfield(s->pictures, sender);
 
 			put(row, "avatarKey", string(pic ? pic : ""));
 		}
 		put(row, "type",
-		    string(type >= 0 && type < (gint64)G_N_ELEMENTS(kinds) ?
-				   kinds[type] :
-				   "other"));
+		    string(notice ? "chat_event" :
+			   type >= 0 && type < (gint64)G_N_ELEMENTS(kinds) ?
+				    kinds[type] :
+				    "other"));
 		J *reactions = field(msg, "27");
 
-		if (length(reactions)) {
+		if (!notice && length(reactions)) {
 			static const char *const names_by_type[] = {
 				NULL,  NULL,	  "nice", "love",
 				"fun", "amazing", "sad",  "omg"
@@ -911,9 +1198,9 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 			   sender ? sender :
 				    "LINE"));
 		put(row, "text", string(text ? text : content_label(type)));
-		boolean(row, "own", own);
+		boolean(row, "own", own && !notice);
 		J *read_count = field(msg, "23");
-		if (own && g_strcmp0(strfield(msg, "2"), s->mid) &&
+		if (own && !notice && g_strcmp0(strfield(msg, "2"), s->mid) &&
 		    json_object_is_type(read_count, json_type_int) &&
 		    json_object_get_int(read_count) >= 0)
 			put(row, "readCount", json_object_get(read_count));

@@ -3,6 +3,7 @@
 #include "vk_present.h"
 #include "vk_canvas.h"
 #include <stdlib.h>
+#include <string.h>
 
 struct backend {
 	struct vk_present *present;
@@ -56,6 +57,33 @@ static int draw(void *state, const struct gpu_scene *scene)
 		return 0;
 	return -1;
 }
+
+static void get_device(void *state, struct gpu_device_info *device)
+{
+	struct backend *b = state;
+	const struct vk_ctx *ctx = vk_present_context(b->present);
+	VkPhysicalDeviceProperties props;
+
+	vkGetPhysicalDeviceProperties(ctx->gpu, &props);
+	_Static_assert(sizeof(device->name) == sizeof(props.deviceName),
+		       "Vulkan physical device name size");
+	memcpy(device->name, props.deviceName, sizeof(device->name));
+	device->vendor = props.vendorID;
+}
+
+__attribute__((visibility("default")))
+const struct gpu_device_query avernella_gpu_device_v1 = { .get = get_device };
+
+static int render_minor(void *state)
+{
+	struct backend *b = state;
+
+	return vk_present_context(b->present)->render_minor;
+}
+
+__attribute__((visibility("default")))
+const struct gpu_drm_query avernella_gpu_drm_v1 = { .render_minor =
+							    render_minor };
 
 __attribute__((visibility("default")))
 const struct gpu_backend avernella_gpu_v1 = {

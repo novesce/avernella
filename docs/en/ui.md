@@ -179,8 +179,8 @@ All in [`ui_media.c`](../../src/ui_media.c):
 - **Copy image:** puts a PNG on the clipboard (`image_clipboard()`, again needing SDL3).
 - **Photo viewer:** `picture()` requests the full image with `photo` and shows it. JPEG EXIF orientation is honored (`exif_orientation()`).
 - **Thumbnails:** `ui_media_thumb()` with a bounded cache (`reserve_thumbnail()`, `evict_thumbnail()`).
-- **Video:** `open_video()` asks for the file with `openVideo` and plays it with `ffplay` through [`video_play.c`](../../src/video_play.c). Video cards show a poster from `videoPoster` when LINE has one.
-- **Camera video messages:** **Record video** uses [`video_record.c`](../../src/video_record.c), which runs `ffmpeg` with V4L2 and PulseAudio to write an H.264/AAC MP4 into a private file. You review it and then send it.
+- **Video:** `open_video()` asks for the file with `openVideo` and plays it with `ffplay` through [`video_play.c`](../../src/video_play.c). With the native renderer, FFplay uses the selected Vulkan GPU to display the clip. On compatible drivers it also decodes video with NVDEC on NVIDIA or Vulkan Video on AMD and Intel. Video cards show a poster from `videoPoster` when LINE has one.
+- **Camera video messages:** **Record video** uses [`video_record.c`](../../src/video_record.c), which runs `ffmpeg` with V4L2 and PulseAudio to write an H.264/AAC MP4 into a private file. On NVIDIA, the recorder tests H.264 NVENC before opening the camera and falls back to the software encoder if startup fails. You review the clip and then send it.
 - **Screenshots:** Ctrl+Alt+S or **Take screenshot** in the chat tools. [`screenshot.c`](../../src/screenshot.c) asks the XDG Screenshot portal, and the result opens as an attachment.
 - **Saving:** Save writes the downloaded bytes through `saveFile`, using `line_save_media()` in the worker, with an atomic rename.
 

@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Waiting for incoming media…",
+	  "音声または映像の受信を待っています…" },
+	{ "Waiting for playback…", "再生を待っています…" },
+	{ "LINE sees this account in a call on another device. End that call before joining here.",
+	  "このアカウントは別の端末でLINE通話中です。その端末で通話を終了してから、こちらで参加してください。" },
 	{ "%B %e, %Y", "%Y年%B%-d日" },
 	{ "%d selected", "%d人を選択中" },
 	{ "%d/%m/%Y %H:%M", "%Y/%-m/%-d %H:%M" },
@@ -660,7 +665,8 @@ static const char *const strings[][2] = {
 	{ "★ Favorite", "★ お気に入り" },
 	{ "Signed out on this computer. LINE did not confirm it, so check linked devices on your phone.",
 	  "このコンピューターからログアウトしました。LINEで確認できなかったため、スマートフォンの連携済み端末を確認してください。" },
-	{ "Sign out of the saved session", "保存されたセッションからログアウト" },
+	{ "Sign out of the saved session",
+	  "保存されたセッションからログアウト" },
 };
 
 const struct ui_lang_table ui_lang_ja = {

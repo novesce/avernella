@@ -1,4 +1,4 @@
 {
-	global: avernella_gpu_v1;
+	global: avernella_gpu_v1; avernella_gpu_device_v1; avernella_gpu_drm_v1;
 	local: *;
 };

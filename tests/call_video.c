@@ -1,9 +1,66 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call_schema.h"
+#include "call_hwdecode_config.h"
 #include "call_video.h"
 #include "call_srtp.h"
+#include "call_vp8.h"
 #include "screencast.h"
 #include <string.h>
+#if CALL_HWDECODE
+#include <libavcodec/avcodec.h>
+#include <libavutil/hwcontext.h>
+
+static guint hardware_transfers;
+static gboolean fail_transfer;
+static gboolean fake_intel, selected_intel;
+char *__real_g_file_read_link(const char *path, GError **error);
+__attribute__((visibility("default"))) char *
+__wrap_g_file_read_link(const char *path, GError **error)
+{
+	if (fake_intel && !strcmp(path, "/sys/dev/char/1:3/device"))
+		return g_strdup("../../../0000:00:02.0");
+	return __real_g_file_read_link(path, error);
+}
+
+gboolean __real_g_file_get_contents(const char *path, char **contents,
+				    gsize *len, GError **error);
+__attribute__((visibility("default"))) gboolean __wrap_g_file_get_contents(
+	const char *path, char **contents, gsize *len, GError **error)
+{
+	if (fake_intel && !strcmp(path, "/sys/dev/char/1:3/device/vendor")) {
+		*contents = g_strdup("0x8086\n");
+		if (len)
+			*len = strlen(*contents);
+		return TRUE;
+	}
+	return __real_g_file_get_contents(path, contents, len, error);
+}
+
+int __real_av_hwdevice_ctx_create(AVBufferRef **ctx, enum AVHWDeviceType type,
+				  const char *node, AVDictionary *opts,
+				  int flags);
+int __wrap_av_hwdevice_ctx_create(AVBufferRef **ctx, enum AVHWDeviceType type,
+				  const char *node, AVDictionary *opts,
+				  int flags)
+{
+	if (fake_intel) {
+		g_assert_cmpint(type, ==, AV_HWDEVICE_TYPE_VAAPI);
+		g_assert_cmpstr(node, ==, "/dev/null");
+		selected_intel = TRUE;
+		return AVERROR(ENODEV);
+	}
+	return __real_av_hwdevice_ctx_create(ctx, type, node, opts, flags);
+}
+
+int __real_av_hwframe_transfer_data(AVFrame *dst, const AVFrame *src,
+				    int flags);
+int __wrap_av_hwframe_transfer_data(AVFrame *dst, const AVFrame *src, int flags)
+{
+	hardware_transfers++;
+	return fail_transfer ? AVERROR_EXTERNAL :
+			       __real_av_hwframe_transfer_data(dst, src, flags);
+}
+#endif
 
 enum {
 	W = 320,
@@ -43,16 +100,11 @@ static void display(const struct line_camera_frame *frame, gpointer data)
 	loop->count++;
 }
 
-static void prepare(struct loop *loop)
+static void prepare_frame(struct loop *loop)
 {
-	g_autoptr(GError) e = NULL;
 	g_autoptr(GRand) rand = g_rand_new_with_seed(123);
 	guint ysize = W * H;
 
-	loop->tx = call_video_open(key_a, key_b, 97, 101, 102, 400, 10, &e);
-	g_assert_no_error(e);
-	loop->rx = call_video_open(key_b, key_a, 97, 102, 101, 400, 10, &e);
-	g_assert_no_error(e);
 	loop->packets =
 		g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
 	for (guint i = 0; i < ysize; i++)
@@ -65,6 +117,17 @@ static void prepare(struct loop *loop)
 		.width = W,
 		.height = H
 	};
+}
+
+static void prepare(struct loop *loop)
+{
+	g_autoptr(GError) e = NULL;
+
+	loop->tx = call_video_open(key_a, key_b, 97, 101, 102, 400, 10, &e);
+	g_assert_no_error(e);
+	loop->rx = call_video_open(key_b, key_a, 97, 102, 101, 400, 10, &e);
+	g_assert_no_error(e);
+	prepare_frame(loop);
 }
 
 static void done(struct loop *loop)
@@ -89,6 +152,142 @@ static gboolean deliver(struct loop *loop, guint i)
 	const guint8 *packet = g_bytes_get_data(loop->packets->pdata[i], &size);
 
 	return call_video_receive(loop->rx, packet, size, display, loop);
+}
+
+static void decoder_recovery(void)
+{
+#if CALL_HWDECODE
+	struct loop loop = { 0 };
+	guint before = hardware_transfers;
+
+	prepare(&loop);
+	encode(&loop, 1000000);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_true(deliver(&loop, i));
+	g_assert_cmpuint(loop.count, ==, 1);
+	if (before == hardware_transfers) {
+		g_test_skip("No hardware VP8 decoder on the selected adapter");
+		done(&loop);
+		return;
+	}
+	fail_transfer = TRUE;
+	encode(&loop, 1100000);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_cmpint(deliver(&loop, i), ==,
+				i + 1 < loop.packets->len);
+	g_assert_true(call_video_needs_keyframe(loop.rx));
+	before = hardware_transfers;
+	encode(&loop, 1200000);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_true(deliver(&loop, i));
+	g_assert_cmpuint(loop.count, ==, 1);
+	call_video_keyframe(loop.tx);
+	encode(&loop, 1300000);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_true(deliver(&loop, i));
+	g_assert_cmpuint(loop.count, ==, 2);
+	g_assert_false(call_video_needs_keyframe(loop.rx));
+	g_assert_cmpuint(hardware_transfers, ==, before);
+	fail_transfer = FALSE;
+	done(&loop);
+#else
+	g_test_skip("Built without FFmpeg acceleration");
+#endif
+}
+
+static void intel_decoder_selection(void)
+{
+#if CALL_HWDECODE
+	const AVCodec *codec = avcodec_find_decoder_by_name("vp8");
+	const AVCodecHWConfig *cfg;
+	guint i = 0;
+
+	while (codec && (cfg = avcodec_get_hw_config(codec, i++))) {
+		if (cfg->device_type == AV_HWDEVICE_TYPE_VAAPI)
+			break;
+	}
+	if (!codec || !cfg) {
+		g_test_skip("FFmpeg was built without VA-API VP8");
+		return;
+	}
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, G_TEST_SUBPROCESS_DEFAULT);
+		g_test_trap_assert_passed();
+		return;
+	}
+	/* Exercise node selection and fallback without an Intel device. */
+	g_setenv("AVERNELLA_RENDER_NODE", "/dev/null", TRUE);
+	g_unsetenv("LINE_DISABLE_GPU");
+	fake_intel = TRUE;
+	struct loop loop = { 0 };
+
+	prepare(&loop);
+	encode(&loop, 1000000);
+	for (guint j = 0; j < loop.packets->len; j++)
+		g_assert_true(deliver(&loop, j));
+	g_assert_true(selected_intel);
+	g_assert_cmpuint(loop.count, ==, 1);
+	done(&loop);
+#else
+	g_test_skip("Built without FFmpeg acceleration");
+#endif
+}
+
+static void check_visible_edges(const struct line_camera_frame *frame,
+				gpointer data)
+{
+	struct loop *loop = data;
+	const int expected[] = { 96, 80, 160 };
+
+	g_assert_cmpuint(frame->width, ==, loop->frame.width);
+	g_assert_cmpuint(frame->height, ==, loop->frame.height);
+	g_assert_cmpuint(frame->rotation, ==, loop->rotation);
+	for (guint i = 0; i < 3; i++) {
+		guint width = (frame->width + !!i) >> !!i;
+		guint height = (frame->height + !!i) >> !!i;
+		const guint8 *first = frame->plane[i];
+		const guint8 *last = first + (height - 1) * frame->stride[i];
+
+		g_assert_cmpint(ABS(first[0] - expected[i]), <=, 3);
+		g_assert_cmpint(ABS(last[width - 1] - expected[i]), <=, 3);
+	}
+	loop->count++;
+}
+
+static void decoder_visible_dimensions(void)
+{
+	/* Flat YUV(96,80,160) generated with libvpx. 159x119 and 160x120
+	 * have identical macroblocks; only the keyframe dimensions differ. */
+	guint8 key[] = {
+		0xf0, 0x06, 0x00, 0x9d, 0x01, 0x2a, 0xa0, 0x00, 0x78, 0x00,
+		0x00, 0x47, 0x08, 0x85, 0x85, 0x88, 0x85, 0x84, 0x88, 0x02,
+		0x02, 0x02, 0x75, 0xaa, 0x03, 0xf8, 0x02, 0x06, 0x93, 0x8f,
+		0x05, 0x10, 0x9c, 0x52, 0xd2, 0xa1, 0x38, 0xa5, 0xa5, 0x42,
+		0x71, 0x4b, 0x4a, 0x84, 0xe2, 0x96, 0x95, 0x09, 0xc5, 0x2d,
+		0x2a, 0x13, 0x8a, 0x5a, 0x54, 0x27, 0x14, 0xb4, 0xa8, 0x4e,
+		0x29, 0x69, 0x50, 0x9b, 0x00, 0xfe, 0xfa, 0x79, 0x5f, 0xff,
+		0xa8, 0xd9, 0xfa, 0x8d, 0x9f, 0xa8, 0xd9, 0xff, 0xa8, 0xd9,
+		0xff, 0xde, 0xc1, 0x7d, 0xd8, 0x2f, 0xbb, 0x05, 0xfe, 0xb6,
+		0x00,
+	};
+	struct loop loop = { .rotation = 270 };
+	struct call_vp8_decoder *decoder = call_vp8_open(1);
+	const char *initial = NULL;
+
+	g_assert_nonnull(decoder);
+	for (guint i = 0; i < 3; i++) {
+		key[6] = loop.frame.width = i == 1 ? 159 : 160;
+		key[8] = loop.frame.height = i == 1 ? 119 : 120;
+		g_assert_cmpint(call_vp8_decode(decoder, key, sizeof(key), TRUE,
+						loop.rotation,
+						check_visible_edges, &loop),
+				==, 1);
+		if (!i)
+			initial = call_vp8_backend(decoder);
+	}
+	g_assert_cmpuint(loop.count, ==, 3);
+	g_assert_cmpstr(call_vp8_backend(decoder), ==, initial);
+	call_vp8_close(decoder);
 }
 
 static void roundtrip(void)
@@ -140,6 +339,55 @@ static void roundtrip(void)
 		g_assert_true(deliver(&loop, i));
 	g_assert_cmpuint(loop.count, ==, 2);
 	done(&loop);
+}
+
+static void conference_directions(void)
+{
+	g_autoptr(GError) e = NULL;
+	struct loop first = { 0 }, second = { 0 };
+
+	first.tx = call_video_open_tx(key_a, 97, 101, 400, 10, &e);
+	g_assert_no_error(e);
+	first.rx = call_video_open_rx(key_a, 97, 101, &e);
+	g_assert_no_error(e);
+	second.tx = call_video_open_tx(key_b, 98, 202, 500, 15, &e);
+	g_assert_no_error(e);
+	second.rx = call_video_open_rx(key_b, 98, 202, &e);
+	g_assert_no_error(e);
+	prepare_frame(&first);
+	prepare_frame(&second);
+
+	g_assert_false(call_video_encode(first.rx, &first.frame, 1000000,
+					 collect, &first, &e));
+	g_assert_nonnull(e);
+	g_clear_error(&e);
+	encode(&first, 1000000);
+	encode(&second, 1000000);
+	while (first.packets->len || second.packets->len) {
+		struct loop *loops[] = { &first, &second };
+
+		for (guint i = 0; i < G_N_ELEMENTS(loops); i++) {
+			struct loop *loop = loops[i];
+			guint last = loop->packets->len;
+
+			if (!last)
+				continue;
+			gsize size;
+			const guint8 *packet = g_bytes_get_data(
+				loop->packets->pdata[last - 1], &size);
+
+			g_assert_false(call_video_receive(
+				loops[1 - i]->rx, packet, size, display, loop));
+			g_assert_false(call_video_receive(loop->tx, packet,
+							  size, display, loop));
+			g_assert_true(deliver(loop, last - 1));
+			g_ptr_array_set_size(loop->packets, last - 1);
+		}
+	}
+	g_assert_cmpuint(first.count, ==, 1);
+	g_assert_cmpuint(second.count, ==, 1);
+	done(&first);
+	done(&second);
 }
 
 static void recovery(void)
@@ -313,7 +561,7 @@ static void single_packet(gconstpointer mode)
 	done(&loop);
 }
 
-static void single_packet_length(void)
+static void single_packet_length(gconstpointer data)
 {
 	struct loop loop = { 0 };
 	srtp_t observer, sender;
@@ -321,6 +569,11 @@ static void single_packet_length(void)
 	gsize size;
 
 	prepare(&loop);
+	if (GPOINTER_TO_INT(data)) {
+		call_video_close(loop.rx);
+		loop.rx = call_video_open_group_rx(key_a, 97, 101, NULL);
+		g_assert_nonnull(loop.rx);
+	}
 	memset(loop.pixels, 120, W * H);
 	encode(&loop, 1000000);
 	g_assert_cmpuint(loop.packets->len, ==, 1);
@@ -344,6 +597,501 @@ static void single_packet_length(void)
 	g_assert_true(deliver(&loop, 0));
 	g_assert_cmpuint(loop.count, ==, 1);
 	srtp_dealloc(sender);
+	srtp_dealloc(observer);
+	done(&loop);
+}
+
+enum profile_length_error {
+	PROFILE_VALID,
+	PROFILE_OUTER_MISMATCH,
+	PROFILE_INNER_MISMATCH,
+	PROFILE_TRUNCATED,
+};
+
+static void reframe_evs3_size(struct loop *loop, srtp_t observer, srtp_t sender,
+			      guint header, enum profile_length_error error)
+{
+	static const guint8 extensions[] = { 5, 2, 0, 0, 0x80, 0x87, 0,
+					     0, 0, 0, 0, 0,    0 };
+	GBytes *original = loop->packets->pdata[0];
+	gsize size;
+	const guint8 *wire = g_bytes_get_data(original, &size);
+	guint8 packet[1200 + SRTP_MAX_TRAILER_LEN];
+	int n = size;
+
+	memcpy(packet, wire, size);
+	g_assert_cmpint(srtp_unprotect(observer, packet, &n), ==,
+			srtp_err_status_ok);
+	g_assert_true(packet[12] & 8);
+	/* The synthetic camera emits no optional extensions on its descriptor. */
+	guint offset = 12 + (packet[12] & 0x40 ? 8 : 5);
+
+	g_assert_cmpint(n, >, offset + 3);
+	guint extension_size = header >= 9 ? sizeof(extensions) : 0;
+	guint total = (packet[offset] & 3) | (packet[offset + 1] << 2) |
+		      (packet[offset + 2] << 10);
+	guint payload = total - 3 + (error == PROFILE_TRUNCATED);
+
+	memmove(packet + offset + extension_size + header, packet + offset + 3,
+		n - offset - 3);
+	n += (int)(extension_size + header) - 3;
+	if (extension_size) {
+		guint32 size = GUINT32_TO_BE(payload + header - 6 +
+					     (error == PROFILE_OUTER_MISMATCH));
+
+		packet[offset - 1] |= 1;
+		memcpy(packet + offset, extensions, extension_size);
+		offset += extension_size;
+		packet[offset++] = header == 9 ? 3 : 4;
+		packet[offset++] = 0x10;
+		memcpy(packet + offset, &size, sizeof(size));
+		offset += sizeof(size);
+	}
+	payload += error == PROFILE_INNER_MISMATCH;
+	if (header == 9) {
+		total = payload + 3;
+		packet[offset] = total & 3;
+		packet[offset + 1] = total >> 2;
+		packet[offset + 2] = total >> 10;
+	} else if (header) {
+		guint32 size = GUINT32_TO_BE(payload);
+
+		memcpy(packet + offset, &size, sizeof(size));
+	}
+	g_assert_cmpint(srtp_protect(sender, packet, &n), ==,
+			srtp_err_status_ok);
+	loop->packets->pdata[0] = g_bytes_new(packet, n);
+	g_bytes_unref(original);
+}
+
+static void group_evs3_sizes(void)
+{
+	static const struct {
+		guint header;
+		gboolean key;
+		enum profile_length_error error;
+	} pictures[] = {
+		{ 0, TRUE, PROFILE_VALID },
+		{ 0, FALSE, PROFILE_VALID },
+		{ 4, TRUE, PROFILE_VALID },
+		{ 4, FALSE, PROFILE_VALID },
+		{ 10, TRUE, PROFILE_VALID },
+		{ 10, FALSE, PROFILE_VALID },
+		{ 10, TRUE, PROFILE_TRUNCATED },
+		{ 10, TRUE, PROFILE_OUTER_MISMATCH },
+		{ 10, TRUE, PROFILE_INNER_MISMATCH },
+		{ 9, TRUE, PROFILE_VALID },
+		{ 9, FALSE, PROFILE_VALID },
+		{ 9, TRUE, PROFILE_OUTER_MISMATCH },
+		{ 9, TRUE, PROFILE_INNER_MISMATCH },
+		{ 9, TRUE, PROFILE_TRUNCATED },
+		{ 3, TRUE, PROFILE_VALID },
+		{ 3, FALSE, PROFILE_VALID },
+	};
+	struct loop loop = { 0 };
+	srtp_t observer, sender;
+	guint shown = 0;
+
+	prepare(&loop);
+	call_video_close(loop.rx);
+	loop.rx = call_video_open_group_rx(key_a, 97, 101, NULL);
+	g_assert_nonnull(loop.rx);
+	g_assert_true(call_srtp_open(&observer, key_a, ssrc_specific, 101));
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < G_N_ELEMENTS(pictures); i++) {
+		gboolean valid = pictures[i].error == PROFILE_VALID;
+
+		if (pictures[i].key)
+			call_video_keyframe(loop.tx);
+		encode(&loop, 1000000 + i * 100000);
+		if (pictures[i].header != 3)
+			reframe_evs3_size(&loop, observer, sender,
+					  pictures[i].header,
+					  pictures[i].error);
+		for (guint j = loop.packets->len; j--;)
+			g_assert_cmpint(deliver(&loop, j), ==, j || valid);
+		shown += valid;
+		g_assert_cmpuint(loop.count, ==, shown);
+	}
+	srtp_dealloc(sender);
+	srtp_dealloc(observer);
+	done(&loop);
+}
+
+struct expected_image {
+	guint width, height, frames;
+};
+
+static void check_resolution(const struct line_camera_frame *frame,
+			     gpointer data)
+{
+	struct expected_image *expected = data;
+
+	g_assert_cmpuint(frame->width, ==, expected->width);
+	g_assert_cmpuint(frame->height, ==, expected->height);
+	for (guint i = 0; i < 3; i++) {
+		guint w = frame->width >> !!i, h = frame->height >> !!i;
+		guint8 last =
+			frame->plane[i][(h - 1) * frame->stride[i] + w - 1];
+
+		/* Padding in the incoming camera rows is white. */
+		g_assert_cmpint(ABS((int)last - (64 + (int)i * 40)), <=, 8);
+	}
+	expected->frames++;
+}
+
+static void group_resolution(void)
+{
+	static const struct {
+		int requested;
+		guint width, height, descriptor, rate;
+		gboolean key;
+	} phases[] = {
+		{ -1, 640, 480, 2, 20, TRUE }, { 0, 160, 120, 0, 7, TRUE },
+		{ 0, 160, 120, 0, 7, FALSE },  { 1, 320, 240, 1, 15, TRUE },
+		{ -1, 640, 480, 2, 20, TRUE }, { 4, 640, 480, 2, 20, FALSE },
+	};
+	struct loop loop = { 0 };
+	struct expected_image expected = { 0 };
+	guint16 layer_sequences[8] = { 0 };
+	static const int strides[] = { 656, 344, 352 };
+	g_autofree guint8 *storage =
+		g_malloc(480 * strides[0] + 240 * (strides[1] + strides[2]));
+	guint8 *plane = storage;
+	struct line_camera_frame *f = &loop.frame;
+
+	loop.tx = call_video_open_group_tx(key_a, 121, 101, 400, 10, NULL);
+	loop.rx = call_video_open_group_rx(key_a, 121, 101, NULL);
+	loop.packets =
+		g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+	g_assert_nonnull(loop.tx);
+	g_assert_nonnull(loop.rx);
+	call_video_set_group_format(loop.tx, CALL_VIDEO_RTP_EXT_VED, TRUE);
+	f->width = 640;
+	f->height = 480;
+	for (guint i = 0; i < 3; i++) {
+		guint w = f->width >> !!i, h = f->height >> !!i;
+
+		f->stride[i] = strides[i];
+		f->plane[i] = plane;
+		for (guint y = 0; y < h; y++, plane += f->stride[i]) {
+			memset(plane, 64 + i * 40, w);
+			memset(plane + w, 255, f->stride[i] - w);
+		}
+	}
+	for (guint i = 0; i < G_N_ELEMENTS(phases); i++) {
+		if (i == 4) {
+			/* A camera with matching chroma strides can be encoded
+			 * directly on restore, releasing the scaled buffer. */
+			guint8 *v = (guint8 *)f->plane[2];
+
+			for (guint row = 0; row < f->height / 2; row++)
+				memmove(v + row * f->stride[1],
+					v + row * f->stride[2], f->width / 2);
+			f->stride[2] = f->stride[1];
+		}
+		expected.width = phases[i].width;
+		expected.height = phases[i].height;
+		call_video_set_group_resolution(loop.tx, phases[i].requested);
+		encode(&loop, 1000000 + i * 100000);
+		g_assert_cmpuint(loop.packets->len, >, 0);
+		for (guint j = 0; j < loop.packets->len; j++) {
+			gsize n;
+			const guint8 *p =
+				g_bytes_get_data(loop.packets->pdata[j], &n);
+
+			/* Thumbnail, grid and larger layers have separate sequences. */
+			guint sid =
+				phases[i].descriptor ? phases[i].descriptor : 7;
+			guint id = (sid << 5) | 4;
+
+			g_assert_cmpuint(n, >, 32);
+			g_assert_cmpuint(p[22], ==, id);
+			g_assert_cmpuint(p[26] & 0xfc, ==, id);
+			g_assert_cmpuint(((guint)p[28] << 8) | p[29], ==,
+					 ++layer_sequences[sid]);
+			if (!j && phases[i].key)
+				g_assert_cmpuint(p[31], ==, id);
+			g_assert_cmpuint(p[23] >> 5, ==, phases[i].descriptor);
+			g_assert_cmpuint(p[25], ==, phases[i].rate);
+			if (!j && phases[i].key)
+				g_assert_cmpuint(p[32], ==, phases[i].rate);
+			g_assert_cmpint(!!(p[23] & 2), ==, phases[i].key);
+			g_assert_true(call_video_receive(
+				loop.rx, p, n, check_resolution, &expected));
+		}
+		g_assert_cmpuint(expected.frames, ==, i + 1);
+	}
+	done(&loop);
+}
+
+/* A camera delivering 20 frames/s must fit the 15 frames/s thumbnail
+ * layer without dropping to 10 frames/s through a relative timeout. */
+static void group_thumbnail_rate(void)
+{
+	struct loop loop = { 0 };
+	guint frames = 0;
+
+	loop.tx = call_video_open_group_tx(key_a, 121, 101, 4000, 30, NULL);
+	g_assert_nonnull(loop.tx);
+	call_video_set_group_format(loop.tx, CALL_VIDEO_RTP_EXT_VED, TRUE);
+	call_video_set_group_resolution(loop.tx, 0);
+	prepare_frame(&loop);
+	for (guint i = 0; i < 40; i++) {
+		encode(&loop, 1000000 + i * 50000);
+		frames += loop.packets->len > 0;
+	}
+	g_assert_cmpuint(frames, ==, 30);
+	done(&loop);
+}
+
+static void group_resolution_aspect(void)
+{
+	static const struct {
+		guint width, height, output_width, output_height;
+	} cases[] = {
+		{ 640, 360, 320, 180 },	 { 1280, 720, 320, 180 },
+		{ 720, 1280, 180, 320 }, { 1920, 1080, 480, 270 },
+		{ 160, 120, 160, 120 },
+	};
+	struct loop loop = { 0 };
+	struct expected_image expected = { 0 };
+
+	loop.tx = call_video_open_group_tx(key_a, 121, 101, 400, 10, NULL);
+	loop.rx = call_video_open_group_rx(key_a, 121, 101, NULL);
+	loop.packets =
+		g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+	g_assert_nonnull(loop.tx);
+	g_assert_nonnull(loop.rx);
+	call_video_set_group_format(loop.tx, CALL_VIDEO_RTP_EXT_VED, TRUE);
+	call_video_set_group_resolution(loop.tx, 1);
+	for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+		guint width = cases[i].width, height = cases[i].height;
+		g_autofree guint8 *image =
+			g_malloc(line_camera_i420_size(width, height));
+
+		line_camera_i420_frame(&loop.frame, image, width, height);
+		for (guint j = 0; j < 3; j++)
+			memset((guint8 *)loop.frame.plane[j], 64 + j * 40,
+			       (gsize)loop.frame.stride[j] * (height >> !!j));
+		expected.width = cases[i].output_width;
+		expected.height = cases[i].output_height;
+		encode(&loop, 1000000 + i * G_USEC_PER_SEC);
+		for (guint j = 0; j < loop.packets->len; j++) {
+			gsize n;
+			const guint8 *packet =
+				g_bytes_get_data(loop.packets->pdata[j], &n);
+
+			g_assert_true(call_video_receive(loop.rx, packet, n,
+							 check_resolution,
+							 &expected));
+		}
+		g_assert_cmpuint(expected.frames, ==, i + 1);
+	}
+	done(&loop);
+}
+
+struct group_test_format {
+	enum call_video_rtp_extension extension;
+	gboolean vp8a;
+};
+
+static void group_evs3_tx(gconstpointer data)
+{
+	static const struct {
+		guint screen_kbps;
+		guint8 generation, source, ved_rate, vfd_rate;
+		gboolean key;
+	} pictures[] = {
+		{ 0, 1, 0, 15, 37, TRUE },	{ 0, 1, 0, 15, 37, FALSE },
+		{ 400, 2, 1, 20, 50, TRUE },	{ 500, 2, 1, 25, 62, TRUE },
+		{ 8000, 2, 1, 255, 255, TRUE }, { 0, 3, 0, 15, 37, TRUE },
+	};
+	struct loop loop = { 0 };
+	srtp_t observer;
+	guint16 layer_seq = 0;
+	const struct group_test_format *format = data;
+	enum call_video_rtp_extension extension = format->extension;
+	guint profile = format->vp8a ? 4 : 3;
+
+	loop.tx = call_video_open_group_tx(key_a, 121, 101, 400, 10, NULL);
+	loop.rx = call_video_open_group_rx(key_a, 121, 101, NULL);
+	g_assert_nonnull(loop.tx);
+	g_assert_nonnull(loop.rx);
+	g_assert_true(call_srtp_open(&observer, key_a, ssrc_specific, 101));
+	call_video_set_group_format(loop.tx, extension, format->vp8a);
+	prepare_frame(&loop);
+	for (guint frame = 0; frame < G_N_ELEMENTS(pictures); frame++) {
+		gboolean key = pictures[frame].key;
+		gboolean single = frame + 1 == G_N_ELEMENTS(pictures);
+		guint32 total = 0, profile_size = 0, codec_size = 0;
+
+		if (single)
+			memset(loop.pixels, 120, W * H);
+		call_video_screen(loop.tx, pictures[frame].screen_kbps, 10);
+		encode(&loop, 1000000 + frame * 100000);
+		if (single)
+			g_assert_cmpuint(loop.packets->len, ==, 1);
+		else
+			g_assert_cmpuint(loop.packets->len, >, key ? 1 : 0);
+		for (guint i = 0; i < loop.packets->len; i++) {
+			gboolean last = i + 1 == loop.packets->len;
+			guint rtp = 12;
+			guint8 packet[1200];
+			gsize size;
+			const guint8 *wire =
+				g_bytes_get_data(loop.packets->pdata[i], &size);
+			int n = size;
+
+			g_assert_cmpuint(size, <=, sizeof(packet));
+			memcpy(packet, wire, size);
+			g_assert_cmpint(srtp_unprotect(observer, packet, &n),
+					==, srtp_err_status_ok);
+			g_assert_cmphex(packet[0], ==, extension ? 0x90 : 0x80);
+			g_assert_cmpuint(packet[1], ==, 121 | (last ? 128 : 0));
+			if (extension == CALL_VIDEO_RTP_EXT_VFD) {
+				const guint8 vfd[] = {
+					2,
+					0,
+					0,
+					2,
+					2,
+					3,
+					0x89 | (last ? 0x40 : 0),
+					0x18 | (key ? 4 : 0) | (!i ? 2 : 0),
+					profile,
+					pictures[frame].vfd_rate,
+					packet[2],
+					packet[3],
+				};
+
+				g_assert_cmpmem(packet + rtp, sizeof(vfd), vfd,
+						sizeof(vfd));
+				rtp += sizeof(vfd);
+			} else if (extension == CALL_VIDEO_RTP_EXT_VED) {
+				/* The first fragment of each key picture advertises
+				 * the rate of its single base layer. */
+				gboolean target = !i && key;
+				guint pd = rtp + (target ? 24 : 20);
+
+				++layer_seq;
+				const guint8 ved[] = {
+					2,
+					0,
+					0,
+					target ? 5 : 4,
+					4,
+					target ? 8 : 6,
+					target ? 0x22 : 0x02,
+					0,
+					packet[pd + 1],
+					packet[pd + 2],
+					0x24,
+					key ? 0x26 : 0x24,
+					profile,
+					pictures[frame].ved_rate,
+					0x24 | (!i ? 2 : 0) | (last ? 1 : 0),
+					key ? 0x38 : 0x18,
+					layer_seq >> 8,
+					(guint8)layer_seq,
+				};
+
+				g_assert_cmpmem(packet + rtp, sizeof(ved), ved,
+						sizeof(ved));
+				rtp += sizeof(ved);
+				if (target) {
+					const guint8 opt[] = {
+						0xa1,
+						0x24,
+						pictures[frame].ved_rate,
+						0,
+					};
+
+					g_assert_cmpmem(packet + rtp,
+							sizeof(opt), opt,
+							sizeof(opt));
+					rtp += sizeof(opt);
+				}
+				g_assert_cmpuint(packet[rtp++], ==, 0);
+				g_assert_cmpuint(packet[rtp++], ==, 0);
+			}
+			guint offset = rtp + 3;
+
+			g_assert_cmpuint(packet[rtp], ==,
+					 (i ? 0x80 : (key ? 0xba : 0xfa)) |
+						 (last ? 4 : 0));
+			if (!i) {
+				guint descriptor = rtp + (key ? 5 : 8);
+				const guint8 capture[] = {
+					0x80, 4,
+					1,    pictures[frame].generation,
+					2,    pictures[frame].source,
+				};
+
+				/* Class 1 uses spatial ID 1 and temporal ID 1. */
+				g_assert_cmphex(packet[rtp + 3], ==,
+						extension ? 0x22 : 0x10);
+				g_assert_cmphex(packet[descriptor - 1], ==,
+						key ? 0x23 : 0x03);
+				g_assert_cmpmem(packet + descriptor,
+						sizeof(capture), capture,
+						sizeof(capture));
+				descriptor += sizeof(capture);
+				g_assert_cmphex(packet[descriptor], ==, 5);
+				g_assert_cmphex(packet[descriptor + 1], ==,
+						extension ? 2 : 0x82);
+				descriptor += 4;
+				if (extension) {
+					const guint8 base[] = { 8, 0x81, 0x24 };
+
+					g_assert_cmpint(
+						n, >,
+						descriptor + sizeof(base) + 6);
+					g_assert_cmpmem(packet + descriptor,
+							sizeof(base), base,
+							sizeof(base));
+					descriptor += sizeof(base);
+					g_assert_cmpuint(packet[descriptor], ==,
+							 profile);
+					g_assert_cmpuint(packet[descriptor + 1],
+							 ==, key ? 0x32 : 0x22);
+					memcpy(&profile_size,
+					       packet + descriptor + 2, 4);
+					descriptor += 6;
+				}
+				if (format->vp8a) {
+					offset = descriptor + 4;
+					g_assert_cmpint(n, >, offset);
+					memcpy(&codec_size, packet + descriptor,
+					       4);
+					codec_size =
+						GUINT32_FROM_BE(codec_size);
+				} else {
+					offset = descriptor + 3;
+					g_assert_cmpint(n, >, offset);
+					guint declared =
+						(packet[descriptor] & 3) |
+						(packet[descriptor + 1] << 2) |
+						(packet[descriptor + 2] << 10);
+
+					g_assert_cmphex(packet[descriptor] &
+								0xfc,
+							==, 0x08);
+					g_assert_cmpuint(declared, >, 3);
+					codec_size = declared - 3;
+				}
+				g_assert_cmpuint(packet[offset] & 1, ==, !key);
+			}
+			total += n - offset;
+		}
+		if (extension)
+			g_assert_cmpuint(GUINT32_FROM_BE(profile_size), ==,
+					 total + (format->vp8a ? 4 : 3));
+		g_assert_cmpuint(codec_size, ==, total);
+		for (guint i = loop.packets->len; i--;)
+			g_assert_true(deliver(&loop, i));
+		g_assert_cmpuint(loop.count, ==, frame + 1);
+	}
 	srtp_dealloc(observer);
 	done(&loop);
 }
@@ -388,6 +1136,98 @@ static void encrypted_feedback(void)
 		g_assert_true(deliver(&loop, i));
 	g_assert_cmpuint(loop.count, ==, 1);
 	g_assert_false(call_video_needs_keyframe(loop.rx));
+	done(&loop);
+}
+
+static void conference_feedback(void)
+{
+	struct loop loop = {
+		.tx = call_video_open_tx(key_a, 97, 100, 400, 10, NULL),
+		.packets = g_ptr_array_new_with_free_func(
+			(GDestroyNotify)g_bytes_unref),
+	};
+	struct call_video *const targets[] = {
+		call_video_open_rx(key_b, 97, 101, NULL),
+		call_video_open_rx(key_b, 97, 102, NULL),
+	};
+	srtp_t relay;
+
+	g_assert_nonnull(loop.tx);
+	g_assert_true(call_srtp_open(&relay, key_a, ssrc_specific, 100));
+	for (guint i = 0; i < 3; i++) {
+		struct call_video *target = targets[i % G_N_ELEMENTS(targets)];
+		guint8 packet[64];
+		gsize size;
+
+		g_assert_nonnull(target);
+		g_assert_true(call_video_send_peer_feedback(loop.tx, target,
+							    collect, &loop));
+		g_assert_cmpuint(loop.packets->len, ==, i + 1);
+		const guint8 *wire =
+			g_bytes_get_data(loop.packets->pdata[i], &size);
+		int n = size;
+
+		g_assert_cmpuint(size, <=, sizeof(packet));
+		memcpy(packet, wire, n);
+		/* A single relay context rejects reusing an SRTCP index. */
+		g_assert_cmpint(srtp_unprotect_rtcp(relay, packet, &n), ==,
+				srtp_err_status_ok);
+		const guint8 header[] = {
+			0x91, 206, 0, 6, 0, 0,
+			0,    100, 0, 0, 0, 101 + i % G_N_ELEMENTS(targets),
+		};
+
+		g_assert_cmpuint(n, ==, 28);
+		g_assert_cmpmem(packet, sizeof(header), header, sizeof(header));
+	}
+	srtp_dealloc(relay);
+	for (guint i = 0; i < G_N_ELEMENTS(targets); i++)
+		call_video_close(targets[i]);
+	done(&loop);
+}
+
+static void conference_receive_fir(void)
+{
+	struct loop loop = { 0 };
+	guint8 packet[28] = {
+		0x91, 206, 0, 6, 0, 0, 0, 102, 0, 0, 0, 101,
+	};
+	const gint64 first = 1100000;
+
+	loop.tx = call_video_open_group_tx(key_a, 97, 101, 400, 10, NULL);
+	loop.rx = call_video_open_group_rx(key_a, 97, 101, NULL);
+	g_assert_nonnull(loop.tx);
+	g_assert_nonnull(loop.rx);
+	prepare_frame(&loop);
+	/* Lose the initial keyframe, then reject control for unknown streams. */
+	encode(&loop, 1000000);
+	g_assert_false(call_video_receive_group_feedback(
+		loop.tx, packet, sizeof(packet), 103, first));
+	packet[11]++;
+	g_assert_false(call_video_receive_group_feedback(
+		loop.tx, packet, sizeof(packet), 102, first));
+	packet[11]--;
+	packet[3]--;
+	g_assert_false(call_video_receive_group_feedback(
+		loop.tx, packet, sizeof(packet), 102, first));
+	packet[3]++;
+	encode(&loop, first);
+	for (guint i = 0; i < loop.packets->len; i++)
+		deliver(&loop, i);
+	g_assert_true(call_video_needs_keyframe(loop.rx));
+
+	g_assert_true(call_video_receive_group_feedback(
+		loop.tx, packet, sizeof(packet), 102, first));
+	g_assert_false(call_video_receive_group_feedback(
+		loop.tx, packet, sizeof(packet), 102,
+		first + G_USEC_PER_SEC - 1));
+	encode(&loop, first + 100000);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_true(deliver(&loop, i));
+	g_assert_cmpuint(loop.count, ==, 1);
+	g_assert_false(call_video_needs_keyframe(loop.rx));
+	g_assert_true(call_video_receive_group_feedback(
+		loop.tx, packet, sizeof(packet), 102, first + G_USEC_PER_SEC));
 	done(&loop);
 }
 
@@ -539,7 +1379,6 @@ static void negotiated_streams(void)
 	g_assert_cmpuint(send, ==, G_N_ELEMENTS(tx));
 }
 
-
 /* A screen-like picture: white with dark text-like bars. */
 static void screen_picture(guint8 *pixels, guint w, guint h, guint shift)
 {
@@ -568,8 +1407,7 @@ static gboolean share_collect(const guint8 *frag, gsize size, gboolean key,
 	return TRUE;
 }
 
-static void share_display(const struct line_camera_frame *frame,
-			  gpointer data)
+static void share_display(const struct line_camera_frame *frame, gpointer data)
 {
 	struct share_loop *loop = data;
 
@@ -583,7 +1421,10 @@ static void share_display(const struct line_camera_frame *frame,
 
 static void screen_share_roundtrip(void)
 {
-	enum { SW = 1280, SH = 720 };
+	enum {
+		SW = 1280,
+		SH = 720
+	};
 	g_autofree guint8 *pixels = g_malloc(SW * SH * 3 / 2);
 	struct call_share_encoder *enc = call_share_encoder_new(3500, 30);
 	struct call_share_decoder *dec = call_share_decoder_new();
@@ -617,8 +1458,8 @@ static void screen_share_roundtrip(void)
 
 	for (guint i = 0; i < loop.fragments->len; i++) {
 		gsize size;
-		const guint8 *f = g_bytes_get_data(loop.fragments->pdata[i],
-						   &size);
+		const guint8 *f =
+			g_bytes_get_data(loop.fragments->pdata[i], &size);
 
 		g_assert_cmpuint(size, <=, 1100);
 		if (i && (f[0] & 8) && !first_delta)
@@ -627,7 +1468,8 @@ static void screen_share_roundtrip(void)
 			vp8 += size - (i ? 3 : 15);
 	}
 	/* Extension 9 holds the keyframe size plus three. */
-	g_assert_cmpuint((guint32)p[11] << 24 | p[12] << 16 | p[13] << 8 | p[14],
+	g_assert_cmpuint((guint32)p[11] << 24 | p[12] << 16 | p[13] << 8 |
+				 p[14],
 			 ==, vp8 + 3);
 	g_assert_cmpuint(first_delta, >, 0);
 	p = g_bytes_get_data(loop.fragments->pdata[first_delta], &n);
@@ -635,11 +1477,11 @@ static void screen_share_roundtrip(void)
 	g_assert_cmpmem(p + 3, 4, ((const guint8[]){ 0x10, 3, 1, 0 }), 4);
 	for (guint i = 0; i < loop.fragments->len; i++) {
 		gsize size;
-		const guint8 *f = g_bytes_get_data(loop.fragments->pdata[i],
-						   &size);
+		const guint8 *f =
+			g_bytes_get_data(loop.fragments->pdata[i], &size);
 
-		g_assert_true(call_share_decode(dec, f, size, share_display,
-						&loop));
+		g_assert_true(
+			call_share_decode(dec, f, size, share_display, &loop));
 	}
 	g_assert_cmpuint(loop.shown, ==, 3);
 	g_assert_cmpint(loop.sample, <=, 80);
@@ -663,12 +1505,12 @@ static void screen_share_official_layout(void)
 
 	screen_picture(pixels, 1280, 720, 0);
 	line_camera_i420_frame(&frame, pixels, 1280, 720);
-	g_assert_true(call_share_encode(enc, &frame, 0, share_collect, &loop,
-					NULL));
+	g_assert_true(
+		call_share_encode(enc, &frame, 0, share_collect, &loop, NULL));
 	for (guint i = 0; i < loop.fragments->len; i++) {
 		gsize size;
-		const guint8 *f = g_bytes_get_data(loop.fragments->pdata[i],
-						   &size);
+		const guint8 *f =
+			g_bytes_get_data(loop.fragments->pdata[i], &size);
 
 		g_byte_array_append(vp8, f + (i ? 3 : 15), size - (i ? 3 : 15));
 	}
@@ -956,6 +1798,8 @@ int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/video/evs3-vp8-srtp-reordering", roundtrip);
+	g_test_add_func("/video/conference-independent-stream-directions",
+			conference_directions);
 	g_test_add_func("/video/evs3-picture-metadata", evs3_picture_metadata);
 	g_test_add_func("/video/authentication-loss-and-keyframe-recovery",
 			recovery);
@@ -964,14 +1808,49 @@ int main(int argc, char **argv)
 			     single_packet);
 	g_test_add_data_func("/video/single-packet/rfc7741", GINT_TO_POINTER(1),
 			     single_packet);
-	g_test_add_func("/video/single-packet/declared-length",
-			single_packet_length);
+	g_test_add_data_func("/video/single-packet/declared-length",
+			     GINT_TO_POINTER(FALSE), single_packet_length);
+	g_test_add_data_func("/video/single-packet/group-declared-length",
+			     GINT_TO_POINTER(TRUE), single_packet_length);
+	g_test_add_func("/video/conference-evs3-size-framing",
+			group_evs3_sizes);
+	g_test_add_func("/video/conference-resolution", group_resolution);
+	g_test_add_func("/video/conference-resolution-aspect",
+			group_resolution_aspect);
+	g_test_add_func("/video/conference-thumbnail-rate",
+			group_thumbnail_rate);
+	static const struct group_test_format formats[] = {
+		{ CALL_VIDEO_RTP_EXT_NONE, FALSE },
+		{ CALL_VIDEO_RTP_EXT_VFD, TRUE },
+		{ CALL_VIDEO_RTP_EXT_VED, TRUE },
+		{ CALL_VIDEO_RTP_EXT_VFD, FALSE },
+		{ CALL_VIDEO_RTP_EXT_VED, FALSE }
+	};
+	g_test_add_data_func("/video/conference-evs3-send", &formats[0],
+			     group_evs3_tx);
+	g_test_add_data_func("/video/conference-evs3-send-vfd", &formats[1],
+			     group_evs3_tx);
+	g_test_add_data_func("/video/conference-evs3-send-ved", &formats[2],
+			     group_evs3_tx);
+	g_test_add_data_func("/video/conference-vp8-compact-vfd", &formats[3],
+			     group_evs3_tx);
+	g_test_add_data_func("/video/conference-vp8-compact-ved", &formats[4],
+			     group_evs3_tx);
 	g_test_add_func("/video/encrypted-keyframe-feedback",
 			encrypted_feedback);
+	g_test_add_func("/video/conference-keyframe-feedback",
+			conference_feedback);
+	g_test_add_func("/video/conference-receive-fir",
+			conference_receive_fir);
 	g_test_add_func("/video/profile-negotiation", negotiation);
 	g_test_add_func("/video/negotiated-stream-reports", negotiated_streams);
 	g_test_add_func("/video/screen-share-roundtrip",
 			screen_share_roundtrip);
+	g_test_add_func("/video/decoder-visible-dimensions",
+			decoder_visible_dimensions);
+	g_test_add_func("/video/hardware-decoder-recovery", decoder_recovery);
+	g_test_add_func("/video/intel-decoder-selection",
+			intel_decoder_selection);
 	g_test_add_func("/video/screen-share-official-layout",
 			screen_share_official_layout);
 	g_test_add_func("/video/screen-capture-conversion",

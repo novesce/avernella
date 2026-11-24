@@ -82,7 +82,7 @@ Messages from history and from sync use the same Thrift struct. The fields the c
 | 3 | audio | 15 | location |
 | 4 | html | 16 | post |
 | 5 | pdf | 17 | rich (imagemap) |
-| 6 | call | 18 | event |
+| 6 | call or chat event | 18 | chat event |
 | 7 | sticker | 19 | music |
 | 8 | presence | 20 | payment |
 | 9 | gift | 21 | externalImage |
@@ -90,6 +90,8 @@ Messages from history and from sync use the same Thrift struct. The fields the c
 | 11 | app | | |
 
 Anything else is shown as "other".
+
+Call records show the type, result, and duration LINE sent. `DURATION` is in milliseconds. Group call starts, endings, and invitations appear as centered notices. Other chat notices use `LOC_KEY` to choose the action and `LOC_ARGS` for names or titles. Unknown notices show the text sent by LINE when available.
 
 ### Metadata keys you'll meet
 

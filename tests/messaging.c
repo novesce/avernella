@@ -728,6 +728,71 @@ static void rich_messages(void)
 	g_clear_pointer(&s.profiles, g_hash_table_unref);
 }
 
+static void call_and_chat_notices(void)
+{
+	Line s = { .mid = SELF };
+	g_autoptr(J) raw = json_tokener_parse(
+		"[{\"1\":\"" SELF
+		"\",\"4\":\"401\",\"5\":401,\"15\":18,\"23\":3,"
+		"\"18\":{\"LOC_KEY\":\"C_MJ\",\"LOC_ARGS\":\"" ALICE
+		"\\u001f" SELF "\"}},"
+		"{\"1\":\"" ALICE "\",\"4\":\"402\",\"5\":402,\"15\":18,"
+		"\"18\":{\"LOC_KEY\":\"C_PN\",\"LOC_ARGS\":\"" ALICE
+		"\\u001eNight tea\"}},"
+		"{\"4\":\"403\",\"5\":403,\"15\":18,\"10\":\"An event from LINE\","
+		"\"18\":{\"LOC_KEY\":\"FUTURE\"}},"
+		"{\"4\":\"404\",\"5\":404,\"15\":6,\"18\":{\"TYPE\":\"G\","
+		"\"GC_EVT_TYPE\":\"E\",\"GC_MEDIA_TYPE\":\"AUDIO\"}},"
+		"{\"1\":\"" ALICE "\",\"4\":\"405\",\"5\":405,\"15\":6,"
+		"\"18\":{\"voipType\":\"V\",\"voipResult\":\"NORMAL\","
+		"\"voipDuration\":\"65000\"}},"
+		"{\"1\":\"" ALICE "\",\"4\":\"406\",\"5\":406,\"15\":6,"
+		"\"18\":{\"TYPE\":\"A\",\"RESULT\":\"NO_RESPONSE\"}},"
+		"{\"1\":\"" SELF "\",\"4\":\"407\",\"5\":407,\"15\":6,"
+		"\"18\":{\"TYPE\":\"A\",\"RESULT\":\"NO_RESPONSE\"}},"
+		"{\"4\":\"408\",\"5\":408,\"15\":6,\"18\":{\"TYPE\":\"G\","
+		"\"GC_EVT_TYPE\":\"S\",\"GC_MEDIA_TYPE\":\"VIDEO\"}},"
+		"{\"4\":\"409\",\"5\":409,\"15\":6,\"18\":{\"TYPE\":\"V\","
+		"\"RESULT\":\"NORMAL\",\"DURATION\":\"-1\"}},"
+		"{\"4\":\"410\",\"5\":410,\"15\":18,\"18\":{\"LOC_KEY\":\"FUTURE\"}}]");
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) index = NULL;
+
+	g_assert_nonnull(raw);
+	recent_fixture = raw;
+	g_autoptr(J) rows = line_history_raw(&s, ALICE, &index, &error);
+	recent_fixture = NULL;
+	g_assert_no_error(error);
+	const char *const expected[] = { "Alice, You joined the group",
+					 "Alice renamed the group to Night tea",
+					 "An event from LINE",
+					 "Group voice call ended",
+					 "Video call · 1:05",
+					 "Voice call · Missed",
+					 "Voice call · No answer",
+					 "Group video call started",
+					 "Video call",
+					 "Chat activity" };
+	g_assert_cmpuint(json_object_array_length(rows), ==,
+			 G_N_ELEMENTS(expected));
+	for (size_t i = 0; i < G_N_ELEMENTS(expected); i++) {
+		J *row = json_object_array_get_idx(rows, i);
+		gboolean notice = i < 4 || i == 7 || i == 9;
+
+		g_assert_cmpstr(strfield(row, "text"), ==, expected[i]);
+		g_assert_cmpstr(strfield(row, "type"), ==,
+				notice ? "chat_event" : "call");
+		if (notice) {
+			g_assert_false(
+				json_object_get_boolean(field(row, "own")));
+			g_assert_null(field(row, "readCount"));
+			g_assert_null(field(row, "senderId"));
+		}
+	}
+	g_assert_nonnull(field(index, "401"));
+	g_clear_pointer(&s.profiles, g_hash_table_unref);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -737,6 +802,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/messaging/history", recent_messages);
 	g_test_add_func("/messaging/flex-history", flex_messages);
 	g_test_add_func("/messaging/rich-messages", rich_messages);
+	g_test_add_func("/messaging/call-and-chat-notices",
+			call_and_chat_notices);
 	g_test_add_func("/messaging/previous-messages", previous_messages);
 	g_test_add_func("/messaging/recover-empty-recent",
 			recover_empty_recent);

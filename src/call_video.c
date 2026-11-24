@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call_video.h"
+#include "call_vp8.h"
 #include "call_srtp.h"
+#include <math.h>
 #include <openssl/rand.h>
 #include <string.h>
 #include <vpx/vp8cx.h>
@@ -22,11 +24,26 @@ enum {
 	LINE_FIR = 17,
 	LINE_FIR_SIZE = 28,
 	SRTCP_TRAILER = 14,
+	FRAME_SIZE_DELTAS = 8,
+	KEY_OFFSET_LIMIT = 64,
+	EVS3_GROUP_PROFILE_VP8 = 3,
+	EVS3_GROUP_PROFILE_VP8A = 4,
+	EVS3_GROUP_LAYER_SYNC = 0x10,
+	EVS3_PROFILE_HEADER = 6,
+	EVS3_CAPTURE_SOURCE_SIZE = 6,
+	EVS3_ENCODE_DELAY_SIZE = 4,
+	EVS3_BASE_LAYER_SIZE = 3,
+	EVS3_RTP_VFD_SIZE = 12,
+	EVS3_RTP_VED_SIZE = 20,
+	EVS3_VED_TARGET_BR_SIZE = 4,
 };
 
 enum video_format {
 	VIDEO_UNKNOWN,
 	VIDEO_EVS3,
+	VIDEO_EVS3_WIDE,
+	VIDEO_EVS3_PROFILED,
+	VIDEO_EVS3_UNSIZED,
 	VIDEO_RFC7741
 };
 
@@ -40,6 +57,7 @@ struct video_payload {
 	gsize offset, expected;
 	gboolean start, end;
 	guint rotation;
+	guint32 extended_size;
 };
 
 /* Encoding time over the last second, for call_video_pace(). */
@@ -89,27 +107,48 @@ static gboolean pace_encoder(vpx_codec_ctx_t *enc, struct encode_pace *p,
 
 struct call_video {
 	srtp_t tx, rx;
-	vpx_codec_ctx_t enc, dec;
+	vpx_codec_ctx_t enc;
+	struct call_vp8_decoder *dec;
 	struct encode_pace pace;
-	gboolean enc_ready, dec_ready, force_key, need_key;
+	gboolean enc_ready, force_key, need_key;
+	gboolean group_tx;
+	int requested_resolution;
+	vpx_image_t *scaled;
 	guint width, height, kbps, fps;
+	guint enc_kbps, enc_fps;
 	guint screen_kbps, screen_fps;
 	guint rx_rotation;
 	guint32 tx_ssrc, rx_ssrc, ts_base, rx_ts;
 	guint16 seq, picture, rx_picture, first, last, previous_end;
-	guint8 pt;
-	gint64 epoch, last_encoded;
+	guint16 ved_seq[8];
+	guint8 pt, capture_source, capture_generation, group_profile;
+	enum call_video_rtp_extension tx_extension;
+	gint64 epoch, last_encoded, next_layer_frame;
+	gint64 group_fir_at;
 	enum video_format framing, rx_format;
-	gboolean have_ts, have_last, have_previous_end, finished;
+	gboolean have_ts, have_last, have_previous_end, finished, group_rx;
+	gboolean group_rx_trace;
 	gsize received, expected;
+	guint32 extended_size;
 	unsigned int fragments, authenticated;
 
 	struct {
 		guint evs_starts, rfc_starts, markers, unknown, incomplete;
 		guint evs_metadata;
+		guint evs_sized_keys, evs_wide_keys, evs_wide_starts;
+		guint evs_profiled_keys, evs_profiled_starts;
+		guint profiled_key_candidates, profiled_ids, profiled_sizes;
+		guint profiled_same_size, profiled_codec_bounds;
+		guint evs_unsized_keys, evs_unsized_starts;
 		guint assembly, length, pictures, keys, deltas;
 		guint bad_key, dimensions, decode, hidden;
 		guint flags[16];
+		guint size_delta[2 * FRAME_SIZE_DELTAS + 3];
+		guint ext_sizes, ext_size_matches;
+		guint rtp_vfd, rtp_ved, rtp_no_extension, rtp_other_extension;
+		guint payload_offsets[KEY_OFFSET_LIMIT];
+		guint vp8_key_offsets[KEY_OFFSET_LIMIT];
+		guint avc_key_offsets[KEY_OFFSET_LIMIT];
 	} stats;
 	struct video_fragment part[MAX_FRAGMENTS];
 };
@@ -156,37 +195,37 @@ void call_video_close(struct call_video *v)
 	clear_picture(v);
 	if (v->enc_ready)
 		vpx_codec_destroy(&v->enc);
-	if (v->dec_ready)
-		vpx_codec_destroy(&v->dec);
+	call_vp8_close(v->dec);
 	if (v->tx)
 		srtp_dealloc(v->tx);
 	if (v->rx)
 		srtp_dealloc(v->rx);
+	g_clear_pointer(&v->scaled, vpx_img_free);
 	g_free(v);
 }
 
-struct call_video *call_video_open(const guint8 tx[30], const guint8 rx[30],
-				   guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
-				   guint kbps, guint fps, GError **e)
+static struct call_video *open_video(const guint8 tx[30], const guint8 rx[30],
+				     guint8 pt, guint32 tx_ssrc,
+				     guint32 rx_ssrc, guint kbps, guint fps,
+				     GError **e)
 {
 	struct call_video *v = g_new0(struct call_video, 1);
-	vpx_codec_dec_cfg_t cfg = { .threads = MIN(4, g_get_num_processors()) };
+	/* Bound decoder threads when a conference subscribes to several peers. */
+	guint threads = tx ? MIN(4, g_get_num_processors()) : 1;
 
-	if (!tx || !rx || pt < 96 || pt > 127 || !kbps || kbps > 8000 || !fps ||
-	    fps > 30 || !call_srtp_open(&v->tx, tx, ssrc_specific, tx_ssrc) ||
-	    !call_srtp_open(&v->rx, rx, ssrc_specific, rx_ssrc) ||
-	    RAND_bytes((guint8 *)&v->seq, sizeof(v->seq)) != 1 ||
-	    RAND_bytes((guint8 *)&v->picture, sizeof(v->picture)) != 1 ||
-	    RAND_bytes((guint8 *)&v->ts_base, sizeof(v->ts_base)) != 1 ||
-	    vpx_codec_dec_init(&v->dec, vpx_codec_vp8_dx(), &cfg, 0)) {
-		g_set_error_literal(
-			e, LINE_ERROR, 1,
-			"Could not initialize encrypted VP8 video.");
-		call_video_close(v);
-		return NULL;
-	}
-	v->dec_ready = TRUE;
-	v->force_key = v->need_key = TRUE;
+	if ((!tx && !rx) || pt < 96 || pt > 127)
+		goto failed;
+	if (tx && (!kbps || kbps > 8000 || !fps || fps > 30 ||
+		   !call_srtp_open(&v->tx, tx, ssrc_specific, tx_ssrc) ||
+		   RAND_bytes((guint8 *)&v->seq, sizeof(v->seq)) != 1 ||
+		   RAND_bytes((guint8 *)&v->picture, sizeof(v->picture)) != 1 ||
+		   RAND_bytes((guint8 *)&v->ts_base, sizeof(v->ts_base)) != 1))
+		goto failed;
+	if (rx && (!call_srtp_open(&v->rx, rx, ssrc_specific, rx_ssrc) ||
+		   !(v->dec = call_vp8_open(threads))))
+		goto failed;
+	v->need_key = rx != NULL;
+	v->force_key = tx != NULL;
 	v->pt = pt;
 	v->tx_ssrc = tx_ssrc;
 	v->rx_ssrc = rx_ssrc;
@@ -194,6 +233,81 @@ struct call_video *call_video_open(const guint8 tx[30], const guint8 rx[30],
 	v->fps = fps;
 	v->epoch = v->last_encoded = -1;
 	return v;
+
+failed:
+	call_video_close(v);
+	g_set_error_literal(e, LINE_ERROR, 1,
+			    "Could not initialize encrypted VP8 video.");
+	return NULL;
+}
+
+struct call_video *call_video_open(const guint8 tx[30], const guint8 rx[30],
+				   guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
+				   guint kbps, guint fps, GError **e)
+{
+	if (!tx || !rx) {
+		g_set_error_literal(
+			e, LINE_ERROR, 1,
+			"Could not initialize encrypted VP8 video.");
+		return NULL;
+	}
+	return open_video(tx, rx, pt, tx_ssrc, rx_ssrc, kbps, fps, e);
+}
+
+struct call_video *call_video_open_tx(const guint8 key[30], guint8 pt,
+				      guint32 ssrc, guint kbps, guint fps,
+				      GError **e)
+{
+	return open_video(key, NULL, pt, ssrc, 0, kbps, fps, e);
+}
+
+struct call_video *call_video_open_group_tx(const guint8 key[30], guint8 pt,
+					    guint32 ssrc, guint kbps, guint fps,
+					    GError **error)
+{
+	struct call_video *v =
+		call_video_open_tx(key, pt, ssrc, kbps, fps, error);
+
+	if (v) {
+		v->group_tx = TRUE;
+		v->requested_resolution = -1;
+		v->capture_source = 0xff; /* No frame has been published yet. */
+	}
+	return v;
+}
+
+struct call_video *call_video_open_rx(const guint8 key[30], guint8 pt,
+				      guint32 ssrc, GError **e)
+{
+	return open_video(NULL, key, pt, 0, ssrc, 0, 0, e);
+}
+
+struct call_video *call_video_open_group_rx(const guint8 key[30], guint8 pt,
+					    guint32 ssrc, GError **error)
+{
+	struct call_video *v = call_video_open_rx(key, pt, ssrc, error);
+
+	if (v) {
+		v->group_rx = TRUE;
+		v->group_rx_trace =
+			!g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1");
+	}
+	return v;
+}
+
+/* Resolution classes used by vns_get_resolution_type_from_wxh. */
+static const guint resolution_pixels[] = { 19200, 172800, 691200, 2764800,
+					   11059200 };
+
+static guint resolution_class(guint count)
+{
+	guint i;
+
+	for (i = 0; i < G_N_ELEMENTS(resolution_pixels) &&
+		    count > resolution_pixels[i];
+	     i++)
+		;
+	return i;
 }
 
 static gboolean configure_encoder(struct call_video *v, guint w, guint h)
@@ -201,7 +315,25 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 	vpx_codec_enc_cfg_t cfg;
 	vpx_codec_iface_t *codec = vpx_codec_vp8_cx();
 
-	if (v->enc_ready && w == v->width && h == v->height)
+	guint pixels = w * h;
+	gboolean screen = v->screen_kbps != 0;
+	guint kbps = screen ? v->screen_kbps : v->kbps;
+	guint fps = screen ? v->screen_fps : v->fps;
+
+	/* The negotiated stream rate is a ceiling for the whole conference
+	 * video. The published SVC camera layer has its own rate budget.
+	 */
+	if (v->group_profile && !screen) {
+		static const guint max_kbps[] = { 150, 300, 800, 3000 };
+		guint layer = resolution_class(pixels);
+
+		if (layer < G_N_ELEMENTS(max_kbps))
+			kbps = MIN(kbps, max_kbps[layer]);
+		if (!layer)
+			fps = MIN(fps, 15u);
+	}
+	if (v->enc_ready && w == v->width && h == v->height &&
+	    kbps == v->enc_kbps && fps == v->enc_fps)
 		return TRUE;
 	if (v->enc_ready) {
 		vpx_codec_destroy(&v->enc);
@@ -209,10 +341,7 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 	}
 	if (vpx_codec_enc_config_default(codec, &cfg, 0))
 		return FALSE;
-	guint pixels = w * h;
 	guint cores = MAX(1, g_get_num_processors());
-	gboolean screen = v->screen_kbps != 0;
-	guint fps = screen ? v->screen_fps : v->fps;
 
 	cfg.g_w = w;
 	cfg.g_h = h;
@@ -225,7 +354,7 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 	cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
 	cfg.g_pass = VPX_RC_ONE_PASS;
 	cfg.rc_end_usage = screen ? VPX_VBR : VPX_CBR;
-	cfg.rc_target_bitrate = screen ? v->screen_kbps : v->kbps;
+	cfg.rc_target_bitrate = kbps;
 	cfg.rc_min_quantizer = 2;
 	cfg.rc_max_quantizer = screen ? 40 : 56;
 	cfg.rc_undershoot_pct = 100;
@@ -243,6 +372,8 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 	v->enc_ready = TRUE;
 	v->width = w;
 	v->height = h;
+	v->enc_kbps = kbps;
+	v->enc_fps = fps;
 	v->force_key = TRUE;
 	/*
 	 * Speed 6 leaves headroom for 720p on a laptop. Small pictures can
@@ -258,40 +389,137 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 					      VP8_ONE_TOKENPARTITION;
 
 	pace_start(&v->pace, speed);
-	return vpx_codec_control(&v->enc, VP8E_SET_CPUUSED, speed) ==
-		       VPX_CODEC_OK &&
-	       vpx_codec_control(&v->enc, VP8E_SET_SCREEN_CONTENT_MODE,
-				 screen ? 1 : 0) == VPX_CODEC_OK &&
-	       vpx_codec_control(&v->enc, VP8E_SET_STATIC_THRESHOLD,
-				 screen ? 20 : 1) == VPX_CODEC_OK &&
-	       vpx_codec_control(&v->enc, VP8E_SET_NOISE_SENSITIVITY, 0) ==
-		       VPX_CODEC_OK &&
-	       vpx_codec_control(&v->enc, VP8E_SET_TOKEN_PARTITIONS,
-				 partitions) == VPX_CODEC_OK &&
-	       vpx_codec_control(&v->enc, VP8E_SET_MAX_INTRA_BITRATE_PCT,
-				 intra) == VPX_CODEC_OK;
+	gboolean configured =
+		vpx_codec_control(&v->enc, VP8E_SET_CPUUSED, speed) ==
+			VPX_CODEC_OK &&
+		vpx_codec_control(&v->enc, VP8E_SET_SCREEN_CONTENT_MODE,
+				  screen ? 1 : 0) == VPX_CODEC_OK &&
+		vpx_codec_control(&v->enc, VP8E_SET_STATIC_THRESHOLD,
+				  screen ? 20 : 1) == VPX_CODEC_OK &&
+		vpx_codec_control(&v->enc, VP8E_SET_NOISE_SENSITIVITY, 0) ==
+			VPX_CODEC_OK &&
+		vpx_codec_control(&v->enc, VP8E_SET_TOKEN_PARTITIONS,
+				  partitions) == VPX_CODEC_OK &&
+		vpx_codec_control(&v->enc, VP8E_SET_MAX_INTRA_BITRATE_PCT,
+				  intra) == VPX_CODEC_OK;
+	if (!configured) {
+		vpx_codec_destroy(&v->enc);
+		v->enc_ready = FALSE;
+		return FALSE;
+	}
+	if (v->group_tx && !g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1"))
+		g_printerr(
+			"group-stats camera-encoder width=%u height=%u kbps=%u fps=%u profile=%u\n",
+			w, h, kbps, fps, v->group_profile);
+	return TRUE;
 }
 
-/* Resolution classes used by vns_get_resolution_type_from_wxh. */
-static guint resolution_class(const struct call_video *v)
+void call_video_set_group_resolution(struct call_video *v, int resolution)
 {
-	const guint pixels[] = { 19200, 172800, 691200, 2764800, 11059200 };
-	guint count = v->width * v->height;
-	guint i;
-
-	for (i = 0; i < G_N_ELEMENTS(pixels) && count > pixels[i]; i++)
-		;
-	return i;
+	if (!v || !v->group_tx || resolution < -1 ||
+	    resolution >= (int)G_N_ELEMENTS(resolution_pixels))
+		return;
+	v->requested_resolution = resolution;
 }
 
-/* The single-stream PLANET VP8 packetizer writes an EVS3 descriptor.
- * The first fragment also carries the three-byte size of its bitstream
- * including that size field.
+/* Bilinear sampling at pixel centers; the source may be a padded camera plane. */
+static void scale_plane(const guint8 *src, int pitch, guint sw, guint sh,
+			guint8 *dst, int stride, guint dw, guint dh)
+{
+	if (sw == dw && sh == dh) {
+		for (guint row = 0; row < sh;
+		     row++, dst += stride, src += pitch)
+			memcpy(dst, src, sw);
+		return;
+	}
+	guint dx = (sw << 16) / dw, dy = (sh << 16) / dh;
+	guint y = (dy - 65536) / 2;
+
+	for (guint row = 0; row < dh; row++, y += dy, dst += stride) {
+		guint sy = y >> 16, fy = (y >> 8) & 255;
+		const guint8 *a = src + (gsize)sy * pitch;
+		const guint8 *b = src + (gsize)MIN(sy + 1, sh - 1) * pitch;
+		guint x = (dx - 65536) / 2;
+
+		for (guint col = 0; col < dw; col++, x += dx) {
+			guint sx = x >> 16, right = MIN(sx + 1, sw - 1);
+			int fx = (x >> 8) & 255;
+			int top = 256 * a[sx] + fx * (a[right] - a[sx]);
+			int bot = 256 * b[sx] + fx * (b[right] - b[sx]);
+
+			dst[col] = ((256 - fy) * top + fy * bot + 32768) >> 16;
+		}
+	}
+}
+
+static gboolean group_encoder_image(struct call_video *v, vpx_image_t *img)
+{
+	guint w = img->w, h = img->h;
+
+	if (v->requested_resolution >= 0) {
+		guint source = resolution_class(w * h);
+		guint target = v->requested_resolution;
+
+		if (target < source && v->screen_kbps) {
+			double ratio = sqrt((double)resolution_pixels[target] /
+					    (w * h));
+
+			w = MAX(2u, (guint)(w * ratio) & ~1u);
+			h = MAX(2u, (guint)(h * ratio) & ~1u);
+		} else if (target < source) {
+			/* LINE's camera transcoder halves both dimensions per class.
+			 * Align the full-size image before reducing to even I420 planes.
+			 */
+			guint mask = (1u << MAX(source, 1u)) - 1;
+			guint shift = source - target;
+
+			w = MAX(2u, ((w & ~mask) >> shift) & ~1u);
+			h = MAX(2u, ((h & ~mask) >> shift) & ~1u);
+		}
+	}
+	if (w == img->w && h == img->h && img->stride[1] == img->stride[2]) {
+		/* libvpx accepts external planes with a shared chroma stride. */
+		g_clear_pointer(&v->scaled, vpx_img_free);
+		return TRUE;
+	}
+
+	if (!v->scaled || v->scaled->d_w != w || v->scaled->d_h != h) {
+		g_clear_pointer(&v->scaled, vpx_img_free);
+		v->scaled = vpx_img_alloc(NULL, VPX_IMG_FMT_I420, w, h, 16);
+		if (!v->scaled)
+			return FALSE;
+	}
+	for (guint i = 0; i < 3; i++) {
+		guint shift = i != 0;
+
+		scale_plane(img->planes[i], img->stride[i],
+			    (img->w + shift) >> shift,
+			    (img->h + shift) >> shift, v->scaled->planes[i],
+			    v->scaled->stride[i], (w + shift) >> shift,
+			    (h + shift) >> shift);
+	}
+	*img = *v->scaled;
+	return TRUE;
+}
+
+/* Conference SVC reserves SID 7 for the thumbnail and SIDs 1..3 for
+ * progressively larger camera layers. TID 1 is the first temporal stream.
  */
-static gsize write_descriptor(guint8 *p, guint16 id, gboolean first,
-			      gboolean last, gboolean key, guint resolution,
-			      guint32 size)
+static guint group_spatial_id(guint resolution)
 {
+	return resolution ? MIN(resolution, 3) : 7;
+}
+
+/* The first fragment carries the negotiated codec header after the picture
+ * descriptor. Group membership does not select a different VP8 payload map.
+ */
+static gsize write_descriptor(const struct call_video *v, guint8 *p, guint16 id,
+			      gboolean first, gboolean last, gboolean key,
+			      guint32 size, guint16 delay_ms)
+{
+	guint res = resolution_class(v->width * v->height);
+	guint sid = group_spatial_id(res);
+	guint layer = (1u << 5) | (sid << 1);
 	gsize pos = 3;
 
 	p[0] = 0x80 | (last ? 4 : 0);
@@ -299,47 +527,182 @@ static gsize write_descriptor(guint8 *p, guint16 id, gboolean first,
 	if (!first)
 		return pos;
 	p[0] |= key ? 0x3a : 0x7a;
-	p[pos++] = 0;
+	/* In conference EVS3, bit 4 identifies temporal layer zero. */
+	p[pos++] = v->group_profile ? layer : (v->group_tx ? 0x10 : 0);
 	if (!key) {
 		p[pos++] = 3;
 		p[pos++] = 1;
 		p[pos++] = 0;
 	}
-	p[pos++] = (resolution << 1) | (key ? 0x20 : 0);
+	p[pos++] = (res << 1) | (key ? 0x20 : 0);
+	if (v->group_tx) {
+		p[pos - 1] |= 1;
+		/* PLANET camera user data precedes the encoder's delay record. */
+		p[pos++] = 0x80;
+		p[pos++] = 4;
+		p[pos++] = 1;
+		p[pos++] = v->capture_generation;
+		p[pos++] = 2;
+		p[pos++] = v->capture_source;
+		p[pos++] = 5;
+		p[pos++] = v->group_profile ? 2 : 0x82;
+		write16(p + pos, delay_ms);
+		pos += 2;
+	}
+	if (v->group_profile) {
+		gboolean wide = v->group_profile == EVS3_GROUP_PROFILE_VP8A;
+
+		/* The SVC picture carries the same base-layer identity as RTP. */
+		p[pos++] = 8;
+		p[pos++] = 0x81;
+		p[pos++] = (1u << 5) | (sid << 2);
+		p[pos++] = v->group_profile;
+		p[pos++] = layer | (key ? EVS3_GROUP_LAYER_SYNC : 0);
+		write32(p + pos, size + (wide ? 4 : 3));
+		pos += 4;
+		if (wide) {
+			write32(p + pos, size);
+			return pos + 4;
+		}
+	}
+
+	/* The compact length includes the three-byte field itself. */
 	size += 3;
-	p[pos++] = size & 3;
+	p[pos++] = (v->group_tx ? 0x08 : 0) | (size & 3);
 	p[pos++] = size >> 2;
 	p[pos++] = size >> 10;
 	return pos;
 }
 
+void call_video_set_group_format(struct call_video *v,
+				 enum call_video_rtp_extension extension,
+				 gboolean vp8a)
+{
+	guint8 profile = 0;
+
+	if (extension != CALL_VIDEO_RTP_EXT_NONE)
+		profile = vp8a ? EVS3_GROUP_PROFILE_VP8A :
+				 EVS3_GROUP_PROFILE_VP8;
+	if (!v || !v->group_tx ||
+	    (v->tx_extension == extension && v->group_profile == profile))
+		return;
+	v->tx_extension = extension;
+	v->group_profile = profile;
+	v->force_key = TRUE;
+}
+
+enum call_video_rtp_extension
+call_video_group_rtp_extension(const struct call_video *v)
+{
+	return v->tx_extension;
+}
+
+/* PLANET RTP extension words hold one record for the single VP8 layer. */
+static void write_group_rtp_extension(struct call_video *v, guint8 *p,
+				      gsize size, guint16 id, gboolean first,
+				      gboolean last, gboolean key)
+{
+	const guint8 codec = v->group_profile;
+	guint kbps = v->enc_kbps;
+	guint res = resolution_class(v->width * v->height);
+	guint sid = group_spatial_id(res);
+	guint layer = (sid << 5) | (1u << 2);
+
+	/* Main-channel video uses PLANET transmission method zero. */
+	write16(p, 0x0200);
+	write16(p + 2, (size - 4) / 4);
+	if (v->tx_extension == CALL_VIDEO_RTP_EXT_VFD) {
+		p[4] = 2;
+		p[5] = 3; /* Six-byte VFD layer descriptor. */
+		p[6] = 0x80 | (last ? 0x40 : 0) | (sid << 3) | 1;
+		p[7] = (MIN(res, 3) << 4) | 8 | (key ? 4 : 0) | (first ? 2 : 0);
+		p[8] = codec;
+		p[9] = MIN(kbps / 8, 255);
+		write16(p + 10, v->seq);
+		return;
+	}
+	p[4] = 4;
+	gboolean target_rate = first && key;
+
+	p[5] = target_rate ? 8 : 6; /* Length in two-byte words. */
+	p[6] = target_rate ? 0x22 : 0x02; /* One layer, optional fields flag. */
+	p[7] = 0;
+	write16(p + 8, id);
+	p[10] = layer;
+	/* Single referenceable VP8 layer, with no inter-layer dependency. */
+	p[11] = (res << 5) | 4 | (key ? 2 : 0);
+	p[12] = codec;
+	p[13] = MIN(kbps / 20, 255);
+	p[14] = layer | (first ? 2 : 0) | (last ? 1 : 0);
+	p[15] = 0x18 | (key ? 0x20 : 0); /* Last record for this packet. */
+	/* The mixer tracks continuity separately for each layer. */
+	write16(p + 16, ++v->ved_seq[sid]);
+	if (target_rate) {
+		/* Target bitrate for the base layer, in units of 20 kbit/s. */
+		p[18] = 0xa1;
+		p[19] = layer;
+		p[20] = p[13];
+		p[21] = 0;
+	}
+	write16(p + size - 2, 0); /* Align the extension to four bytes. */
+}
+
 static gboolean send_picture(struct call_video *v, guint32 timestamp,
 			     const guint8 *picture, gsize size, gboolean key,
-			     call_video_send_fn send, gpointer data)
+			     guint16 delay_ms, call_video_send_fn send,
+			     gpointer data)
 {
-	const gsize chunk = VIDEO_MTU - RTP_HEADER - 11 - 10;
+	const gsize codec_header =
+		(v->group_profile ? EVS3_PROFILE_HEADER : 0) +
+		(v->group_profile == EVS3_GROUP_PROFILE_VP8A ? 4 : 3);
+	const gsize metadata = v->group_tx ? EVS3_CAPTURE_SOURCE_SIZE +
+						     EVS3_ENCODE_DELAY_SIZE :
+					     0;
+	const gsize header_max = 8 + codec_header + metadata +
+				 (v->group_profile ? EVS3_BASE_LAYER_SIZE : 0);
+	const gsize base_extension =
+		v->tx_extension == CALL_VIDEO_RTP_EXT_VFD ? EVS3_RTP_VFD_SIZE :
+		v->tx_extension == CALL_VIDEO_RTP_EXT_VED ? EVS3_RTP_VED_SIZE :
+							    0;
 	guint16 id = v->picture++;
+	guint8 source = v->screen_kbps != 0; /* Camera 0, virtual display 1. */
 
 	if (size > FRAME_LIMIT) {
 		v->force_key = TRUE;
 		return TRUE;
 	}
+	/* Count source changes on published pictures, including the first. */
+	if (v->group_tx && v->capture_source != source) {
+		v->capture_source = source;
+		v->capture_generation++;
+	}
 	for (gsize pos = 0; pos < size;) {
 		guint8 packet[VIDEO_MTU + SRTP_MAX_TRAILER_LEN];
+		gsize extension = base_extension;
+
+		if (!pos && key && v->tx_extension == CALL_VIDEO_RTP_EXT_VED)
+			extension += EVS3_VED_TARGET_BR_SIZE;
+		gsize chunk =
+			VIDEO_MTU - RTP_HEADER - extension - header_max - 10;
 		gsize len = MIN(chunk, size - pos);
 		gboolean last = pos + len == size;
 		gsize header;
 		int n;
 
-		packet[0] = 0x80;
+		packet[0] = extension ? 0x90 : 0x80;
 		packet[1] = v->pt | (last ? 0x80 : 0);
+		if (extension)
+			write_group_rtp_extension(v, packet + RTP_HEADER,
+						  extension, id, !pos, last,
+						  key);
 		write16(packet + 2, v->seq++);
 		write32(packet + 4, timestamp);
 		write32(packet + 8, v->tx_ssrc);
-		header = write_descriptor(packet + RTP_HEADER, id, !pos, last,
-					  key, resolution_class(v), size);
-		memcpy(packet + RTP_HEADER + header, picture + pos, len);
-		n = RTP_HEADER + header + len;
+		header = RTP_HEADER + extension;
+		header += write_descriptor(v, packet + header, id, !pos, last,
+					   key, size, delay_ms);
+		memcpy(packet + header, picture + pos, len);
+		n = header + len;
 		if (srtp_protect(v->tx, packet, &n) != srtp_err_status_ok ||
 		    !send(packet, n, data))
 			return FALSE;
@@ -350,14 +713,14 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 
 void call_video_keyframe(struct call_video *v)
 {
-	if (v)
+	if (v && v->tx)
 		v->force_key = TRUE;
 }
 
 void call_video_screen(struct call_video *v, guint kbps, guint fps)
 {
 	fps = kbps ? CLAMP(fps, 1, 30) : 0;
-	if (!v || (kbps == v->screen_kbps && fps == v->screen_fps))
+	if (!v || !v->tx || (kbps == v->screen_kbps && fps == v->screen_fps))
 		return;
 	if (v->enc_ready) {
 		vpx_codec_destroy(&v->enc);
@@ -380,16 +743,21 @@ gboolean call_video_encode(struct call_video *v,
 			    .y_chroma_shift = 1,
 			    .bps = 12 };
 	guint64 pts;
+	gint64 elapsed;
 
-	if (!v || !send || !frame || now < 0 ||
+	if (!v || !v->tx || !send || !frame || now < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		goto failed;
-	guint fps = v->screen_kbps ? v->screen_fps : v->fps;
-
 	/* Accept jitter, and switch sources immediately even at the same size. */
-	if (v->enc_ready && v->last_encoded >= 0 &&
-	    now - v->last_encoded < G_USEC_PER_SEC / fps * 3 / 4)
-		return TRUE;
+	if (v->enc_ready && v->last_encoded >= 0) {
+		if (v->next_layer_frame) {
+			if (now < v->next_layer_frame)
+				return TRUE;
+		} else if (now - v->last_encoded <
+			   G_USEC_PER_SEC / v->enc_fps * 3 / 4) {
+			return TRUE;
+		}
+	}
 	img.w = img.d_w = frame->width;
 	img.h = img.d_h = frame->height;
 	for (int i = 0; i < 3; i++) {
@@ -400,7 +768,8 @@ gboolean call_video_encode(struct call_video *v,
 		img.planes[i] = (guint8 *)frame->plane[i];
 		img.stride[i] = frame->stride[i];
 	}
-	if (!configure_encoder(v, img.w, img.h))
+	if ((v->group_tx && !group_encoder_image(v, &img)) ||
+	    !configure_encoder(v, img.d_w, img.d_h))
 		goto failed;
 	if (v->epoch < 0)
 		v->epoch = now;
@@ -408,13 +777,24 @@ gboolean call_video_encode(struct call_video *v,
 	      ((guint64)(now - v->epoch) % 100) * 9 / 100;
 	gint64 started = g_get_monotonic_time();
 
-	if (vpx_codec_encode(&v->enc, &img, pts, 90000 / fps,
+	if (vpx_codec_encode(&v->enc, &img, pts, 90000 / v->enc_fps,
 			     v->force_key ? VPX_EFLAG_FORCE_KF : 0,
-			     VPX_DL_REALTIME) ||
-	    !pace_encoder(&v->enc, &v->pace, g_get_monotonic_time() - started,
-			  fps))
+			     VPX_DL_REALTIME))
+		goto failed;
+	elapsed = g_get_monotonic_time() - started;
+	if (!pace_encoder(&v->enc, &v->pace, elapsed, v->enc_fps))
 		goto failed;
 	v->last_encoded = now;
+	if (!v->screen_kbps && v->enc_fps < v->fps) {
+		gint64 interval = G_USEC_PER_SEC / v->enc_fps;
+		gint64 due = v->next_layer_frame;
+
+		/* Keep the reduced layer clock on cadence between camera samples. */
+		v->next_layer_frame =
+			(due && now - due < interval ? due : now) + interval;
+	} else {
+		v->next_layer_frame = 0;
+	}
 	v->force_key = FALSE;
 	while ((packet = vpx_codec_get_cx_data(&v->enc, &iter))) {
 		if (packet->kind == VPX_CODEC_CX_FRAME_PKT &&
@@ -422,7 +802,7 @@ gboolean call_video_encode(struct call_video *v,
 				  packet->data.frame.sz,
 				  !!(packet->data.frame.flags &
 				     VPX_FRAME_IS_KEY),
-				  send, data))
+				  MIN(elapsed / 1000, G_MAXUINT16), send, data))
 			goto failed;
 	}
 	return TRUE;
@@ -435,8 +815,7 @@ failed:
 static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 			       call_video_display_fn display, gpointer data)
 {
-	vpx_codec_iter_t iter = NULL;
-	vpx_image_t *img;
+	int shown;
 	gboolean key = !(p[0] & 1);
 
 	v->stats.pictures++;
@@ -458,46 +837,34 @@ static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 		v->stats.deltas++;
 		return TRUE;
 	}
-	if (vpx_codec_decode(&v->dec, p, n, NULL, VPX_DL_REALTIME)) {
+	shown = call_vp8_decode(v->dec, p, n, key, v->rx_rotation, display,
+				data);
+	if (shown < 0) {
 		v->stats.decode++;
+		v->need_key = TRUE;
 		return FALSE;
 	}
 	v->need_key = FALSE;
-	gboolean displayed = FALSE;
-
-	while ((img = vpx_codec_get_frame(&v->dec, &iter))) {
-		struct line_camera_frame frame = { .width = img->d_w,
-						   .height = img->d_h,
-						   .rotation = v->rx_rotation };
-
-		if (img->fmt != VPX_IMG_FMT_I420 ||
-		    !line_camera_frame_size_valid(frame.width, frame.height)) {
-			v->stats.dimensions++;
-			return FALSE;
-		}
-		for (int i = 0; i < 3; i++) {
-			frame.plane[i] = img->planes[i];
-			frame.stride[i] = img->stride[i];
-		}
-		display(&frame, data);
-		displayed = TRUE;
-	}
-	v->stats.hidden += !displayed;
+	v->stats.hidden += !shown;
 	return TRUE;
 }
 
-/* Skip optional layer references, rotation and extension records before the
- * length field. Only the base-layer EVS3 RTP profile is negotiated.
- */
+static guint32 evs3_compact_length(const guint8 *p)
+{
+	return (p[0] & 3) | (p[1] << 2) | (p[2] << 10);
+}
+
 /*
- * Over RTP the first fragment carries a three-byte frame length. A PDTP
- * stream delivers whole frames and omits it, as in LINE screen shares.
+ * Skip optional layer references, rotation and extensions. EVS3 format 1
+ * includes a three-byte length in the first fragment. Format 2 and PDTP
+ * screen-share frames omit it.
  */
 static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 				  struct video_payload *out)
 {
 	gsize pos = 3, expected = 0;
 	guint flags, rotation = 0;
+	guint32 extended_size = 0;
 	gboolean ext = FALSE;
 
 	if (n <= pos || !(p[0] & 0x80))
@@ -529,11 +896,14 @@ static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 		if (n - pos < 2)
 			return FALSE;
 		guint len = p[pos + 1] & 127;
+		guint type = p[pos];
 
 		ext = !(p[pos + 1] & 128);
 		pos += 2;
 		if (len > n - pos)
 			return FALSE;
+		if (type == 9 && len == 4)
+			extended_size = read32(p + pos);
 		pos += len;
 	}
 	if ((flags & 8) && length) {
@@ -541,7 +911,7 @@ static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 
 		if (n - pos < 3)
 			return FALSE;
-		total = (p[pos] & 3) | (p[pos + 1] << 2) | (p[pos + 2] << 10);
+		total = evs3_compact_length(p + pos);
 		if (total <= 3)
 			return FALSE;
 		expected = total - 3;
@@ -549,14 +919,159 @@ static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 	}
 	if (pos >= n)
 		return FALSE;
-	*out = (struct video_payload){ pos, expected, !!(flags & 8),
-				       !!(flags & 4), rotation };
+	*out = (struct video_payload){ .offset = pos,
+				       .expected = expected,
+				       .start = !!(flags & 8),
+				       .end = !!(flags & 4),
+				       .rotation = rotation,
+				       .extended_size = extended_size };
 	return TRUE;
 }
 
-static gboolean parse_evs3(const guint8 *p, gsize n, struct video_payload *out)
+static gboolean vp8_key_at(const guint8 *frame, gsize n)
 {
-	return parse_evs3_framed(p, n, TRUE, out);
+	if (n < 10)
+		return FALSE;
+	vpx_codec_stream_info_t info = { .sz = sizeof(info) };
+
+	return !(frame[0] & 1) && frame[3] == 0x9d && frame[4] == 0x01 &&
+	       frame[5] == 0x2a &&
+	       !vpx_codec_peek_stream_info(vpx_codec_vp8_dx(), frame, n,
+					   &info) &&
+	       info.is_kf && line_camera_frame_size_valid(info.w, info.h);
+}
+
+/* The type 2 EVS3 codec header holds the exact frame size in big endian. */
+static gboolean evs3_wide_size(const guint8 *p, gsize n,
+			       struct video_payload *out)
+{
+	if (!out->start)
+		return TRUE;
+	if (n - out->offset <= 4)
+		return FALSE;
+	guint32 size = read32(p + out->offset);
+
+	if (size > FRAME_LIMIT || size < n - out->offset - 4)
+		return FALSE;
+	out->offset += 4;
+	out->expected = size;
+	return TRUE;
+}
+
+/* The conference profile gives the size of the codec header and VP8 data. */
+static gboolean evs3_profiled_size(const guint8 *p, gsize n,
+				   struct video_payload *out)
+{
+	if (!out->start)
+		return TRUE;
+	gsize pos = out->offset;
+
+	if (n - pos <= 6)
+		return FALSE;
+	guint32 total = read32(p + pos + 2);
+
+	out->offset += 6;
+	if (p[pos] == EVS3_GROUP_PROFILE_VP8A)
+		return evs3_wide_size(p, n, out) && total == out->expected + 4;
+	if (p[pos] != EVS3_GROUP_PROFILE_VP8 || n - out->offset <= 3 ||
+	    total <= 3 || total - 3 > FRAME_LIMIT || total < n - out->offset ||
+	    total != evs3_compact_length(p + out->offset))
+		return FALSE;
+	out->offset += 3;
+	out->expected = total - 3;
+	return TRUE;
+}
+
+static void record_key_offsets(struct call_video *v, const guint8 *p, gsize n)
+{
+	/* Record offsets only. The media bytes remain in the decryption buffer. */
+	for (guint i = 3; i < KEY_OFFSET_LIMIT && i + 4 < n; i++) {
+		if (p[i + 3] == 0x9d && vp8_key_at(p + i, n - i))
+			v->stats.vp8_key_offsets[i]++;
+		if (!p[i] && !p[i + 1] && !p[i + 2] && p[i + 3] == 1 &&
+		    ((p[i + 4] & 31) == 5 || (p[i + 4] & 31) == 7))
+			v->stats.avc_key_offsets[i]++;
+	}
+}
+
+static void record_profile_key(struct call_video *v, const guint8 *p, gsize n)
+{
+	if (!n)
+		return;
+	guint header = p[0] == EVS3_GROUP_PROFILE_VP8 ? 3 : 4;
+
+	if (n <= 6 + header || !vp8_key_at(p + 6 + header, n - 6 - header))
+		return;
+	guint32 profile_size = read32(p + 2);
+	guint64 framed_size = header == 3 ? evs3_compact_length(p + 6) :
+					    (guint64)read32(p + 6) + 4;
+
+	v->stats.profiled_key_candidates++;
+	v->stats.profiled_ids += p[0] == EVS3_GROUP_PROFILE_VP8 ||
+				 p[0] == EVS3_GROUP_PROFILE_VP8A;
+	v->stats.profiled_sizes += profile_size == framed_size;
+	v->stats.profiled_same_size += (guint64)profile_size + header ==
+				       framed_size;
+	v->stats.profiled_codec_bounds += framed_size <= FRAME_LIMIT + header &&
+					  framed_size >= n - 6;
+}
+
+static enum video_format evs3_payload(struct call_video *v, const guint8 *p,
+				      gsize n, struct video_payload *out)
+{
+	gboolean sized = parse_evs3_framed(p, n, TRUE, out);
+	enum video_format format = sized ? VIDEO_EVS3 : VIDEO_UNKNOWN;
+	struct video_payload unsized;
+
+	if (!v->group_rx || !(p[0] & 8) ||
+	    !parse_evs3_framed(p, n, FALSE, &unsized))
+		return format;
+	gboolean sized_key = sized &&
+			     vp8_key_at(p + out->offset, n - out->offset);
+	gboolean unsized_key =
+		vp8_key_at(p + unsized.offset, n - unsized.offset);
+	struct video_payload wide = unsized;
+	gboolean wide_size = evs3_wide_size(p, n, &wide);
+	gboolean wide_key = wide_size &&
+			    vp8_key_at(p + wide.offset, n - wide.offset);
+	struct video_payload profiled = unsized;
+	gboolean profiled_size = evs3_profiled_size(p, n, &profiled);
+	gboolean profiled_key =
+		profiled_size &&
+		vp8_key_at(p + profiled.offset, n - profiled.offset);
+
+	if (v->group_rx_trace) {
+		v->stats.evs_sized_keys += sized_key;
+		v->stats.evs_wide_keys += wide_key;
+		v->stats.evs_profiled_keys += profiled_key;
+		v->stats.evs_unsized_keys += unsized_key;
+		if (sized && out->offset < KEY_OFFSET_LIMIT)
+			v->stats.payload_offsets[out->offset]++;
+		record_key_offsets(v, p, n);
+		record_profile_key(v, p + unsized.offset, n - unsized.offset);
+	}
+	/* Latch alternate framing only on a recognizable VP8 keyframe. */
+	if (sized_key)
+		return format;
+	if (profiled_size &&
+	    (profiled_key || (!wide_key && !unsized_key &&
+			      v->rx_format == VIDEO_EVS3_PROFILED))) {
+		*out = profiled;
+		v->stats.evs_profiled_starts += v->group_rx_trace;
+		return VIDEO_EVS3_PROFILED;
+	}
+	if (wide_size &&
+	    (wide_key || (!unsized_key && v->rx_format == VIDEO_EVS3_WIDE))) {
+		*out = wide;
+		v->stats.evs_wide_starts += v->group_rx_trace;
+		return VIDEO_EVS3_WIDE;
+	}
+	if (unsized_key || v->rx_format == VIDEO_EVS3_UNSIZED) {
+		*out = unsized;
+		v->stats.evs_unsized_starts += v->group_rx_trace;
+		return VIDEO_EVS3_UNSIZED;
+	}
+	return format;
 }
 
 static gboolean parse_vp8(const guint8 *p, gsize n, gboolean marker,
@@ -579,22 +1094,39 @@ static gboolean parse_vp8(const guint8 *p, gsize n, gboolean marker,
 	}
 	if (pos >= n)
 		return FALSE;
-	*out = (struct video_payload){ pos, 0, (p[0] & 0x17) == 0x10, marker,
-				       0 };
+	*out = (struct video_payload){ .offset = pos,
+				       .start = (p[0] & 0x17) == 0x10,
+				       .end = marker };
 	return TRUE;
 }
 
 static gboolean describe(enum video_format framing, const guint8 *p, gsize n,
 			 gboolean marker, struct video_payload *out)
 {
-	return framing == VIDEO_EVS3 ? parse_evs3(p, n, out) :
-				       parse_vp8(p, n, marker, out);
+	if (framing == VIDEO_RFC7741)
+		return parse_vp8(p, n, marker, out);
+	return parse_evs3_framed(p, n, framing == VIDEO_EVS3, out) &&
+	       (framing != VIDEO_EVS3_WIDE || evs3_wide_size(p, n, out)) &&
+	       (framing != VIDEO_EVS3_PROFILED ||
+		evs3_profiled_size(p, n, out));
 }
 
 static gboolean finish_picture(struct call_video *v, const guint8 *picture,
 			       gsize len, call_video_display_fn display,
 			       gpointer data)
 {
+	if (v->group_rx_trace && v->extended_size) {
+		v->stats.ext_sizes++;
+		v->stats.ext_size_matches += len + 3 == v->extended_size ||
+					     len + 6 == v->extended_size;
+	}
+	if (v->group_rx_trace && v->expected) {
+		int delta = (int)len - (int)v->expected;
+
+		delta = CLAMP(delta, -FRAME_SIZE_DELTAS - 1,
+			      FRAME_SIZE_DELTAS + 1);
+		v->stats.size_delta[delta + FRAME_SIZE_DELTAS + 1]++;
+	}
 	if (v->expected && len != v->expected) {
 		v->stats.length++;
 		return FALSE;
@@ -603,8 +1135,14 @@ static gboolean finish_picture(struct call_video *v, const guint8 *picture,
 		v->need_key = TRUE;
 	v->previous_end = v->last;
 	v->have_previous_end = TRUE;
+	if (!v->group_rx) {
+		v->rx_format = v->framing;
+		return decode_picture(v, picture, len, display, data);
+	}
+	if (!decode_picture(v, picture, len, display, data))
+		return FALSE;
 	v->rx_format = v->framing;
-	return decode_picture(v, picture, len, display, data);
+	return TRUE;
 }
 
 static gboolean assemble_picture(struct call_video *v, guint count,
@@ -627,7 +1165,7 @@ static gboolean assemble_picture(struct call_video *v, guint count,
 		if (!describe(v->framing, p, bytes, part->marker, &payload) ||
 		    payload.start != (i == 0) ||
 		    payload.end != (i + 1 == count) ||
-		    (v->framing == VIDEO_EVS3 &&
+		    (v->framing != VIDEO_RFC7741 &&
 		     read16(p + 1) != v->rx_picture))
 			return FALSE;
 		bytes -= payload.offset;
@@ -674,7 +1212,7 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 {
 	struct video_fragment *part = &v->part[seq % MAX_FRAGMENTS];
 	struct video_payload evs3 = { 0 }, vp8 = { 0 }, payload;
-	gboolean evs = parse_evs3(p, n, &evs3);
+	enum video_format evs = evs3_payload(v, p, n, &evs3);
 	gboolean rfc = parse_vp8(p, n, marker, &vp8);
 
 	v->stats.flags[p[0] >> 4]++;
@@ -701,21 +1239,23 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 	    n > ASSEMBLY_LIMIT - v->received)
 		return FALSE;
 	if (v->framing == VIDEO_UNKNOWN && (evs3.start || vp8.start)) {
-		v->framing = evs3.start ? VIDEO_EVS3 : VIDEO_RFC7741;
+		v->framing = evs3.start ? evs : VIDEO_RFC7741;
 		payload = evs3.start ? evs3 : vp8;
 		v->rx_picture = evs3.start ? read16(p + 1) : 0;
 		v->expected = payload.expected;
+		v->extended_size = payload.extended_size;
 		v->rx_rotation = payload.rotation;
 		v->first = seq;
 		if (!find_early_end(v))
 			goto invalid;
 	} else {
-		payload = v->framing == VIDEO_EVS3 ? evs3 : vp8;
+		payload = v->framing == VIDEO_RFC7741 ? vp8 : evs3;
 		if (v->framing != VIDEO_UNKNOWN &&
 		    (!payload.offset || payload.start))
 			return FALSE;
 	}
-	if (v->framing == VIDEO_EVS3 && read16(p + 1) != v->rx_picture)
+	if (v->framing != VIDEO_UNKNOWN && v->framing != VIDEO_RFC7741 &&
+	    read16(p + 1) != v->rx_picture)
 		return FALSE;
 	if (v->framing != VIDEO_UNKNOWN && payload.end && !mark_end(v, seq))
 		goto invalid;
@@ -752,6 +1292,34 @@ invalid:
 	return FALSE;
 }
 
+static void record_group_rtp_extensions(struct call_video *v, const guint8 *p,
+					gsize n)
+{
+	gboolean vfd = FALSE, ved = FALSE;
+
+	if (p[0] == 2) {
+		/* Routing words precede the media elements in a PLANET extension. */
+		for (gsize i = 4u + 4u * (p[1] & 15); i < n;) {
+			if (!p[i]) {
+				i++;
+				continue;
+			}
+			if (n - i < 2)
+				break;
+			guint length = 2u * p[i + 1];
+
+			if (length > n - i - 2)
+				break;
+			vfd |= p[i] == 2 && length >= 6;
+			ved |= p[i] == 4 && length >= 4;
+			i += 2 + length;
+		}
+	}
+	v->stats.rtp_vfd += vfd;
+	v->stats.rtp_ved += ved;
+	v->stats.rtp_other_extension += !vfd && !ved;
+}
+
 gboolean call_video_receive(struct call_video *v, const guint8 *packet,
 			    gsize size, call_video_display_fn display,
 			    gpointer data)
@@ -760,7 +1328,7 @@ gboolean call_video_receive(struct call_video *v, const guint8 *packet,
 	int plain = size;
 	gsize pos, end;
 
-	if (!v || !packet || !display || size <= RTP_HEADER + 10 ||
+	if (!v || !v->rx || !packet || !display || size <= RTP_HEADER + 10 ||
 	    size > sizeof(buf) || packet[0] >> 6 != 2 ||
 	    (packet[1] & 127) != v->pt || read32(packet + 8) != v->rx_ssrc)
 		return FALSE;
@@ -777,9 +1345,15 @@ gboolean call_video_receive(struct call_video *v, const guint8 *packet,
 	if (buf[0] & 0x10) {
 		if (end - pos < 4)
 			return FALSE;
-		pos += 4u + 4u * read16(buf + pos + 2);
-		if (pos >= end)
+		gsize extension = 4u + 4u * read16(buf + pos + 2);
+
+		if (extension >= end - pos)
 			return FALSE;
+		if (v->group_rx_trace)
+			record_group_rtp_extensions(v, buf + pos, extension);
+		pos += extension;
+	} else if (v->group_rx_trace) {
+		v->stats.rtp_no_extension++;
 	}
 	if (buf[0] & 0x20) {
 		guint pad = buf[end - 1];
@@ -803,18 +1377,68 @@ guint call_video_authenticated_packets(const struct call_video *v)
 	return v ? v->authenticated : 0;
 }
 
-void call_video_report(const struct call_video *v)
+static void report_group_framing(const struct call_video *v)
+{
+	GString *s = g_string_new(
+		"group-stats video size-deltas actual-minus-declared");
+
+	for (guint i = 0; i < G_N_ELEMENTS(v->stats.size_delta); i++)
+		if (v->stats.size_delta[i])
+			g_string_append_printf(s, " %d:%u",
+					       (int)i - FRAME_SIZE_DELTAS - 1,
+					       v->stats.size_delta[i]);
+	g_printerr("%s\n", s->str);
+	g_string_assign(s, "group-stats video keyframe offsets");
+	for (guint i = 3; i < KEY_OFFSET_LIMIT; i++) {
+		if (v->stats.payload_offsets[i])
+			g_string_append_printf(s, " sized@%u:%u", i,
+					       v->stats.payload_offsets[i]);
+		if (v->stats.vp8_key_offsets[i])
+			g_string_append_printf(s, " vp8@%u:%u", i,
+					       v->stats.vp8_key_offsets[i]);
+		if (v->stats.avc_key_offsets[i])
+			g_string_append_printf(s, " avc@%u:%u", i,
+					       v->stats.avc_key_offsets[i]);
+	}
+	g_printerr("%s\n", s->str);
+	g_printerr("group-stats video extended-length found=%u matches=%u\n",
+		   v->stats.ext_sizes, v->stats.ext_size_matches);
+	g_printerr(
+		"group-stats video profile-candidates keys=%u native-id=%u lengths-match=%u lengths-equal=%u codec-size-valid=%u\n",
+		v->stats.profiled_key_candidates, v->stats.profiled_ids,
+		v->stats.profiled_sizes, v->stats.profiled_same_size,
+		v->stats.profiled_codec_bounds);
+	g_printerr(
+		"group-stats video RTP extensions vfd=%u ved=%u none=%u other=%u\n",
+		v->stats.rtp_vfd, v->stats.rtp_ved, v->stats.rtp_no_extension,
+		v->stats.rtp_other_extension);
+	g_string_free(s, TRUE);
+}
+
+void call_video_report(const struct call_video *v, gboolean group)
 {
 	if (!v)
 		return;
 	g_printerr(
-		"line-call video payload evs-start=%u metadata=%u rfc-start=%u marker=%u unknown=%u incomplete=%u assembly=%u length=%u pictures=%u keys=%u waiting-key=%u bad-key=%u dimensions=%u decode=%u hidden=%u\n",
-		v->stats.evs_starts, v->stats.evs_metadata, v->stats.rfc_starts,
-		v->stats.markers, v->stats.unknown, v->stats.incomplete,
-		v->stats.assembly, v->stats.length, v->stats.pictures,
-		v->stats.keys, v->stats.deltas, v->stats.bad_key,
-		v->stats.dimensions, v->stats.decode, v->stats.hidden);
-	GString *flags = g_string_new("line-call video descriptor classes");
+		"%s video payload evs-start=%u metadata=%u rfc-start=%u marker=%u unknown=%u incomplete=%u assembly=%u length=%u pictures=%u keys=%u waiting-key=%u bad-key=%u dimensions=%u decode=%u hidden=%u decoder=%s\n",
+		group ? "group-stats" : "line-call", v->stats.evs_starts,
+		v->stats.evs_metadata, v->stats.rfc_starts, v->stats.markers,
+		v->stats.unknown, v->stats.incomplete, v->stats.assembly,
+		v->stats.length, v->stats.pictures, v->stats.keys,
+		v->stats.deltas, v->stats.bad_key, v->stats.dimensions,
+		v->stats.decode, v->stats.hidden, call_vp8_backend(v->dec));
+	if (group && v->group_rx_trace) {
+		g_printerr(
+			"group-stats video size-framing sized-keys=%u wide-keys=%u wide-starts=%u profiled-keys=%u profiled-starts=%u unsized-keys=%u unsized-starts=%u\n",
+			v->stats.evs_sized_keys, v->stats.evs_wide_keys,
+			v->stats.evs_wide_starts, v->stats.evs_profiled_keys,
+			v->stats.evs_profiled_starts, v->stats.evs_unsized_keys,
+			v->stats.evs_unsized_starts);
+		report_group_framing(v);
+	}
+	GString *flags =
+		g_string_new(group ? "group-stats video descriptor classes" :
+				     "line-call video descriptor classes");
 
 	for (guint i = 0; i < G_N_ELEMENTS(v->stats.flags); i++)
 		if (v->stats.flags[i])
@@ -824,27 +1448,34 @@ void call_video_report(const struct call_video *v)
 	g_string_free(flags, TRUE);
 }
 
-gboolean call_video_send_feedback(struct call_video *v, call_video_send_fn send,
-				  gpointer data)
+gboolean call_video_send_peer_feedback(struct call_video *tx,
+				       const struct call_video *rx,
+				       call_video_send_fn send, gpointer data)
 {
 	guint8 packet[LINE_FIR_SIZE + SRTP_MAX_TRAILER_LEN + 4] = { 0 };
 	gboolean standard;
 	int size;
 
-	if (!v || !send)
+	if (!tx || !tx->tx || !rx || !rx->rx || !send)
 		return FALSE;
-	standard =
-		v->framing == VIDEO_RFC7741 ||
-		(v->framing == VIDEO_UNKNOWN && v->rx_format == VIDEO_RFC7741);
+	standard = rx->framing == VIDEO_RFC7741 ||
+		   (rx->framing == VIDEO_UNKNOWN &&
+		    rx->rx_format == VIDEO_RFC7741);
 	size = standard ? RTP_HEADER : LINE_FIR_SIZE;
 	packet[0] = 0x80 | (standard ? RTCP_PLI : LINE_FIR);
 	packet[1] = RTCP_PSFB;
 	write16(packet + 2, size / 4 - 1);
-	write32(packet + 4, v->tx_ssrc);
-	write32(packet + 8, v->rx_ssrc);
+	write32(packet + 4, tx->tx_ssrc);
+	write32(packet + 8, rx->rx_ssrc);
 	/* Use LINE's base-layer FCI with no reference picture. */
-	return srtp_protect_rtcp(v->tx, packet, &size) == srtp_err_status_ok &&
+	return srtp_protect_rtcp(tx->tx, packet, &size) == srtp_err_status_ok &&
 	       send(packet, size, data);
+}
+
+gboolean call_video_send_feedback(struct call_video *v, call_video_send_fn send,
+				  gpointer data)
+{
+	return call_video_send_peer_feedback(v, v, send, data);
 }
 
 static gboolean picture_feedback(const guint8 *p, gsize size, guint32 local,
@@ -876,9 +1507,9 @@ gboolean call_video_receive_feedback(struct call_video *v, const guint8 *packet,
 	gboolean request = FALSE;
 	gsize pos = 0;
 
-	if (!v || !packet || size <= 8 + SRTCP_TRAILER || size > sizeof(buf) ||
-	    packet[0] >> 6 != 2 || packet[1] < 192 || packet[1] > 223 ||
-	    read32(packet + 4) != v->rx_ssrc)
+	if (!v || !v->tx || !v->rx || !packet || size <= 8 + SRTCP_TRAILER ||
+	    size > sizeof(buf) || packet[0] >> 6 != 2 || packet[1] < 192 ||
+	    packet[1] > 223 || read32(packet + 4) != v->rx_ssrc)
 		return FALSE;
 	memcpy(buf, packet, size);
 	if (srtp_unprotect_rtcp(v->rx, buf, &plain) != srtp_err_status_ok)
@@ -905,8 +1536,24 @@ gboolean call_video_receive_feedback(struct call_video *v, const guint8 *packet,
 	return TRUE;
 }
 
+gboolean call_video_receive_group_feedback(struct call_video *v,
+					   const guint8 *packet, gsize size,
+					   guint32 sender, gint64 now)
+{
+	if (!v || !v->group_tx || !packet || !sender || sender == v->tx_ssrc ||
+	    size != LINE_FIR_SIZE || packet[0] != (0x80 | LINE_FIR) ||
+	    read16(packet + 2) != LINE_FIR_SIZE / 4 - 1 ||
+	    !picture_feedback(packet, size, v->tx_ssrc, sender) || now <= 0)
+		return FALSE;
+	if (v->group_fir_at && now - v->group_fir_at < G_USEC_PER_SEC)
+		return FALSE;
+	v->group_fir_at = now;
+	call_video_keyframe(v);
+	return TRUE;
+}
+
 struct call_share_decoder {
-	vpx_codec_ctx_t dec;
+	struct call_vp8_decoder *dec;
 	gboolean need_key, assembling;
 	guint16 picture;
 	guint rotation;
@@ -917,9 +1564,9 @@ struct call_share_decoder {
 struct call_share_decoder *call_share_decoder_new(void)
 {
 	struct call_share_decoder *s = g_new0(struct call_share_decoder, 1);
-	vpx_codec_dec_cfg_t cfg = { .threads = MIN(4, g_get_num_processors()) };
 
-	if (vpx_codec_dec_init(&s->dec, vpx_codec_vp8_dx(), &cfg, 0)) {
+	s->dec = call_vp8_open(MIN(4, g_get_num_processors()));
+	if (!s->dec) {
 		g_free(s);
 		return NULL;
 	}
@@ -932,7 +1579,7 @@ void call_share_decoder_free(struct call_share_decoder *s)
 {
 	if (!s)
 		return;
-	vpx_codec_destroy(&s->dec);
+	call_vp8_close(s->dec);
 	g_byte_array_free(s->frame, TRUE);
 	g_free(s);
 }
@@ -947,8 +1594,7 @@ static gboolean share_decode_frame(struct call_share_decoder *s,
 				   call_video_display_fn display, gpointer data)
 {
 	gboolean key = n >= 3 && !(vp8[0] & 1);
-	vpx_codec_iter_t iter = NULL;
-	vpx_image_t *img;
+	int shown;
 
 	if (!key && s->need_key)
 		return TRUE;
@@ -961,24 +1607,12 @@ static gboolean share_decode_frame(struct call_share_decoder *s,
 		    !line_camera_frame_size_valid(info.w, info.h))
 			return FALSE;
 	}
-	if (vpx_codec_decode(&s->dec, vp8, n, NULL, VPX_DL_REALTIME))
+	shown = call_vp8_decode(s->dec, vp8, n, key, s->rotation, display,
+				data);
+	if (shown < 0)
 		return FALSE;
 	s->need_key = FALSE;
-	while ((img = vpx_codec_get_frame(&s->dec, &iter))) {
-		struct line_camera_frame out = { .width = img->d_w,
-						 .height = img->d_h,
-						 .rotation = s->rotation };
-
-		if (img->fmt != VPX_IMG_FMT_I420 ||
-		    !line_camera_frame_size_valid(out.width, out.height))
-			return FALSE;
-		for (int i = 0; i < 3; i++) {
-			out.plane[i] = img->planes[i];
-			out.stride[i] = img->stride[i];
-		}
-		display(&out, data);
-		s->frames++;
-	}
+	s->frames += shown;
 	return TRUE;
 }
 

@@ -8,8 +8,13 @@
  */
 J *line_voice_start(Line *s, const char *chat, GError **error);
 gboolean line_video_enabled(void);
+gboolean line_group_voice_enabled(void);
+gboolean line_group_video_enabled(void);
+/* Worker-thread view of the active group call, if any. */
+const char *line_call_group_chat(gboolean connected);
 J *line_call_start(Line *s, const char *chat, gboolean video, GError **error);
 J *line_call_camera(gboolean enabled, GError **error);
+J *line_call_video_focus(const char *chat, const char *id, GError **error);
 void line_call_preview(const char *chat, gboolean visible);
 /* Starts or stops sharing this desktop through the screen cast portal. */
 J *line_call_share(gboolean enabled, GError **error);

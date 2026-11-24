@@ -8,13 +8,23 @@
 #include <string.h>
 #include <sys/prctl.h>
 #include <sys/stat.h>
+#include <sys/sysmacros.h>
 #include <sys/wait.h>
 #include <unistd.h>
+
+enum record_encoder {
+	ENCODER_CPU,
+	ENCODER_PROBE,
+	ENCODER_NVENC
+};
 
 struct video_recording {
 	GPid pid;
 	int stderr_fd;
-	char *path;
+	char *path, *program;
+	char **gpu_env;
+	enum record_encoder encoder;
+	gboolean synthetic;
 	LineRecordDone done;
 	gpointer data;
 	gboolean cancelled;
@@ -49,7 +59,8 @@ static void request_stop(gboolean cancel)
 		active->cancelled |= cancel;
 		if (!active->stop_time) {
 			active->stop_time = g_get_monotonic_time();
-			kill(active->pid, SIGINT);
+			if (active->pid)
+				kill(active->pid, SIGINT);
 		}
 	}
 	g_mutex_unlock(&lock);
@@ -116,29 +127,31 @@ static void read_diagnostic(int fd, GString *log)
 	}
 }
 
-static gpointer monitor(gpointer data)
+static gboolean wait_encoder(struct video_recording *job, int *status,
+			     GString *diagnostic)
 {
-	struct video_recording *job = data;
-
-	g_autoptr(GString) diagnostic = g_string_new(NULL);
 	struct pollfd pfd = { .fd = job->stderr_fd, .events = POLLIN };
-	int status = 0;
-	gboolean reaped = FALSE, stopped;
+	gint64 started = g_get_monotonic_time();
+	gboolean reaped;
 
 	for (;;) {
 		read_diagnostic(job->stderr_fd, diagnostic);
 		g_mutex_lock(&lock);
-		pid_t r = waitpid(job->pid, &status, WNOHANG);
+		pid_t r = waitpid(job->pid, status, WNOHANG);
 
 		if (r == job->pid || (r < 0 && errno != EINTR)) {
 			reaped = r == job->pid;
-			stopped = job->stop_time != 0;
-			active = NULL;
+			g_spawn_close_pid(job->pid);
+			job->pid = 0;
 			g_mutex_unlock(&lock);
 			break;
 		}
-		if (job->stop_time && g_get_monotonic_time() - job->stop_time >
-					      4 * G_USEC_PER_SEC)
+		gint64 now = g_get_monotonic_time();
+
+		if ((job->stop_time &&
+		     now - job->stop_time > 4 * G_USEC_PER_SEC) ||
+		    (job->encoder == ENCODER_PROBE &&
+		     now - started > 5 * G_USEC_PER_SEC))
 			kill(job->pid, SIGKILL);
 		g_mutex_unlock(&lock);
 		if (poll(&pfd, 1, 80) > 0 &&
@@ -147,12 +160,64 @@ static gpointer monitor(gpointer data)
 	}
 	read_diagnostic(job->stderr_fd, diagnostic);
 	close(job->stderr_fd);
-	g_spawn_close_pid(job->pid);
+	return reaped;
+}
+
+static gboolean spawn_encoder(struct video_recording *job,
+			      enum record_encoder encoder, GError **error);
+
+static gboolean nvenc_open_failed(const char *path, const char *diagnostic)
+{
+	struct stat st;
+
+	if (!strstr(diagnostic, "h264_nvenc"))
+		return FALSE;
+	if (g_stat(path, &st))
+		return errno == ENOENT;
+	/* FFmpeg may already have written the MP4 file and empty media headers. */
+	return st.st_size <= 48;
+}
+
+static gpointer monitor(gpointer data)
+{
+	struct video_recording *job = data;
+
+	g_autoptr(GString) diagnostic = g_string_new(NULL);
+	int status = 0;
+	gboolean success, stopped;
 	char *path = NULL, *error = NULL;
 
+	for (;;) {
+		success = wait_encoder(job, &status, diagnostic) &&
+			  WIFEXITED(status) && !WEXITSTATUS(status);
+		g_mutex_lock(&lock);
+		stopped = job->stop_time != 0;
+		enum record_encoder next = ENCODER_CPU;
+		gboolean starting = job->encoder == ENCODER_PROBE;
+
+		if (starting && success)
+			next = ENCODER_NVENC;
+		if (!stopped &&
+		    (starting ||
+		     (!success && job->encoder == ENCODER_NVENC &&
+		      nvenc_open_failed(job->path, diagnostic->str)))) {
+			g_autoptr(GError) issue = NULL;
+
+			g_string_truncate(diagnostic, 0);
+			if (spawn_encoder(job, next, &issue)) {
+				g_mutex_unlock(&lock);
+				continue;
+			}
+			g_string_assign(diagnostic, issue->message);
+			success = FALSE;
+		}
+		active = NULL;
+		g_mutex_unlock(&lock);
+		break;
+	}
 	if (!job->cancelled) {
-		if (reaped && WIFEXITED(status) &&
-		    (WEXITSTATUS(status) == 0 || stopped) &&
+		if (job->encoder != ENCODER_PROBE &&
+		    (success || stopped || job->encoder == ENCODER_NVENC) &&
 		    finalized(job->path))
 			path = g_steal_pointer(&job->path);
 		else {
@@ -170,6 +235,8 @@ static gpointer monitor(gpointer data)
 	line_record_discard(job->path);
 	if (!job->cancelled)
 		job->done(path, error, job->data);
+	g_strfreev(job->gpu_env);
+	g_free(job->program);
 	g_free(job);
 	g_mutex_lock(&lock);
 	jobs--;
@@ -184,42 +251,87 @@ static void die_with_parent(gpointer unused)
 	prctl(PR_SET_PDEATHSIG, SIGTERM);
 }
 
-static gboolean start_recording(gboolean synthetic, LineRecordDone done,
-				gpointer data, GError **error)
+static gboolean select_nvenc(guint vendor, int render_minor, char ***gpu_env)
 {
-	g_return_val_if_fail(done, FALSE);
-	g_autofree char *program = g_find_program_in_path("ffmpeg");
+	const char *node = g_getenv("AVERNELLA_RENDER_NODE");
+	struct stat st;
 
-	if (!program) {
-		g_set_error_literal(
-			error, G_SPAWN_ERROR, G_SPAWN_ERROR_NOENT,
-			"Video recording needs FFmpeg with H.264, AAC, V4L2 and PulseAudio support.");
+	if (!g_strcmp0(g_getenv("LINE_DISABLE_GPU"), "1"))
+		return FALSE;
+	if (node && *node) {
+		if (stat(node, &st) || !S_ISCHR(st.st_mode) ||
+		    major(st.st_rdev) != 226)
+			return FALSE;
+		render_minor = minor(st.st_rdev);
+	} else if (vendor && vendor != 0x10de) {
 		return FALSE;
 	}
-	g_mutex_lock(&lock);
-	if (active) {
-		g_mutex_unlock(&lock);
-		g_set_error_literal(error, G_SPAWN_ERROR, G_SPAWN_ERROR_FAILED,
-				    "A recording is already active.");
-		return FALSE;
-	}
-	g_autofree char *dir = g_dir_make_tmp("line-camera-XXXXXX", error);
+	if (render_minor < 0)
+		return vendor == 0x10de ||
+		       !access("/dev/nvidiactl", R_OK | W_OK);
+	g_autofree char *device =
+		g_strdup_printf("/sys/dev/char/226:%d/device", render_minor);
+	g_autofree char *target = g_file_read_link(device, NULL);
 
-	if (!dir) {
-		g_mutex_unlock(&lock);
+	if (!target)
 		return FALSE;
-	}
-	char *path = g_build_filename(dir, "video.mp4", NULL);
-	struct video_recording *job = g_new0(struct video_recording, 1);
+	g_autofree char *pci = g_path_get_basename(target);
+	g_autofree char *info = g_build_filename("/proc/driver/nvidia/gpus",
+						 pci, "information", NULL);
+	g_autofree char *text = NULL;
 
-	job->path = path;
-	job->done = done;
-	job->data = data;
-	const char *argv[80] = { program, "-hide_banner", "-loglevel",
-				 "error", "-nostdin",	  "-y" };
+	if (!g_file_get_contents(info, &text, NULL, NULL))
+		return FALSE;
+	char *label = strstr(text, "GPU UUID:");
+
+	if (!label)
+		return FALSE;
+	char *uuid = label + strlen("GPU UUID:");
+
+	uuid[strcspn(uuid, "\r\n")] = 0;
+	g_strstrip(uuid);
+	if (!g_str_has_prefix(uuid, "GPU-") ||
+	    !g_uuid_string_is_valid(uuid + 4))
+		return FALSE;
+	/* Narrow an existing visibility mask only when it names this device. */
+	const char *mask = g_getenv("CUDA_VISIBLE_DEVICES");
+
+	if (mask) {
+		g_auto(GStrv) devices = g_strsplit(mask, ",", -1);
+
+		if (!g_strv_contains((const char *const *)devices, uuid)) {
+			if (strcmp(mask, "0"))
+				return FALSE;
+			g_autoptr(GDir) gpus =
+				g_dir_open("/proc/driver/nvidia/gpus", 0, NULL);
+
+			if (!gpus || !g_dir_read_name(gpus) ||
+			    g_dir_read_name(gpus))
+				return FALSE;
+		}
+	}
+	*gpu_env = g_environ_setenv(g_get_environ(), "CUDA_VISIBLE_DEVICES",
+				    uuid, TRUE);
+	return TRUE;
+}
+
+static gboolean spawn_encoder(struct video_recording *job,
+			      enum record_encoder encoder, GError **error)
+{
+	const char *argv[80] = { job->program, "-hide_banner", "-loglevel",
+				 "error",      "-nostdin",     "-y" };
 	size_t arg = 6;
 
-	if (synthetic) {
+	if (encoder == ENCODER_PROBE) {
+		const char *const inputs[] = {
+			"-f",	     "lavfi",
+			"-i",	     "color=c=black:s=320x240:r=24",
+			"-frames:v", "1"
+		};
+
+		memcpy(argv + arg, inputs, sizeof(inputs));
+		arg += G_N_ELEMENTS(inputs);
+	} else if (job->synthetic) {
 		const char *const inputs[] = {
 			"-re",
 			"-f",
@@ -250,7 +362,7 @@ static gboolean start_recording(gboolean synthetic, LineRecordDone done,
 		memcpy(argv + arg, inputs, sizeof(inputs));
 		arg += G_N_ELEMENTS(inputs);
 	}
-	const char *const output[] = {
+	const char *const mapping[] = {
 		"-map",
 		"0:v:0",
 		"-map",
@@ -259,47 +371,96 @@ static gboolean start_recording(gboolean synthetic, LineRecordDone done,
 		"scale=w='min(1280,iw)':h='min(720,ih)':force_original_aspect_ratio=decrease:force_divisible_by=2",
 		"-r",
 		"24",
-		"-c:v",
-		"libx264",
-		"-threads:v",
-		"2",
-		"-preset",
-		"veryfast",
-		"-crf",
-		"25",
-		"-pix_fmt",
-		"yuv420p",
-		"-c:a",
-		"aac",
-		"-b:a",
-		"96k",
-		"-ac",
-		"1",
-		"-ar",
-		"48000",
-		"-fs",
-		"66000000",
-		"-movflags",
-		"+faststart",
-		"-f",
-		"mp4",
-		path,
-		NULL
 	};
-	memcpy(argv + arg, output, sizeof(output));
-	gboolean spawned = g_spawn_async_with_pipes(
-		NULL, (char **)argv, NULL,
-		G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
-		die_with_parent, NULL, &job->pid, NULL, NULL, &job->stderr_fd,
-		error);
-	if (!spawned) {
+	const char *const cpu[] = { "-c:v",    "libx264",  "-threads:v", "2",
+				    "-preset", "veryfast", "-crf",	 "25" };
+	const char *const nvenc[] = { "-c:v",	 "h264_nvenc", "-gpu", "0",
+				      "-preset", "p4",	       "-rc",  "vbr",
+				      "-cq",	 "25",	       "-b:v", "0" };
+	if (encoder != ENCODER_PROBE) {
+		memcpy(argv + arg, mapping, sizeof(mapping));
+		arg += G_N_ELEMENTS(mapping);
+	}
+	if (encoder == ENCODER_CPU) {
+		memcpy(argv + arg, cpu, sizeof(cpu));
+		arg += G_N_ELEMENTS(cpu);
+	} else {
+		memcpy(argv + arg, nvenc, sizeof(nvenc));
+		arg += G_N_ELEMENTS(nvenc);
+	}
+	const char *const output[] = { "-pix_fmt",  "yuv420p",	  "-c:a",
+				       "aac",	    "-b:a",	  "96k",
+				       "-ac",	    "1",	  "-ar",
+				       "48000",	    "-fs",	  "66000000",
+				       "-movflags", "+faststart", "-f",
+				       "mp4",	    job->path,	  NULL };
+	if (encoder == ENCODER_PROBE) {
+		const char *const sink[] = { "-pix_fmt", "yuv420p", "-f",
+					     "null",	 "-",	    NULL };
+
+		memcpy(argv + arg, sink, sizeof(sink));
+	} else {
+		memcpy(argv + arg, output, sizeof(output));
+	}
+	if (!g_spawn_async_with_pipes(
+		    NULL, (char **)argv,
+		    encoder == ENCODER_CPU ? NULL : job->gpu_env,
+		    G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_STDOUT_TO_DEV_NULL,
+		    die_with_parent, NULL, &job->pid, NULL, NULL,
+		    &job->stderr_fd, error))
+		return FALSE;
+	fcntl(job->stderr_fd, F_SETFL,
+	      fcntl(job->stderr_fd, F_GETFL) | O_NONBLOCK);
+	job->encoder = encoder;
+	return TRUE;
+}
+
+static gboolean start_recording(gboolean synthetic, guint vendor,
+				int render_minor, LineRecordDone done,
+				gpointer data, GError **error)
+{
+	g_return_val_if_fail(done, FALSE);
+	g_autofree char *program = g_find_program_in_path("ffmpeg");
+
+	if (!program) {
+		g_set_error_literal(
+			error, G_SPAWN_ERROR, G_SPAWN_ERROR_NOENT,
+			"Video recording needs FFmpeg with H.264, AAC, V4L2 and PulseAudio support.");
+		return FALSE;
+	}
+	g_mutex_lock(&lock);
+	if (active) {
 		g_mutex_unlock(&lock);
-		line_record_discard(path);
+		g_set_error_literal(error, G_SPAWN_ERROR, G_SPAWN_ERROR_FAILED,
+				    "A recording is already active.");
+		return FALSE;
+	}
+	g_autofree char *dir = g_dir_make_tmp("line-camera-XXXXXX", error);
+
+	if (!dir) {
+		g_mutex_unlock(&lock);
+		return FALSE;
+	}
+	struct video_recording *job = g_new0(struct video_recording, 1);
+
+	job->path = g_build_filename(dir, "video.mp4", NULL);
+	job->program = g_steal_pointer(&program);
+	job->synthetic = synthetic;
+	job->done = done;
+	job->data = data;
+	enum record_encoder stage =
+		select_nvenc(vendor, render_minor, &job->gpu_env) ?
+			ENCODER_PROBE :
+			ENCODER_CPU;
+
+	if (!spawn_encoder(job, stage, error)) {
+		g_mutex_unlock(&lock);
+		line_record_discard(job->path);
+		g_free(job->program);
+		g_strfreev(job->gpu_env);
 		g_free(job);
 		return FALSE;
 	}
-	fcntl(job->stderr_fd, F_SETFL,
-	      fcntl(job->stderr_fd, F_GETFL) | O_NONBLOCK);
 	active = job;
 	jobs++;
 	g_thread_unref(g_thread_new("camera-recorder", monitor, job));
@@ -307,16 +468,17 @@ static gboolean start_recording(gboolean synthetic, LineRecordDone done,
 	return TRUE;
 }
 
-gboolean line_record_start(LineRecordDone done, gpointer data, GError **error)
+gboolean line_record_start(guint vendor, int render_minor, LineRecordDone done,
+			   gpointer data, GError **error)
 {
-	return start_recording(FALSE, done, data, error);
+	return start_recording(FALSE, vendor, render_minor, done, data, error);
 }
 
 #ifdef LINE_RECORD_TEST
-gboolean line_record_start_synthetic(LineRecordDone done, gpointer data,
-				     GError **error)
+gboolean line_record_start_synthetic(guint vendor, LineRecordDone done,
+				     gpointer data, GError **error)
 {
-	return start_recording(TRUE, done, data, error);
+	return start_recording(TRUE, vendor, -1, done, data, error);
 }
 #endif
 

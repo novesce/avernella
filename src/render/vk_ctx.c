@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vk_ctx.h"
+#include "vk_adapter.h"
 #include "vk_desc_buffer.h"
 #include "vk_drm.h"
 #include <stdbool.h>
@@ -189,111 +190,115 @@ static uint32_t graphics_family(VkPhysicalDevice gpu, VkSurfaceKHR surface)
 	return family;
 }
 
-static VkResult pick_gpu(struct vk_ctx *ctx, uint32_t vendor,
-			 unsigned maintenance, const char **swapchain_ext)
+VkResult vk_surface_format(VkPhysicalDevice gpu, VkSurfaceKHR surface,
+			   VkSurfaceFormatKHR *format)
 {
 	uint32_t count = 0;
-	VkResult result =
-		vkEnumeratePhysicalDevices(ctx->instance, &count, NULL);
+	VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface,
+							       &count, NULL);
+	if (result != VK_SUCCESS || !count)
+		return result == VK_SUCCESS ? VK_ERROR_FORMAT_NOT_SUPPORTED :
+					      result;
+	VkSurfaceFormatKHR *formats = calloc(count, sizeof(*formats));
 
-	if (result != VK_SUCCESS)
-		return result;
-	if (!count)
-		return VK_ERROR_INITIALIZATION_FAILED;
-	VkPhysicalDevice *devices = calloc(count, sizeof(*devices));
-
-	if (!devices)
+	if (!formats)
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
-	result = vkEnumeratePhysicalDevices(ctx->instance, &count, devices);
+	result = vkGetPhysicalDeviceSurfaceFormatsKHR(gpu, surface, &count,
+						      formats);
 	if (result == VK_SUCCESS) {
-		const char *mode = getenv("AVERNELLA_VK_DESCRIPTORS");
-		const char *render_node = getenv("AVERNELLA_RENDER_NODE");
-		bool force_buffer = mode && !strcmp(mode, "buffer");
-		bool force_heap = mode && !strcmp(mode, "heap");
-		int best = -1;
-		result = VK_ERROR_FEATURE_NOT_PRESENT;
+		result = VK_ERROR_FORMAT_NOT_SUPPORTED;
+		/* Cairo pixels are already encoded in the sRGB color space. */
 		for (uint32_t i = 0; i < count; i++) {
-			VkPhysicalDeviceProperties properties;
-			struct device_caps caps = { 0 };
-			struct vk_features f;
-
-			vkGetPhysicalDeviceProperties(devices[i], &properties);
-			bool v14 = properties.apiVersion >= VK_API_VERSION_1_4;
-			bool cpu = properties.deviceType ==
-				   VK_PHYSICAL_DEVICE_TYPE_CPU;
-			if (cpu && ctx->surface && !vendor && !force_heap &&
-			    !force_buffer && (!render_node || !*render_node))
+			VkSurfaceFormatKHR candidate = formats[i];
+			if (candidate.colorSpace !=
+			    VK_COLOR_SPACE_SRGB_NONLINEAR_KHR)
 				continue;
-			if (properties.apiVersion < VK_API_VERSION_1_3 ||
-			    (vendor && vendor != properties.vendorID) ||
-			    !read_extensions(devices[i], &caps) ||
-			    !vk_drm_matches(devices[i], render_node,
-					    caps.drm) ||
-			    (ctx->surface &&
-			     (!caps.swapchain ||
-			      !(caps.maintenance & maintenance))))
-				continue;
-			VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR present = {
-				.sType =
-					VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
-			};
-			feature_chain(&f, v14, caps.heap, caps.buffer,
-				      ctx->surface ? &present : NULL);
-			vkGetPhysicalDeviceFeatures2(devices[i], &f.core);
-			bool heap = v14 && caps.heap && f.heap.descriptorHeap &&
-				    !force_buffer;
-			VkPhysicalDeviceLimits *limits = &properties.limits;
-			bool buffer =
-				caps.buffer && f.buffer.descriptorBuffer &&
-				!force_heap &&
-				limits->maxPerStageDescriptorSampledImages >=
-					UI_TEXTURE_SLOTS &&
-				limits->maxDescriptorSetSampledImages >=
-					UI_TEXTURE_SLOTS &&
-				limits->maxPerStageResources >=
-					UI_TEXTURE_SLOTS + 1;
-			if ((!heap && !buffer) || !f.v12.bufferDeviceAddress ||
-			    !f.v12.scalarBlockLayout ||
-			    !f.v12.shaderSampledImageArrayNonUniformIndexing ||
-			    !f.v12.timelineSemaphore ||
-			    !f.v13.dynamicRendering ||
-			    !f.v13.synchronization2 ||
-			    !f.v13.shaderDemoteToHelperInvocation ||
-			    (ctx->surface && !present.swapchainMaintenance1))
-				continue;
-			uint32_t family =
-				graphics_family(devices[i], ctx->surface);
-			/*
-			 * A hardware GPU first, then a discrete one (on a
-			 * hybrid laptop, the NVIDIA or AMD card rather than
-			 * the processor's graphics), then descriptor heaps.
-			 * AVERNELLA_RENDER_NODE picks one explicitly.
-			 */
-			bool discrete = properties.deviceType ==
-					VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU;
-			int score = (cpu ? 0 : 4) + (discrete ? 2 : 0) + heap;
-
-			if (family == UINT32_MAX || score <= best)
-				continue;
-			best = score;
-			ctx->gpu = devices[i];
-			ctx->family = family;
-			ctx->descriptor_heap = heap;
-			*swapchain_ext =
-				(caps.maintenance & maintenance &
-				 MAINTENANCE_KHR) ?
-					VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME :
-					VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
-			ctx->incremental_present = ctx->surface &&
-						   caps.incremental;
-			ctx->host_image_copy = v14 && f.v14.hostImageCopy;
-			result = VK_SUCCESS;
-			if (best == 7)
+			if (count == 1 &&
+			    candidate.format == VK_FORMAT_UNDEFINED)
+				candidate.format = VK_FORMAT_B8G8R8A8_UNORM;
+			if (candidate.format == VK_FORMAT_B8G8R8A8_UNORM ||
+			    candidate.format == VK_FORMAT_R8G8B8A8_UNORM) {
+				*format = candidate;
+				result = VK_SUCCESS;
 				break;
+			}
 		}
 	}
-	free(devices);
+	free(formats);
 	return result;
+}
+
+static void inspect_adapter(struct vk_adapter *adapter, VkPhysicalDevice gpu,
+			    VkSurfaceKHR surface, uint32_t vendor,
+			    unsigned maintenance, const char *render_node,
+			    bool force_heap, bool force_buffer)
+{
+	VkPhysicalDeviceProperties properties;
+	struct device_caps caps = { 0 };
+	struct vk_features f;
+	int render_minor;
+
+	vkGetPhysicalDeviceProperties(gpu, &properties);
+	bool v14 = properties.apiVersion >= VK_API_VERSION_1_4;
+	bool cpu = properties.deviceType == VK_PHYSICAL_DEVICE_TYPE_CPU;
+	if (cpu && surface && !vendor && !force_heap && !force_buffer &&
+	    (!render_node || !*render_node))
+		return;
+	if (properties.apiVersion < VK_API_VERSION_1_3 ||
+	    (vendor && vendor != properties.vendorID) ||
+	    !read_extensions(gpu, &caps) ||
+	    !vk_drm_matches(gpu, render_node, caps.drm, &render_minor) ||
+	    (surface && (!caps.swapchain || !(caps.maintenance & maintenance))))
+		return;
+	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR present = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+	};
+	feature_chain(&f, v14, caps.heap, caps.buffer,
+		      surface ? &present : NULL);
+	vkGetPhysicalDeviceFeatures2(gpu, &f.core);
+	bool heap = v14 && caps.heap && f.heap.descriptorHeap && !force_buffer;
+	VkPhysicalDeviceLimits *limits = &properties.limits;
+	bool buffer = caps.buffer && f.buffer.descriptorBuffer && !force_heap &&
+		      limits->maxPerStageDescriptorSampledImages >=
+			      UI_TEXTURE_SLOTS &&
+		      limits->maxDescriptorSetSampledImages >=
+			      UI_TEXTURE_SLOTS &&
+		      limits->maxPerStageResources >= UI_TEXTURE_SLOTS + 1;
+	if ((!heap && !buffer) || !f.v12.bufferDeviceAddress ||
+	    !f.v12.scalarBlockLayout ||
+	    !f.v12.shaderSampledImageArrayNonUniformIndexing ||
+	    !f.v12.timelineSemaphore || !f.v13.dynamicRendering ||
+	    !f.v13.synchronization2 || !f.v13.shaderDemoteToHelperInvocation ||
+	    (surface && !present.swapchainMaintenance1))
+		return;
+	uint32_t family = graphics_family(gpu, surface);
+	if (family == UINT32_MAX)
+		return;
+	if (surface) {
+		VkSurfaceCapabilitiesKHR usable;
+		VkSurfaceFormatKHR format;
+
+		if (vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
+			    gpu, surface, &usable) != VK_SUCCESS ||
+		    !(usable.supportedUsageFlags &
+		      VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT) ||
+		    !usable.supportedCompositeAlpha ||
+		    vk_surface_format(gpu, surface, &format) != VK_SUCCESS)
+			return;
+	}
+	*adapter = (struct vk_adapter){
+		.gpu = gpu,
+		.type = properties.deviceType,
+		.vendor = properties.vendorID,
+		.family = family,
+		.render_minor = render_minor,
+		.heap = heap,
+		.maintenance_khr = caps.maintenance & maintenance &
+				   MAINTENANCE_KHR,
+		.incremental = surface && caps.incremental,
+		.host_copy = v14 && f.v14.hostImageCopy,
+	};
 }
 
 uint32_t vk_memory_type(const struct vk_ctx *ctx, uint32_t bits,
@@ -614,41 +619,15 @@ VkResult vk_image_slot_write(const struct vk_ctx *ctx, uint32_t slot,
 		       result;
 }
 
-VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
-		     const struct vk_surface_config *surface)
+static VkResult open_device(struct vk_ctx *ctx,
+			    const struct vk_adapter *adapter)
 {
-	*ctx = (struct vk_ctx){ 0 };
-	VkResult result = volkInitialize();
-
-	if (result != VK_SUCCESS)
-		return result;
-	VkApplicationInfo app = {
-		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
-		.pApplicationName = "Avernella",
-		.apiVersion = volkGetInstanceVersion() >= VK_API_VERSION_1_4 ?
-				      VK_API_VERSION_1_4 :
-				      VK_API_VERSION_1_3,
-	};
-	unsigned instance_maintenance = 0;
-	const char *swapchain_ext = NULL;
-
-	if (volkGetInstanceVersion() < VK_API_VERSION_1_3) {
-		result = VK_ERROR_INCOMPATIBLE_DRIVER;
-		goto fail;
-	}
-	result = create_instance(ctx, &app, surface, &instance_maintenance);
-	if (result != VK_SUCCESS)
-		goto fail;
-	volkLoadInstanceOnly(ctx->instance);
-	if (surface) {
-		result = surface->create(ctx->instance, surface->window,
-					 &ctx->surface);
-		if (result != VK_SUCCESS)
-			goto fail;
-	}
-	result = pick_gpu(ctx, vendor, instance_maintenance, &swapchain_ext);
-	if (result != VK_SUCCESS)
-		goto fail;
+	ctx->gpu = adapter->gpu;
+	ctx->family = adapter->family;
+	ctx->render_minor = adapter->render_minor;
+	ctx->descriptor_heap = adapter->heap;
+	ctx->incremental_present = adapter->incremental;
+	ctx->host_image_copy = adapter->host_copy;
 	struct vk_features features;
 
 	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance = {
@@ -658,7 +637,7 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 	};
 	feature_chain(&features, ctx->host_image_copy || ctx->descriptor_heap,
 		      ctx->descriptor_heap, !ctx->descriptor_heap,
-		      surface ? &maintenance : NULL);
+		      ctx->surface ? &maintenance : NULL);
 	features.v12.bufferDeviceAddress = VK_TRUE;
 	features.v12.scalarBlockLayout = VK_TRUE;
 	features.v12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
@@ -680,7 +659,9 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		ctx->descriptor_heap ? VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME :
 				       VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
 		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-		swapchain_ext,
+		adapter->maintenance_khr ?
+			VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME :
+			VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
 		VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME,
 	};
 	VkDeviceCreateInfo device = {
@@ -689,14 +670,16 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &queue,
 		.enabledExtensionCount = ctx->incremental_present ? 4 :
-					 surface		  ? 3 :
+					 ctx->surface		  ? 3 :
 								    1,
 		.ppEnabledExtensionNames = extensions,
 	};
 
-	result = vkCreateDevice(ctx->gpu, &device, NULL, &ctx->device);
+	VkDevice handle;
+	VkResult result = vkCreateDevice(ctx->gpu, &device, NULL, &handle);
 	if (result != VK_SUCCESS)
-		goto fail;
+		return result;
+	ctx->device = handle;
 	volkLoadDevice(ctx->device);
 	vkGetDeviceQueue(ctx->device, ctx->family, 0, &ctx->queue);
 	vkGetPhysicalDeviceMemoryProperties(ctx->gpu, &ctx->memory);
@@ -705,15 +688,108 @@ VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
 		if (result == VK_ERROR_FORMAT_NOT_SUPPORTED)
 			ctx->host_image_copy = false;
 		else if (result != VK_SUCCESS)
-			goto fail;
+			return result;
 	}
 	if (!ctx->host_image_copy)
 		ctx->texture_layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 	ctx->free_head = 1; /* zero is the persistent glyph atlas */
 	for (uint32_t i = 1; i < UI_TEXTURE_SLOTS; i++)
 		ctx->free_next[i] = i + 1;
-	result = ctx->descriptor_heap ? init_heaps(ctx) :
-					vk_desc_buffer_open(ctx);
+	return ctx->descriptor_heap ? init_heaps(ctx) :
+				      vk_desc_buffer_open(ctx);
+}
+
+static void close_device(struct vk_ctx *ctx)
+{
+	if (ctx->device) {
+		vkDeviceWaitIdle(ctx->device);
+		vk_desc_buffer_close(ctx);
+		vk_buffer_destroy(ctx, &ctx->samplers.buffer);
+		vk_buffer_destroy(ctx, &ctx->resources.buffer);
+		vkDestroyDevice(ctx->device, NULL);
+	}
+	/* The instance and its window surface survive an adapter retry. */
+	*ctx = (struct vk_ctx){ .instance = ctx->instance,
+				.surface = ctx->surface };
+}
+
+static VkResult open_adapter(struct vk_ctx *ctx, uint32_t vendor,
+			     unsigned maintenance)
+{
+	const char *mode = getenv("AVERNELLA_VK_DESCRIPTORS");
+	const char *node = getenv("AVERNELLA_RENDER_NODE");
+	bool force_heap = mode && !strcmp(mode, "heap");
+	bool force_buffer = mode && !strcmp(mode, "buffer");
+	uint32_t count = 0;
+	VkResult result =
+		vkEnumeratePhysicalDevices(ctx->instance, &count, NULL);
+
+	if (result != VK_SUCCESS || !count)
+		return result != VK_SUCCESS ? result :
+					      VK_ERROR_FEATURE_NOT_PRESENT;
+	VkPhysicalDevice *devices = calloc(count, sizeof(*devices));
+	struct vk_adapter *adapters = calloc(count, sizeof(*adapters));
+
+	if (!devices || !adapters) {
+		result = VK_ERROR_OUT_OF_HOST_MEMORY;
+		goto done;
+	}
+	result = vkEnumeratePhysicalDevices(ctx->instance, &count, devices);
+	if (result != VK_SUCCESS)
+		goto done;
+	for (uint32_t i = 0; i < count; i++)
+		inspect_adapter(&adapters[i], devices[i], ctx->surface, vendor,
+				maintenance, node, force_heap, force_buffer);
+	result = VK_ERROR_FEATURE_NOT_PRESENT;
+	struct vk_adapter *adapter;
+
+	while ((adapter = vk_preferred_adapter(adapters, count))) {
+		result = open_device(ctx, adapter);
+		if (result == VK_SUCCESS)
+			break;
+		close_device(ctx);
+		if (result == VK_ERROR_OUT_OF_HOST_MEMORY)
+			break;
+		adapter->gpu = VK_NULL_HANDLE;
+	}
+done:
+	free(adapters);
+	free(devices);
+	return result;
+}
+
+VkResult vk_ctx_init(struct vk_ctx *ctx, uint32_t vendor,
+		     const struct vk_surface_config *surface)
+{
+	*ctx = (struct vk_ctx){ 0 };
+	VkResult result = volkInitialize();
+
+	if (result != VK_SUCCESS)
+		return result;
+	VkApplicationInfo app = {
+		.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO,
+		.pApplicationName = "Avernella",
+		.apiVersion = volkGetInstanceVersion() >= VK_API_VERSION_1_4 ?
+				      VK_API_VERSION_1_4 :
+				      VK_API_VERSION_1_3,
+	};
+	unsigned instance_maintenance = 0;
+
+	if (volkGetInstanceVersion() < VK_API_VERSION_1_3) {
+		result = VK_ERROR_INCOMPATIBLE_DRIVER;
+		goto fail;
+	}
+	result = create_instance(ctx, &app, surface, &instance_maintenance);
+	if (result != VK_SUCCESS)
+		goto fail;
+	volkLoadInstanceOnly(ctx->instance);
+	if (surface) {
+		result = surface->create(ctx->instance, surface->window,
+					 &ctx->surface);
+		if (result != VK_SUCCESS)
+			goto fail;
+	}
+	result = open_adapter(ctx, vendor, instance_maintenance);
 	if (result == VK_SUCCESS)
 		return result;
 fail:
@@ -723,13 +799,7 @@ fail:
 
 void vk_ctx_destroy(struct vk_ctx *ctx)
 {
-	if (ctx->device) {
-		vkDeviceWaitIdle(ctx->device);
-		vk_desc_buffer_close(ctx);
-		vk_buffer_destroy(ctx, &ctx->samplers.buffer);
-		vk_buffer_destroy(ctx, &ctx->resources.buffer);
-		vkDestroyDevice(ctx->device, NULL);
-	}
+	close_device(ctx);
 	if (ctx->surface)
 		vkDestroySurfaceKHR(ctx->instance, ctx->surface, NULL);
 	if (ctx->instance)

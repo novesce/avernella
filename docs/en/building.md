@@ -35,6 +35,7 @@ Optional pieces, each detected automatically:
 | WebKitGTK browser | `webkitgtk-6.0` | No `avernella-liff-gtk`. With neither browser, links open in the system browser. |
 | Native Vulkan renderer | `glslangValidator`, `spirv-val`, Vulkan headers that declare `VK_EXT_descriptor_heap`, and volk (`/usr/include/volk.c` or `-lvolk`) | No `avernella-vulkan.so`. The app draws through SDL instead. |
 | ZBar | `libzbar.so.0` at run time, loaded by `dlopen` in [`qr_scan.c`](../../src/qr_scan.c) | **Read QR image** is unavailable. |
+| Hardware call decoding | FFmpeg development headers for `libavcodec` and `libavutil` (Ubuntu packages `libavcodec-dev libavutil-dev`, Arch package `ffmpeg`) | VP8 calls decode with libvpx. Set `CALL_HWDECODE=0` to build this configuration explicitly. |
 | FFmpeg | `ffmpeg`, `ffplay`, `ffprobe` executables | No camera video messages or video playback, and the recording tests fail. |
 | XDG desktop portal | `xdg-desktop-portal` with a backend for your desktop | No screenshots or screen sharing. |
 
@@ -127,7 +128,7 @@ Only one Avernella can use a session at a time: the session directory is locked 
 
 ### Wayland and X11
 
-In a Wayland session the client asks SDL for `wayland,x11`, so it uses native Wayland and falls back to X11. Set `SDL_VIDEODRIVER=x11` to force X11. On a laptop with two GPUs, the native Vulkan module prefers the discrete one (an NVIDIA or AMD card) over the processor's integrated graphics, whatever order the Vulkan loader lists them in. It still checks that the GPU can present to the window. To use the integrated GPU instead, for longer battery life, set `AVERNELLA_RENDER_NODE` to its render node. `LINE_RENDER_LOG=1` prints the chosen device. With the SDL renderer, `SDL_VIDEODRIVER=x11 prime-run ./avernella` selects the NVIDIA GPU through X11 or XWayland.
+In a Wayland session the client asks SDL for `wayland,x11`, so it uses native Wayland and falls back to X11. Set `SDL_VIDEODRIVER=x11` to force X11. On a laptop with two GPUs, the native Vulkan module prefers a compatible NVIDIA discrete GPU, then other discrete GPUs, then integrated graphics. If a device fails to open it tries the next candidate. It still checks that the GPU can present to the window. To use the integrated GPU instead, for longer battery life, set `AVERNELLA_RENDER_NODE` to its render node. `LINE_RENDER_LOG=1` prints the chosen device. With the SDL renderer, `SDL_VIDEODRIVER=x11 prime-run ./avernella` selects the NVIDIA GPU through X11 or XWayland.
 
 ## Installing
 
@@ -188,7 +189,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 
 | Variable | Effect |
 | -------- | ------ |
-| `LINE_DISABLE_GPU=1` | Skips Vulkan entirely and draws to the SDL window surface |
+| `LINE_DISABLE_GPU=1` | Uses the SDL window surface, libvpx call decoding and software video-message encoding |
 | `AVERNELLA_VULKAN=sdl` | Skips the native module but still tries SDL's Vulkan renderer |
 | `AVERNELLA_VK_DESCRIPTORS=buffer` | Makes the native module use descriptor buffers instead of descriptor heaps |
 | `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` | Picks the GPU by DRM render node, on drivers that expose DRM properties |

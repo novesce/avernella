@@ -32,6 +32,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -311,6 +312,7 @@ static struct {
 	guint generation, seq, newest_history, rendered_history;
 	guint history_pending;
 	gboolean history_again, chats_again;
+	gint stopping;
 	GHashTable *read_marks;
 	Json *selected_summary; /* borrowed from ui.chats; rebound when the list changes */
 	gint64 notification_baseline;
@@ -330,8 +332,6 @@ static struct pending_preview previews[LINE_PREVIEW_COUNT] = {
 	[LINE_PREVIEW_REMOTE] = { .fd = -1 },
 	[LINE_PREVIEW_SELF] = { .fd = -1 },
 };
-
-extern char **environ;
 
 static void set_string(char **dest, const char *s);
 
@@ -500,6 +500,10 @@ static void post_packet(guint generation, char *line)
 {
 	SDL_Event e = { 0 };
 
+	if (g_atomic_int_get(&wire.stopping)) {
+		g_free(line);
+		return;
+	}
 	e.type = wire.packet_event;
 	e.user.code = (Sint32)generation;
 	e.user.data1 = line;
@@ -510,6 +514,10 @@ static void post_packet(guint generation, char *line)
 struct wire_write {
 	size_t size;
 	char data[];
+};
+
+enum {
+	WORKER_QUIT_GRACE_MS = 2250
 };
 
 static void pump_preview(guint generation)
@@ -550,14 +558,19 @@ static gpointer pump(gpointer data)
 	size_t offset = 0;
 
 	for (;;) {
-		if (!writing) {
+		gboolean stopping = g_atomic_int_get(&wire.stopping);
+
+		if (stopping) {
+			g_clear_pointer(&writing, g_free);
+		} else if (!writing) {
 			writing = g_async_queue_try_pop(wire.writes);
 			offset = 0;
 		}
-		struct pollfd fds[] = { { wire.fd,
-					  POLLIN | (writing ? POLLOUT : 0), 0 },
-					{ wire.wake, POLLIN, 0 },
-					{ wire.preview, POLLIN, 0 } };
+		struct pollfd fds[] = {
+			{ wire.fd, POLLIN | (writing ? POLLOUT : 0), 0 },
+			{ wire.wake, POLLIN, 0 },
+			{ stopping ? -1 : wire.preview, POLLIN, 0 }
+		};
 		int rc = poll(fds, G_N_ELEMENTS(fds), -1);
 
 		if (rc < 0 && errno == EINTR)
@@ -577,6 +590,8 @@ static gpointer pump(gpointer data)
 				continue;
 			if (got <= 0)
 				break;
+			if (g_atomic_int_get(&wire.stopping))
+				continue;
 			size_t start = 0;
 
 			for (size_t i = 0; i < (size_t)got; i++) {
@@ -598,6 +613,9 @@ static gpointer pump(gpointer data)
 					 MSG_NOSIGNAL);
 			if (n < 0 && (errno == EINTR || errno == EAGAIN))
 				continue;
+			if (n < 0 && errno == EPIPE &&
+			    g_atomic_int_get(&wire.stopping))
+				continue;
 			if (n <= 0)
 				break;
 			offset += n;
@@ -606,7 +624,8 @@ static gpointer pump(gpointer data)
 		}
 		if (fds[2].revents & POLLIN)
 			pump_preview(generation);
-		if (fds[2].revents & (POLLERR | POLLHUP | POLLNVAL))
+		if ((fds[2].revents & (POLLERR | POLLHUP | POLLNVAL)) &&
+		    !g_atomic_int_get(&wire.stopping))
 			break;
 	}
 	g_free(writing);
@@ -615,7 +634,47 @@ static gpointer pump(gpointer data)
 	return NULL;
 }
 
-static void stop_worker(void)
+static gboolean reap_worker(int options)
+{
+	pid_t result;
+
+	do {
+		result = waitpid(wire.pid, NULL, options);
+	} while (result < 0 && errno == EINTR);
+	/* A failed wait cannot authorize a signal to a reused PID. */
+	return result != 0;
+}
+
+static gboolean wait_worker(gint64 deadline)
+{
+#ifdef SYS_pidfd_open
+	int fd = (int)syscall(SYS_pidfd_open, wire.pid, 0);
+
+	if (fd >= 0) {
+		struct pollfd exit = { .fd = fd, .events = POLLIN };
+		gint64 remaining;
+
+		while ((remaining = deadline - g_get_monotonic_time()) > 0) {
+			int rc = poll(&exit, 1, (remaining + 999) / 1000);
+
+			if (rc >= 0 || errno != EINTR)
+				break;
+		}
+		close(fd);
+		return reap_worker(WNOHANG);
+	}
+#endif
+	while (!reap_worker(WNOHANG)) {
+		gint64 remaining = deadline - g_get_monotonic_time();
+
+		if (remaining <= 0)
+			return FALSE;
+		g_usleep(MIN(remaining, 10000));
+	}
+	return TRUE;
+}
+
+static void stop_worker(gboolean orderly)
 {
 	wire.generation++;
 	if (wire.login_timer) {
@@ -623,10 +682,18 @@ static void stop_worker(void)
 		wire.login_timer = 0;
 	}
 	if (wire.pid > 0) {
+		gboolean exited = FALSE;
+
+		g_atomic_int_set(&wire.stopping, TRUE);
+		/* EOF lets the worker leave a call while the pump drains replies. */
+		if (orderly && !shutdown(wire.fd, SHUT_WR))
+			exited = wait_worker(g_get_monotonic_time() +
+					     WORKER_QUIT_GRACE_MS * 1000);
 		shutdown(wire.fd, SHUT_RDWR);
-		kill(wire.pid, SIGTERM);
-		while (waitpid(wire.pid, NULL, 0) < 0 && errno == EINTR)
-			;
+		if (!exited && !reap_worker(WNOHANG)) {
+			kill(wire.pid, orderly ? SIGKILL : SIGTERM);
+			reap_worker(0);
+		}
 		g_thread_join(wire.thread);
 		close(wire.fd);
 		close(wire.wake);
@@ -645,6 +712,35 @@ static void stop_worker(void)
 	wire.rendered_history = 0;
 	wire.history_pending = 0;
 	wire.history_again = wire.chats_again = FALSE;
+}
+
+/*
+ * The decoder lives in the worker. Pass the GPU actually opened by the UI,
+ * including a fallback after device creation failed on the preferred GPU.
+ */
+static char **worker_environment(void)
+{
+	char **env = g_get_environ();
+	int minor = ui_gpu_render_minor();
+	guint vendor = ui_gpu_device_vendor();
+
+	env = g_environ_unsetenv(env, "AVERNELLA_MEDIA_RENDER_NODE");
+	env = g_environ_unsetenv(env, "AVERNELLA_MEDIA_GPU_VENDOR");
+	if (minor >= 0) {
+		g_autofree char *node =
+			g_strdup_printf("/dev/dri/renderD%d", minor);
+
+		env = g_environ_setenv(env, "AVERNELLA_MEDIA_RENDER_NODE", node,
+				       TRUE);
+	}
+	if (vendor) {
+		char id[16];
+
+		g_snprintf(id, sizeof(id), "0x%x", vendor);
+		env = g_environ_setenv(env, "AVERNELLA_MEDIA_GPU_VENDOR", id,
+				       TRUE);
+	}
+	return env;
 }
 
 static gboolean start_worker(int credentials_fd)
@@ -696,9 +792,12 @@ static gboolean start_worker(int credentials_fd)
 					       (char *)"--worker-password" :
 					       (char *)"--worker",
 				       NULL };
-		if (!err)
+		if (!err) {
+			g_auto(GStrv) env = worker_environment();
+
 			err = posix_spawn(&wire.pid, "/proc/self/exe", &actions,
-					  NULL, args, environ);
+					  NULL, args, env);
+		}
 		posix_spawn_file_actions_destroy(&actions);
 	}
 	close(pair[1]);
@@ -715,6 +814,7 @@ static gboolean start_worker(int credentials_fd)
 	wire.preview = preview[0];
 	fcntl(wire.fd, F_SETFL, O_NONBLOCK);
 	wire.writes = g_async_queue_new_full(g_free);
+	g_atomic_int_set(&wire.stopping, FALSE);
 	wire.thread = g_thread_new("line-ipc", pump,
 				   GUINT_TO_POINTER(wire.generation));
 	return TRUE;
@@ -747,7 +847,8 @@ static guint submit(struct ui_request *saved, const char *name, Json *args)
 	uint64_t one = 1;
 
 	if (wake)
-		while (write(wire.wake, &one, sizeof(one)) < 0 && errno == EINTR)
+		while (write(wire.wake, &one, sizeof(one)) < 0 &&
+		       errno == EINTR)
 			;
 	return id;
 }
@@ -1028,7 +1129,7 @@ static void clear_password(void)
 
 static void reset_login(const char *message)
 {
-	stop_worker();
+	stop_worker(FALSE);
 	ui_sound_stop_loop();
 	ui_media_reset();
 	ui_lists_reset();
@@ -1251,9 +1352,9 @@ static void chat_message(Json *packet)
 	if (!mine)
 		json_object_object_add(
 			moved, "unread",
-			json_object_new_int64(
-				json_object_get_int64(ui_field(moved, "unread")) +
-				1));
+			json_object_new_int64(json_object_get_int64(ui_field(
+						      moved, "unread")) +
+					      1));
 	Json *rows = json_object_new_array();
 
 	json_object_array_add(rows, moved);
@@ -1599,8 +1700,9 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 	size_t n = json_object_array_length(ui.history);
 
 	for (size_t i = 0; i < n; i++)
-		if (!g_strcmp0(id, ui_string(json_object_array_get_idx(ui.history, i),
-					   "id", NULL)))
+		if (!g_strcmp0(id, ui_string(json_object_array_get_idx(
+						     ui.history, i),
+					     "id", NULL)))
 			return;
 	Json *row = json_object_new_object();
 	gint64 sent = json_object_get_int64(ui_field(receipt, "sentAt"));
@@ -1612,10 +1714,13 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 	json_object_object_add(row, "type", json_object_new_string("text"));
 	json_object_object_add(row, "from", json_object_new_string("You"));
 	json_object_object_add(row, "own", json_object_new_boolean(TRUE));
-	json_object_object_add(row, "time", json_object_new_int64(
-		sent > 0 ? sent : g_get_real_time() / 1000));
+	json_object_object_add(
+		row, "time",
+		json_object_new_int64(sent > 0 ? sent :
+						 g_get_real_time() / 1000));
 	if (ui.self_id)
-		json_object_object_add(row, "senderId", json_object_new_string(ui.self_id));
+		json_object_object_add(row, "senderId",
+				       json_object_new_string(ui.self_id));
 	if (emojis)
 		json_object_object_add(row, "emojis", json_object_get(emojis));
 	if (reply)
@@ -1853,6 +1958,9 @@ static void handle_packet(Json *packet)
 		ui_desktop_notify(ui_string(chat, "name", NULL), TRUE);
 	}
 	if ((!strcmp(event, "call") || !strcmp(event, "call_incoming") ||
+	     !strcmp(event, "call_reception") ||
+	     !strcmp(event, "call_participants") ||
+	     !strcmp(event, "call_video_peer") ||
 	     !strcmp(event, "call_error") || !strcmp(event, "call_frame") ||
 	     !strcmp(event, "call_self_frame") ||
 	     !strcmp(event, "call_share") ||
@@ -2418,10 +2526,9 @@ static int hover_target(int x, int y)
 			return -5;
 		if ((ui.photos || ui.files) && inside(ui.attach, x, y))
 			return -2;
-		if (ui_media_can_call() && inside(ui.call, x, y))
+		if (ui_media_can_call(FALSE) && inside(ui.call, x, y))
 			return -3;
-		if (ui_media_can_call() && ui.video_calls &&
-		    inside(ui.video, x, y))
+		if (ui_media_can_call(TRUE) && inside(ui.video, x, y))
 			return -4;
 	}
 	if (ui_compact() && ui_chat_visible() && inside(ui.back, x, y))
@@ -2796,7 +2903,7 @@ int line_ui(int argc, char **argv)
 		}
 	}
 	ui_tray_stop();
-	stop_worker();
+	stop_worker(TRUE);
 	g_clear_pointer(&ui.qr, QRcode_free);
 	ui_media_shutdown();
 	ui_lists_reset();

@@ -3,6 +3,10 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Waiting for incoming media…", "正在等待对方的音频或视频…" },
+	{ "Waiting for playback…", "正在等待播放…" },
+	{ "LINE sees this account in a call on another device. End that call before joining here.",
+	  "LINE 显示此账号正在另一台设备上通话。请先在那台设备上结束通话，再从这里加入。" },
 	{ "%B %e, %Y", "%Y年%B%-d日" },
 	{ "%d selected", "已选择 %d 人" },
 	{ "%d/%m/%Y %H:%M", "%Y/%-m/%-d %H:%M" },

@@ -35,6 +35,7 @@
 | เบราว์เซอร์ WebKitGTK | `webkitgtk-6.0` | ไม่มี `avernella-liff-gtk` ถ้าไม่มีเบราว์เซอร์เลย ลิงก์จะเปิดในเบราว์เซอร์ของระบบ |
 | ตัววาด Vulkan แบบเนทีฟ | `glslangValidator`, `spirv-val`, header ของ Vulkan ที่ประกาศ `VK_EXT_descriptor_heap` และ volk (`/usr/include/volk.c` หรือ `-lvolk`) | ไม่มี `avernella-vulkan.so` แอปจะวาดผ่าน SDL แทน |
 | ZBar | `libzbar.so.0` ตอนรัน โหลดด้วย `dlopen` ใน [`qr_scan.c`](../../src/qr_scan.c) | ใช้ **Read QR image** ไม่ได้ |
+| ถอดรหัสวิดีโอคอลด้วยฮาร์ดแวร์ | header ของ FFmpeg สำหรับ `libavcodec` และ `libavutil` (บน Ubuntu คือ `libavcodec-dev libavutil-dev` และบน Arch คือ `ffmpeg`) | แอปถอดรหัส VP8 ด้วย libvpx ตั้ง `CALL_HWDECODE=0` เพื่อเลือก build แบบนี้ |
 | FFmpeg | โปรแกรม `ffmpeg`, `ffplay`, `ffprobe` | อัดคลิปจากกล้องและเล่นวิดีโอไม่ได้ และเทสต์การอัดจะล้มเหลว |
 | XDG desktop portal | `xdg-desktop-portal` พร้อม backend ของเดสก์ท็อปที่ใช้ | จับภาพหน้าจอและแชร์หน้าจอไม่ได้ |
 
@@ -127,7 +128,7 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 
 ### Wayland และ X11
 
-ในเซสชัน Wayland ไคลเอนต์ขอ SDL เป็น `wayland,x11` จึงใช้ Wayland โดยตรงและถอยไปใช้ X11 ถ้าไม่ได้ ตั้ง `SDL_VIDEODRIVER=x11` เพื่อบังคับ X11 บนแล็ปท็อปที่มีสอง GPU โมดูล Vulkan ของ Avernella จะเลือก GPU แยก (การ์ด NVIDIA หรือ AMD) ก่อนกราฟิกในตัวของโปรเซสเซอร์ ไม่ว่า Vulkan loader จะเรียงลำดับอย่างไร และยังตรวจว่า GPU นั้นแสดงผลไปที่หน้าต่างได้ ถ้าต้องการใช้ GPU ในตัวเพื่อประหยัดแบตเตอรี่ ให้ตั้ง `AVERNELLA_RENDER_NODE` เป็น render node ของ GPU นั้น `LINE_RENDER_LOG=1` จะพิมพ์ชื่ออุปกรณ์ที่เลือก ส่วนเมื่อใช้ตัวเรนเดอร์ของ SDL `SDL_VIDEODRIVER=x11 prime-run ./avernella` จะเลือก GPU ของ NVIDIA ผ่าน X11 หรือ XWayland
+ในเซสชัน Wayland ไคลเอนต์ขอ SDL เป็น `wayland,x11` จึงใช้ Wayland โดยตรงและถอยไปใช้ X11 ถ้าไม่ได้ ตั้ง `SDL_VIDEODRIVER=x11` เพื่อบังคับ X11 บนแล็ปท็อปที่มีสอง GPU โมดูล Vulkan ของ Avernella จะลองใช้ GPU แยกของ NVIDIA ก่อน ตามด้วย GPU แยกยี่ห้ออื่นและกราฟิกในตัวตามลำดับ หากเปิดอุปกรณ์ไม่ได้จะลองตัวถัดไป และยังตรวจว่า GPU นั้นแสดงผลไปที่หน้าต่างได้ ถ้าต้องการใช้ GPU ในตัวเพื่อประหยัดแบตเตอรี่ ให้ตั้ง `AVERNELLA_RENDER_NODE` เป็น render node ของ GPU นั้น `LINE_RENDER_LOG=1` จะพิมพ์ชื่ออุปกรณ์ที่เลือก ส่วนเมื่อใช้ตัวเรนเดอร์ของ SDL `SDL_VIDEODRIVER=x11 prime-run ./avernella` จะเลือก GPU ของ NVIDIA ผ่าน X11 หรือ XWayland
 
 ## การติดตั้ง
 
@@ -188,7 +189,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 
 | ตัวแปร | ผล |
 | ------ | -- |
-| `LINE_DISABLE_GPU=1` | ข้าม Vulkan ทั้งหมด วาดลงพื้นผิวหน้าต่างของ SDL |
+| `LINE_DISABLE_GPU=1` | วาดลงพื้นผิวหน้าต่างของ SDL ถอดรหัสวิดีโอคอลด้วย libvpx และเข้ารหัสข้อความวิดีโอด้วยซอฟต์แวร์ |
 | `AVERNELLA_VULKAN=sdl` | ข้ามโมดูลเนทีฟ แต่ยังลองตัววาด Vulkan ของ SDL |
 | `AVERNELLA_VK_DESCRIPTORS=buffer` | ให้โมดูลเนทีฟใช้ descriptor buffer แทน descriptor heap |
 | `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` | เลือก GPU ด้วย DRM render node บนไดรเวอร์ที่เปิดเผยคุณสมบัติ DRM |

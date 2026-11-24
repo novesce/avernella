@@ -179,8 +179,8 @@ struct เดียวชื่อ `Interface ui` (ประกาศใน [`ui
 - **คัดลอกรูป:** ใส่ PNG ลงคลิปบอร์ด (`image_clipboard()` ก็ต้องใช้ SDL3 เช่นกัน)
 - **ตัวดูรูป:** `picture()` ขอรูปเต็มด้วย `photo` แล้วแสดง ทิศทางจาก EXIF ของ JPEG ถูกนำมาใช้ (`exif_orientation()`)
 - **ภาพย่อ:** `ui_media_thumb()` พร้อมแคชที่มีขอบเขต (`reserve_thumbnail()`, `evict_thumbnail()`)
-- **วิดีโอ:** `open_video()` ขอไฟล์ด้วย `openVideo` แล้วเล่นด้วย `ffplay` ผ่าน [`video_play.c`](../../src/video_play.c) การ์ดวิดีโอแสดงภาพตัวอย่างจาก `videoPoster` ถ้า LINE มีให้
-- **คลิปวิดีโอจากกล้อง:** **Record video** ใช้ [`video_record.c`](../../src/video_record.c) ซึ่งรัน `ffmpeg` กับ V4L2 และ PulseAudio เพื่อเขียน MP4 แบบ H.264/AAC ลงไฟล์ส่วนตัว คุณดูทวนแล้วค่อยส่ง
+- **วิดีโอ:** `open_video()` ขอไฟล์ด้วย `openVideo` แล้วเล่นด้วย `ffplay` ผ่าน [`video_play.c`](../../src/video_play.c) การ์ดวิดีโอแสดงภาพตัวอย่างจาก `videoPoster` ถ้า LINE มีให้ เมื่อใช้ตัววาด Vulkan แบบเนทีฟ FFplay จะแสดงคลิปบน GPU ที่แอปเลือก และถอดรหัสด้วย NVDEC บน NVIDIA หรือ Vulkan Video บน AMD และ Intel เมื่อไดรเวอร์รองรับ
+- **คลิปวิดีโอจากกล้อง:** **Record video** ใช้ [`video_record.c`](../../src/video_record.c) ซึ่งรัน `ffmpeg` กับ V4L2 และ PulseAudio เพื่อเขียน MP4 แบบ H.264/AAC ลงไฟล์ส่วนตัว คุณดูทวนแล้วค่อยส่ง บน NVIDIA แอปจะทดสอบ H.264 NVENC ก่อนเปิดกล้อง และใช้ตัวเข้ารหัสซอฟต์แวร์หากเริ่มตัวเข้ารหัสฮาร์ดแวร์ไม่ได้
 - **ภาพหน้าจอ:** Ctrl+Alt+S หรือ **Take screenshot** ในเครื่องมือแชต [`screenshot.c`](../../src/screenshot.c) ขอผ่าน portal Screenshot ของ XDG และผลลัพธ์เปิดเป็นไฟล์แนบ
 - **การบันทึก:** Save เขียนข้อมูลที่ดาวน์โหลดผ่าน `saveFile` โดยใช้ `line_save_media()` ใน worker ซึ่ง rename แบบ atomic
 

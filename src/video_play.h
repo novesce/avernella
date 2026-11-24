@@ -5,12 +5,17 @@
 typedef struct line_video_playback LineVideoPlayback;
 typedef void (*LineVideoDone)(const char *error, gpointer data);
 
+struct line_video_gpu {
+	const char *name;
+	guint vendor;
+};
+
 /*
  * Takes ownership of fd, including on failure. The callback runs on the
  * monitor thread with an error valid for the duration of the call, or NULL
  * on normal playback completion. Vulkan playback can fall back to software.
  */
-LineVideoPlayback *line_video_play(int fd, gboolean use_vulkan,
+LineVideoPlayback *line_video_play(int fd, const struct line_video_gpu *gpu,
 				   LineVideoDone done, gpointer data,
 				   GError **error);
 

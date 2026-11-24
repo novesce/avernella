@@ -55,6 +55,11 @@ typedef void (*call_pdtp_event_fn)(guint64 stream, const char *service,
 struct call_pdtp *call_pdtp_open(const guint8 tx[30], const guint8 rx[30],
 				 guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
 				 GError **error);
+/* Group DATA negotiates ACK timing and acknowledges received packets. */
+struct call_pdtp *call_pdtp_open_group(const guint8 tx[30], const guint8 rx[30],
+				       guint8 pt, guint32 tx_ssrc,
+				       guint32 rx_ssrc, GError **error);
+gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *pdtp);
 void call_pdtp_close(struct call_pdtp *pdtp);
 void call_pdtp_set_trace(struct call_pdtp *pdtp, gboolean trace);
 void call_pdtp_set_handlers(struct call_pdtp *pdtp, call_pdtp_stream_fn data,

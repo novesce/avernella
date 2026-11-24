@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Waiting for incoming media…",
+	  "상대방의 음성 또는 영상을 기다리는 중…" },
+	{ "Waiting for playback…", "재생 대기 중…" },
+	{ "LINE sees this account in a call on another device. End that call before joining here.",
+	  "LINE에서 이 계정이 다른 기기로 통화 중인 것으로 확인됩니다. 해당 기기에서 통화를 종료한 후 여기에서 참여하세요." },
 	{ "%-m/%-d", "%-m. %-d." },
 	{ "%B %e, %Y", "%Y년 %B %-d일" },
 	{ "%Y/%-m/%-d", "%Y. %-m. %-d." },

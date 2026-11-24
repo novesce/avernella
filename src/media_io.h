@@ -3,6 +3,13 @@
 #include "line.h"
 struct line_camera_frame;
 
+/* Group receive progress sent once per transition over the worker IPC. */
+enum line_media_reception {
+	LINE_MEDIA_WAITING,
+	LINE_MEDIA_RECEIVING,
+	LINE_MEDIA_PLAYABLE,
+};
+
 enum line_preview_source {
 	LINE_PREVIEW_SCREEN,
 	LINE_PREVIEW_REMOTE,

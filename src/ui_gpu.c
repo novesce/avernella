@@ -5,10 +5,27 @@
 
 static void *module, *state;
 static const struct gpu_backend *api;
+static struct gpu_device_info device;
+static int render_minor = -1;
 
 bool ui_gpu_active(void)
 {
 	return state != NULL;
+}
+
+const char *ui_gpu_device_name(void)
+{
+	return device.name[0] ? device.name : NULL;
+}
+
+uint32_t ui_gpu_device_vendor(void)
+{
+	return device.vendor;
+}
+
+int ui_gpu_render_minor(void)
+{
+	return render_minor;
 }
 
 void ui_gpu_close(void)
@@ -17,6 +34,8 @@ void ui_gpu_close(void)
 		api->close(state);
 	state = NULL;
 	api = NULL;
+	device = (struct gpu_device_info){ 0 };
+	render_minor = -1;
 	if (module)
 		dlclose(module);
 	module = NULL;
@@ -29,7 +48,7 @@ static bool load_module(void)
 	if (!exe)
 		return false;
 	g_autofree char *dir = g_path_get_dirname(exe);
-	const char *folders[] = { ".", "../lib/avernella" };
+	static const char *const folders[] = { ".", "../lib/avernella" };
 
 	for (size_t i = 0; i < G_N_ELEMENTS(folders); i++) {
 		g_autofree char *path = g_build_filename(
@@ -55,10 +74,21 @@ SDL_Window *ui_gpu_window(const char *title, int x, int y, int w, int h,
 			title, x, y, w, h, flags | SDL_WINDOW_VULKAN);
 
 		bool log = !g_strcmp0(g_getenv("LINE_RENDER_LOG"), "1");
+
 		if (window)
 			state = api->open(window, log);
-		if (state)
+		if (state) {
+			const struct gpu_device_query *query =
+				dlsym(module, "avernella_gpu_device_v1");
+			const struct gpu_drm_query *drm =
+				dlsym(module, "avernella_gpu_drm_v1");
+
+			if (query)
+				query->get(state, &device);
+			if (drm)
+				render_minor = drm->render_minor(state);
 			return window;
+		}
 		if (log)
 			g_printerr(
 				"Avernella: native Vulkan unavailable, trying SDL\n");

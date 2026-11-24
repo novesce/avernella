@@ -735,13 +735,12 @@ void ui_layout(void)
 		ui.find_button = (Rect){ icon_x, 8, 32, 32 };
 		icon_x -= 40;
 	}
-	if (ui_media_can_call()) {
-		if (ui.video_calls) {
-			ui.video = (Rect){ icon_x, 8, 32, 32 };
-			icon_x -= 40;
-		}
-		ui.call = (Rect){ icon_x, 8, 32, 32 };
+	if (ui_media_can_call(TRUE)) {
+		ui.video = (Rect){ icon_x, 8, 32, 32 };
+		icon_x -= 40;
 	}
+	if (ui_media_can_call(FALSE))
+		ui.call = (Rect){ icon_x, 8, 32, 32 };
 	/* One rounded composer holds attach, the text, emoji and send. */
 	ui.composer = (Rect){ chat_x + 16, h - 68, w - chat_x - 32, 44 };
 	Rect c = ui.composer;
@@ -792,8 +791,8 @@ void ui_layout(void)
 		       (stage_motion.end - stage_motion.start);
 		left = left * left * left;
 	}
-	double shown = stage_motion.to +
-		       (stage_motion.from - stage_motion.to) * left;
+	double shown =
+		stage_motion.to + (stage_motion.from - stage_motion.to) * left;
 
 	if (target != (int)stage_motion.to) {
 		stage_motion.from = shown;
@@ -1820,8 +1819,9 @@ static void chats_panel(void)
 			ui.chats, g_array_index(ui.visible, guint, i));
 		const char *id = ui_string(c, "id", ""),
 			   *name = ui_string(c, "name", id);
-		Rect row = line_style ? (Rect){ rail, y, s - rail, row_h } :
-					(Rect){ rail + 8, y + 1, s - rail - 16, 42 };
+		Rect row = line_style ?
+				   (Rect){ rail, y, s - rail, row_h } :
+				   (Rect){ rail + 8, y + 1, s - rail - 16, 42 };
 		gboolean selected = ui_compact() && ui.focus == F_LIST ?
 					    (int)i == ui.list_cursor :
 					    !friends_open &&
@@ -1918,7 +1918,7 @@ struct message_layout {
 	struct ui_flex_layout *flex;
 	int y, w, h, top; /* top: offset of the message below any divider */
 	int x, body_top, body_h, text_origin;
-	gboolean mine, group, photo, video, rich, receipt;
+	gboolean mine, group, photo, video, rich, receipt, notice;
 	Json *message; /* borrowed from the cached history */
 };
 
@@ -2053,8 +2053,9 @@ static void prepare_bubbles(Rect area)
 			ui_string(msg, "senderId", ui_string(msg, "from", ""));
 		struct message_layout row = { .y = cache.height,
 					      .message = msg };
+		row.notice = ui_is_chat_event(msg);
 		row.mine = json_object_get_boolean(ui_field(msg, "own"));
-		row.receipt = row.mine && ui.selected &&
+		row.receipt = !row.notice && row.mine && ui.selected &&
 			      g_strcmp0(ui.selected, ui.self_id) &&
 			      ui_read_id(ui_string(msg, "id", NULL));
 		if (row.receipt && !cache.sent) {
@@ -2089,6 +2090,29 @@ static void prepare_bubbles(Rect area)
 				ui_lang_date(dt, _("%B %e, %Y"));
 			/* Unbounded, so the pill can centre RTL text too. */
 			row.date = layout(date, 12, 600, -1, FALSE);
+		}
+		if (row.notice) {
+			int width = MIN(640, MAX(1, area.w - 2 * CHAT_MARGIN));
+			PangoRectangle logical;
+
+			row.body = layout(ui_string(msg, "text", ""), 13, 500,
+					  width, TRUE);
+			pango_layout_set_alignment(row.body,
+						   PANGO_ALIGN_CENTER);
+			pango_layout_get_pixel_extents(row.body, NULL,
+						       &logical);
+			row.top = row.date ? DIVIDER_H : 0;
+			row.body_top = row.top + 4;
+			row.w = logical.width;
+			row.x = (area.w - row.w) / 2;
+			row.body_h = logical.height;
+			row.text_origin = -logical.x;
+			row.h = row.body_top + row.body_h + 6;
+			cache.height += row.h;
+			g_array_append_val(cache.rows, row);
+			last_date = local_day;
+			last = NULL;
+			continue;
 		}
 		if (dt) {
 			g_autofree char *hm = g_date_time_format(dt, "%H:%M");
@@ -2290,7 +2314,7 @@ Json *ui_sender_at(int x, int y, Rect *anchor)
 {
 	struct message_layout *r = bubble_at(x, y);
 
-	if (!r || r->group || (cache.line_style && r->mine))
+	if (!r || r->notice || r->group || (cache.line_style && r->mine))
 		return NULL;
 	Rect area = ui.conversation;
 	int top = area.y + r->y - ui.history_offset + r->top + 2;
@@ -2321,7 +2345,7 @@ Json *ui_row_at(int x, int y)
 {
 	struct message_layout *row = bubble_at(x, y);
 
-	if (row && cache.line_style) {
+	if (row && (cache.line_style || row->notice)) {
 		Rect body = message_rect(row, ui.conversation);
 
 		if (!contains_point(body, x, y) &&
@@ -2760,6 +2784,10 @@ static void message_rows(Rect area)
 			}
 			paint(r->date, left, mid - 8, UI_SUBTLE);
 		}
+		if (r->notice) {
+			paint(r->body, x + r->text_origin, body.y, UI_MUTED);
+			continue;
+		}
 		y += r->top;
 		Rect bg = { area.x, y, area.w, r->h - r->top };
 
@@ -3151,6 +3179,7 @@ static void chat_view(void)
 		Json *chat = ui_selected_chat();
 		const char *name = ui_string(chat, "name", ui.selected);
 		int right = ui.call.w	     ? ui.call.x :
+			    ui.video.w	     ? ui.video.x :
 			    ui.find_button.w ? ui.find_button.x :
 			    ui.members.w     ? ui.members.x :
 					       ui.chat_tools.x;
@@ -3185,11 +3214,10 @@ static void chat_view(void)
 			    ui.focus == F_FIND_TEXT);
 	if (ui.groups && ui.selected && *ui.selected == 'c' && ui.members.w)
 		header_icon(ui.members, ICON_MEMBERS, ui.focus == F_MEMBERS);
-	if (ui_media_can_call()) {
+	if (ui.call.w)
 		header_icon(ui.call, ICON_CALL, FALSE);
-		if (ui.video_calls)
-			header_icon(ui.video, ICON_VIDEO, FALSE);
-	}
+	if (ui.video.w)
+		header_icon(ui.video, ICON_VIDEO, FALSE);
 	if (!ui.selected)
 		empty_chat();
 	else {

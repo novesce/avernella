@@ -46,6 +46,7 @@ endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync tune http_tune
+SOURCES += call_group call_vp8
 SOURCES += chat_lists shared_content ui_chat_lists ui_chat_tools ui_shared_content ui_notifications screenshot
 SOURCES += ui_tray ui_logo video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
 SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu ui_theme ui_lang
@@ -73,6 +74,7 @@ CHECKPATCH_TEST_FLAGS = $(CHECKPATCH_FLAGS) --ignore SPLIT_STRING,MISSING_SPACE
 TESTS = build/test-thrift build/test-state build/test-sealing build/test-messaging build/test-pair build/test-transport build/test-media build/test-call build/test-audio build/test-media-io build/test-obs build/test-video-record build/test-ui-motion build/test-ui-pixels build/test-emoji-message build/test-ui-apng build/test-emoji build/test-ui-emoji
 TESTS += build/test-friends build/test-groups build/test-ui-friends build/test-ui-read
 TESTS += build/test-stickers build/test-call-video
+TESTS += build/test-call-group build/test-pdtp
 TESTS += build/test-chat-lists build/test-shared-content build/test-ui-tray
 TESTS += build/test-video-play build/test-talk-sync build/test-live-sync
 TESTS += build/test-flex-asset build/test-ui-flex
@@ -200,8 +202,31 @@ build/test-ui-apng: tests/ui_apng.c build/ui_apng.o build/ui_pixels.o
 build/test-emoji: tests/emoji.c build/emoji.o
 build/test-media: tests/media.c build/media.o build/media_crypto.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
 build/test-call: LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_QueueAudio
-build/test-call: tests/call.c build/call.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o
+build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o
+build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
+build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/camera_pixels.o
+build/test-call build/test-call-video: build/call_vp8.o
+build/test-call-video: private CPPFLAGS += -Ibuild
+# The renderer accepts I420 frames from either decoder.
+CALL_HWDECODE_PKGS = libavcodec libavutil
+CALL_HWDECODE ?= $(shell pkg-config --exists $(CALL_HWDECODE_PKGS) && echo 1 || echo 0)
+ifeq ($(CALL_HWDECODE),1)
+build/call_vp8.o build/test-call-video: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
+build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwframe_transfer_data
+build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwdevice_ctx_create,--wrap=g_file_read_link,--wrap=g_file_get_contents
+avernella build/test-call build/test-call-video: private LDLIBS += $(shell pkg-config --libs $(CALL_HWDECODE_PKGS))
+endif
+CALL_HWDECODE_DEFINE := \#define CALL_HWDECODE $(CALL_HWDECODE)
+ifneq ($(file <build/call_hwdecode_config.h),$(CALL_HWDECODE_DEFINE))
+.PHONY: force-hwdecode-config
+build/call_hwdecode_config.h: force-hwdecode-config
+endif
+build/call_hwdecode_config.h: | build
+	@printf '%s\n' '$(CALL_HWDECODE_DEFINE)' > $@.tmp
+	mv -f $@.tmp $@
+build/call_vp8.o: private CPPFLAGS += -Ibuild
+build/call_vp8.o: build/call_hwdecode_config.h
 # GCC vectorizes the per-pixel inner loop while keeping the rest of the
 # portable release built for size. Preserve explicit debug/sanitizer flags.
 build/ui_pixels.o: CFLAGS += -O3
@@ -214,7 +239,7 @@ build/test-ui-pixels: tests/ui_pixels.c build/ui_pixels.o build/ui_gpu_scroll.o
 build/test-ui-motion: tests/ui_motion.c build/ui_motion.o
 build/test-ui-theme: tests/ui_theme.c build/ui_theme.o
 build/test-ui-lang: tests/ui_lang.c $(UI_LANG_OBJECTS)
-build/test-audio: LDFLAGS += -Wl,--wrap=SDL_QueueAudio
+build/test-audio: LDFLAGS += -Wl,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
 build/test-audio: tests/call_audio.c build/call_audio.o build/call_srtp.o build/call_denoise.o
 build/test-video-record: CPPFLAGS += -DLINE_RECORD_TEST
 build/test-video-record: tests/video_record.c src/video_record.c
