@@ -33,6 +33,7 @@ enum {
 	EVS3_PROFILE_HEADER = 6,
 	EVS3_CAPTURE_SOURCE_SIZE = 6,
 	EVS3_SOURCE_CAMERA = 0,
+	GROUP_SCREEN_CLASS = 3, /* HD_FHD, up to 1920x1440 pixels */
 	EVS3_ENCODE_DELAY_SIZE = 4,
 	EVS3_BASE_LAYER_SIZE = 3,
 	EVS3_RTP_VFD_SIZE = 12,
@@ -630,6 +631,13 @@ static gboolean group_encoder_image(struct call_video *v, vpx_image_t *img)
 		guint source = resolution_class(w * h);
 		guint target = v->requested_resolution;
 
+		/*
+		 * Grid tiles request small layers, which make shared text
+		 * unreadable. The relay still forwards the HD layer and LINE
+		 * Android displays it, so a shared screen never goes below it.
+		 */
+		if (v->screen_kbps)
+			target = MAX(target, (guint)GROUP_SCREEN_CLASS);
 		/*
 		 * Fill the requested class with the source's shape. LINE
 		 * Android displays any size within the class, so a grid tile

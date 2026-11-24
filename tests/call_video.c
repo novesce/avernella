@@ -1067,6 +1067,54 @@ static void group_resolution_aspect(void)
 	done(&loop);
 }
 
+/* A shared screen keeps the HD layer for a viewer that requested a grid
+ * tile, while the camera on the same stream fills the smaller class. */
+static void group_screen_resolution(void)
+{
+	static const struct {
+		guint screen_kbps, width, height, descriptor;
+	} cases[] = {
+		{ 3000, 1280, 720, 3 },
+		{ 0, 554, 310, 1 },
+		{ 3000, 1280, 720, 3 },
+	};
+	struct loop loop = { 0 };
+	struct expected_image expected = { 0 };
+	g_autofree guint8 *image = g_malloc(line_camera_i420_size(1280, 720));
+
+	loop.tx = call_video_open_group_tx(key_a, 121, 101, 3000, 30, NULL);
+	loop.rx = call_video_open_group_rx(key_a, 121, 101, NULL);
+	loop.packets =
+		g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+	g_assert_nonnull(loop.tx);
+	g_assert_nonnull(loop.rx);
+	call_video_set_group_format(loop.tx, CALL_VIDEO_RTP_EXT_VED, TRUE);
+	call_video_set_group_resolution(loop.tx, 1);
+	line_camera_i420_frame(&loop.frame, image, 1280, 720);
+	for (guint j = 0; j < 3; j++)
+		memset((guint8 *)loop.frame.plane[j], 64 + j * 40,
+		       (gsize)loop.frame.stride[j] * (720 >> !!j));
+	for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+		call_video_screen(loop.tx, cases[i].screen_kbps, 10);
+		expected.width = cases[i].width;
+		expected.height = cases[i].height;
+		encode(&loop, 1000000 + i * G_USEC_PER_SEC);
+		g_assert_cmpuint(loop.packets->len, >, 0);
+		for (guint j = 0; j < loop.packets->len; j++) {
+			gsize n;
+			const guint8 *p =
+				g_bytes_get_data(loop.packets->pdata[j], &n);
+
+			g_assert_cmpuint(n, >, 32);
+			g_assert_cmpuint(p[23] >> 5, ==, cases[i].descriptor);
+			g_assert_true(call_video_receive(
+				loop.rx, p, n, check_resolution, &expected));
+		}
+		g_assert_cmpuint(expected.frames, ==, i + 1);
+	}
+	done(&loop);
+}
+
 struct group_test_format {
 	enum call_video_rtp_extension extension;
 	gboolean vp8a;
@@ -2314,6 +2362,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/video/conference-resolution", group_resolution);
 	g_test_add_func("/video/conference-resolution-aspect",
 			group_resolution_aspect);
+	g_test_add_func("/video/conference-screen-resolution",
+			group_screen_resolution);
 	g_test_add_func("/video/conference-thumbnail-rate",
 			group_thumbnail_rate);
 	static const struct group_test_format formats[] = {
