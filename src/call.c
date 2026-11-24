@@ -285,22 +285,6 @@ static gboolean send_to(struct voice_call *c, const struct call_endpoint *to,
 	return n == (ssize_t)pkt.n;
 }
 
-static void format_endpoint(const struct call_endpoint *e, char *out,
-			    gsize size)
-{
-	char host[INET6_ADDRSTRLEN] = "?";
-	const struct sockaddr_in *v4 = (const void *)&e->addr;
-	const struct sockaddr_in6 *v6 = (const void *)&e->addr;
-	gboolean ip4 = e->addr.ss_family == AF_INET;
-
-	inet_ntop(e->addr.ss_family,
-		  ip4 ? (const void *)&v4->sin_addr :
-			(const void *)&v6->sin6_addr,
-		  host, sizeof(host));
-	g_snprintf(out, size, "%s:%d", host,
-		   ntohs(ip4 ? v4->sin_port : v6->sin6_port));
-}
-
 static void media_received(struct voice_call *c, struct media_route *route,
 			   const struct call_endpoint *source)
 {
@@ -309,16 +293,11 @@ static void media_received(struct voice_call *c, struct media_route *route,
 	c->deadline = now + 90 * G_USEC_PER_SEC;
 	if (c->video_trace.enabled && !equal_address(&route->current, source) &&
 	    !route->reported_mismatch) {
-		char from[INET6_ADDRSTRLEN + 8], to[INET6_ADDRSTRLEN + 8];
-
 		route->reported_mismatch = TRUE;
-		format_endpoint(source, from, sizeof(from));
-		format_endpoint(&route->current, to, sizeof(to));
-		g_printerr("line-call %s arrives from %s, sending to %s\n",
+		g_printerr("line-call %s arrived on a different route\n",
 			   route == &c->audio_route ? "audio" :
 			   route == &c->data_route  ? "data" :
-						      "video",
-			   from, to);
+						      "video");
 	}
 	if (equal_address(&route->current, source)) {
 		route->last_received = now;
@@ -336,27 +315,13 @@ static void media_received(struct voice_call *c, struct media_route *route,
 		route->previous = route->current;
 		route->current = *source;
 		route->last_received = now;
-		if (c->video_trace.enabled) {
-			char host[INET6_ADDRSTRLEN] = "?";
-			const struct sockaddr_in *v4 =
-				(const void *)&source->addr;
-			const struct sockaddr_in6 *v6 =
-				(const void *)&source->addr;
-			int port = source->addr.ss_family == AF_INET ?
-					   ntohs(v4->sin_port) :
-					   ntohs(v6->sin6_port);
-
-			inet_ntop(source->addr.ss_family,
-				  source->addr.ss_family == AF_INET ?
-					  (const void *)&v4->sin_addr :
-					  (const void *)&v6->sin6_addr,
-				  host, sizeof(host));
-			g_printerr("line-call %s route now %s:%d\n",
+		if (c->video_trace.enabled)
+			g_printerr("line-call %s route changed to %s\n",
 				   route == &c->audio_route ? "audio" :
 				   route == &c->data_route  ? "data" :
 							      "video",
-				   host, port);
-		}
+				   source->addr.ss_family == AF_INET ? "IPv4" :
+								       "IPv6");
 	}
 }
 
@@ -700,22 +665,11 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 			gsize size, gpointer user)
 {
 	struct voice_call *c = user;
-	const char *dump = g_getenv("LINE_CALL_PDTP_DUMP");
-
 	(void)offset;
 	(void)time;
-	/* Debug aid: append each in-order stream to DIR/SERVICE-STREAM.bin. */
-	if (c->video_trace.enabled && dump && *dump) {
-		g_autofree char *name =
-			g_strdup_printf("%s/%s-%" G_GUINT64_FORMAT ".bin", dump,
-					service, stream);
-		FILE *f = fopen(name, "ab");
-
-		if (f) {
-			fwrite(bytes, 1, size, f);
-			fclose(f);
-		}
-	}
+	if (c->video_trace.enabled)
+		call_pdtp_dump_stream(g_getenv("LINE_CALL_PDTP_DUMP"), service,
+				      stream, bytes, size);
 	if (strcmp(service, "PLANET"))
 		return;
 	if (stream == SHARE_CONTROL_STREAM) {
@@ -1221,35 +1175,6 @@ static void camera_state(struct voice_call *c)
 	c->reported_video = streaming;
 }
 
-static void trace_hex(const char *label, Slice data)
-{
-	g_autoptr(GString) hex = g_string_new(NULL);
-
-	for (gsize i = 0; i < data.n; i++)
-		g_string_append_printf(hex, "%02x", data.p[i]);
-	g_printerr("line-call %s %s\n", label, hex->str);
-}
-
-/* Prints only the video media records, which carry no key material. */
-static void trace_video_description(Slice description)
-{
-	PbField record;
-
-	while (description.n && pb_next(&description, &record)) {
-		if (record.field != 1 || record.type != 2)
-			continue;
-		Slice name = pb_data(pb_data(record.data, 1), 1);
-
-		if (name.n != 1 || *name.p != 'V')
-			continue;
-		g_autoptr(GString) hex = g_string_new(NULL);
-
-		for (gsize i = 0; i < record.data.n; i++)
-			g_string_append_printf(hex, "%02x", record.data.p[i]);
-		g_printerr("line-call video description %s\n", hex->str);
-	}
-}
-
 /*
  * Send the best picture the peer accepts. The bitrate decides how many
  * pixels it can keep sharp, and the resolution class caps the frame size.
@@ -1320,8 +1245,6 @@ static gboolean setup_video(struct voice_call *c, Slice offer, Slice key,
 		offer = PB_SLICE(answer);
 	}
 	if (!call_video_profile(offer, &pt, &local_ssrc, &remote_ssrc)) {
-		if (c->video_trace.enabled)
-			trace_video_description(offer);
 		set_error(
 			error,
 			"The peer did not select the supported LINE VP8 video profile.");
@@ -1357,20 +1280,6 @@ static void setup_data(struct voice_call *c, Slice offer, Slice key,
 	if (c->incoming) {
 		call_answer_offer(&answer, &c->info);
 		offer = PB_SLICE(answer);
-	}
-	if (c->video_trace.enabled) {
-		PbField record;
-		Slice rest = offer;
-
-		while (rest.n && pb_next(&rest, &record)) {
-			Slice name = pb_data(pb_data(record.data, 1), 1);
-
-			if (record.field == 1 && name.n == 1 && *name.p == 'D')
-				trace_hex(c->incoming ?
-						  "answered data session" :
-						  "answer data session",
-					  record.data);
-		}
 	}
 	if (!call_session_rtp(offer, 'D', &pt, &local, &remote))
 		return;
@@ -1722,7 +1631,6 @@ static gboolean mc_request(struct voice_call *c,
 			(guint)pb_number(req, 3, 0), data.n,
 			data.n >= 12 ? data.p[8] << 8 | data.p[9] : -1,
 			data.n >= 16 ? data.p[14] << 8 | data.p[15] : -1);
-		trace_hex("media data", data);
 	}
 	if (choice == 16) {
 		pb_uint(&rsp, 2, 0);
@@ -2588,11 +2496,6 @@ static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 	if (c->video_trace.enabled && (plane != 4 || msg.field != 16))
 		g_printerr("line-call control plane=%u message=%u\n", plane,
 			   msg.field);
-	/* Feature-set messages carry the peer's shared camera status. */
-	if (c->video_trace.enabled && plane == 3 &&
-	    (msg.field == 17 || msg.field == 18))
-		trace_hex(msg.field == 17 ? "feature set" : "feature set reply",
-			  msg.data);
 	if (plane == 4) {
 		if (c->audio &&
 		    (msg.field == 9 || msg.field == 11 || msg.field == 16))
@@ -2635,22 +2538,9 @@ static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 		c->info.audio_payload = audio.pt;
 		/* Answer the data session with the payload type it offered. */
 		c->info.data_payload = call_session_payload(offer, 'D');
-		if (c->video_trace.enabled) {
-			PbField record;
-			Slice rest = offer;
-
+		if (c->video_trace.enabled)
 			g_printerr("line-call offered data payload=%u\n",
 				   c->info.data_payload);
-			while (rest.n && pb_next(&rest, &record)) {
-				Slice name =
-					pb_data(pb_data(record.data, 1), 1);
-
-				if (record.field == 1 && name.n == 1 &&
-				    *name.p == 'D')
-					trace_hex("offered data session",
-						  record.data);
-			}
-		}
 		if (c->info.video_capable) {
 			guint8 video_pt;
 			guint32 video_ssrc, remote_ssrc;
@@ -2790,10 +2680,8 @@ static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 				(guint)pb_number(msg.data, 2, 0),
 				(guint)pb_number(msg.data, 3, 0),
 				(guint)pb_number(msg.data, 5, 0), contents.n);
-			trace_hex("big data", contents);
 			g_printerr("line-call big data request id=0x%x\n",
 				   (guint)pb_number(hdr, 2, 0));
-			trace_hex("big data request", msg.data);
 		}
 		/* Our own feature-share messages reuse its ID and services. */
 		c->big_data_id = (guint)pb_number(hdr, 2, 0);

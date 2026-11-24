@@ -124,9 +124,9 @@ make checkpatch CHECKPATCH=/usr/lib/modules/<version>/build/scripts/checkpatch.p
 | `LINE_DEBUG_SYNC=1` | Report each long-poll sync round |
 | `LINE_DEBUG_TIMING=1` | Print `line-timing <method> <ms>` for each worker request |
 | `LINE_DEBUG_MEDIA=1` | Report failed image downloads with their HTTP status and decode errors |
-| `LINE_DEBUG_LIFF=1` | Print a LINE app page's console and native-bridge calls, without the page address, which carries tokens |
+| `LINE_DEBUG_LIFF=1` | Report WebKit load stages and supported native-bridge operation names |
 | `LINE_CALL_DEBUG=1` | Report call negotiation, control messages, packet counts and first frames |
-| `LINE_CALL_PDTP_DUMP=<dir>` | Append each in-order PDTP call stream to `<dir>/<service>-<stream>.bin` for analysis |
+| `LINE_CALL_PDTP_DUMP=<dir>` | With `LINE_CALL_DEBUG=1`, save raw LINE and PLANET streams, which may include a screen share, in an existing owner-only directory (mode 0700) |
 | `LINE_EXPERIMENTAL_VIDEO=0` | Turn off video calls |
 | `LINE_NOISE_SUPPRESSION=0` | Send the raw microphone in calls, without RNNoise |
 | `LINE_CALL_VIDEO_KBPS` | Override the video sending bitrate |
@@ -144,7 +144,7 @@ make checkpatch CHECKPATCH=/usr/lib/modules/<version>/build/scripts/checkpatch.p
 
 - **Worker failures** show in the status line, the request's error text. Run with `LINE_DEBUG_TIMING=1` to see which request failed or was slow.
 - **A blank card picture:** run with `LINE_DEBUG_MEDIA=1`.
-- **A LINE app that stays on its loading screen:** run with `LINE_DEBUG_LIFF=1` and open it again. The SDK's own console messages usually say what it's waiting for.
+- **A LINE app that stays on its loading screen:** run with `LINE_DEBUG_LIFF=1` and open it again. Check the last load stage and whether the bridge reported an unsupported operation.
 - **Stepping through code:** build with `DEBUG=1`, then attach `gdb` to the UI or to `avernella --worker`.
 - **Testing `avernella-liff` alone:** start it with a `SOCK_SEQPACKET` socket on fd 3 and the parent PID as its only argument, then send it `L full <url>` datagrams. With `LINE_DEBUG_LIFF=1` it also loads pages from `http://127.0.0.1:<port>/`, so a local page that loads the real LIFF SDK can test the bridge.
 

@@ -35,7 +35,8 @@ Optional pieces, each detected automatically:
 | WebKitGTK browser | `webkitgtk-6.0` | No `avernella-liff-gtk`. With neither browser, links open in the system browser. |
 | Native Vulkan renderer | `glslangValidator`, `spirv-val`, Vulkan headers that declare `VK_EXT_descriptor_heap`, and volk (`/usr/include/volk.c` or `-lvolk`) | No `avernella-vulkan.so`. The app draws through SDL instead. |
 | ZBar | `libzbar.so.0` at run time, loaded by `dlopen` in [`qr_scan.c`](../../src/qr_scan.c) | **Read QR image** is unavailable. |
-| Hardware call decoding | FFmpeg development headers for `libavcodec` and `libavutil` (Ubuntu packages `libavcodec-dev libavutil-dev`, Arch package `ffmpeg`) | VP8 calls decode with libvpx. Set `CALL_HWDECODE=0` to build this configuration explicitly. |
+| Hardware VP8 calls | FFmpeg development headers for `libavcodec` and `libavutil` (Ubuntu packages `libavcodec-dev libavutil-dev`, Arch package `ffmpeg`) | libvpx handles calls in software. Set `CALL_HWCODECS=0` to disable the FFmpeg call backends. The older `CALL_HWDECODE=0` switch also works. |
+| Jetson VP8 encoder | On AArch64 the build detects `gstreamer-app-1.0` and `gstreamer-video-1.0`. Jetson Nano and TX2 use the JetPack `nvvidconv` and `nvv4l2vp8enc` plugins. | The other encoders remain available. Set `CALL_VP8_JETSON=0` to omit the Jetson backend. |
 | FFmpeg | `ffmpeg`, `ffplay`, `ffprobe` executables | No camera video messages or video playback, and the recording tests fail. |
 | XDG desktop portal | `xdg-desktop-portal` with a backend for your desktop | No screenshots or screen sharing. |
 
@@ -165,10 +166,10 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `LINE_DEBUG_TIMING=1` | Prints `line-timing <method> <ms>` for every worker request | `handle()` in `main.c` |
 | `LINE_DEBUG_SYNC=1` | Prints each long-poll round: result, duration, operation count | `live_sync.c` |
 | `LINE_DEBUG_SESSION=1` | Reports token renewals and protocol replies it can't decode | `maintain_tokens()` in `main.c`, `line_decode_reply()` in `thrift.c` |
-| `LINE_DEBUG_MEDIA=1` | Reports each Flex or rich-message picture that failed: address, HTTP status, decode error | `flex_asset.c`, `ui_media.c` |
-| `LINE_DEBUG_LIFF=1` | Prints a LINE app page's console and each native-bridge call (never the page address, which carries tokens). Also lets the browser load `http://127.0.0.1:<port>/` pages for local testing. | `liff_browser.c` |
+| `LINE_DEBUG_MEDIA=1` | Reports the failure stage, transfer status and byte count for Flex and rich-message pictures | `flex_asset.c`, `ui_media.c` |
+| `LINE_DEBUG_LIFF=1` | Reports WebKit load stages and the names of supported bridge operations. Other operations appear as `unsupported`. Also lets the browser load `http://127.0.0.1:<port>/` pages for local testing. | `liff_browser.c` |
 | `LINE_CALL_DEBUG=1` | Reports call negotiation, control messages, packet counts every five seconds and first-frame milestones | `call.c`, `camera.c`, `ui_media.c` |
-| `LINE_CALL_PDTP_DUMP=<dir>` | Appends each in-order PDTP stream to `<dir>/<service>-<stream>.bin` | `call.c` |
+| `LINE_CALL_PDTP_DUMP=<dir>` | With `LINE_CALL_DEBUG=1`, stores raw LINE and PLANET stream data in an existing owner-only directory (mode 0700) | `call.c` |
 | `LINE_RENDER_LOG=1` | Says which renderer was chosen and why fallbacks happened | `ui_gpu.c`, `ui_draw.c` |
 
 ### Behavior
@@ -189,7 +190,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 
 | Variable | Effect |
 | -------- | ------ |
-| `LINE_DISABLE_GPU=1` | Uses the SDL window surface, libvpx call decoding and software video-message encoding |
+| `LINE_DISABLE_GPU=1` | Uses the SDL window surface, libvpx for incoming and outgoing call video, and software video-message encoding |
 | `AVERNELLA_VULKAN=sdl` | Skips the native module but still tries SDL's Vulkan renderer |
 | `AVERNELLA_VK_DESCRIPTORS=buffer` | Makes the native module use descriptor buffers instead of descriptor heaps |
 | `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` | Picks the GPU by DRM render node, on drivers that expose DRM properties |
@@ -207,7 +208,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 - **A request fails.** The error text from the worker appears in the status line at the top of the chat. Run with `LINE_DEBUG_TIMING=1` to see which request failed or was slow. A message such as "LINE declined sendMessage (service code 10)" carries LINE's own error number. [Protocol basics](protocol-basics.md#errors) explains the common codes.
 - **Messages arrive late.** Run with `LINE_DEBUG_SYNC=1`. Each long-poll round should take about 50 seconds when idle and return immediately when something happens.
 - **A card picture stays blank.** Run with `LINE_DEBUG_MEDIA=1`.
-- **A LINE app never finishes loading.** Run with `LINE_DEBUG_LIFF=1` and open it again. The page's own console messages usually say what it is waiting for.
+- **A LINE app never finishes loading.** Run with `LINE_DEBUG_LIFF=1` and open it again. Check whether the load reached `committed` and `finished`, and whether the bridge reported an unsupported operation.
 - **A call has no video.** Run with `LINE_CALL_DEBUG=1`.
 - **Stepping through code.** Build with `make clean && make DEBUG=1`. The window is the `avernella` process. The worker is a child process named `avernella --worker`; attach to it separately with `gdb -p $(pgrep -f 'avernella --worker')`. Because the worker exits when its parent dies (`PR_SET_PDEATHSIG`), killing the window also ends the worker.
 - **Testing `avernella-liff` alone.** Start it with a `SOCK_SEQPACKET` socket on file descriptor 3 and the parent PID as its only argument, then send it `L\tfull\t<url>` datagrams. With `LINE_DEBUG_LIFF=1` it also loads pages from `http://127.0.0.1:<port>/`, so a local page that loads the real LIFF SDK can exercise the bridge.

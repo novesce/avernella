@@ -35,7 +35,8 @@
 | เบราว์เซอร์ WebKitGTK | `webkitgtk-6.0` | ไม่มี `avernella-liff-gtk` ถ้าไม่มีเบราว์เซอร์เลย ลิงก์จะเปิดในเบราว์เซอร์ของระบบ |
 | ตัววาด Vulkan แบบเนทีฟ | `glslangValidator`, `spirv-val`, header ของ Vulkan ที่ประกาศ `VK_EXT_descriptor_heap` และ volk (`/usr/include/volk.c` หรือ `-lvolk`) | ไม่มี `avernella-vulkan.so` แอปจะวาดผ่าน SDL แทน |
 | ZBar | `libzbar.so.0` ตอนรัน โหลดด้วย `dlopen` ใน [`qr_scan.c`](../../src/qr_scan.c) | ใช้ **Read QR image** ไม่ได้ |
-| ถอดรหัสวิดีโอคอลด้วยฮาร์ดแวร์ | header ของ FFmpeg สำหรับ `libavcodec` และ `libavutil` (บน Ubuntu คือ `libavcodec-dev libavutil-dev` และบน Arch คือ `ffmpeg`) | แอปถอดรหัส VP8 ด้วย libvpx ตั้ง `CALL_HWDECODE=0` เพื่อเลือก build แบบนี้ |
+| เข้ารหัสและถอดรหัส VP8 สำหรับวิดีโอคอลด้วยฮาร์ดแวร์ | header ของ FFmpeg สำหรับ `libavcodec` และ `libavutil` (บน Ubuntu คือ `libavcodec-dev libavutil-dev` และบน Arch คือ `ffmpeg`) | แอปใช้ libvpx บน CPU ตั้ง `CALL_HWCODECS=0` เพื่อปิดการใช้ FFmpeg สำหรับวิดีโอคอล ตัวเลือกเดิม `CALL_HWDECODE=0` ยังใช้ได้ |
+| ตัวเข้ารหัส VP8 บน Jetson | บน AArch64 ระบบบิลด์จะตรวจหา `gstreamer-app-1.0` และ `gstreamer-video-1.0` ส่วน Jetson Nano และ TX2 ต้องมีปลั๊กอิน `nvvidconv` และ `nvv4l2vp8enc` ของ JetPack | ตั้ง `CALL_VP8_JETSON=0` เพื่อบิลด์โดยปิดส่วนนี้ |
 | FFmpeg | โปรแกรม `ffmpeg`, `ffplay`, `ffprobe` | อัดคลิปจากกล้องและเล่นวิดีโอไม่ได้ และเทสต์การอัดจะล้มเหลว |
 | XDG desktop portal | `xdg-desktop-portal` พร้อม backend ของเดสก์ท็อปที่ใช้ | จับภาพหน้าจอและแชร์หน้าจอไม่ได้ |
 
@@ -165,10 +166,10 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `LINE_DEBUG_TIMING=1` | พิมพ์ `line-timing <method> <ms>` สำหรับทุกคำขอไปยัง worker | `handle()` ใน `main.c` |
 | `LINE_DEBUG_SYNC=1` | พิมพ์ผลของ long poll แต่ละรอบ: ผลลัพธ์ เวลา จำนวน operation | `live_sync.c` |
 | `LINE_DEBUG_SESSION=1` | รายงานการต่ออายุโทเค็นและคำตอบโปรโตคอลที่ถอดรหัสไม่ได้ | `maintain_tokens()` ใน `main.c`, `line_decode_reply()` ใน `thrift.c` |
-| `LINE_DEBUG_MEDIA=1` | รายงานรูปใน Flex หรือ rich message ที่โหลดไม่สำเร็จ: ที่อยู่ สถานะ HTTP ข้อผิดพลาดการถอดรหัส | `flex_asset.c`, `ui_media.c` |
-| `LINE_DEBUG_LIFF=1` | พิมพ์ console ของหน้าแอป LINE และการเรียก native bridge ทุกครั้ง (ไม่พิมพ์ที่อยู่หน้าเว็บ เพราะมีโทเค็นอยู่) และยอมให้เบราว์เซอร์โหลดหน้า `http://127.0.0.1:<port>/` สำหรับทดสอบในเครื่อง | `liff_browser.c` |
+| `LINE_DEBUG_MEDIA=1` | รายงานขั้นตอนที่ล้มเหลว สถานะการรับส่ง และจำนวนไบต์ของรูปใน Flex หรือ rich message | `flex_asset.c`, `ui_media.c` |
+| `LINE_DEBUG_LIFF=1` | รายงานขั้นตอนการโหลดหน้าเว็บและชื่อคำสั่ง bridge ที่รองรับ คำสั่งอื่นจะแสดงเป็น `unsupported` และยอมให้เบราว์เซอร์โหลดหน้า `http://127.0.0.1:<port>/` สำหรับทดสอบในเครื่อง | `liff_browser.c` |
 | `LINE_CALL_DEBUG=1` | รายงานการต่อรองการโทร ข้อความควบคุม จำนวนแพ็กเก็ตทุกห้าวินาที และจังหวะที่ได้เฟรมแรก | `call.c`, `camera.c`, `ui_media.c` |
-| `LINE_CALL_PDTP_DUMP=<dir>` | ต่อท้ายข้อมูลสตรีม PDTP ที่เรียงลำดับแล้วลงใน `<dir>/<service>-<stream>.bin` | `call.c` |
+| `LINE_CALL_PDTP_DUMP=<dir>` | เมื่อเปิด `LINE_CALL_DEBUG=1` จะเก็บข้อมูลดิบของสตรีม LINE และ PLANET ในไดเรกทอรีที่สร้างไว้และให้สิทธิ์เฉพาะเจ้าของ (0700) | `call.c` |
 | `LINE_RENDER_LOG=1` | บอกว่าเลือกตัววาดตัวไหนและทำไมต้องถอยไปตัวสำรอง | `ui_gpu.c`, `ui_draw.c` |
 
 ### พฤติกรรม
@@ -189,7 +190,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 
 | ตัวแปร | ผล |
 | ------ | -- |
-| `LINE_DISABLE_GPU=1` | วาดลงพื้นผิวหน้าต่างของ SDL ถอดรหัสวิดีโอคอลด้วย libvpx และเข้ารหัสข้อความวิดีโอด้วยซอฟต์แวร์ |
+| `LINE_DISABLE_GPU=1` | วาดลงพื้นผิวหน้าต่างของ SDL ใช้ libvpx สำหรับภาพวิดีโอคอลทั้งขารับและขาส่ง และเข้ารหัสข้อความวิดีโอด้วยซอฟต์แวร์ |
 | `AVERNELLA_VULKAN=sdl` | ข้ามโมดูลเนทีฟ แต่ยังลองตัววาด Vulkan ของ SDL |
 | `AVERNELLA_VK_DESCRIPTORS=buffer` | ให้โมดูลเนทีฟใช้ descriptor buffer แทน descriptor heap |
 | `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` | เลือก GPU ด้วย DRM render node บนไดรเวอร์ที่เปิดเผยคุณสมบัติ DRM |
@@ -207,7 +208,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 - **คำขอล้มเหลว** ข้อความผิดพลาดจาก worker จะขึ้นที่บรรทัดสถานะด้านบนของแชต รันด้วย `LINE_DEBUG_TIMING=1` เพื่อดูว่าคำขอไหนล้มเหลวหรือช้า ข้อความอย่าง "LINE declined sendMessage (service code 10)" มีหมายเลขข้อผิดพลาดของ LINE เองติดมาด้วย หน้า [พื้นฐานโปรโตคอล](protocol-basics.md) อธิบายรหัสที่พบบ่อย
 - **ข้อความมาช้า** รันด้วย `LINE_DEBUG_SYNC=1` ตอนว่าง long poll แต่ละรอบควรใช้เวลาราว 50 วินาที และตอบกลับทันทีเมื่อมีอะไรเกิดขึ้น
 - **รูปในการ์ดว่างเปล่า** รันด้วย `LINE_DEBUG_MEDIA=1`
-- **แอป LINE โหลดไม่เสร็จ** รันด้วย `LINE_DEBUG_LIFF=1` แล้วเปิดใหม่ ข้อความใน console ของหน้านั้นมักบอกว่ากำลังรออะไรอยู่
+- **แอป LINE โหลดไม่เสร็จ** รันด้วย `LINE_DEBUG_LIFF=1` แล้วเปิดใหม่ ตรวจสอบว่าการโหลดถึง `committed` และ `finished` หรือยัง และมีคำสั่ง bridge ที่ขึ้นว่า `unsupported` หรือไม่
 - **โทรแล้วไม่มีภาพ** รันด้วย `LINE_CALL_DEBUG=1`
 - **ไล่โค้ดทีละขั้น** build ด้วย `make clean && make DEBUG=1` หน้าต่างคือโปรเซส `avernella` ส่วน worker เป็นโปรเซสลูกชื่อ `avernella --worker` ให้ attach แยกด้วย `gdb -p $(pgrep -f 'avernella --worker')` เนื่องจาก worker จะจบตามเมื่อโปรเซสแม่ตาย (`PR_SET_PDEATHSIG`) การปิดหน้าต่างจึงทำให้ worker จบด้วย
 - **ทดสอบ `avernella-liff` ตัวเดียว** เริ่มมันโดยให้ file descriptor 3 เป็นซ็อกเก็ต `SOCK_SEQPACKET` และส่ง PID ของโปรเซสแม่เป็นอาร์กิวเมนต์เดียว แล้วส่ง datagram `L\tfull\t<url>` ไปหา เมื่อตั้ง `LINE_DEBUG_LIFF=1` มันจะโหลดหน้าจาก `http://127.0.0.1:<port>/` ได้ด้วย หน้าทดสอบในเครื่องที่โหลด LIFF SDK ตัวจริงจึงใช้ทดสอบ bridge ได้

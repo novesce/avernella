@@ -18,7 +18,7 @@ struct response {
 	gsize limit;
 };
 
-static const char origin[] = "https://legy.line-apps.com";
+static const char origin[] = LINE_RPC_ORIGIN;
 
 static gpointer fail(GError **error, const char *reason)
 {

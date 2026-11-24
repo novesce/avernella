@@ -122,8 +122,10 @@ Ctrl+Shift+O เปิดหน้าปัจจุบันในเบรา�
 
 ## การดีบักแอป LINE
 
-รันด้วย `LINE_DEBUG_LIFF=1` แล้วเปิดแอปอีกครั้ง เทอร์มินัลจะแสดงข้อความ console ของหน้าและการเรียก bridge แต่ละครั้ง แต่ไม่แสดงที่อยู่หน้าเว็บ ซึ่งมีโทเค็นอยู่ ข้อความของ SDK เองมักบอกว่ากำลังรออะไร ตัวแปรเดียวกันนี้ยังทำให้เบราว์เซอร์โหลดหน้า `http://127.0.0.1:<port>/` ได้ หน้าทดสอบในเครื่องที่โหลด SDK ตัวจริง (`https://static.line-scdn.net/liff/edge/2/sdk.js`) จึงทดสอบ bridge ได้ ดู [การ build การรัน และการดีบัก](building.md)
+รันด้วย `LINE_DEBUG_LIFF=1` แล้วเปิดแอปอีกครั้ง เทอร์มินัลจะแสดงขั้นตอนการโหลดของ WebKit และคำสั่ง bridge เป็น `openWindow`, `closeWindow` หรือ `unsupported` การใช้ป้ายกำกับคงที่ช่วยป้องกันไม่ให้ URL ข้อความจาก console ของหน้าเว็บ และโทเค็นปรากฏในบันทึกการดีบัก LIFF ของ Avernella ตัวแปรเดียวกันนี้ยังทำให้เบราว์เซอร์โหลดหน้า `http://127.0.0.1:<port>/` ได้ หน้าทดสอบในเครื่องที่โหลด SDK ตัวจริง (`https://static.line-scdn.net/liff/edge/2/sdk.js`) จึงทดสอบ bridge ได้ ดู [การ build การรัน และการดีบัก](building.md)
 
 ## เทสต์
 
 `tests/liff.c` ตรวจคำขอ `issueLiffView` ทีละฟิลด์ การสร้าง URL สำหรับเปิด เส้นทางขอความยินยอมและหน้าสำรอง และการจดจำลิงก์ โดยใช้ fixture ของ RPC ที่อธิบายใน [การทดสอบ](testing.md)
+
+รัน `python3 tests/liff_browser_debug.py ./avernella-liff` เพื่อตรวจบันทึกการดีบักด้วยหน้าเว็บในเครื่องและโทเค็นจำลอง สำหรับ helper ของ GTK ใช้จอเสมือนด้วยคำสั่ง `xvfb-run -a python3 tests/liff_browser_debug.py ./avernella-liff-gtk`

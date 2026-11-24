@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "line.h"
+#include "login_retry.h"
 #include "messaging.h"
 #include "liff.h"
 #include "friends.h"
@@ -350,6 +351,7 @@ static J *login(struct line_worker *w, GError **error)
 		w->dir = line_store_open(s, error);
 		if (w->dir < 0)
 			return NULL;
+		line_cooldown_use_store(w->dir);
 	}
 	if (!w->ready) {
 		if (!s->access) {
@@ -1427,6 +1429,8 @@ static J *sign_out(struct line_worker *w, GError **error)
 		g_autoptr(GError) unreadable = NULL;
 
 		w->dir = line_store_open(s, &unreadable);
+		if (w->dir >= 0)
+			line_cooldown_use_store(w->dir);
 		/* A session file this version cannot read is removed unread. */
 		if (w->dir < 0 && !line_store_discard(error))
 			return NULL;
@@ -2240,21 +2244,7 @@ static void handle(struct line_worker *w, const char *line)
 			reply, "error",
 			json_object_new_string(error ? error->message :
 						       "Request failed."));
-	if (g_error_matches(error, LINE_ERROR, LINE_RETRY))
-		json_object_object_add(reply, "retry",
-				       json_object_new_boolean(TRUE));
-	/*
-	 * Each sign-in attempt runs in a fresh worker, so the window keeps
-	 * what this one learned: why it failed and how long LINE asked to wait.
-	 */
-	if (error && error->domain == LINE_ERROR)
-		json_object_object_add(reply, "code",
-				       json_object_new_int(error->code));
-	int wait = line_transport_retry_after();
-
-	if (wait && g_error_matches(error, LINE_ERROR, LINE_RATE_LIMITED))
-		json_object_object_add(reply, "retryAfter",
-				       json_object_new_int(wait));
+	line_reply_retry(reply, error, !g_strcmp0(method, "login"));
 	line_emit(reply);
 	/* A request LINE answered with an auth refusal ends the session. */
 	if (w->ready && w->session.denied) {
@@ -2868,8 +2858,10 @@ static int worker(int credentials_fd)
 	if (frame_fd >= 0)
 		close(frame_fd);
 	g_hash_table_unref(w.leases);
-	if (w.dir >= 0)
+	if (w.dir >= 0) {
+		line_cooldown_use_store(-1);
 		close(w.dir);
+	}
 	if (w.credentials_fd >= 0)
 		close(w.credentials_fd);
 	if (w.timer >= 0)

@@ -5,6 +5,7 @@
 #include "ui_private.h"
 #include "ui_gpu.h"
 #include "line.h"
+#include "login_retry.h"
 #include "state.h"
 #include "media_io.h"
 #include "line_build_commit.h"
@@ -351,20 +352,11 @@ static int sign_in_wait(void)
 
 static void note_sign_in_failure(Json *packet)
 {
-	/* The first two rejections are free; then 10 s, 30 s and 2 minutes. */
-	static const int pause[] = { 0, 0, 0, 10, 30, 120 };
-	int wait = json_object_get_int(ui_field(packet, "retryAfter"));
+	gint64 wait = line_login_wait_us(packet, &sign_in.rejected);
 
-	if (json_object_get_int(ui_field(packet, "code")) ==
-	    LINE_CREDENTIALS_REJECTED) {
-		sign_in.rejected =
-			MIN(sign_in.rejected + 1, G_N_ELEMENTS(pause) - 1);
-		wait = MAX(wait, pause[sign_in.rejected]);
-	}
 	if (wait > 0)
 		sign_in.not_before =
-			MAX(sign_in.not_before,
-			    g_get_monotonic_time() + wait * G_USEC_PER_SEC);
+			MAX(sign_in.not_before, g_get_monotonic_time() + wait);
 	g_clear_pointer(&sign_in.notice, g_free);
 }
 
@@ -1204,7 +1196,7 @@ static void login(gboolean resume)
 	}
 	gboolean password = ui.email_login && !resume;
 
-	if (!resume && sign_in_wait()) {
+	if (sign_in_wait()) {
 		set_string(&ui.notice, "");
 		show_sign_in_wait();
 		return;
@@ -1252,6 +1244,14 @@ static Uint32 login_again(Uint32 interval, void *generation)
 	return 0;
 }
 
+static void arm_login_timer(guint seconds)
+{
+	/* SDL takes a 32-bit millisecond interval. Recheck long waits daily. */
+	wire.login_timer = SDL_AddTimer(MIN(seconds, 86400u) * 1000u,
+					login_again,
+					GUINT_TO_POINTER(wire.generation));
+}
+
 /*
  * LINE could not be reached with a saved session. Stay signed in and retry
  * after 5, 10, 20 ... seconds, at most every five minutes.
@@ -1266,9 +1266,7 @@ static void retry_login(const char *error)
 		_("Still signed in. %s Retrying in %u s…"), error, delay);
 	set_string(&ui.notice, notice);
 	if (!wire.login_timer)
-		wire.login_timer =
-			SDL_AddTimer(delay * 1000, login_again,
-				     GUINT_TO_POINTER(wire.generation));
+		arm_login_timer(delay);
 }
 
 static void logout(void)
@@ -2604,8 +2602,14 @@ static void event(SDL_Event *e)
 			return;
 		if (e->user.data1 == &wire.login_timer) {
 			wire.login_timer = 0;
-			if (ui.authenticating && !ui.connected)
-				request(LOGIN, NULL, NULL);
+			if (ui.authenticating && !ui.connected) {
+				int wait = sign_in_wait();
+
+				if (wait)
+					arm_login_timer(wait);
+				else
+					request(LOGIN, NULL, NULL);
+			}
 		}
 		return;
 	}

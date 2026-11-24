@@ -10,7 +10,7 @@ enum {
 	BUSY_COOLDOWN_SECONDS = 30
 };
 
-static const char origin[] = "https://legy.line-apps.com";
+static const char origin[] = LINE_RPC_ORIGIN;
 static const char refresh_path[] = "/EXT/auth/tokenrefresh/v1";
 
 /*

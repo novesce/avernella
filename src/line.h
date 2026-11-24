@@ -172,6 +172,9 @@ static inline gboolean line_busy_code(int code)
 
 typedef void CURL;
 
+#define LINE_RPC_HOST "legy.line-apps.com"
+#define LINE_RPC_ORIGIN "https://" LINE_RPC_HOST
+
 /*
  * Per-host cooldowns shared by every thread and every HTTP path that reaches
  * LINE (RPCs, object storage, CDNs, albums and notes, card artwork). A 429 or
@@ -179,6 +182,8 @@ typedef void CURL;
  * passes, requests to that host fail at once with LINE_RATE_LIMITED.
  */
 int line_cooldown_seconds(const char *url);
+/* Borrow the worker's locked state directory, or pass -1 before closing it. */
+void line_cooldown_use_store(int dir);
 /* Records a cooldown when status is 429 or 503. handle may be NULL. */
 void line_cooldown_note(const char *url, CURL *handle, long status);
 /* Starts or extends a cooldown for the URL's host. */

@@ -435,33 +435,26 @@ static const char *const bridge[] = {
 	NULL,
 };
 
-/*
- * LINE_DEBUG_LIFF=1 prints the page's console, but not its address:
- * LINE's tokens are in the fragment.
- */
-static const char *const console_tap[] = {
-	"(() => {",
-	" const native = webkit.messageHandlers.liffConsole;",
-	" const post = (...a) => { try { native.postMessage(a.map(v =>",
-	"  v instanceof Error ? v.name + ': ' + v.message :",
-	"  typeof v === 'object' ? JSON.stringify(v) : String(v)).join(' '));",
-	"  } catch (e) {} };",
-	" for (const k of ['log', 'info', 'warn', 'error', 'debug']) {",
-	"  const f = console[k];",
-	"  console[k] = (...a) => { post(k + ':', ...a); return f.apply(console, a); };",
-	" }",
-	"})();",
-	NULL,
-};
-
-static void on_console(WebKitUserContentManager *manager, JSCValue *value,
-		       gpointer data)
+/* LIFF addresses contain tokens. Log only WebKit's load state. */
+static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event,
+			    gpointer data)
 {
-	(void)manager;
+	(void)view;
 	(void)data;
-	g_autofree char *text = jsc_value_to_string(value);
-
-	g_printerr("avernella-liff: %s\n", text);
+	switch (event) {
+	case WEBKIT_LOAD_STARTED:
+		g_printerr("avernella-liff: load started\n");
+		break;
+	case WEBKIT_LOAD_REDIRECTED:
+		g_printerr("avernella-liff: load redirected\n");
+		break;
+	case WEBKIT_LOAD_COMMITTED:
+		g_printerr("avernella-liff: load committed\n");
+		break;
+	case WEBKIT_LOAD_FINISHED:
+		g_printerr("avernella-liff: load finished\n");
+		break;
+	}
 }
 
 /* Bridge names are SDK identifiers: openWindow, iap.createPayment. */
@@ -532,17 +525,20 @@ static void on_bridge(WebKitUserContentManager *manager, JSCValue *value,
 	g_autofree char *callback = jsc_value_to_string(c);
 	g_autofree char *json = jsc_value_to_string(j);
 
-	if (b.debug)
-		g_printerr("avernella-liff: bridge %s\n", action);
 	if (!bridge_name(action) || !bridge_name(callback))
 		return;
 	if (!strcmp(action, "closeWindow")) {
+		if (b.debug)
+			g_printerr("avernella-liff: bridge closeWindow\n");
 		quit();
 		return;
 	}
-	gboolean done = !strcmp(action, "openWindow") &&
-			bridge_open(value, json);
+	gboolean open = !strcmp(action, "openWindow");
+	gboolean done = open && bridge_open(value, json);
 
+	if (b.debug)
+		g_printerr("avernella-liff: bridge %s\n",
+			   open ? "openWindow" : "unsupported");
 	bridge_reply(action, callback, done);
 }
 
@@ -609,19 +605,12 @@ static WebKitWebView *create_view(void)
 	webkit_user_content_manager_register_script_message_handler(
 		content, "liff", NULL);
 	add_script(content, bridge, NULL);
-	if (b.debug) {
-		g_signal_connect(content,
-				 "script-message-received::liffConsole",
-				 G_CALLBACK(on_console), NULL);
-		webkit_user_content_manager_register_script_message_handler(
-			content, "liffConsole", NULL);
-		add_script(content, console_tap, NULL);
-	}
 	b.settings = webkit_settings_new_with_settings(
 		"user-agent", LINE_LIFF_USER_AGENT, "enable-developer-extras",
 		FALSE, "enable-page-cache", FALSE,
 		"media-playback-requires-user-gesture", TRUE,
-		"javascript-can-open-windows-automatically", FALSE, NULL);
+		"javascript-can-open-windows-automatically", FALSE,
+		"enable-write-console-messages-to-stdout", FALSE, NULL);
 	WebKitWebView *view =
 		g_object_new(WEBKIT_TYPE_WEB_VIEW, "web-context", context,
 			     "network-session", session, "settings", b.settings,
@@ -630,6 +619,9 @@ static WebKitWebView *create_view(void)
 #endif
 			     "user-content-manager", content, NULL);
 
+	if (b.debug)
+		g_signal_connect(view, "load-changed",
+				 G_CALLBACK(on_load_changed), NULL);
 	g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide), NULL);
 	g_signal_connect(view, "script-dialog", G_CALLBACK(on_dialog), NULL);
 	g_signal_connect(view, "permission-request", G_CALLBACK(on_permission),

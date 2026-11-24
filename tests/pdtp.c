@@ -1,6 +1,9 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call_pdtp.h"
 #include "call_srtp.h"
+#include <glib/gstdio.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 enum {
 	DATA_PT = 101,
@@ -229,10 +232,104 @@ static void group_setup_retries(gconstpointer acknowledged)
 	call_pdtp_close(d);
 }
 
+static void private_stream_dump(void)
+{
+	g_autofree char *dir = g_dir_make_tmp("avernella-pdtp-XXXXXX", NULL);
+	g_assert_nonnull(dir);
+	g_autofree char *path = g_build_filename(dir, "PLANET-4.bin", NULL);
+	g_autofree char *line = g_build_filename(dir, "LINE-8.bin", NULL);
+	g_autofree char *unknown = g_build_filename(dir, "OTHER-4.bin", NULL);
+	g_autofree char *link_dir = g_strconcat(dir, "-link", NULL);
+	const guint8 part[] = { 1, 0, 3 };
+	g_autofree char *content = NULL;
+	gsize size;
+	struct stat st;
+
+	call_pdtp_dump_stream(dir, "PLANET", 4, part, sizeof(part));
+	call_pdtp_dump_stream(dir, "PLANET", 4, part, 1);
+	g_assert_cmpint(stat(path, &st), ==, 0);
+	g_assert_cmpuint(st.st_mode & 0777, ==, 0600);
+	g_assert_true(g_file_get_contents(path, &content, &size, NULL));
+	g_assert_cmpmem(content, size, "\x01\x00\x03\x01", 4);
+	call_pdtp_dump_stream(dir, "OTHER", 4, part, sizeof(part));
+	g_assert_false(g_file_test(unknown, G_FILE_TEST_EXISTS));
+
+	call_pdtp_dump_stream(dir, "LINE", 8, part, 1);
+	g_assert_cmpint(g_remove(path), ==, 0);
+	g_assert_cmpint(symlink(line, path), ==, 0);
+	call_pdtp_dump_stream(dir, "PLANET", 4, part, sizeof(part));
+	g_assert_cmpint(g_remove(path), ==, 0);
+	g_assert_cmpint(link(line, path), ==, 0);
+	call_pdtp_dump_stream(dir, "PLANET", 4, part, sizeof(part));
+	g_assert_cmpint(g_remove(path), ==, 0);
+	g_assert_cmpint(chmod(line, 0644), ==, 0);
+	call_pdtp_dump_stream(dir, "LINE", 8, part, sizeof(part));
+	g_assert_cmpint(stat(line, &st), ==, 0);
+	g_assert_cmpint(st.st_size, ==, 1);
+
+	g_assert_cmpint(symlink(dir, link_dir), ==, 0);
+	call_pdtp_dump_stream(link_dir, "PLANET", 4, part, sizeof(part));
+	g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(g_remove(link_dir), ==, 0);
+	g_assert_cmpint(chmod(dir, 0755), ==, 0);
+	call_pdtp_dump_stream(dir, "PLANET", 4, part, sizeof(part));
+	g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(g_remove(line), ==, 0);
+	g_assert_cmpint(g_rmdir(dir), ==, 0);
+}
+
+static void trace_metadata(void)
+{
+	/* Synthetic service name and bytes must stay out of ordinary logs. */
+	static const guint8 open[] = "\x80\0"
+				     "192.0.2.7"
+				     "\0\0\x08"
+				     "\x05\x01\x40\x6e\x12\0";
+	static const guint8 unknown[] = "\x80\0\0\x80\0"
+					"fixture-body";
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 5000000, 0);
+		g_test_trap_assert_passed();
+		g_test_trap_assert_stderr("*pdtp tx bytes=*");
+		g_test_trap_assert_stderr("*pdtp rx bytes=*");
+		g_test_trap_assert_stderr("*pdtp rx malformed bytes=*");
+		g_test_trap_assert_stderr("*open stream=110 service=other*");
+		g_test_trap_assert_stderr_unmatched("*80000002000240c8*");
+		g_test_trap_assert_stderr_unmatched("*192.0.2.7*");
+		g_test_trap_assert_stderr_unmatched("*3139322e302e322e37*");
+		g_test_trap_assert_stderr_unmatched("*fixture-body*");
+		g_test_trap_assert_stderr_unmatched(
+			"*666978747572652d626f6479*");
+		return;
+	}
+
+	struct call_pdtp *d = call_pdtp_open_group(
+		local_key, relay_key, DATA_PT, LOCAL_SSRC, RELAY_SSRC, NULL);
+	g_autoptr(GBytes) wire = NULL;
+	guint8 packet[128];
+	srtp_t tx;
+	int n;
+
+	g_assert_nonnull(d);
+	g_assert_true(
+		call_srtp_open(&tx, relay_key, ssrc_specific, RELAY_SSRC));
+	call_pdtp_set_trace(d, TRUE);
+	call_pdtp_poll(d, 1000000, save_packet, &wire);
+	g_assert_nonnull(wire);
+	n = relay_packet(tx, packet, 1, open, sizeof(open) - 1);
+	g_assert_true(call_pdtp_receive(d, packet, n, 1000000));
+	n = relay_packet(tx, packet, 2, unknown, sizeof(unknown) - 1);
+	g_assert_false(call_pdtp_receive(d, packet, n, 1000000));
+	srtp_dealloc(tx);
+	call_pdtp_close(d);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/pdtp/group-ack", group_ack);
+	g_test_add_func("/pdtp/private-stream-dump", private_stream_dump);
+	g_test_add_func("/pdtp/trace-metadata", trace_metadata);
 	g_test_add_data_func("/pdtp/group-setup-delayed-ack",
 			     GINT_TO_POINTER(1), group_setup_retries);
 	g_test_add_data_func("/pdtp/group-setup-no-ack", NULL,

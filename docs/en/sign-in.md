@@ -126,6 +126,8 @@ Signing out doesn't need a running session. When a session is saved but isn't si
 
 `load()` rejects the file unless it is a regular file owned by you, not readable by group or others, between 1 byte and 8 MiB, valid JSON with a non-empty `access`, an object `keys` and an integer `seq` from 0 to 2³¹−1. The buffer holding the file is wiped after parsing.
 
+If a save is interrupted, the next worker that acquires the exclusive session lock removes the incomplete `session.new` before restoring the saved session. A failed save also attempts to remove its staged credentials.
+
 `line_store_save()` writes `session.new` with `O_EXCL | O_NOFOLLOW` and mode 0600, `fdatasync`s it, renames it over `session.json` and `fsync`s the directory. If the JSON would exceed 8 MiB, it first drops the `peers` and `groups` caches, which can be fetched again, and keeps your own keys and tokens, which can't.
 
 The worker re-saves the session whenever `s->token_changed` is set: after pairing, a renewal, a rotated token or a new renewal schedule.

@@ -153,7 +153,7 @@ static struct {
 	gsize cache_bytes;
 	gboolean emoji_busy;
 	guint use_seq, frame, last_full_frame, previous_full_frame;
-	gboolean avatar_busy, flex_busy;
+	gboolean avatar_busy, flex_busy, flex_invalid_reported;
 	guint session, avatar_seq;
 	GThreadPool *pool;
 	cairo_surface_t *image;
@@ -522,23 +522,10 @@ static void fit(int w, int h, int limit, int *ow, int *oh)
 	*oh = MAX(1, (int)(h * scale));
 }
 
-/* LINE_DEBUG_MEDIA=1: each Flex or rich picture outcome, once per URL. */
-static void media_debug(const char *what, const char *url)
+static void media_debug(const char *stage)
 {
-	static GHashTable *seen;
-	static int enabled = -1;
-
-	if (enabled < 0)
-		enabled = !g_strcmp0(g_getenv("LINE_DEBUG_MEDIA"), "1");
-	if (!enabled || !url)
-		return;
-	if (!seen)
-		seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
-					     NULL);
-	g_autofree char *key = g_strconcat(what, " ", url, NULL);
-
-	if (g_hash_table_add(seen, g_steal_pointer(&key)))
-		g_printerr("line-media %s: %s\n", what, url);
+	if (!g_strcmp0(g_getenv("LINE_DEBUG_MEDIA"), "1"))
+		g_printerr("line-media image %s\n", stage);
 }
 
 static cairo_surface_t *new_image(int w, int h)
@@ -1075,7 +1062,7 @@ static void complete_decode(struct decode_job *job)
 
 		if (image && image->serial == job->serial) {
 			if (!job->image)
-				media_debug("could not decode", job->id);
+				media_debug("decode failed");
 			store_thumbnail(image, &job->image);
 			m.flex_busy = FALSE;
 		}
@@ -1152,6 +1139,7 @@ void ui_media_reset(void)
 		g_hash_table_remove_all(m.avatars);
 	g_clear_pointer(&m.flex_images, g_hash_table_unref);
 	m.flex_busy = FALSE;
+	m.flex_invalid_reported = FALSE;
 	g_clear_pointer(&m.call_chat, g_free);
 	g_clear_pointer(&m.call_name, g_free);
 	g_clear_pointer(&m.call_state, g_free);
@@ -1524,7 +1512,11 @@ cairo_surface_t *ui_flex_image(const char *url)
 
 	if (!entry) {
 		if (!m.flex_busy && !line_flex_image_allowed(url)) {
-			media_debug("skipped (not a public HTTPS URL)", url);
+			/* A rejected source can appear on every repaint. */
+			if (!m.flex_invalid_reported) {
+				media_debug("skipped unsupported source");
+				m.flex_invalid_reported = TRUE;
+			}
 			return NULL;
 		}
 		if (m.flex_busy)
@@ -3567,7 +3559,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			ui_rpc("releaseMedia", params, 0);
 		}
 		if (current && error)
-			media_debug(error, url);
+			media_debug("download failed");
 		if (current && !start_decode(fd, FLEX_IMAGE, url, tag, FALSE)) {
 			store_thumbnail(entry, NULL);
 			m.flex_busy = FALSE;

@@ -80,9 +80,6 @@ CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO name, ...)
 	case CURLINFO_REDIRECT_URL:
 		*va_arg(args, const char **) = redirect_to;
 		break;
-	case CURLINFO_CONTENT_TYPE:
-		*va_arg(args, const char **) = "image/png";
-		break;
 	case CURLINFO_RETRY_AFTER:
 		*va_arg(args, curl_off_t *) = 120;
 		break;
@@ -286,6 +283,31 @@ static void run_script(const long *statuses, guint n)
 	g_ptr_array_set_size(requested, 0);
 }
 
+static void private_diagnostics(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		g_test_trap_assert_stderr(
+			"line-media image fetch 1: curl 0, HTTP 302, 8 bytes\n"
+			"line-media image fetch 2: curl 0, HTTP 404, 8 bytes\n");
+		return;
+	}
+	static const long moved_then_missing[] = { 302, 404 };
+	g_autoptr(GError) error = NULL;
+
+	g_setenv("LINE_DEBUG_MEDIA", "1", TRUE);
+	requested = g_ptr_array_new_with_free_func(g_free);
+	run_script(moved_then_missing, G_N_ELEMENTS(moved_then_missing));
+	redirect_to = "https://cdn.example.org/private-path?signature=token";
+	g_assert_null(line_flex_image_download(
+		"https://sender.example.org/private-album?recipient=test",
+		&error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_cmpuint(hits, ==, 2);
+	g_clear_pointer(&requested, g_ptr_array_unref);
+}
+
 static void fallbacks(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -430,6 +452,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/flex-assets/bounded-anonymous-transfer",
 			transfer_policy);
 	g_test_add_func("/flex-assets/redirects-widths-and-webp", fallbacks);
+	g_test_add_func("/flex-assets/private-diagnostics",
+			private_diagnostics);
 	g_test_add_func("/flex-assets/slow-down", slow_down);
 	g_test_add_func("/flex-assets/official-account-images", hosted_images);
 	return g_test_run();

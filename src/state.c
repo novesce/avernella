@@ -193,6 +193,15 @@ static gboolean migrate_store(int root, GError **error)
 	return TRUE;
 }
 
+/* A crashed save can leave a second copy of the session keys. */
+static gboolean remove_incomplete(int dir, GError **error)
+{
+	if (unlinkat(dir, TEMP, 0) < 0)
+		return errno == ENOENT ||
+		       io_failure("remove the incomplete update to", error);
+	return fsync(dir) == 0 || io_failure("sync", error);
+}
+
 int line_store_open(Line *s, GError **error)
 {
 	const char *base = g_get_user_state_dir();
@@ -219,7 +228,8 @@ int line_store_open(Line *s, GError **error)
 	close(root);
 	if (dir < 0)
 		return -1;
-	if (lock_store(dir, LINE_STATE_DIR, error) && load(dir, s, error))
+	if (lock_store(dir, LINE_STATE_DIR, error) &&
+	    remove_incomplete(dir, error) && load(dir, s, error))
 		return dir;
 	close(dir);
 	return -1;
@@ -269,20 +279,32 @@ gboolean line_store_save(int dir, Line *s, GError **error)
 			0600);
 	if (fd < 0)
 		return io_failure("save", error);
+	int failure = 0;
+
 	while (left) {
 		ssize_t n = write(fd, p, left);
 
 		if (n < 0 && errno == EINTR)
 			continue;
-		if (n <= 0)
+		if (n <= 0) {
+			failure = n ? errno : EIO;
 			break;
+		}
 		p += n;
 		left -= n;
 	}
-	gboolean ok = !left && fdatasync(fd) == 0;
-	int close_rc = close(fd);
-
-	if (!ok || close_rc || renameat(dir, TEMP, dir, SESSION) || fsync(dir))
+	if (!failure && fdatasync(fd))
+		failure = errno;
+	if (close(fd) && !failure)
+		failure = errno;
+	if (!failure && renameat(dir, TEMP, dir, SESSION))
+		failure = errno;
+	if (failure) {
+		unlinkat(dir, TEMP, 0);
+		errno = failure;
+		return io_failure("save", error);
+	}
+	if (fsync(dir))
 		return io_failure("save", error);
 	s->token_changed = FALSE;
 	return TRUE;
@@ -312,11 +334,19 @@ gint32 line_store_sequence(int dir, Line *s, GError **error)
 
 gboolean line_store_forget(int dir, GError **error)
 {
-	if (unlinkat(dir, TEMP, 0) < 0 && errno != ENOENT)
-		return io_failure("remove", error);
+	int failure = 0;
+
 	if (unlinkat(dir, SESSION, 0) < 0 && errno != ENOENT)
+		failure = errno;
+	if (unlinkat(dir, TEMP, 0) < 0 && errno != ENOENT && !failure)
+		failure = errno;
+	int sync_error = fsync(dir);
+
+	if (failure) {
+		errno = failure;
 		return io_failure("remove", error);
-	return fsync(dir) == 0 || io_failure("remove", error);
+	}
+	return !sync_error || io_failure("sync", error);
 }
 
 gboolean line_store_discard(GError **error)

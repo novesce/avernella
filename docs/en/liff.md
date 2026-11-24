@@ -122,8 +122,10 @@ The browser protects the chat from heavy pages:
 
 ## Debugging a LINE app
 
-Run with `LINE_DEBUG_LIFF=1` and open the app again. The terminal shows the page's console messages and each bridge call, but never the page address, which carries tokens. The SDK's own messages usually say what it is waiting for. With the same variable, the browser also loads `http://127.0.0.1:<port>/` pages, so a local test page that loads the real SDK (`https://static.line-scdn.net/liff/edge/2/sdk.js`) can exercise the bridge. See [Building: debugging](building.md#debugging).
+Run with `LINE_DEBUG_LIFF=1` and open the app again. The terminal reports WebKit load stages and bridge operations as `openWindow`, `closeWindow` or `unsupported`. These fixed labels keep URLs, page console text and tokens out of Avernella's LIFF diagnostics. With the same variable, the browser also loads `http://127.0.0.1:<port>/` pages, so a local test page that loads the real SDK (`https://static.line-scdn.net/liff/edge/2/sdk.js`) can exercise the bridge. See [Building: debugging](building.md#debugging).
 
 ## Tests
 
 `tests/liff.c` checks the `issueLiffView` request field by field, the launch-URL construction, the consent and fallback paths, and link recognition, using the RPC fixture described in [Testing](testing.md).
+
+Run `python3 tests/liff_browser_debug.py ./avernella-liff` to check diagnostic output with a local test page and a synthetic token. To test the GTK helper with a virtual display, run `xvfb-run -a python3 tests/liff_browser_debug.py ./avernella-liff-gtk`.

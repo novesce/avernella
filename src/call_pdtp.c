@@ -7,8 +7,12 @@
  */
 #include "call_pdtp.h"
 #include "call_srtp.h"
+#include <errno.h>
+#include <fcntl.h>
 #include <openssl/rand.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 enum {
 	RTP_HEADER = 12,
@@ -193,14 +197,59 @@ gboolean call_pdtp_read_varint(const guint8 **p, const guint8 *end,
 	return TRUE;
 }
 
-static void trace_bytes(const char *label, const guint8 *p, gsize n)
+/* The peer supplies the service field. Only local labels reach diagnostics. */
+static const char *service_label(const char *service)
 {
-	g_autoptr(GString) hex = g_string_new(NULL);
+	if (!strcmp(service, "PLANET"))
+		return "PLANET";
+	if (!strcmp(service, "LINE"))
+		return "LINE";
+	return *service ? "other" : "control";
+}
 
-	for (gsize i = 0; i < n && i < 96; i++)
-		g_string_append_printf(hex, "%02x", p[i]);
-	g_printerr("line-call pdtp %s%s%s\n", label, n > 96 ? " (cut) " : " ",
-		   hex->str);
+void call_pdtp_dump_stream(const char *dir, const char *service, guint64 stream,
+			   const guint8 *bytes, gsize size)
+{
+	if (!dir || !*dir || !service || !size)
+		return;
+	const char *label = service_label(service);
+
+	if (!strcmp(label, "other") || !strcmp(label, "control"))
+		return;
+	int dfd = open(dir, O_DIRECTORY | O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+	struct stat st;
+
+	if (dfd < 0)
+		return;
+	if (fstat(dfd, &st) || st.st_uid != geteuid() || (st.st_mode & 0077)) {
+		close(dfd);
+		return;
+	}
+	char name[48];
+	g_snprintf(name, sizeof(name), "%s-%" G_GUINT64_FORMAT ".bin", label,
+		   stream);
+	int fd = openat(dfd, name,
+			O_WRONLY | O_APPEND | O_CREAT | O_NOCTTY | O_NOFOLLOW |
+				O_NONBLOCK | O_CLOEXEC,
+			0600);
+	close(dfd);
+	if (fd < 0)
+		return;
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+	    (st.st_mode & 0077) || st.st_nlink != 1)
+		goto out;
+	while (size) {
+		ssize_t n = write(fd, bytes, size);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			break;
+		bytes += n;
+		size -= n;
+	}
+out:
+	close(fd);
 }
 
 static struct rx_stream *rx_stream(struct call_pdtp *d, guint64 id,
@@ -603,8 +652,9 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				" x08=%" G_GUINT64_FORMAT
 				" x04=%" G_GUINT64_FORMAT
 				" x02=%" G_GUINT64_FORMAT "\n",
-				stream, service, flags, offset, length, ext[0],
-				ext[6], ext[5], ext[4], ext[3], ext[2], ext[1]);
+				stream, service_label(service), flags, offset,
+				length, ext[0], ext[6], ext[5], ext[4], ext[3],
+				ext[2], ext[1]);
 		if (s)
 			stream_data(d, s, offset, ext[0], flags, p, length);
 		p += length;
@@ -631,7 +681,8 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				"line-call pdtp control stream=%" G_GUINT64_FORMAT
 				" service=%s direction=%u offset=%" G_GUINT64_FORMAT
 				" control=%u\n",
-				stream, service, dir, a, (guint)ctrl);
+				stream, service_label(service), dir, a,
+				(guint)ctrl);
 		struct tx_stream *s = tx_stream(d, stream);
 
 		if (s && dir == 2 && (ctrl == 6 || ctrl == 7)) {
@@ -658,7 +709,7 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				"line-call pdtp open stream=%" G_GUINT64_FORMAT
 				" service=%s flags=%" G_GUINT64_FORMAT
 				" start=%" G_GUINT64_FORMAT "\n",
-				stream, service, a, b);
+				stream, service_label(service), a, b);
 		{
 			struct rx_stream *s =
 				rx_stream(d, stream, service, TRUE);
@@ -715,19 +766,10 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 		break;
 	default:
 		/* Closes and resets: skipped by the group length. */
-		if (d->trace) {
-			const guint8 *q = *pp;
-			guint64 v1 = 0, v2 = 0;
-
-			call_pdtp_read_varint(&q, end, &stream);
-			call_pdtp_read_varint(&q, end, &v1);
-			call_pdtp_read_varint(&q, end, &v2);
+		if (d->trace)
 			g_printerr(
-				"line-call pdtp element=%u stream=%" G_GUINT64_FORMAT
-				" service=%s values=%" G_GUINT64_FORMAT
-				",%" G_GUINT64_FORMAT "\n",
-				type, stream, service, v1, v2);
-		}
+				"line-call pdtp element=%u service=%s bytes=%zu\n",
+				type, service_label(service), (gsize)(end - p));
 		p = end;
 		if (d->on_event && type <= PDTP_STREAM_RESET) {
 			const guint8 *q = *pp;
@@ -760,7 +802,8 @@ static gboolean parse_packet(struct call_pdtp *d, const guint8 *p, gsize n,
 	write16(number + len - 2, seq);
 	const guint8 *q = number;
 
-	call_pdtp_read_varint(&q, number + len, &pn);
+	if (!call_pdtp_read_varint(&q, number + len, &pn))
+		return FALSE;
 	p += len - 2;
 	const guint8 *nul = memchr(p, 0, end - p);
 
@@ -853,11 +896,12 @@ gboolean call_pdtp_receive(struct call_pdtp *d, const guint8 *packet,
 	if ((gsize)plain <= pos)
 		return FALSE;
 	if (d->trace && d->traced++ < 400)
-		trace_bytes("rx", buf + pos, plain - pos);
+		g_printerr("line-call pdtp rx bytes=%zu\n", plain - pos);
 	if (parse_packet(d, buf + pos, plain - pos, read16(buf + 2), now))
 		return TRUE;
-	if (d->trace)
-		trace_bytes("rx malformed", buf + pos, plain - pos);
+	if (d->trace && d->traced++ < 4000)
+		g_printerr("line-call pdtp rx malformed bytes=%zu\n",
+			   plain - pos);
 	return !d->group;
 }
 
@@ -944,7 +988,7 @@ static gboolean emit(struct call_pdtp *d, struct builder *b, gint64 now,
 		write16(packet + RTP_HEADER + 2, 0);
 	}
 	if (d->trace && d->traced++ < 4000)
-		trace_bytes("tx", packet + rtp_header, pos - rtp_header);
+		g_printerr("line-call pdtp tx bytes=%zu\n", pos - rtp_header);
 	int n = pos;
 
 	if (srtp_protect(d->tx, packet, &n) != srtp_err_status_ok ||
@@ -1456,8 +1500,8 @@ void call_pdtp_report(const struct call_pdtp *d)
 				" sent-to=%" G_GUINT64_FORMAT
 				" queued-to=%" G_GUINT64_FORMAT
 				" window=%" G_GUINT64_FORMAT "\n",
-				s->id, s->service, s->open_acked, s->buf_offset,
-				s->next, s->buf_offset + s->buf->len,
-				s->peer_window);
+				s->id, service_label(s->service), s->open_acked,
+				s->buf_offset, s->next,
+				s->buf_offset + s->buf->len, s->peer_window);
 	}
 }

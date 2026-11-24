@@ -46,7 +46,15 @@ endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync tune http_tune
-SOURCES += call_group call_vp8
+SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode
+# Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
+JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
+ifeq ($(origin CALL_VP8_JETSON),undefined)
+CALL_VP8_JETSON := $(if $(filter aarch64%,$(shell $(CC) -dumpmachine)),$(shell pkg-config --exists $(JETSON_PKGS) && echo 1 || echo 0),0)
+endif
+ifeq ($(CALL_VP8_JETSON),1)
+SOURCES += call_vp8_jetson
+endif
 SOURCES += chat_lists shared_content ui_chat_lists ui_chat_tools ui_shared_content ui_notifications screenshot
 SOURCES += ui_tray ui_logo video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
 SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu ui_theme ui_lang
@@ -206,18 +214,27 @@ build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.
 build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/camera_pixels.o
-build/test-call build/test-call-video: build/call_vp8.o
+ifeq ($(CALL_VP8_JETSON),1)
+build/call_vp8_jetson.o: private CPPFLAGS += $(shell pkg-config --cflags $(JETSON_PKGS))
+avernella build/test-call build/test-call-video: private LDLIBS += $(shell pkg-config --libs $(JETSON_PKGS))
+build/test-call build/test-call-video: build/call_vp8_jetson.o
+endif
+build/test-call build/test-call-video: build/call_vp8.o build/call_vp8_device.o
+build/test-call: build/call_vp8_encode.o
+build/test-call-video: build/test-call_vp8_encode.o
+build/test-call-video: private LDFLAGS += -Wl,--wrap=call_vp8_encoder_open,--wrap=call_vp8_encoder_frame,--wrap=call_vp8_encoder_close,--wrap=call_vp8_encoder_name
 build/test-call-video: private CPPFLAGS += -Ibuild
-# The renderer accepts I420 frames from either decoder.
+# Hardware call codecs are optional. Retain the original build switch.
 CALL_HWDECODE_PKGS = libavcodec libavutil
 CALL_HWDECODE ?= $(shell pkg-config --exists $(CALL_HWDECODE_PKGS) && echo 1 || echo 0)
-ifeq ($(CALL_HWDECODE),1)
-build/call_vp8.o build/test-call-video: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
+CALL_HWCODECS ?= $(CALL_HWDECODE)
+ifeq ($(CALL_HWCODECS),1)
+build/call_vp8.o build/call_vp8_encode.o build/test-call_vp8_encode.o build/test-call-video: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
 build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwframe_transfer_data
 build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwdevice_ctx_create,--wrap=g_file_read_link,--wrap=g_file_get_contents
 avernella build/test-call build/test-call-video: private LDLIBS += $(shell pkg-config --libs $(CALL_HWDECODE_PKGS))
 endif
-CALL_HWDECODE_DEFINE := \#define CALL_HWDECODE $(CALL_HWDECODE)
+CALL_HWDECODE_DEFINE := \#define CALL_HWDECODE $(CALL_HWCODECS)
 ifneq ($(file <build/call_hwdecode_config.h),$(CALL_HWDECODE_DEFINE))
 .PHONY: force-hwdecode-config
 build/call_hwdecode_config.h: force-hwdecode-config
@@ -225,8 +242,20 @@ endif
 build/call_hwdecode_config.h: | build
 	@printf '%s\n' '$(CALL_HWDECODE_DEFINE)' > $@.tmp
 	mv -f $@.tmp $@
-build/call_vp8.o: private CPPFLAGS += -Ibuild
-build/call_vp8.o: build/call_hwdecode_config.h
+JETSON_DEFINE := \#define CALL_VP8_JETSON $(CALL_VP8_JETSON)
+ifneq ($(file <build/call_jetson_config.h),$(JETSON_DEFINE))
+.PHONY: force-jetson-config
+build/call_jetson_config.h: force-jetson-config
+endif
+build/call_jetson_config.h: | build
+	@printf '%s\n' '$(JETSON_DEFINE)' > $@.tmp
+	mv -f $@.tmp $@
+build/call_vp8.o build/call_vp8_encode.o build/test-call_vp8_encode.o: private CPPFLAGS += -Ibuild
+build/call_vp8.o build/call_vp8_encode.o: build/call_hwdecode_config.h
+build/call_vp8_encode.o: build/call_jetson_config.h
+# Keep linker wrappers at the encoder boundary visible in the video tests.
+build/test-call_vp8_encode.o: src/call_vp8_encode.c Makefile build/call_hwdecode_config.h build/call_jetson_config.h | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fno-lto -MMD -MP -c $< -o $@
 # GCC vectorizes the per-pixel inner loop while keeping the rest of the
 # portable release built for size. Preserve explicit debug/sanitizer flags.
 build/ui_pixels.o: CFLAGS += -O3
@@ -363,7 +392,8 @@ check: $(TESTS)
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
+	$(RM) build/test-call_vp8_encode.o build/test-call_vp8_encode.d build/call_vp8_jetson.o build/call_vp8_jetson.d build/call_jetson_config.h
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
 	$(RM) build/vulkan-smoke build/vulkan-preview build/volk.o build/line_ui_spirv.h build/ui_uber.vert.spv build/ui_uber.frag.spv
 
--include $(OBJECTS:.o=.d) build/liff_browser.d build/liff_browser_gtk.d
+-include $(OBJECTS:.o=.d) build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d

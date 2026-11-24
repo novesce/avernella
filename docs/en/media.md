@@ -183,7 +183,7 @@ Flex and rich-message artwork can come from **any HTTPS host** the sender choose
 - Redirects are followed only to other allowed HTTPS URLs.
 - Only JPEG, PNG or WebP is accepted, up to 64 MiB, a limit that only guards against a server that never stops sending.
 - A host that answers 429 or 503 gets no further request until its `Retry-After` passes, and the imagemap plain-URL fallback is skipped.
-- `LINE_DEBUG_MEDIA=1` reports each failure: address, HTTP status and decode error.
+- `LINE_DEBUG_MEDIA=1` reports the failure stage, attempt number, curl code, HTTP status and bytes received. Image addresses and server-supplied text stay out of these logs.
 
 ## Albums, notes and polls
 

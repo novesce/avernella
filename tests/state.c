@@ -41,6 +41,54 @@ static void persistence(void)
 	line_session_clear(&b);
 }
 
+static void incomplete_session(void)
+{
+	g_autofree char *staged =
+		g_build_filename(sandbox, LINE_STATE_DIR, "session.new", NULL);
+	g_autofree char *session =
+		g_build_filename(sandbox, LINE_STATE_DIR, "session.json", NULL);
+	g_autoptr(GError) error = NULL;
+	Line saved = { .access = g_strdup("committed"), .keys = obj() };
+	Line restored = { 0 };
+	int dir = line_store_open(&restored, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpint(dir, >=, 0);
+	/* A failure to publish a staged file must remove its contents. */
+	g_assert_cmpint(g_mkdir(session, 0700), ==, 0);
+	g_assert_false(line_store_save(dir, &saved, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_false(g_file_test(staged, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(g_rmdir(session), ==, 0);
+
+	g_assert_true(line_store_save(dir, &saved, &error));
+	g_assert_true(g_file_set_contents_full(staged, "interrupted save", -1,
+					       G_FILE_SET_CONTENTS_CONSISTENT,
+					       0600, &error));
+	/* Only the owner, never a competing window, may discard staging. */
+	g_assert_cmpint(line_store_open(&restored, &error), ==, -1);
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_true(g_file_test(staged, G_FILE_TEST_IS_REGULAR));
+	close(dir);
+
+	dir = line_store_open(&restored, &error);
+	g_assert_no_error(error);
+	g_assert_cmpint(dir, >=, 0);
+	g_assert_cmpstr(restored.access, ==, "committed");
+	g_assert_false(g_file_test(staged, G_FILE_TEST_EXISTS));
+	/* An unremovable staging entry cannot prevent committed-token removal. */
+	g_assert_cmpint(g_mkdir(staged, 0700), ==, 0);
+	g_assert_false(line_store_forget(dir, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_false(g_file_test(session, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(g_rmdir(staged), ==, 0);
+	close(dir);
+	line_session_clear(&saved);
+	line_session_clear(&restored);
+}
+
 static void legacy_migration(void)
 {
 	g_autofree char *current = g_build_filename(sandbox, "avernella", NULL);
@@ -291,6 +339,7 @@ int main(int argc, char **argv)
 	g_assert_nonnull(sandbox);
 	g_setenv("XDG_STATE_HOME", sandbox, TRUE);
 	g_test_add_func("/state/private-atomic-roundtrip", persistence);
+	g_test_add_func("/state/incomplete-session", incomplete_session);
 	g_test_add_func("/state/legacy-migration", legacy_migration);
 	g_test_add_func("/state/current-directory-wins",
 			current_directory_wins);

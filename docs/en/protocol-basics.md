@@ -204,6 +204,7 @@ Other services, such as RelationService, ShopService and the refresh endpoint, h
 Every HTTP path that reaches LINE shares one table of **per-host cooldowns** (`line_cooldown_*()` in [`http_tune.c`](../../src/http_tune.c)): RPCs in `transport.c`, object storage and the CDNs in `obs_http.c`, albums and notes in `shared_content.c`, and card artwork in `flex_asset.c`.
 
 - **Starting one.** An HTTP 429 or 503 sets a cooldown for that host from `Retry-After`, or 30 s without it (`line_cooldown_note()`). A TalkException `EXCESSIVE_ACCESS` (4), `CONGESTION_CONTROL` (58) or `SERVER_BUSY` (101) on `/S4` or `/SYNC4` sets 30 s for `legy.line-apps.com`.
+- **Across restarts.** The worker stores the main LINE RPC host’s retry deadline in an owner-only `rpc.retry-until` file in the state directory. It contains a timestamp. Fresh sign-in, session restore and background requests all honor the remaining wait. Local sign-out still works.
 - **Honoring it.** Until it passes, every request to that host fails at once with `LINE_RATE_LIMITED`, without touching the network (`line_cooldown_check()`). Other hosts carry on: a busy object store doesn't stop chat.
 - **Who waits.** The maintenance timer (`sync_revision()`) and the long-poll thread wait at least as long as legy's cooldown (`line_transport_retry_after()`). Nothing retries a refused request automatically; the user can try again once the time has passed.
 - **No "try something else".** A 429 on an imagemap picture is not followed by the plain-URL fallback (`line_flex_image_download()`).

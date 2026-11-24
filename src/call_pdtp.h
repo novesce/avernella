@@ -92,6 +92,10 @@ gsize call_pdtp_stream_backlog(const struct call_pdtp *pdtp, guint64 stream);
 /* Prints send counters and stream positions for LINE_CALL_DEBUG. */
 void call_pdtp_report(const struct call_pdtp *pdtp);
 
+/* Explicit raw capture into an owner-private diagnostic directory. */
+void call_pdtp_dump_stream(const char *dir, const char *service, guint64 stream,
+			   const guint8 *bytes, gsize size);
+
 /* Packet codec, exposed for tests. */
 gsize call_pdtp_varint(guint8 *out, guint64 value);
 gboolean call_pdtp_read_varint(const guint8 **p, const guint8 *end,

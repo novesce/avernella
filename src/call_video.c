@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call_video.h"
 #include "call_vp8.h"
+#include "call_vp8_encode.h"
 #include "call_srtp.h"
 #include <math.h>
 #include <openssl/rand.h>
@@ -105,17 +106,241 @@ static gboolean pace_encoder(vpx_codec_ctx_t *enc, struct encode_pace *p,
 	return vpx_codec_control(enc, VP8E_SET_CPUUSED, next) == VPX_CODEC_OK;
 }
 
+enum vp8_source {
+	VP8_CAMERA,
+	VP8_SCREEN_RTP,
+	VP8_SCREEN_PDTP,
+};
+
+struct vp8_sender {
+	struct call_vp8_encoder *hw;
+	vpx_codec_ctx_t sw;
+	struct encode_pace pace;
+	enum vp8_source source;
+	guint width, height, kbps, fps;
+	gboolean ready, force_key, hw_failed, announced;
+};
+
+struct vp8_picture {
+	const guint8 *data;
+	gsize size;
+	gboolean key;
+	guint16 delay_ms;
+};
+
+static void sender_close(struct vp8_sender *s)
+{
+	if (s->hw)
+		g_clear_pointer(&s->hw, call_vp8_encoder_close);
+	else if (s->ready)
+		vpx_codec_destroy(&s->sw);
+	s->ready = FALSE;
+	s->announced = FALSE;
+}
+
+/* Both transports submit exactly one image at a time. Without lookahead,
+ * alt-ref frames or partition output, libvpx returns a complete VP8 picture.
+ */
+static gboolean sender_open_software(struct vp8_sender *s)
+{
+	vpx_codec_enc_cfg_t cfg;
+	vpx_codec_iface_t *codec = vpx_codec_vp8_cx();
+	gboolean screen = s->source != VP8_CAMERA;
+	gboolean pdtp = s->source == VP8_SCREEN_PDTP;
+	guint pixels = s->width * s->height;
+	guint cores = MAX(1, g_get_num_processors());
+	int speed = pixels >= 1280 * 720 ? -6 : pixels >= 640 * 360 ? -5 : -4;
+
+	if (vpx_codec_enc_config_default(codec, &cfg, 0))
+		return FALSE;
+	cfg.g_w = s->width;
+	cfg.g_h = s->height;
+	cfg.g_threads = pixels >= 1280 * 720 ? MIN(cores, screen ? 8 : 4) :
+			pixels >= 640 * 360  ? MIN(cores, 2) :
+					       1;
+	cfg.g_timebase = (vpx_rational_t){ 1, 90000 };
+	cfg.g_lag_in_frames = 0;
+	cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
+	cfg.g_pass = VPX_RC_ONE_PASS;
+	cfg.rc_end_usage = screen ? VPX_VBR : VPX_CBR;
+	cfg.rc_target_bitrate = s->kbps;
+	cfg.rc_min_quantizer = 2;
+	cfg.rc_max_quantizer = screen ? 40 : 56;
+	cfg.rc_undershoot_pct = 100;
+	cfg.rc_overshoot_pct = screen ? 50 : 15;
+	cfg.rc_buf_initial_sz = 500;
+	cfg.rc_buf_optimal_sz = 600;
+	cfg.rc_buf_sz = 1000;
+	cfg.rc_dropframe_thresh = 0;
+	cfg.rc_resize_allowed = 0;
+	cfg.kf_mode = VPX_KF_AUTO;
+	cfg.kf_max_dist = 3 * s->fps;
+
+	guint intra = screen ? CLAMP(131072u * s->fps / s->kbps, 400, 1000) :
+			       300;
+	int partitions = screen && cfg.g_threads >= 4 ?
+				 VP8_FOUR_TOKENPARTITION :
+			 cfg.g_threads >= 2 ? VP8_TWO_TOKENPARTITION :
+					      VP8_ONE_TOKENPARTITION;
+	int threshold = screen ? 20 : 1;
+
+	/* Reliable screen-share transport has a larger buffer and favors text. */
+	if (pdtp) {
+		cfg.g_threads = MIN(cores, 8);
+		cfg.g_error_resilient = 0;
+		cfg.rc_buf_initial_sz = 1000;
+		cfg.rc_buf_optimal_sz = 1500;
+		cfg.rc_buf_sz = 3000;
+		cfg.kf_max_dist = 10 * s->fps;
+		speed = pixels > 1280 * 720 ? -8 : -6;
+		intra = 1000;
+		threshold = 100;
+		partitions = VP8_FOUR_TOKENPARTITION;
+	}
+	if (vpx_codec_enc_init(&s->sw, codec, &cfg, 0))
+		return FALSE;
+	pace_start(&s->pace, speed);
+	if (vpx_codec_control(&s->sw, VP8E_SET_CPUUSED, speed) ||
+	    vpx_codec_control(&s->sw, VP8E_SET_SCREEN_CONTENT_MODE,
+			      (int)screen) ||
+	    vpx_codec_control(&s->sw, VP8E_SET_STATIC_THRESHOLD, threshold) ||
+	    vpx_codec_control(&s->sw, VP8E_SET_NOISE_SENSITIVITY, 0) ||
+	    vpx_codec_control(&s->sw, VP8E_SET_TOKEN_PARTITIONS, partitions) ||
+	    vpx_codec_control(&s->sw, VP8E_SET_MAX_INTRA_BITRATE_PCT, intra)) {
+		vpx_codec_destroy(&s->sw);
+		return FALSE;
+	}
+	s->ready = TRUE;
+	s->force_key = TRUE;
+	return TRUE;
+}
+
+static gboolean sender_open(struct vp8_sender *s, guint w, guint h, guint kbps,
+			    guint fps, enum vp8_source source)
+{
+	sender_close(s);
+	s->width = w;
+	s->height = h;
+	s->kbps = kbps;
+	s->fps = fps;
+	s->source = source;
+	if (!s->hw_failed)
+		s->hw = call_vp8_encoder_open(
+			w, h, kbps, fps,
+			fps * (source == VP8_SCREEN_PDTP ? 10 : 3));
+	if (s->hw) {
+		s->ready = TRUE;
+		s->force_key = TRUE;
+		return TRUE;
+	}
+	return sender_open_software(s);
+}
+
+static gboolean sender_image(vpx_image_t *img,
+			     const struct line_camera_frame *frame)
+{
+	*img = (vpx_image_t){ .fmt = VPX_IMG_FMT_I420,
+			      .bit_depth = 8,
+			      .x_chroma_shift = 1,
+			      .y_chroma_shift = 1,
+			      .bps = 12,
+			      .w = frame->width,
+			      .d_w = frame->width,
+			      .h = frame->height,
+			      .d_h = frame->height };
+	for (int i = 0; i < 3; i++) {
+		guint w = i ? (img->w + 1) / 2 : img->w;
+
+		if (!frame->plane[i] || frame->stride[i] < (int)w)
+			return FALSE;
+		img->planes[i] = (guint8 *)frame->plane[i];
+		img->stride[i] = frame->stride[i];
+	}
+	return TRUE;
+}
+
+static void sender_emitted(struct vp8_sender *s)
+{
+	s->force_key = FALSE;
+	if (s->announced)
+		return;
+	s->announced = TRUE;
+	if (!g_strcmp0(g_getenv("LINE_RENDER_LOG"), "1"))
+		g_printerr(
+			"Outgoing %s VP8 encoder produced a picture using %s\n",
+			s->source == VP8_CAMERA ? "camera" : "screen",
+			s->hw ? call_vp8_encoder_name(s->hw) : "libvpx");
+}
+
+static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
+			      gint64 pts, struct vp8_picture *picture)
+{
+	const vpx_codec_cx_pkt_t *pkt;
+	vpx_codec_iter_t iter = NULL;
+	gint64 started = g_get_monotonic_time();
+
+	if (s->hw) {
+		const struct line_camera_frame frame = {
+			.width = img->d_w,
+			.height = img->d_h,
+			.plane = { img->planes[0], img->planes[1],
+				   img->planes[2] },
+			.stride = { img->stride[0], img->stride[1],
+				    img->stride[2] },
+		};
+		if (call_vp8_encoder_frame(s->hw, &frame, pts, s->force_key,
+					   &picture->data, &picture->size,
+					   &picture->key) &&
+		    picture->data && picture->size &&
+		    picture->size <= FRAME_LIMIT) {
+			picture->delay_ms =
+				MIN((g_get_monotonic_time() - started) / 1000,
+				    G_MAXUINT16);
+			sender_emitted(s);
+			return TRUE;
+		}
+		/* A fresh software keyframe can replace this very picture. No
+		 * packet or sequence number has gone to the peer yet. */
+		if (!g_strcmp0(g_getenv("LINE_RENDER_LOG"), "1"))
+			g_printerr(
+				"Call VP8 encoder %s failed, switching to libvpx\n",
+				call_vp8_encoder_name(s->hw));
+		sender_close(s);
+		s->hw_failed = TRUE;
+		if (!sender_open_software(s))
+			return FALSE;
+	}
+	if (vpx_codec_encode(&s->sw, img, pts, 90000 / s->fps,
+			     s->force_key ? VPX_EFLAG_FORCE_KF : 0,
+			     VPX_DL_REALTIME))
+		return FALSE;
+	gint64 elapsed = g_get_monotonic_time() - started;
+
+	if (!pace_encoder(&s->sw, &s->pace, elapsed, s->fps))
+		return FALSE;
+	picture->delay_ms = MIN(elapsed / 1000, G_MAXUINT16);
+	picture->size = 0;
+	while ((pkt = vpx_codec_get_cx_data(&s->sw, &iter))) {
+		if (pkt->kind != VPX_CODEC_CX_FRAME_PKT)
+			continue;
+		picture->data = pkt->data.frame.buf;
+		picture->size = pkt->data.frame.sz;
+		picture->key = !!(pkt->data.frame.flags & VPX_FRAME_IS_KEY);
+		sender_emitted(s);
+		break;
+	}
+	return TRUE;
+}
+
 struct call_video {
 	srtp_t tx, rx;
-	vpx_codec_ctx_t enc;
+	struct vp8_sender sender;
 	struct call_vp8_decoder *dec;
-	struct encode_pace pace;
-	gboolean enc_ready, force_key, need_key;
+	gboolean need_key;
 	gboolean group_tx;
 	int requested_resolution;
 	vpx_image_t *scaled;
-	guint width, height, kbps, fps;
-	guint enc_kbps, enc_fps;
+	guint kbps, fps;
 	guint screen_kbps, screen_fps;
 	guint rx_rotation;
 	guint32 tx_ssrc, rx_ssrc, ts_base, rx_ts;
@@ -193,8 +418,7 @@ void call_video_close(struct call_video *v)
 	if (!v)
 		return;
 	clear_picture(v);
-	if (v->enc_ready)
-		vpx_codec_destroy(&v->enc);
+	sender_close(&v->sender);
 	call_vp8_close(v->dec);
 	if (v->tx)
 		srtp_dealloc(v->tx);
@@ -225,7 +449,7 @@ static struct call_video *open_video(const guint8 tx[30], const guint8 rx[30],
 		   !(v->dec = call_vp8_open(threads))))
 		goto failed;
 	v->need_key = rx != NULL;
-	v->force_key = tx != NULL;
+
 	v->pt = pt;
 	v->tx_ssrc = tx_ssrc;
 	v->rx_ssrc = rx_ssrc;
@@ -312,9 +536,7 @@ static guint resolution_class(guint count)
 
 static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 {
-	vpx_codec_enc_cfg_t cfg;
-	vpx_codec_iface_t *codec = vpx_codec_vp8_cx();
-
+	struct vp8_sender *s = &v->sender;
 	guint pixels = w * h;
 	gboolean screen = v->screen_kbps != 0;
 	guint kbps = screen ? v->screen_kbps : v->kbps;
@@ -332,85 +554,17 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 		if (!layer)
 			fps = MIN(fps, 15u);
 	}
-	if (v->enc_ready && w == v->width && h == v->height &&
-	    kbps == v->enc_kbps && fps == v->enc_fps)
+	if (s->ready && w == s->width && h == s->height && kbps == s->kbps &&
+	    fps == s->fps)
 		return TRUE;
-	if (v->enc_ready) {
-		vpx_codec_destroy(&v->enc);
-		v->enc_ready = FALSE;
-	}
-	if (vpx_codec_enc_config_default(codec, &cfg, 0))
+	if (!sender_open(s, w, h, kbps, fps,
+			 screen ? VP8_SCREEN_RTP : VP8_CAMERA))
 		return FALSE;
-	guint cores = MAX(1, g_get_num_processors());
-
-	cfg.g_w = w;
-	cfg.g_h = h;
-	/* Real-time settings follow the WebRTC VP8 encoder defaults. */
-	cfg.g_threads = pixels >= 1280 * 720 ? MIN(cores, screen ? 8 : 4) :
-			pixels >= 640 * 360  ? MIN(cores, 2) :
-					       1;
-	cfg.g_timebase = (vpx_rational_t){ 1, 90000 };
-	cfg.g_lag_in_frames = 0;
-	cfg.g_error_resilient = VPX_ERROR_RESILIENT_DEFAULT;
-	cfg.g_pass = VPX_RC_ONE_PASS;
-	cfg.rc_end_usage = screen ? VPX_VBR : VPX_CBR;
-	cfg.rc_target_bitrate = kbps;
-	cfg.rc_min_quantizer = 2;
-	cfg.rc_max_quantizer = screen ? 40 : 56;
-	cfg.rc_undershoot_pct = 100;
-	cfg.rc_overshoot_pct = screen ? 50 : 15;
-	cfg.rc_buf_initial_sz = 500;
-	cfg.rc_buf_optimal_sz = 600;
-	cfg.rc_buf_sz = 1000;
-	/* Lower quality briefly rather than stutter after keyframes. */
-	cfg.rc_dropframe_thresh = 0;
-	cfg.rc_resize_allowed = 0;
-	cfg.kf_mode = VPX_KF_AUTO;
-	cfg.kf_max_dist = 3 * fps;
-	if (vpx_codec_enc_init(&v->enc, codec, &cfg, 0))
-		return FALSE;
-	v->enc_ready = TRUE;
-	v->width = w;
-	v->height = h;
-	v->enc_kbps = kbps;
-	v->enc_fps = fps;
-	v->force_key = TRUE;
-	/*
-	 * Speed 6 leaves headroom for 720p on a laptop. Small pictures can
-	 * afford the slower, sharper search.
-	 */
-	int speed = pixels >= 1280 * 720 ? -6 : pixels >= 640 * 360 ? -5 : -4;
-	/* Give text-heavy keyframes more room, while limiting RTP bursts. */
-	guint intra =
-		screen ? CLAMP(131072u * fps / v->screen_kbps, 400, 1000) : 300;
-	int partitions = screen && cfg.g_threads >= 4 ?
-				 VP8_FOUR_TOKENPARTITION :
-			 cfg.g_threads >= 2 ? VP8_TWO_TOKENPARTITION :
-					      VP8_ONE_TOKENPARTITION;
-
-	pace_start(&v->pace, speed);
-	gboolean configured =
-		vpx_codec_control(&v->enc, VP8E_SET_CPUUSED, speed) ==
-			VPX_CODEC_OK &&
-		vpx_codec_control(&v->enc, VP8E_SET_SCREEN_CONTENT_MODE,
-				  screen ? 1 : 0) == VPX_CODEC_OK &&
-		vpx_codec_control(&v->enc, VP8E_SET_STATIC_THRESHOLD,
-				  screen ? 20 : 1) == VPX_CODEC_OK &&
-		vpx_codec_control(&v->enc, VP8E_SET_NOISE_SENSITIVITY, 0) ==
-			VPX_CODEC_OK &&
-		vpx_codec_control(&v->enc, VP8E_SET_TOKEN_PARTITIONS,
-				  partitions) == VPX_CODEC_OK &&
-		vpx_codec_control(&v->enc, VP8E_SET_MAX_INTRA_BITRATE_PCT,
-				  intra) == VPX_CODEC_OK;
-	if (!configured) {
-		vpx_codec_destroy(&v->enc);
-		v->enc_ready = FALSE;
-		return FALSE;
-	}
 	if (v->group_tx && !g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1"))
 		g_printerr(
-			"group-stats camera-encoder width=%u height=%u kbps=%u fps=%u profile=%u\n",
-			w, h, kbps, fps, v->group_profile);
+			"group-stats camera-encoder width=%u height=%u kbps=%u fps=%u profile=%u backend=%s\n",
+			w, h, kbps, fps, v->group_profile,
+			s->hw ? call_vp8_encoder_name(s->hw) : "libvpx");
 	return TRUE;
 }
 
@@ -517,7 +671,7 @@ static gsize write_descriptor(const struct call_video *v, guint8 *p, guint16 id,
 			      gboolean first, gboolean last, gboolean key,
 			      guint32 size, guint16 delay_ms)
 {
-	guint res = resolution_class(v->width * v->height);
+	guint res = resolution_class(v->sender.width * v->sender.height);
 	guint sid = group_spatial_id(res);
 	guint layer = (1u << 5) | (sid << 1);
 	gsize pos = 3;
@@ -588,7 +742,7 @@ void call_video_set_group_format(struct call_video *v,
 		return;
 	v->tx_extension = extension;
 	v->group_profile = profile;
-	v->force_key = TRUE;
+	v->sender.force_key = TRUE;
 }
 
 enum call_video_rtp_extension
@@ -603,8 +757,8 @@ static void write_group_rtp_extension(struct call_video *v, guint8 *p,
 				      gboolean last, gboolean key)
 {
 	const guint8 codec = v->group_profile;
-	guint kbps = v->enc_kbps;
-	guint res = resolution_class(v->width * v->height);
+	guint kbps = v->sender.kbps;
+	guint res = resolution_class(v->sender.width * v->sender.height);
 	guint sid = group_spatial_id(res);
 	guint layer = (sid << 5) | (1u << 2);
 
@@ -668,7 +822,7 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 	guint8 source = v->screen_kbps != 0; /* Camera 0, virtual display 1. */
 
 	if (size > FRAME_LIMIT) {
-		v->force_key = TRUE;
+		v->sender.force_key = TRUE;
 		return TRUE;
 	}
 	/* Count source changes on published pictures, including the first. */
@@ -714,7 +868,7 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 void call_video_keyframe(struct call_video *v)
 {
 	if (v && v->tx)
-		v->force_key = TRUE;
+		v->sender.force_key = TRUE;
 }
 
 void call_video_screen(struct call_video *v, guint kbps, guint fps)
@@ -722,71 +876,46 @@ void call_video_screen(struct call_video *v, guint kbps, guint fps)
 	fps = kbps ? CLAMP(fps, 1, 30) : 0;
 	if (!v || !v->tx || (kbps == v->screen_kbps && fps == v->screen_fps))
 		return;
-	if (v->enc_ready) {
-		vpx_codec_destroy(&v->enc);
-		v->enc_ready = FALSE;
-	}
+	sender_close(&v->sender);
 	v->screen_kbps = kbps;
 	v->screen_fps = fps;
-	v->force_key = TRUE;
+	v->sender.force_key = TRUE;
 }
 
 gboolean call_video_encode(struct call_video *v,
 			   const struct line_camera_frame *frame, gint64 now,
 			   call_video_send_fn send, gpointer data, GError **e)
 {
-	const vpx_codec_cx_pkt_t *packet;
-	vpx_codec_iter_t iter = NULL;
-	vpx_image_t img = { .fmt = VPX_IMG_FMT_I420,
-			    .bit_depth = 8,
-			    .x_chroma_shift = 1,
-			    .y_chroma_shift = 1,
-			    .bps = 12 };
+	vpx_image_t img;
+	struct vp8_picture picture = { 0 };
 	guint64 pts;
-	gint64 elapsed;
 
 	if (!v || !v->tx || !send || !frame || now < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		goto failed;
 	/* Accept jitter, and switch sources immediately even at the same size. */
-	if (v->enc_ready && v->last_encoded >= 0) {
+	if (v->sender.ready && v->last_encoded >= 0) {
 		if (v->next_layer_frame) {
 			if (now < v->next_layer_frame)
 				return TRUE;
 		} else if (now - v->last_encoded <
-			   G_USEC_PER_SEC / v->enc_fps * 3 / 4) {
+			   G_USEC_PER_SEC / v->sender.fps * 3 / 4) {
 			return TRUE;
 		}
 	}
-	img.w = img.d_w = frame->width;
-	img.h = img.d_h = frame->height;
-	for (int i = 0; i < 3; i++) {
-		guint width = i ? (img.w + 1) / 2 : img.w;
-
-		if (!frame->plane[i] || frame->stride[i] < (int)width)
-			goto failed;
-		img.planes[i] = (guint8 *)frame->plane[i];
-		img.stride[i] = frame->stride[i];
-	}
-	if ((v->group_tx && !group_encoder_image(v, &img)) ||
+	if (!sender_image(&img, frame) ||
+	    (v->group_tx && !group_encoder_image(v, &img)) ||
 	    !configure_encoder(v, img.d_w, img.d_h))
 		goto failed;
 	if (v->epoch < 0)
 		v->epoch = now;
 	pts = ((guint64)(now - v->epoch) / 100) * 9 +
 	      ((guint64)(now - v->epoch) % 100) * 9 / 100;
-	gint64 started = g_get_monotonic_time();
-
-	if (vpx_codec_encode(&v->enc, &img, pts, 90000 / v->enc_fps,
-			     v->force_key ? VPX_EFLAG_FORCE_KF : 0,
-			     VPX_DL_REALTIME))
-		goto failed;
-	elapsed = g_get_monotonic_time() - started;
-	if (!pace_encoder(&v->enc, &v->pace, elapsed, v->enc_fps))
+	if (!sender_encode(&v->sender, &img, pts, &picture))
 		goto failed;
 	v->last_encoded = now;
-	if (!v->screen_kbps && v->enc_fps < v->fps) {
-		gint64 interval = G_USEC_PER_SEC / v->enc_fps;
+	if (!v->screen_kbps && v->sender.fps < v->fps) {
+		gint64 interval = G_USEC_PER_SEC / v->sender.fps;
 		gint64 due = v->next_layer_frame;
 
 		/* Keep the reduced layer clock on cadence between camera samples. */
@@ -795,16 +924,10 @@ gboolean call_video_encode(struct call_video *v,
 	} else {
 		v->next_layer_frame = 0;
 	}
-	v->force_key = FALSE;
-	while ((packet = vpx_codec_get_cx_data(&v->enc, &iter))) {
-		if (packet->kind == VPX_CODEC_CX_FRAME_PKT &&
-		    !send_picture(v, v->ts_base + pts, packet->data.frame.buf,
-				  packet->data.frame.sz,
-				  !!(packet->data.frame.flags &
-				     VPX_FRAME_IS_KEY),
-				  MIN(elapsed / 1000, G_MAXUINT16), send, data))
-			goto failed;
-	}
+	if (picture.size &&
+	    !send_picture(v, v->ts_base + pts, picture.data, picture.size,
+			  picture.key, picture.delay_ms, send, data))
+		goto failed;
 	return TRUE;
 failed:
 	g_set_error_literal(e, LINE_ERROR, 1,
@@ -1671,10 +1794,8 @@ failed:
  * small updates rather than motion.
  */
 struct call_share_encoder {
-	vpx_codec_ctx_t enc;
-	struct encode_pace pace;
-	gboolean ready, force_key;
-	guint width, height, kbps, fps;
+	struct vp8_sender sender;
+	guint kbps, fps;
 	guint16 picture;
 	gint64 last_encoded;
 };
@@ -1685,7 +1806,6 @@ struct call_share_encoder *call_share_encoder_new(guint kbps, guint fps)
 
 	s->kbps = CLAMP(kbps, 300, 20000);
 	s->fps = CLAMP(fps, 1, 60);
-	s->force_key = TRUE;
 	s->last_encoded = -1;
 	if (RAND_bytes((guint8 *)&s->picture, sizeof(s->picture)) != 1)
 		s->picture = 1;
@@ -1696,73 +1816,14 @@ void call_share_encoder_free(struct call_share_encoder *s)
 {
 	if (!s)
 		return;
-	if (s->ready)
-		vpx_codec_destroy(&s->enc);
+	sender_close(&s->sender);
 	g_free(s);
 }
 
 void call_share_encoder_keyframe(struct call_share_encoder *s)
 {
 	if (s)
-		s->force_key = TRUE;
-}
-
-static gboolean share_encoder_configure(struct call_share_encoder *s, guint w,
-					guint h)
-{
-	vpx_codec_enc_cfg_t cfg;
-	vpx_codec_iface_t *codec = vpx_codec_vp8_cx();
-
-	if (s->ready && w == s->width && h == s->height)
-		return TRUE;
-	if (s->ready) {
-		vpx_codec_destroy(&s->enc);
-		s->ready = FALSE;
-	}
-	if (vpx_codec_enc_config_default(codec, &cfg, 0))
-		return FALSE;
-	cfg.g_w = w;
-	cfg.g_h = h;
-	cfg.g_threads = MIN(MAX(1, g_get_num_processors()), 8);
-	cfg.g_timebase = (vpx_rational_t){ 1, 90000 };
-	cfg.g_lag_in_frames = 0;
-	cfg.g_error_resilient = 0; /* PDTP delivers every byte. */
-	cfg.g_pass = VPX_RC_ONE_PASS;
-	cfg.rc_end_usage = VPX_VBR;
-	cfg.rc_target_bitrate = s->kbps;
-	/* Low quantizers keep small text legible. */
-	cfg.rc_min_quantizer = 2;
-	cfg.rc_max_quantizer = 40;
-	cfg.rc_undershoot_pct = 100;
-	cfg.rc_overshoot_pct = 50;
-	cfg.rc_buf_initial_sz = 1000;
-	cfg.rc_buf_optimal_sz = 1500;
-	cfg.rc_buf_sz = 3000;
-	cfg.rc_dropframe_thresh = 0;
-	cfg.rc_resize_allowed = 0;
-	cfg.kf_mode = VPX_KF_AUTO;
-	cfg.kf_max_dist = 10 * s->fps;
-	if (vpx_codec_enc_init(&s->enc, codec, &cfg, 0))
-		return FALSE;
-	s->ready = TRUE;
-	s->width = w;
-	s->height = h;
-	s->force_key = TRUE;
-	int speed = w * h > 1280 * 720 ? -8 : -6;
-
-	pace_start(&s->pace, speed);
-	return vpx_codec_control(&s->enc, VP8E_SET_CPUUSED, speed) ==
-		       VPX_CODEC_OK &&
-	       vpx_codec_control(&s->enc, VP8E_SET_SCREEN_CONTENT_MODE, 1) ==
-		       VPX_CODEC_OK &&
-	       vpx_codec_control(&s->enc, VP8E_SET_STATIC_THRESHOLD, 100) ==
-		       VPX_CODEC_OK &&
-	       vpx_codec_control(&s->enc, VP8E_SET_NOISE_SENSITIVITY, 0) ==
-		       VPX_CODEC_OK &&
-	       vpx_codec_control(&s->enc, VP8E_SET_TOKEN_PARTITIONS,
-				 VP8_FOUR_TOKENPARTITION) == VPX_CODEC_OK &&
-	       vpx_codec_control(&s->enc, VP8E_SET_MAX_INTRA_BITRATE_PCT,
-				 1000) == VPX_CODEC_OK;
+		s->sender.force_key = TRUE;
 }
 
 /*
@@ -1804,74 +1865,47 @@ gboolean call_share_encode(struct call_share_encoder *s,
 			   call_share_fragment_fn emit, gpointer data,
 			   GError **e)
 {
-	const vpx_codec_cx_pkt_t *packet;
-	vpx_codec_iter_t iter = NULL;
-	vpx_image_t img = { .fmt = VPX_IMG_FMT_I420,
-			    .bit_depth = 8,
-			    .x_chroma_shift = 1,
-			    .y_chroma_shift = 1,
-			    .bps = 12 };
+	vpx_image_t img;
+	struct vp8_picture picture = { 0 };
 
-	if (!s || !emit || !frame ||
+	if (!s || !emit || !frame || now < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		goto failed;
 	if (s->last_encoded >= 0 &&
 	    now - s->last_encoded < G_USEC_PER_SEC / s->fps * 3 / 4)
 		return TRUE;
-	img.w = img.d_w = frame->width;
-	img.h = img.d_h = frame->height;
-	for (int i = 0; i < 3; i++) {
-		img.planes[i] = (guint8 *)frame->plane[i];
-		img.stride[i] = frame->stride[i];
-	}
-	if (!share_encoder_configure(s, img.w, img.h))
+	if (!sender_image(&img, frame))
 		goto failed;
-	gint64 started = g_get_monotonic_time();
-	guint64 pts = (guint64)now * 9 / 100;
-
-	if (vpx_codec_encode(&s->enc, &img, pts, 90000 / s->fps,
-			     s->force_key ? VPX_EFLAG_FORCE_KF : 0,
-			     VPX_DL_REALTIME))
+	if ((!s->sender.ready || s->sender.width != img.w ||
+	     s->sender.height != img.h) &&
+	    !sender_open(&s->sender, img.w, img.h, s->kbps, s->fps,
+			 VP8_SCREEN_PDTP))
+		goto failed;
+	if (!sender_encode(&s->sender, &img, (guint64)now * 9 / 100, &picture))
 		goto failed;
 	s->last_encoded = now;
-	s->force_key = FALSE;
-	gint64 spent = g_get_monotonic_time() - started;
-	guint delay = spent / 1000;
+	if (!picture.size)
+		return TRUE;
 
-	if (!pace_encoder(&s->enc, &s->pace, spent, s->fps))
-		goto failed;
-	const guint pixels[] = { 19200, 172800, 691200, 2764800, 11059200 };
-	guint resolution = 0;
+	guint16 id = s->picture++;
+	guint res = resolution_class(img.w * img.h);
 
-	while (resolution < G_N_ELEMENTS(pixels) &&
-	       img.w * img.h > pixels[resolution])
-		resolution++;
-	while ((packet = vpx_codec_get_cx_data(&s->enc, &iter))) {
-		if (packet->kind != VPX_CODEC_CX_FRAME_PKT)
-			continue;
-		const guint8 *vp8 = packet->data.frame.buf;
-		gsize size = packet->data.frame.sz;
-		gboolean key = !!(packet->data.frame.flags & VPX_FRAME_IS_KEY);
-		guint16 id = s->picture++;
+	if (picture.size > FRAME_LIMIT) {
+		s->sender.force_key = TRUE;
+		return TRUE;
+	}
+	/* The official app sends about 900 bytes of VP8 per fragment. */
+	for (gsize pos = 0; pos < picture.size;) {
+		guint8 frag[1024 + 32];
+		gsize len = MIN(1000, picture.size - pos);
+		gsize header = call_share_descriptor(
+			frag, id, !pos, pos + len == picture.size, picture.key,
+			res, picture.delay_ms, picture.size);
 
-		if (size > FRAME_LIMIT) {
-			s->force_key = TRUE;
-			continue;
-		}
-		/* The official app sends about 900 bytes of VP8 a fragment. */
-		for (gsize pos = 0; pos < size;) {
-			guint8 frag[1024 + 32];
-			gsize len = MIN(1000, size - pos);
-			gsize header = call_share_descriptor(frag, id, !pos,
-							     pos + len == size,
-							     key, resolution,
-							     delay, size);
-
-			memcpy(frag + header, vp8 + pos, len);
-			if (!emit(frag, header + len, key, data))
-				goto failed;
-			pos += len;
-		}
+		memcpy(frag + header, picture.data + pos, len);
+		if (!emit(frag, header + len, picture.key, data))
+			goto failed;
+		pos += len;
 	}
 	return TRUE;
 failed:

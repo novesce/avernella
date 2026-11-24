@@ -173,15 +173,15 @@ static gboolean bitmap(const GByteArray *body)
  * target, which the caller follows only to another allowed CDN URL.
  */
 static GByteArray *fetch(const char *url, CURLcode *rc, long *status,
-			 char **location, char **type)
+			 char **location)
 {
 	CURL *curl = curl_easy_init();
 	GByteArray *body = g_byte_array_new();
-	char *where = NULL, *kind = NULL;
+	char *where = NULL;
 
 	*rc = CURLE_FAILED_INIT;
 	*status = 0;
-	*location = *type = NULL;
+	*location = NULL;
 	if (!curl)
 		return body;
 #define OPT(name, value)                                   \
@@ -213,10 +213,7 @@ static GByteArray *fetch(const char *url, CURLcode *rc, long *status,
 	if (*rc == CURLE_OK && *status >= 300 && *status < 400 &&
 	    curl_easy_getinfo(curl, CURLINFO_REDIRECT_URL, &where) != CURLE_OK)
 		where = NULL;
-	if (curl_easy_getinfo(curl, CURLINFO_CONTENT_TYPE, &kind) != CURLE_OK)
-		kind = NULL;
 	*location = g_strdup(where);
-	*type = g_strdup(kind);
 done:
 	curl_easy_cleanup(curl);
 	return body;
@@ -250,7 +247,7 @@ GBytes *line_flex_image_download(const char *url, GError **error)
 	gboolean plain = FALSE;
 
 	for (int hop = 0; hop < 4; hop++) {
-		g_autofree char *location = NULL, *type = NULL;
+		g_autofree char *location = NULL;
 		CURLcode rc;
 		long status;
 
@@ -258,16 +255,15 @@ GBytes *line_flex_image_download(const char *url, GError **error)
 		if (line_cooldown_check(current, error))
 			return NULL;
 		g_autoptr(GByteArray) body =
-			fetch(current, &rc, &status, &location, &type);
+			fetch(current, &rc, &status, &location);
 
 		if (rc == CURLE_OK && status == 200 && bitmap(body))
 			return g_byte_array_free_to_bytes(
 				g_steal_pointer(&body));
 		if (debug)
 			g_printerr(
-				"line-media %s: %s, HTTP %ld, %s, %u bytes\n",
-				current, curl_easy_strerror(rc), status,
-				type ? type : "no type", body->len);
+				"line-media image fetch %d: curl %d, HTTP %ld, %u bytes\n",
+				hop + 1, (int)rc, status, body->len);
 		if (rc != CURLE_OK)
 			break;
 		if (status >= 300 && status < 400 && location &&

@@ -5,9 +5,7 @@
 #include <vpx/vpx_decoder.h>
 #include <vpx/vpx_encoder.h>
 #if CALL_HWDECODE
-#include <dlfcn.h>
-#include <sys/stat.h>
-#include <sys/sysmacros.h>
+#include "call_vp8_device.h"
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #endif
@@ -144,55 +142,17 @@ static void close_hardware(struct call_vp8_decoder *d)
 	avcodec_free_context(&d->codec);
 }
 
-/*
- * A CUDA ordinal is independent of the Linux render node number. Resolve
- * the node's PCI address through the driver, including CUDA_VISIBLE_DEVICES.
- */
-static gboolean cuda_ordinal(const char *pci, char result[16])
+struct decoder_device {
+	struct call_vp8_decoder *decoder;
+	const AVCodec *codec;
+};
+
+static gboolean open_device(const char *node, guint vendor, const char *pci,
+			    gpointer data)
 {
-	void *library = dlopen("libcuda.so.1", RTLD_LAZY | RTLD_LOCAL);
-	int (*init)(unsigned int flags);
-	int (*lookup)(int *device, const char *pci);
-	int device;
-	gboolean found = FALSE;
-
-	if (!library)
-		return FALSE;
-	void *symbol = dlsym(library, "cuInit");
-
-	memcpy(&init, &symbol, sizeof(init));
-	symbol = dlsym(library, "cuDeviceGetByPCIBusId");
-	memcpy(&lookup, &symbol, sizeof(lookup));
-	if (init && lookup && !init(0) && !lookup(&device, pci)) {
-		g_snprintf(result, 16, "%d", device);
-		found = TRUE;
-	}
-	dlclose(library);
-	return found;
-}
-
-static guint render_vendor(const char *node, char **pci)
-{
-	struct stat st;
-
-	if (stat(node, &st) || !S_ISCHR(st.st_mode))
-		return 0;
-	g_autofree char *device = g_strdup_printf("/sys/dev/char/%u:%u/device",
-						  major(st.st_rdev),
-						  minor(st.st_rdev));
-	g_autofree char *vendor_file = g_build_filename(device, "vendor", NULL);
-	g_autofree char *vendor = NULL;
-	g_autofree char *target = g_file_read_link(device, NULL);
-
-	if (!target || !g_file_get_contents(vendor_file, &vendor, NULL, NULL))
-		return 0;
-	*pci = g_path_get_basename(target);
-	return g_ascii_strtoull(vendor, NULL, 0);
-}
-
-static gboolean open_device(struct call_vp8_decoder *d, const AVCodec *codec,
-			    const char *node, guint vendor, const char *pci)
-{
+	const struct decoder_device *probe = data;
+	struct call_vp8_decoder *d = probe->decoder;
+	const AVCodec *codec = probe->codec;
 	enum AVHWDeviceType type;
 	AVDictionary *options = NULL;
 	char ordinal[16];
@@ -221,7 +181,7 @@ static gboolean open_device(struct call_vp8_decoder *d, const AVCodec *codec,
 	if (!config)
 		return FALSE;
 	if (type == AV_HWDEVICE_TYPE_CUDA) {
-		if (!cuda_ordinal(pci, ordinal))
+		if (!call_vp8_cuda_ordinal(pci, ordinal))
 			return FALSE;
 		node = ordinal;
 		av_dict_set(&options, "primary_ctx", "1", 0);
@@ -231,55 +191,14 @@ static gboolean open_device(struct call_vp8_decoder *d, const AVCodec *codec,
 	return error >= 0;
 }
 
-static gboolean select_device(struct call_vp8_decoder *d, const AVCodec *codec)
-{
-	const char *node = g_getenv("AVERNELLA_RENDER_NODE");
-	const char *hint = g_getenv("AVERNELLA_MEDIA_GPU_VENDOR");
-	guint preferred = hint ? g_ascii_strtoull(hint, NULL, 0) : 0;
-
-	if (!node || !*node)
-		node = g_getenv("AVERNELLA_MEDIA_RENDER_NODE");
-	if (node && *node) {
-		g_autofree char *pci = NULL;
-		guint vendor = render_vendor(node, &pci);
-
-		return open_device(d, codec, node, vendor, pci);
-	}
-	g_autoptr(GDir) dir = g_dir_open("/dev/dri", 0, NULL);
-	const char *name;
-
-	if (!dir)
-		return FALSE;
-	/*
-	 * Prefer the discrete NVIDIA decoder on a hybrid machine without
-	 * a renderer selection. On Intel and AMD, use the DRM VA-API device.
-	 */
-	for (int pass = 0; pass < (preferred ? 1 : 2); pass++) {
-		while ((name = g_dir_read_name(dir))) {
-			if (!g_str_has_prefix(name, "renderD"))
-				continue;
-			g_autofree char *path =
-				g_build_filename("/dev/dri", name, NULL);
-			g_autofree char *pci = NULL;
-			guint vendor = render_vendor(path, &pci);
-
-			if (preferred ? vendor != preferred :
-					(vendor == 0x10de) != !pass)
-				continue;
-			if (open_device(d, codec, path, vendor, pci))
-				return TRUE;
-		}
-		g_dir_rewind(dir);
-	}
-	return FALSE;
-}
-
 static void open_hardware(struct call_vp8_decoder *d, guint width, guint height)
 {
 	const AVCodec *codec = avcodec_find_decoder_by_name("vp8");
+	struct decoder_device probe = { d, codec };
 
 	if (!codec || !g_strcmp0(g_getenv("LINE_DISABLE_GPU"), "1") ||
-	    (!d->device && !select_device(d, codec)))
+	    (!d->device &&
+	     !call_vp8_try_render_nodes(FALSE, open_device, &probe)))
 		return;
 	d->codec = avcodec_alloc_context3(codec);
 	if (!d->codec) {

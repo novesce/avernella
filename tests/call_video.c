@@ -4,6 +4,7 @@
 #include "call_video.h"
 #include "call_srtp.h"
 #include "call_vp8.h"
+#include "call_vp8_encode.h"
 #include "screencast.h"
 #include <string.h>
 #if CALL_HWDECODE
@@ -12,12 +13,13 @@
 
 static guint hardware_transfers;
 static gboolean fail_transfer;
-static gboolean fake_intel, selected_intel;
+static const char *mock_drm_vendor;
+static gboolean tried_vaapi;
 char *__real_g_file_read_link(const char *path, GError **error);
 __attribute__((visibility("default"))) char *
 __wrap_g_file_read_link(const char *path, GError **error)
 {
-	if (fake_intel && !strcmp(path, "/sys/dev/char/1:3/device"))
+	if (mock_drm_vendor && !strcmp(path, "/sys/dev/char/1:3/device"))
 		return g_strdup("../../../0000:00:02.0");
 	return __real_g_file_read_link(path, error);
 }
@@ -27,8 +29,9 @@ gboolean __real_g_file_get_contents(const char *path, char **contents,
 __attribute__((visibility("default"))) gboolean __wrap_g_file_get_contents(
 	const char *path, char **contents, gsize *len, GError **error)
 {
-	if (fake_intel && !strcmp(path, "/sys/dev/char/1:3/device/vendor")) {
-		*contents = g_strdup("0x8086\n");
+	if (mock_drm_vendor &&
+	    !strcmp(path, "/sys/dev/char/1:3/device/vendor")) {
+		*contents = g_strdup(mock_drm_vendor);
 		if (len)
 			*len = strlen(*contents);
 		return TRUE;
@@ -43,10 +46,10 @@ int __wrap_av_hwdevice_ctx_create(AVBufferRef **ctx, enum AVHWDeviceType type,
 				  const char *node, AVDictionary *opts,
 				  int flags)
 {
-	if (fake_intel) {
+	if (mock_drm_vendor) {
 		g_assert_cmpint(type, ==, AV_HWDEVICE_TYPE_VAAPI);
 		g_assert_cmpstr(node, ==, "/dev/null");
-		selected_intel = TRUE;
+		tried_vaapi = TRUE;
 		return AVERROR(ENODEV);
 	}
 	return __real_av_hwdevice_ctx_create(ctx, type, node, opts, flags);
@@ -62,6 +65,71 @@ int __wrap_av_hwframe_transfer_data(AVFrame *dst, const AVFrame *src, int flags)
 }
 #endif
 
+/* A fixed two-frame libvpx stream lets the sender tests exercise the actual
+ * decrypt, reassembly and decode paths on machines without a VP8 encoder. */
+static const guint8 gray_key[] = {
+	0x10, 0x02, 0x00, 0x9d, 0x01, 0x2a, 0x10, 0x00, 0x10, 0x00,
+	0x00, 0x47, 0x08, 0x85, 0x85, 0x88, 0x85, 0x84, 0x88, 0x02,
+	0x02, 0x00, 0x0c, 0x0e, 0x60, 0x00, 0xfe, 0x68, 0x00,
+};
+static const guint8 gray_delta[] = {
+	0xb1, 0x01, 0x00, 0x05, 0x10, 0xac, 0x00, 0x18, 0x00,
+	0x18, 0x58, 0x2f, 0xf4, 0x00, 0x08, 0x00, 0x00,
+};
+
+static struct encoder_fixture {
+	guint opens, frames, closes, kbps, fps;
+	gboolean enabled, fail, force_key;
+} encoder;
+
+struct call_vp8_encoder *__wrap_call_vp8_encoder_open(guint w, guint h,
+						      guint kbps, guint fps,
+						      guint key_distance)
+{
+	if (!encoder.enabled)
+		return NULL;
+	g_assert_cmpuint(w, ==, 16);
+	g_assert_cmpuint(h, ==, 16);
+	g_assert_cmpuint(key_distance, >, 0);
+	encoder.opens++;
+	encoder.kbps = kbps;
+	encoder.fps = fps;
+	return (struct call_vp8_encoder *)&encoder;
+}
+
+gboolean __wrap_call_vp8_encoder_frame(struct call_vp8_encoder *enc,
+				       const struct line_camera_frame *frame,
+				       gint64 pts, gboolean force_key,
+				       const guint8 **data, gsize *size,
+				       gboolean *key)
+{
+	g_assert_true(enc == (struct call_vp8_encoder *)&encoder);
+	g_assert_cmpint(pts, >=, 0);
+	g_assert_cmpuint(frame->width, ==, 16);
+	g_assert_cmpuint(frame->height, ==, 16);
+	encoder.frames++;
+	if (encoder.fail)
+		return FALSE;
+	*key = force_key || encoder.force_key;
+	*data = *key ? gray_key : gray_delta;
+	*size = *key ? sizeof(gray_key) : sizeof(gray_delta);
+	return TRUE;
+}
+
+const char *__wrap_call_vp8_encoder_name(const struct call_vp8_encoder *enc)
+{
+	g_assert_true(enc == (struct call_vp8_encoder *)&encoder);
+	return "fixture";
+}
+
+void __wrap_call_vp8_encoder_close(struct call_vp8_encoder *enc)
+{
+	if (enc) {
+		g_assert_true(enc == (struct call_vp8_encoder *)&encoder);
+		encoder.closes++;
+	}
+}
+
 enum {
 	W = 320,
 	H = 240
@@ -72,7 +140,7 @@ static const guint8 key_a[30] = { 1, 2, 3 }, key_b[30] = { 4, 5, 6 };
 struct loop {
 	struct call_video *tx, *rx;
 	GPtrArray *packets;
-	guint count, rotation;
+	guint count, rotation, color_tolerance;
 	guint8 pixels[W * H * 3 / 2];
 	struct line_camera_frame frame;
 };
@@ -218,14 +286,14 @@ static void intel_decoder_selection(void)
 	/* Exercise node selection and fallback without an Intel device. */
 	g_setenv("AVERNELLA_RENDER_NODE", "/dev/null", TRUE);
 	g_unsetenv("LINE_DISABLE_GPU");
-	fake_intel = TRUE;
+	mock_drm_vendor = "0x8086";
 	struct loop loop = { 0 };
 
 	prepare(&loop);
 	encode(&loop, 1000000);
 	for (guint j = 0; j < loop.packets->len; j++)
 		g_assert_true(deliver(&loop, j));
-	g_assert_true(selected_intel);
+	g_assert_true(tried_vaapi);
 	g_assert_cmpuint(loop.count, ==, 1);
 	done(&loop);
 #else
@@ -248,8 +316,10 @@ static void check_visible_edges(const struct line_camera_frame *frame,
 		const guint8 *first = frame->plane[i];
 		const guint8 *last = first + (height - 1) * frame->stride[i];
 
-		g_assert_cmpint(ABS(first[0] - expected[i]), <=, 3);
-		g_assert_cmpint(ABS(last[width - 1] - expected[i]), <=, 3);
+		g_assert_cmpint(ABS(first[0] - expected[i]), <=,
+				loop->color_tolerance);
+		g_assert_cmpint(ABS(last[width - 1] - expected[i]), <=,
+				loop->color_tolerance);
 	}
 	loop->count++;
 }
@@ -270,7 +340,7 @@ static void decoder_visible_dimensions(void)
 		0xff, 0xde, 0xc1, 0x7d, 0xd8, 0x2f, 0xbb, 0x05, 0xfe, 0xb6,
 		0x00,
 	};
-	struct loop loop = { .rotation = 270 };
+	struct loop loop = { .rotation = 270, .color_tolerance = 3 };
 	struct call_vp8_decoder *decoder = call_vp8_open(1);
 	const char *initial = NULL;
 
@@ -1490,6 +1560,238 @@ static void screen_share_roundtrip(void)
 	call_share_decoder_free(dec);
 }
 
+struct encoder_output {
+	guint pictures, luma;
+};
+
+static void check_encoded_frame(const struct line_camera_frame *f,
+				gpointer data)
+{
+	struct encoder_output *out = data;
+
+	g_assert_cmpuint(f->width, ==, 16);
+	g_assert_cmpuint(f->height, ==, 16);
+	g_assert_cmpint(ABS((int)f->plane[0][0] - (int)out->luma), <=, 3);
+	out->pictures++;
+}
+
+enum encoder_transport {
+	ENC_CAMERA,
+	ENC_GROUP_CAMERA,
+	ENC_SCREEN_RTP,
+	ENC_SCREEN_PDTP,
+};
+
+static void outgoing_hardware_vp8(gconstpointer data)
+{
+	enum encoder_transport transport = GPOINTER_TO_UINT(data);
+	struct loop loop = { 0 };
+	struct share_loop share = { 0 };
+	struct call_share_encoder *presentation = NULL;
+	struct call_share_decoder *presentation_rx = NULL;
+	guint8 pixels[16 * 16 * 3 / 2];
+	struct encoder_output out = { .luma = 126 };
+	srtp_t observer = NULL;
+	guint expected_opens = 1;
+
+	encoder = (struct encoder_fixture){ .enabled = TRUE };
+	prepare(&loop);
+	memset(pixels, 212, 16 * 16);
+	memset(pixels + 16 * 16, 128, sizeof(pixels) - 16 * 16);
+	line_camera_i420_frame(&loop.frame, pixels, 16, 16);
+	if (transport == ENC_GROUP_CAMERA) {
+		call_video_close(loop.tx);
+		call_video_close(loop.rx);
+		loop.tx =
+			call_video_open_group_tx(key_a, 97, 101, 400, 10, NULL);
+		loop.rx = call_video_open_group_rx(key_a, 97, 101, NULL);
+		g_assert_nonnull(loop.tx);
+		g_assert_nonnull(loop.rx);
+		call_video_set_group_format(loop.tx, CALL_VIDEO_RTP_EXT_VED,
+					    TRUE);
+	} else if (transport == ENC_SCREEN_PDTP) {
+		presentation = call_share_encoder_new(900, 20);
+		presentation_rx = call_share_decoder_new();
+		g_assert_nonnull(presentation);
+		g_assert_nonnull(presentation_rx);
+		share.fragments = g_ptr_array_new_with_free_func(
+			(GDestroyNotify)g_bytes_unref);
+	}
+	if (!presentation)
+		g_assert_true(
+			call_srtp_open(&observer, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < 6; i++) {
+		gint64 now = 1000000 + i * 100000;
+		gboolean key = i == 0 || i == 2 || i == 3 || i == 4;
+		gsize size;
+
+		/* A driver's spontaneous keyframe, a remote refresh, then a
+		 * driver failure requiring the same input as a software keyframe. */
+		encoder.force_key = i == 2 && transport != ENC_SCREEN_RTP;
+		if (transport == ENC_SCREEN_RTP && i == 2) {
+			call_video_screen(loop.tx, 900, 20);
+			expected_opens++;
+		}
+		if (i == 3) {
+			if (presentation)
+				call_share_encoder_keyframe(presentation);
+			else
+				call_video_keyframe(loop.tx);
+		}
+		if (i == 4) {
+			encoder.fail = TRUE;
+			out.luma = pixels[0];
+		}
+		/* Returning to the camera after a runtime hardware failure
+		 * must restart in software without probing the failed encoder. */
+		if (transport == ENC_SCREEN_RTP && i == 5) {
+			call_video_screen(loop.tx, 0, 0);
+			key = TRUE;
+		}
+		if (presentation) {
+			g_ptr_array_set_size(share.fragments, 0);
+			g_assert_true(call_share_encode(
+				presentation, &loop.frame, now, share_collect,
+				&share, NULL));
+			g_assert_cmpuint(share.fragments->len, ==, 1);
+			const guint8 *f = g_bytes_get_data(
+				share.fragments->pdata[0], &size);
+			g_assert_cmpint(!(f[0] & 0x40), ==, key);
+			g_assert_true(
+				call_share_decode(presentation_rx, f, size,
+						  check_encoded_frame, &out));
+		} else {
+			encode(&loop, now);
+			g_assert_cmpuint(loop.packets->len, ==, 1);
+			const guint8 *f =
+				g_bytes_get_data(loop.packets->pdata[0], &size);
+			guint8 packet[1200];
+			int length = size;
+			guint header = 12;
+
+			g_assert_cmpuint(size, <=, sizeof(packet));
+			memcpy(packet, f, size);
+			g_assert_cmpint(srtp_unprotect(observer, packet,
+						       &length),
+					==, srtp_err_status_ok);
+			if (packet[0] & 0x10)
+				header += 4 +
+					  4 * (packet[14] * 256u + packet[15]);
+			g_assert_cmpuint(header, <, (guint)length);
+			g_assert_cmpint(!(packet[header] & 0x40), ==, key);
+			g_assert_true(call_video_receive(
+				loop.rx, f, size, check_encoded_frame, &out));
+		}
+		g_assert_cmpuint(out.pictures, ==, i + 1);
+		g_assert_cmpuint(encoder.opens, ==, expected_opens);
+		g_assert_cmpuint(encoder.frames, ==, MIN(i + 1, 5u));
+	}
+	g_assert_cmpuint(encoder.kbps, ==,
+			 transport == ENC_GROUP_CAMERA ? 150 :
+			 transport == ENC_CAMERA       ? 400 :
+							 900);
+	g_assert_cmpuint(encoder.fps, ==,
+			 transport <= ENC_GROUP_CAMERA ? 10 : 20);
+	if (observer)
+		srtp_dealloc(observer);
+	g_clear_pointer(&share.fragments, g_ptr_array_unref);
+	call_share_encoder_free(presentation);
+	call_share_decoder_free(presentation_rx);
+	done(&loop);
+	g_assert_cmpuint(encoder.closes, ==, expected_opens);
+	encoder = (struct encoder_fixture){ 0 };
+}
+
+struct call_vp8_encoder *__real_call_vp8_encoder_open(guint w, guint h,
+						      guint kbps, guint fps,
+						      guint key_distance);
+gboolean __real_call_vp8_encoder_frame(struct call_vp8_encoder *e,
+				       const struct line_camera_frame *f,
+				       gint64 pts, gboolean force_key,
+				       const guint8 **data, gsize *size,
+				       gboolean *key);
+void __real_call_vp8_encoder_close(struct call_vp8_encoder *e);
+const char *__real_call_vp8_encoder_name(const struct call_vp8_encoder *e);
+
+static void vaapi_encoder_selection(gconstpointer vendor)
+{
+#if CALL_HWDECODE
+	if (!avcodec_find_encoder_by_name("vp8_vaapi")) {
+		g_test_skip("FFmpeg was built without the VP8 VA-API encoder");
+		return;
+	}
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, G_TEST_SUBPROCESS_DEFAULT);
+		g_test_trap_assert_passed();
+		return;
+	}
+	/* Pin a synthetic DRM render node. Its deliberately unavailable VA
+	 * device must be probed once and leave software encoding available. */
+	g_unsetenv("LINE_DISABLE_GPU");
+	g_setenv("AVERNELLA_RENDER_NODE", "/dev/null", TRUE);
+	mock_drm_vendor = vendor;
+	g_assert_null(__real_call_vp8_encoder_open(W, H, 400, 10, 30));
+	g_assert_true(tried_vaapi);
+#else
+	(void)vendor;
+	g_test_skip("Built without FFmpeg acceleration");
+#endif
+}
+
+static void native_hardware_vp8(void)
+{
+	struct call_vp8_encoder *enc =
+		__real_call_vp8_encoder_open(W, H, 400, 10, 30);
+	if (!enc) {
+		g_test_skip(
+			"Selected adapter has no usable hardware VP8 encoder");
+		return;
+	}
+
+	struct call_vp8_decoder *dec = call_vp8_open(1);
+	struct loop loop = { .color_tolerance = 12 };
+	const int strides[] = { W + 9, W / 2 + 3, W / 2 + 11 };
+	g_autofree guint8 *storage =
+		g_malloc(H * strides[0] + H / 2 * (strides[1] + strides[2]));
+	guint8 *p = storage;
+	static const guint8 samples[] = { 96, 80, 160 };
+
+	g_test_message("Hardware encoder: %s",
+		       __real_call_vp8_encoder_name(enc));
+	g_assert_nonnull(dec);
+	loop.frame.width = W;
+	loop.frame.height = H;
+	for (guint i = 0; i < 3; i++) {
+		guint w = i ? W / 2 : W, h = i ? H / 2 : H;
+		loop.frame.plane[i] = p;
+		loop.frame.stride[i] = strides[i];
+		for (guint row = 0; row < h; row++, p += strides[i]) {
+			memset(p, samples[i], w);
+			memset(p + w, 0xff, strides[i] - w);
+		}
+	}
+	for (guint i = 0; i < 3; i++) {
+		const guint8 *picture;
+		gsize size;
+		gboolean key;
+		gboolean force_key = i != 1;
+
+		g_assert_true(__real_call_vp8_encoder_frame(
+			enc, &loop.frame, i * 9000, force_key, &picture, &size,
+			&key));
+		g_assert_cmpuint(size, >, 3);
+		g_assert_cmpint(key, ==, !(picture[0] & 1));
+		if (force_key)
+			g_assert_true(key);
+		g_assert_cmpint(call_vp8_decode(dec, picture, size, key, 0,
+						check_visible_edges, &loop),
+				==, 1);
+	}
+	g_assert_cmpuint(loop.count, ==, 3);
+	call_vp8_close(dec);
+	__real_call_vp8_encoder_close(enc);
+}
+
 /* Bytes captured from LINE Android 26.18.2's presentation stream. */
 static void screen_share_official_layout(void)
 {
@@ -1844,6 +2146,23 @@ int main(int argc, char **argv)
 			conference_receive_fir);
 	g_test_add_func("/video/profile-negotiation", negotiation);
 	g_test_add_func("/video/negotiated-stream-reports", negotiated_streams);
+	g_test_add_func("/video/hardware-encode/native", native_hardware_vp8);
+	g_test_add_data_func("/video/hardware-encode/amd-selection", "0x1002",
+			     vaapi_encoder_selection);
+	g_test_add_data_func("/video/hardware-encode/intel-selection", "0x8086",
+			     vaapi_encoder_selection);
+	g_test_add_data_func("/video/hardware-encode/camera",
+			     GUINT_TO_POINTER(ENC_CAMERA),
+			     outgoing_hardware_vp8);
+	g_test_add_data_func("/video/hardware-encode/group-camera",
+			     GUINT_TO_POINTER(ENC_GROUP_CAMERA),
+			     outgoing_hardware_vp8);
+	g_test_add_data_func("/video/hardware-encode/rtp-screen",
+			     GUINT_TO_POINTER(ENC_SCREEN_RTP),
+			     outgoing_hardware_vp8);
+	g_test_add_data_func("/video/hardware-encode/pdtp-screen",
+			     GUINT_TO_POINTER(ENC_SCREEN_PDTP),
+			     outgoing_hardware_vp8);
 	g_test_add_func("/video/screen-share-roundtrip",
 			screen_share_roundtrip);
 	g_test_add_func("/video/decoder-visible-dimensions",

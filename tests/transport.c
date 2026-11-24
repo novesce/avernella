@@ -4,9 +4,13 @@
  * refresh state machine without opening a network connection.
  */
 #include "line.h"
+#include "login_retry.h"
 #include <curl/curl.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static curl_write_callback receive_body;
 static void *receive_data;
@@ -266,11 +270,26 @@ static void rate_limit(void)
 	g_autoptr(GError) error = NULL;
 
 	http_code = 429;
-	retry_after = 90;
+	retry_after = 3 * 86400;
 	requests = 0;
 	g_assert_null(line_rpc(&client, "/S4", "getProfile", NULL, &error));
 	g_assert_error(error, LINE_ERROR, LINE_RATE_LIMITED);
-	g_assert_cmpint(line_transport_retry_after(), >=, 89);
+	g_assert_cmpint(line_transport_retry_after(), >=, retry_after - 1);
+	/* A saved-session login marks a transient failure as retryable. The
+	 * worker must carry the full wait to the next login in the window. */
+	error->code = LINE_RETRY;
+	g_autoptr(J) reply = obj();
+	guint rejected = 0;
+
+	line_reply_retry(reply, error, TRUE);
+	g_assert_true(json_object_get_boolean(field(reply, "retry")));
+	g_assert_cmpint(json_object_get_int(field(reply, "code")), ==,
+			LINE_RETRY);
+	g_assert_cmpint(line_login_wait_us(reply, &rejected), >=,
+			(retry_after - 1) * G_USEC_PER_SEC);
+	json_object_object_add(reply, "retryAfter", json_object_new_int(7200));
+	g_assert_cmpint(line_login_wait_us(reply, &rejected), ==,
+			(gint64)7200 * G_USEC_PER_SEC);
 	g_clear_error(&error);
 
 	http_code = 200;
@@ -388,6 +407,117 @@ static void busy_cooldown(void)
 	line_transport_release();
 }
 
+static void restored_cooldown(void)
+{
+	const char *store = g_getenv("AVERNELLA_TEST_RETRY_DIR");
+	g_assert_nonnull(store);
+	int dir = open(store, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	g_autoptr(GError) error = NULL;
+	Line session = { 0 };
+
+	g_assert_cmpint(dir, >=, 0);
+	line_cooldown_use_store(dir);
+	int wait = line_transport_retry_after();
+
+	g_assert_cmpint(wait, >, 3500);
+	g_assert_cmpint(wait, <=, 3600);
+	g_assert_null(line_call(&session, "/acct/lgn/sq/v1", "createSession",
+				NULL, NULL, 0, &error));
+	g_assert_error(error, LINE_ERROR, LINE_RATE_LIMITED);
+	g_clear_error(&error);
+	g_assert_null(line_auth_call(&session, "/api/v3/TalkService.do",
+				     "getRSAKeyInfo", NULL, &error));
+	g_assert_error(error, LINE_ERROR, LINE_RATE_LIMITED);
+	g_assert_cmpint(requests, ==, 0);
+	line_cooldown_use_store(-1);
+	close(dir);
+}
+
+static void expired_cooldown(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_autofree char *store = g_dir_make_tmp("avernella-retry-XXXXXX", NULL);
+	g_assert_nonnull(store);
+	int dir = open(store, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	g_autofree char *path =
+		g_build_filename(store, "rpc.retry-until", NULL);
+	gint64 past = GINT64_TO_LE(g_get_real_time() - G_USEC_PER_SEC);
+
+	g_assert_cmpint(dir, >=, 0);
+	g_assert_true(g_file_set_contents_full(
+		path, (const char *)&past, sizeof(past),
+		G_FILE_SET_CONTENTS_CONSISTENT, 0600, NULL));
+	line_cooldown_use_store(dir);
+	g_assert_cmpint(line_transport_retry_after(), ==, 0);
+	g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+	g_assert_true(g_file_set_contents_full(path, "incomplete", -1,
+					       G_FILE_SET_CONTENTS_CONSISTENT,
+					       0600, NULL));
+	line_cooldown_use_store(dir);
+	g_assert_cmpint(line_transport_retry_after(), ==, 0);
+	line_cooldown_use_store(-1);
+	close(dir);
+	g_assert_cmpint(unlink(path), ==, 0);
+	g_assert_cmpint(rmdir(store), ==, 0);
+}
+
+static void persist_cooldown(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_autofree char *store = g_dir_make_tmp("avernella-retry-XXXXXX", NULL);
+	g_assert_nonnull(store);
+	int dir = open(store, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	g_autofree char *path =
+		g_build_filename(store, "rpc.retry-until", NULL);
+	g_autoptr(GError) error = NULL;
+	Line session = { 0 };
+
+	g_assert_cmpint(dir, >=, 0);
+	line_cooldown_use_store(dir);
+	line_cooldown_set("https://cdn.example.org/image", 100);
+	g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+	http_code = 429;
+	retry_after = 3600;
+	g_assert_null(line_rpc(&session, "/S4", "getProfile", NULL, &error));
+	g_assert_error(error, LINE_ERROR, LINE_RATE_LIMITED);
+	struct stat st;
+
+	g_assert_cmpint(stat(path, &st), ==, 0);
+	g_assert_cmpint(st.st_size, ==, sizeof(gint64));
+	g_assert_cmpint(st.st_mode & 0777, ==, 0600);
+	g_autofree char *saved = NULL, *after = NULL;
+	gsize n, m;
+
+	g_assert_true(g_file_get_contents(path, &saved, &n, NULL));
+	gint64 record;
+
+	memcpy(&record, saved, sizeof(record));
+	gint64 remaining = GINT64_FROM_LE(record) - g_get_real_time();
+
+	g_assert_cmpint(remaining, >, (gint64)3500 * G_USEC_PER_SEC);
+	g_assert_cmpint(remaining, <=, (gint64)3600 * G_USEC_PER_SEC);
+	line_cooldown_set(LINE_RPC_ORIGIN, 30);
+	line_cooldown_use_store(-1);
+	close(dir);
+
+	g_setenv("AVERNELLA_TEST_RETRY_DIR", store, TRUE);
+	g_test_trap_subprocess("/transport/subprocess/restore-cooldown", 0, 0);
+	g_test_trap_assert_passed();
+	g_assert_true(g_file_get_contents(path, &after, &m, NULL));
+	g_assert_cmpmem(saved, n, after, m);
+	g_assert_cmpint(unlink(path), ==, 0);
+	g_assert_cmpint(rmdir(store), ==, 0);
+	line_transport_release();
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -401,6 +531,10 @@ int main(int argc, char **argv)
 	g_test_add_func("/transport/access-denied", access_denied);
 	g_test_add_func("/transport/denial-latch", denial_latch);
 	g_test_add_func("/transport/busy-cooldown", busy_cooldown);
+	g_test_add_func("/transport/persist-cooldown", persist_cooldown);
+	g_test_add_func("/transport/expired-cooldown", expired_cooldown);
+	g_test_add_func("/transport/subprocess/restore-cooldown",
+			restored_cooldown);
 	g_test_add_func("/transport/retry-after", rate_limit);
 	return g_test_run();
 }

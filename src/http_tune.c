@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "line.h"
 #include <curl/curl.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 static gsize curl_initialized;
 
@@ -92,12 +96,66 @@ gboolean line_curl_tune(CURL *handle, gboolean pooled)
  */
 enum {
 	COOLDOWN_DEFAULT_SECONDS = 30,
-	COOLDOWN_MAX_SECONDS = 24 * 60 * 60,
 	COOLDOWN_HOSTS = 64,
 };
 
 static GMutex cooldown_lock;
 static GHashTable *cooldowns; /* lowercase host → monotonic µs deadline */
+static gint64 rpc_until;
+static int rpc_dir = -1;
+
+#define RPC_WAIT_FILE "rpc.retry-until"
+
+/* No account details on disk, just the absolute UTC deadline in microseconds. */
+static void save_rpc_wait(gint64 expiry)
+{
+	g_autofree char *path =
+		g_strdup_printf("/proc/self/fd/%d/" RPC_WAIT_FILE, rpc_dir);
+	gint64 record = GINT64_TO_LE(expiry);
+
+	if (!g_file_set_contents_full(path, (const char *)&record,
+				      sizeof(record),
+				      G_FILE_SET_CONTENTS_CONSISTENT |
+					      G_FILE_SET_CONTENTS_DURABLE,
+				      0600, NULL))
+		g_printerr(
+			"Could not save LINE's retry time for the next launch.\n");
+}
+
+/* The store is private and exclusively locked by the worker. An absent or
+ * damaged optional record must leave manual sign-in and sign-out usable.
+ */
+void line_cooldown_use_store(int dir)
+{
+	g_mutex_lock(&cooldown_lock);
+	rpc_dir = dir;
+	if (dir >= 0) {
+		int fd = openat(dir, RPC_WAIT_FILE,
+				O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+		struct stat st;
+		gint64 record;
+
+		if (fd >= 0 && !fstat(fd, &st) && S_ISREG(st.st_mode) &&
+		    st.st_uid == geteuid() && !(st.st_mode & 077) &&
+		    st.st_size == sizeof(record) &&
+		    TEMP_FAILURE_RETRY(read(fd, &record, sizeof(record))) ==
+			    sizeof(record)) {
+			gint64 expiry = GINT64_FROM_LE(record);
+			gint64 now = g_get_real_time();
+
+			if (expiry <= now)
+				unlinkat(dir, RPC_WAIT_FILE, 0);
+			else if (expiry - now <=
+				 (gint64)G_MAXINT * G_USEC_PER_SEC)
+				rpc_until =
+					MAX(rpc_until, g_get_monotonic_time() +
+							       (expiry - now));
+		}
+		if (fd >= 0)
+			close(fd);
+	}
+	g_mutex_unlock(&cooldown_lock);
+}
 
 static char *cooldown_host(const char *url)
 {
@@ -117,16 +175,22 @@ static gboolean expired(gpointer key, gpointer value, gpointer now)
 int line_cooldown_seconds(const char *url)
 {
 	g_autofree char *host = cooldown_host(url);
-	gint64 now = g_get_monotonic_time(), until = 0;
+	gint64 until = 0;
 
 	if (!host)
 		return 0;
 	g_mutex_lock(&cooldown_lock);
-	gint64 *found = cooldowns ? g_hash_table_lookup(cooldowns, host) : NULL;
+	if (!strcmp(host, LINE_RPC_HOST))
+		until = rpc_until;
+	else if (cooldowns) {
+		gint64 *found = g_hash_table_lookup(cooldowns, host);
 
-	if (found)
-		until = *found;
+		if (found)
+			until = *found;
+	}
 	g_mutex_unlock(&cooldown_lock);
+	gint64 now = g_get_monotonic_time();
+
 	if (until <= now)
 		return 0;
 	return (until - now + G_USEC_PER_SEC - 1) / G_USEC_PER_SEC;
@@ -139,10 +203,19 @@ void line_cooldown_set(const char *url, int seconds)
 	if (!host || seconds <= 0)
 		return;
 	gint64 now = g_get_monotonic_time();
-	gint64 until = now + (gint64)MIN(seconds, COOLDOWN_MAX_SECONDS) *
-				     G_USEC_PER_SEC;
+	gint64 until = now + (gint64)seconds * G_USEC_PER_SEC;
 
 	g_mutex_lock(&cooldown_lock);
+	if (!strcmp(host, LINE_RPC_HOST)) {
+		if (until > rpc_until) {
+			rpc_until = until;
+			if (rpc_dir >= 0)
+				save_rpc_wait(g_get_real_time() +
+					      (until - g_get_monotonic_time()));
+		}
+		g_mutex_unlock(&cooldown_lock);
+		return;
+	}
 	if (!cooldowns)
 		cooldowns = g_hash_table_new_full(g_str_hash, g_str_equal,
 						  g_free, g_free);
