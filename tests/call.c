@@ -8,6 +8,7 @@
 #include "call_video.h"
 #include "media_io.h"
 #include "screencast.h"
+#include <sys/eventfd.h>
 #include <sys/timerfd.h>
 #include <arpa/inet.h>
 #include <errno.h>
@@ -33,8 +34,10 @@ static gint audio_devices;
 static gboolean bad_route, video_fixture, voice_fallback, migrate_media;
 static gboolean start_with_camera_off;
 static gboolean share_fixture, group_fixture, camera_unavailable;
+static gboolean peer_share_fixture;
 static guint fixture_camera_width = 160;
 static gint cameras_opened;
+static gint picker_fd = -1;
 static gint peer_video_ready;
 static int test_camera_fd = -1, preview_fd = -1;
 #define audio_active (g_atomic_int_get(&audio_devices) > 0)
@@ -150,6 +153,14 @@ void line_emit(J *event)
 		g_assert_cmpint(
 			json_object_get_int64(field(event, "changedAt")), >, 0);
 		line_event(type, "id", strfield(event, "id"));
+	} else if (!g_strcmp0(type, "call_share") &&
+		   field(event, "peerSharing")) {
+		g_assert_true(peer_share_fixture);
+		gboolean sharing =
+			json_object_get_boolean(field(event, "peerSharing"));
+
+		line_event(type, "state",
+			   sharing ? "peer-started" : "peer-stopped");
 	} else if (!g_strcmp0(type, "call_share")) {
 		gboolean sharing =
 			json_object_get_boolean(field(event, "selfSharing"));
@@ -266,7 +277,7 @@ enum {
 
 struct line_screencast {
 	int fd;
-	gboolean ready;
+	gboolean ready, picker;
 };
 
 struct line_screencast *line_screencast_start(unsigned int width,
@@ -281,6 +292,12 @@ struct line_screencast *line_screencast_start(unsigned int width,
 	struct line_screencast *cast = g_new0(struct line_screencast, 1);
 	static const struct itimerspec first = { .it_value.tv_nsec = 1000000 };
 
+	cast->fd = g_atomic_int_get(&picker_fd);
+	if (cast->fd >= 0) {
+		cast->picker = TRUE;
+		g_atomic_int_set(&picker_fd, -1);
+		return cast;
+	}
 	cast->fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	g_assert_cmpint(cast->fd, >=, 0);
 	g_assert_cmpint(timerfd_settime(cast->fd, 0, &first, NULL), ==, 0);
@@ -305,9 +322,32 @@ enum line_screencast_state line_screencast_poll(struct line_screencast *cast,
 {
 	guint64 ticks;
 
-	(void)message;
 	cast->ready = read(cast->fd, &ticks, sizeof(ticks)) == sizeof(ticks);
+	if (cast->picker) {
+		g_assert_true(cast->ready);
+		if (ticks == 1) {
+			line_event("test_picker", "state", "open");
+			return LINE_SCREENCAST_STARTING;
+		}
+		g_assert_cmpuint(ticks, ==, 2);
+		*message = g_strdup("Screen selection canceled.");
+		return LINE_SCREENCAST_STOPPED;
+	}
 	return LINE_SCREENCAST_RUNNING;
+}
+
+static GBytes *fixture_screen_pixels(void)
+{
+	gsize size = line_camera_i420_size(SCREEN_WIDTH, SCREEN_HEIGHT);
+	guint8 *pixels = g_malloc(size);
+
+	gsize half = SCREEN_WIDTH * SCREEN_HEIGHT / 2;
+
+	memset(pixels, 168, half);
+	memset(pixels + half, 72, half);
+	memset(pixels + SCREEN_WIDTH * SCREEN_HEIGHT, 128,
+	       size - SCREEN_WIDTH * SCREEN_HEIGHT);
+	return g_bytes_new_take(pixels, size);
 }
 
 GBytes *line_screencast_take(struct line_screencast *cast, unsigned int *width,
@@ -319,13 +359,7 @@ GBytes *line_screencast_take(struct line_screencast *cast, unsigned int *width,
 	*width = SCREEN_WIDTH;
 	*height = SCREEN_HEIGHT;
 	*time = (guint64)g_get_monotonic_time() * 1000;
-	gsize size = line_camera_i420_size(*width, *height);
-	guint8 *pixels = g_malloc(size);
-
-	memset(pixels, 168, SCREEN_WIDTH * SCREEN_HEIGHT);
-	memset(pixels + SCREEN_WIDTH * SCREEN_HEIGHT, 128,
-	       size - SCREEN_WIDTH * SCREEN_HEIGHT);
-	return g_bytes_new_take(pixels, size);
+	return fixture_screen_pixels();
 }
 
 SDL_AudioDeviceID __real_SDL_OpenAudioDevice(const char *device, int capture,
@@ -678,6 +712,8 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 				 guint32 tx_ssrc, gboolean trial,
 				 guint32 accepted_ssrc,
 				 enum call_video_rtp_extension format);
+static void group_share_exchange(struct fake_relay *relay, const guint8 *local,
+				 guint8 pt, guint32 rx_ssrc, guint32 ssrc);
 static void expect_camera_control(struct fake_relay *relay, guint action,
 				  guint32 tx_ssrc, gboolean expect_report);
 
@@ -876,7 +912,10 @@ static void group_call(gconstpointer args)
 	}
 	video_fixture = mode != 0 && mode != 3;
 	voice_fallback = mode == 2;
-	camera_unavailable = mode == 6;
+	camera_unavailable = mode == 6 || mode == 11;
+	share_fixture = mode == 10 || mode == 11;
+	if (share_fixture)
+		g_setenv("LINE_SHARE_TRANSPORT", "presentation", TRUE);
 	fixture_camera_width = mode == 8 ? 640 : 160;
 	if (trial)
 		g_setenv("LINE_EXPERIMENTAL_GROUP_UPLINK", "1", TRUE);
@@ -1119,7 +1158,10 @@ static void group_call(gconstpointer args)
 	if (!video_fixture)
 		group_data_exchange(&relay, local_key.p, remote_key, RTP_PT + 2,
 				    RX_SSRC + 2, TX_SSRC + 2);
-	if (video_fixture && !voice_fallback && !camera_unavailable)
+	if (share_fixture)
+		group_share_exchange(&relay, local_key.p, RTP_PT + 1,
+				     RX_SSRC + 1, TX_SSRC + 1);
+	else if (video_fixture && !voice_fallback && !camera_unavailable)
 		group_video_exchange(&relay, local_key.p, remote_key,
 				     RTP_PT + 1, TX_SSRC + 1, trial,
 				     mode == 7 ? RX_SSRC + 1 : TX_SSRC + 1,
@@ -1127,8 +1169,11 @@ static void group_call(gconstpointer args)
 	g_autoptr(J) muted = line_voice_mute(TRUE, &error);
 	g_assert_no_error(error);
 	g_assert_true(json_object_get_boolean(field(muted, "muted")));
-	g_assert_null(line_call_share(TRUE, &error));
-	g_clear_error(&error);
+	if (!video_fixture || voice_fallback) {
+		g_assert_null(line_call_share(TRUE, &error));
+		g_assert_error(error, LINE_ERROR, 1);
+		g_clear_error(&error);
+	}
 	gint64 leaving = g_get_monotonic_time();
 	g_autoptr(J) left = line_voice_hangup(&error);
 	g_assert_no_error(error);
@@ -1428,19 +1473,12 @@ static void assert_camera_map(const Pb *packet,
 	}
 }
 
-static void expect_group_camera_restart(struct fake_relay *relay,
-					const guint8 *key, guint8 pt,
-					guint32 ssrc, guint encoding,
-					enum call_video_rtp_extension format)
+static void request_group_camera(struct fake_relay *relay, guint32 ssrc,
+				 guint encoding,
+				 enum call_video_rtp_extension format)
 {
-	struct video_peer decoded = { 0 };
 	Pb stream = { 0 }, request = { 0 }, plain = { 0 }, wire = { 0 };
-	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
-	struct call_video *receiver =
-		call_video_open_group_rx(key, pt, ssrc, NULL);
-	gboolean acknowledged = FALSE;
 
-	g_assert_nonnull(receiver);
 	pb_uint(&stream, 1, 1); /* START */
 	pb_uint(&stream, 3, ssrc);
 	pb_uint(&stream, 6, encoding);
@@ -1453,7 +1491,6 @@ static void expect_group_camera_restart(struct fake_relay *relay,
 		pb_uint(&layer, 2, 1);
 		pb_msg(&stream, 8, &layer);
 		pb_uint(&request, 2, encoding);
-		decoded.expected_width = 320;
 	}
 	pb_msg(&request, 1, &stream);
 	g_assert_true(call_envelope(&plain, &relay->info, 4,
@@ -1464,6 +1501,23 @@ static void expect_group_camera_restart(struct fake_relay *relay,
 	g_assert_cmpint(sendto(server_fd, wire.p, wire.n, 0,
 			       (const void *)&relay->remote, relay->remote_len),
 			==, (ssize_t)wire.n);
+}
+
+static void expect_group_camera_restart(struct fake_relay *relay,
+					const guint8 *key, guint8 pt,
+					guint32 ssrc, guint encoding,
+					enum call_video_rtp_extension format)
+{
+	struct video_peer decoded = { 0 };
+	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
+	struct call_video *receiver =
+		call_video_open_group_rx(key, pt, ssrc, NULL);
+	gboolean acknowledged = FALSE;
+
+	g_assert_nonnull(receiver);
+	if (format == CALL_VIDEO_RTP_EXT_VED)
+		decoded.expected_width = 320;
+	request_group_camera(relay, ssrc, encoding, format);
 	while (!decoded.got_frame && readable_until(server_fd, end)) {
 		Pb packet = receive_packet(relay), control = { 0 };
 
@@ -1629,6 +1683,7 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 	g_assert_no_error(error);
 	g_assert_nonnull(disabled);
 	expect_camera_control(relay, 2, tx_ssrc, TRUE);
+	synthetic_frame(&frame, 320);
 	g_assert_true(call_video_encode(sender, &frame, g_get_monotonic_time(),
 					send_peer_video, &endpoint, &error));
 	g_assert_no_error(error);
@@ -1637,6 +1692,32 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 	image = line_call_take_frame(group, &width, &height, &rotation,
 				     &camera);
 	g_assert_nonnull(image);
+	g_assert_false(camera);
+	g_assert_cmpint(width, ==, 320);
+	g_assert_cmpint(height, ==, 240);
+
+	/* The focused participant can publish a display on this same stream. */
+	g_autoptr(GBytes) desktop = fixture_screen_pixels();
+
+	line_camera_i420_frame(&frame, g_bytes_get_data(desktop, NULL),
+			       SCREEN_WIDTH, SCREEN_HEIGHT);
+	call_video_screen(sender, 600, 10);
+	g_assert_true(call_video_encode(sender, &frame, g_get_monotonic_time(),
+					send_peer_video, &endpoint, &error));
+	g_assert_no_error(error);
+	expect_event("call_frame c33333333333333333333333333333333");
+	g_clear_pointer(&image, g_bytes_unref);
+	image = line_call_take_frame(group, &width, &height, &rotation,
+				     &camera);
+	g_assert_nonnull(image);
+	g_assert_cmpint(width, ==, SCREEN_WIDTH);
+	g_assert_cmpint(height, ==, SCREEN_HEIGHT);
+	g_assert_cmpuint(g_bytes_get_size(image), ==,
+			 g_bytes_get_size(desktop));
+	const guint8 *pixels = g_bytes_get_data(image, NULL);
+
+	g_assert_cmpint(ABS((int)pixels[0] - 168), <=, 8);
+	g_assert_cmpint(ABS((int)pixels[width * (height - 1)] - 72), <=, 8);
 	g_assert_false(camera);
 	g_autoptr(J) enabled = line_call_camera(TRUE, &error);
 
@@ -1832,8 +1913,8 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 }
 
 struct share_picture {
-	guint width;
-	guint8 luma;
+	guint width, height;
+	guint8 top, bottom;
 	guint received;
 };
 
@@ -1844,7 +1925,12 @@ static void check_share_picture(const struct line_camera_frame *frame,
 
 	if (frame->width != expected->width)
 		return;
-	g_assert_cmpint(ABS((int)frame->plane[0][0] - expected->luma), <=, 8);
+	g_assert_cmpuint(frame->height, ==, expected->height);
+	const guint8 *last =
+		frame->plane[0] + (frame->height - 1) * frame->stride[0];
+
+	g_assert_cmpint(ABS((int)frame->plane[0][0] - expected->top), <=, 8);
+	g_assert_cmpint(ABS((int)last[0] - expected->bottom), <=, 8);
 	expected->received++;
 }
 
@@ -1858,11 +1944,107 @@ static void receive_share_pictures(int fd, struct call_video *video,
 		guint8 packet[2048];
 		ssize_t n = recv(fd, packet, sizeof(packet), 0);
 
-		if (n >= 12 && (packet[0] & 0xc0) == 0x80 &&
-		    (packet[1] & 127) == 109)
+		if (n > 0)
 			call_video_receive(video, packet, n,
 					   check_share_picture, expected);
 	}
+}
+
+static void group_share_exchange(struct fake_relay *relay, const guint8 *local,
+				 guint8 pt, guint32 rx_ssrc, guint32 ssrc)
+{
+	struct share_picture camera = {
+		.width = 160, .height = 120, .top = 96, .bottom = 96
+	};
+	struct share_picture screen = { .width = SCREEN_WIDTH,
+					.height = SCREEN_HEIGHT,
+					.top = 168,
+					.bottom = 72 };
+	g_autoptr(GError) error = NULL;
+	guint8 rx[30];
+
+	call_group_media_key("VIDEO", local, rx);
+	struct call_video *viewer =
+		call_video_open_group_rx(rx, pt, ssrc, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(viewer);
+	g_atomic_int_set(&peer_video_ready, TRUE);
+	if (!camera_unavailable) {
+		receive_share_pictures(server_fd, viewer, &camera, 1,
+				       2 * G_USEC_PER_SEC);
+		g_assert_cmpuint(camera.received, ==, 1);
+
+		/* The capture fixture owns this fd until it handles cancellation. */
+		int picker = eventfd(1, EFD_CLOEXEC | EFD_NONBLOCK);
+
+		g_assert_cmpint(picker, >=, 0);
+		g_atomic_int_set(&picker_fd, picker);
+		g_autoptr(J) denied = line_call_share(TRUE, &error);
+
+		g_assert_no_error(error);
+		g_assert_true(
+			json_object_get_boolean(field(denied, "pending")));
+		expect_event("test_picker open");
+		receive_share_pictures(server_fd, viewer, &camera, 2,
+				       2 * G_USEC_PER_SEC);
+		g_assert_cmpuint(camera.received, ==, 2);
+		g_assert_cmpint(eventfd_write(picker, 2), ==, 0);
+		expect_event("call_share stopped");
+		receive_share_pictures(server_fd, viewer, &camera, 3,
+				       2 * G_USEC_PER_SEC);
+		g_assert_cmpuint(camera.received, ==, 3);
+		g_assert_cmpint(g_atomic_int_get(&cameras_opened), ==, 1);
+	}
+	g_autoptr(J) start = line_call_share(TRUE, &error);
+
+	g_assert_no_error(error);
+	g_assert_true(json_object_get_boolean(field(start, "pending")));
+	expect_event("call_share started");
+	if (camera_unavailable)
+		expect_camera_control(relay, 1, ssrc, TRUE);
+	receive_share_pictures(server_fd, viewer, &screen, 2,
+			       3 * G_USEC_PER_SEC);
+	g_assert_cmpuint(screen.received, ==, 2);
+
+	/* A new receiver has no reference frame for this static desktop. */
+	call_video_close(viewer);
+	viewer = call_video_open_group_rx(rx, pt, ssrc, &error);
+	g_assert_no_error(error);
+	g_assert_nonnull(viewer);
+	if (camera_unavailable) {
+		guint8 fir[28] = { 0x91, 206, 0, 6 };
+		guint32 sender = htonl(rx_ssrc), target = htonl(ssrc);
+
+		memcpy(fir + 4, &sender, sizeof(sender));
+		memcpy(fir + 8, &target, sizeof(target));
+		g_assert_cmpint(sendto(server_fd, fir, sizeof(fir), 0,
+				       (const void *)&relay->remote,
+				       relay->remote_len),
+				==, sizeof(fir));
+	} else {
+		request_group_camera(relay, ssrc, 1, CALL_VIDEO_RTP_EXT_NONE);
+	}
+	receive_share_pictures(server_fd, viewer, &screen, 3, 1800000);
+	g_assert_cmpuint(screen.received, ==, 3);
+
+	g_autoptr(J) stop = line_call_share(FALSE, &error);
+
+	g_assert_no_error(error);
+	g_assert_false(json_object_get_boolean(field(stop, "pending")));
+	expect_event("call_share stopped");
+	if (camera_unavailable) {
+		expect_camera_control(relay, 2, ssrc, TRUE);
+		receive_share_pictures(server_fd, viewer, &screen, 4, 1200000);
+		g_assert_cmpuint(screen.received, ==, 3);
+		g_assert_cmpint(g_atomic_int_get(&cameras_opened), ==, 0);
+	} else {
+		receive_share_pictures(server_fd, viewer, &camera, 4,
+				       2 * G_USEC_PER_SEC);
+		g_assert_cmpuint(camera.received, ==, 4);
+		g_assert_cmpint(g_atomic_int_get(&cameras_opened), ==, 2);
+	}
+	call_video_close(viewer);
 }
 
 static void share_exchange(int fd, const struct fake_relay *r, EVP_PKEY *media,
@@ -1885,7 +2067,10 @@ static void share_exchange(int fd, const struct fake_relay *r, EVP_PKEY *media,
 	g_assert_no_error(error);
 	g_assert_true(json_object_get_boolean(field(started, "pending")));
 	expect_event("call_share started");
-	struct share_picture screen = { .width = SCREEN_WIDTH, .luma = 168 };
+	struct share_picture screen = { .width = SCREEN_WIDTH,
+					.height = SCREEN_HEIGHT,
+					.top = 168,
+					.bottom = 72 };
 
 	/* The portal gave us just one frame. A late viewer still needs it. */
 	receive_share_pictures(fd, video, &screen, 2, 3 * G_USEC_PER_SEC);
@@ -1902,7 +2087,9 @@ static void share_exchange(int fd, const struct fake_relay *r, EVP_PKEY *media,
 		g_assert_cmpuint(screen.received, ==, 2);
 		g_assert_cmpint(g_atomic_int_get(&cameras_opened), ==, 0);
 	} else {
-		struct share_picture camera = { .width = 160, .luma = 96 };
+		struct share_picture camera = {
+			.width = 160, .height = 120, .top = 96, .bottom = 96
+		};
 
 		receive_share_pictures(fd, video, &camera, 1,
 				       2 * G_USEC_PER_SEC);
@@ -1910,6 +2097,100 @@ static void share_exchange(int fd, const struct fake_relay *r, EVP_PKEY *media,
 		g_assert_cmpint(g_atomic_int_get(&cameras_opened), ==, 2);
 	}
 	call_video_close(video);
+}
+
+/*
+ * An independent tablet peer. Use the captured PLANET stream IDs, commands
+ * and EVS3 descriptor layout (analysis/video-call-wire.md). The VP8 payload
+ * is a synthetic 32x48, two-band I420 card encoded once with ffmpeg/libvpx.
+ * Keep both the PDTP packet writer and the picture independent of our sender.
+ */
+static void send_planet_packet(int fd, const struct sockaddr_in *client,
+			       srtp_t tx, guint16 seq, guint8 mask,
+			       const guint8 *elements, gsize size)
+{
+	guint8 packet[256] = {
+		0x80, 0x80 | 98, seq >> 8, seq, 0,    0, 0,    0,
+		0,    0,	 0,	   122, 0x80, 0, 'P',  'L',
+		'A',  'N',	 'E',	   'T', 0,    0, mask,
+	};
+	int n = 24 + size;
+
+	g_assert_cmpuint(size, <, 64);
+	packet[23] = size;
+	memcpy(packet + 24, elements, size);
+	g_assert_cmpint(srtp_protect(tx, packet, &n), ==, srtp_err_status_ok);
+	g_assert_cmpint(sendto(fd, packet, n, 0, (const void *)client,
+			       sizeof(*client)),
+			==, n);
+}
+
+static void receive_presentation(int fd, const struct fake_relay *r,
+				 EVP_PKEY *media, Slice material)
+{
+	static const guint8 open[] = { 2, 3, 0x12, 0, 4, 0x12, 0 };
+	/* count, stream, flags, start/end extensions, offset, length, data */
+	static const guint8 start[] = { 1, 3, 0x0c, 0, 0, 0, 2, 1, 1 };
+	static const guint8 stop[] = { 1, 3, 0x0c, 0, 0, 2, 3, 2, 1, 0x33 };
+	static const guint8 first[] = {
+		1,    4,    0x0c, 0,	0,    0,    36,	  0xba, 0,
+		1,    0x10, 0x27, 5,	2,    0,    0x3c, 9,	0x84,
+		0,    0,    0,	  44,	0xd0, 0x02, 0x00, 0x9d, 0x01,
+		0x2a, 0x20, 0x00, 0x30, 0x00, 0x00, 0x47, 0x08, 0x85,
+		0x85, 0x88, 0x85, 0x84, 0x88, 0x02, 0x02,
+	};
+	static const guint8 last[] = {
+		1,    4,    0x0c, 0,	0,    36,   23,	  0x84, 0,    1,
+		0x00, 0x08, 0x0f, 0x42, 0x43, 0x22, 0x22, 0xff, 0x51, 0xb8,
+		0x00, 0xfe, 0xfe, 0xf9, 0x79, 0xfb, 0xff, 0xd8, 0x80, 0x00,
+	};
+	guint8 send_key[30], recv_key[30];
+	guint16 seq = 1;
+	srtp_t tx;
+	int width, height, rotation;
+	gboolean sharing;
+
+	g_assert_true(call_data_keys(
+		media, r->info.pub, pb_data(material, 1).p, r->info.media_nonce,
+		pb_data(material, 3).p, r->info.media_id,
+		pb_number(material, 2, 0), send_key, recv_key));
+	g_assert_true(call_srtp_open(&tx, send_key, ssrc_specific, 122));
+	send_planet_packet(fd, &r->remote, tx, seq++, 8, open, sizeof(open));
+	send_planet_packet(fd, &r->remote, tx, seq++, 1, start, sizeof(start));
+	expect_event("call_share peer-started");
+
+	send_planet_packet(fd, &r->remote, tx, seq++, 1, first, sizeof(first));
+	send_planet_packet(fd, &r->remote, tx, seq++, 1, last, sizeof(last));
+	expect_event("call_share_frame u22222222222222222222222222222222");
+	g_autoptr(GBytes) image = line_call_take_share_frame(
+		peer, &width, &height, &rotation, &sharing);
+
+	g_assert_true(sharing);
+	g_assert_nonnull(image);
+	g_assert_cmpint(width, ==, 32);
+	g_assert_cmpint(height, ==, 48);
+	g_assert_cmpint(rotation, ==, 0);
+	g_assert_cmpuint(g_bytes_get_size(image), ==, 32 * 48 * 3 / 2);
+	const guint8 *y = g_bytes_get_data(image, NULL);
+
+	g_assert_cmpint(ABS((int)y[width * 12] - 50), <=, 3);
+	g_assert_cmpint(ABS((int)y[width * 36] - 194), <=, 3);
+
+	/* Leave a second complete picture queued, as on a slow UI thread. */
+	guint8 whole[63] = { 1, 4, 0x0c, 0, 0, 59, 56 };
+
+	memcpy(whole + 7, first + 7, sizeof(first) - 7);
+	memcpy(whole + sizeof(first), last + 10, sizeof(last) - 10);
+	whole[7] = 0xbe; /* Single-fragment keyframe. */
+	whole[9] = 2;
+	send_planet_packet(fd, &r->remote, tx, seq++, 1, whole, sizeof(whole));
+	expect_event("call_share_frame u22222222222222222222222222222222");
+	send_planet_packet(fd, &r->remote, tx, seq++, 1, stop, sizeof(stop));
+	expect_event("call_share peer-stopped");
+	g_assert_null(line_call_take_share_frame(peer, &width, &height,
+						 &rotation, &sharing));
+	g_assert_false(sharing);
+	srtp_dealloc(tx);
 }
 
 static gboolean reported_running;
@@ -2167,7 +2448,9 @@ static void outgoing(void)
 	if (r.info.video && !start_with_camera_off)
 		video_exchange(media_fd, &r, media, client_material, 109, FALSE,
 			       TRUE);
-	if (share_fixture)
+	if (peer_share_fixture)
+		receive_presentation(media_fd, &r, media, client_material);
+	else if (share_fixture)
 		share_exchange(media_fd, &r, media, client_material);
 	if (voice_fallback) {
 		g_autoptr(GError) e = NULL;
@@ -2264,7 +2547,10 @@ static void share_on_tablet(void)
 		g_unsetenv("LINE_EXPERIMENTAL_VIDEO");
 		g_unsetenv("LINE_SHARE_TRANSPORT");
 		video_fixture = share_fixture = TRUE;
+		peer_share_fixture =
+			!strcmp(g_test_get_path(), "/call/share-from-tablet");
 		start_with_camera_off =
+			peer_share_fixture ||
 			g_str_has_suffix(g_test_get_path(), "voice");
 		outgoing();
 		return;
@@ -2793,6 +3079,10 @@ int main(int argc, char **argv)
 			     group_call);
 	g_test_add_data_func("/call/group-video", GUINT_TO_POINTER(1),
 			     group_call);
+	g_test_add_data_func("/call/group-share/camera", GUINT_TO_POINTER(10),
+			     group_call);
+	g_test_add_data_func("/call/group-share/no-camera",
+			     GUINT_TO_POINTER(11), group_call);
 	g_test_add_data_func("/call/group-video-software-svc",
 			     GUINT_TO_POINTER(8), group_call);
 	g_test_add_data_func("/call/group-video-legacy-svc",
@@ -2812,6 +3102,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/call/authenticated-media-migration", media_migration);
 	g_test_add_func("/call/video-outgoing", video_outgoing);
 	g_test_add_func("/call/voice-then-video", voice_then_video);
+	g_test_add_func("/call/share-from-tablet", share_on_tablet);
 	g_test_add_func("/call/share-to-tablet/video", share_on_tablet);
 	g_test_add_func("/call/share-to-tablet/voice", share_on_tablet);
 	g_test_add_func("/call/video-to-voice-fallback", video_voice_fallback);

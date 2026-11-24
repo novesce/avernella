@@ -180,10 +180,10 @@ Media packets go to the media address the peer's connection signalling gives, wh
 
 There are two ways to send them:
 
-1. **In the video stream** (the default). The shared screen replaces the camera in the sender's video tile. The encoder uses a screen-specific bitrate budget (`call_video_screen()`, `LINE_SHARE_KBPS`) and varies resolution and frame rate to keep text sharp. If the camera was on, it is paused while sharing and restored afterwards.
-2. **As a native presentation** (`LINE_SHARE_TRANSPORT=presentation`, experimental), the way LINE's apps share: over **PDTP** in the **D** session.
+1. **In the video stream** (the default). The shared screen replaces the camera in the sender's video tile. The encoder uses a screen-specific bitrate budget (`call_video_screen()`, `LINE_SHARE_KBPS`) and varies resolution and frame rate to keep text sharp. In a group call, Avernella uses the negotiated group video track. Share a window with **Alt+S** and press it again to stop. Avernella restores the previous camera state. A new subscriber can request a keyframe even while the desktop image stays still.
+2. **As a native presentation in a one-to-one call** (`LINE_SHARE_TRANSPORT=presentation`, experimental), the way LINE's apps share: over **PDTP** in the **D** session.
 
-**Receiving** a peer's presentation always works: it appears as a separate tile with a **LIVE** badge.
+In one-to-one calls, Avernella displays an incoming native presentation in a separate tile with a **LIVE** badge. In group calls it can display a screen sent on the focused participant’s video track. Receiving Android’s separate group presentation stream is still unsupported. The APK and loopback harness and the procedure for verifying playback on handsets are in [Testing](testing.md#group-video-and-screen-sharing).
 
 ### PDTP
 
@@ -198,7 +198,7 @@ LINE calls a screen share a *presentation*: media kind 4 (DATA) with data servic
 - **Announcement:** a share is also announced as feature-share item 16 in a plane-3 `big_data_req`, with a zlib-compressed JSON body.
 - `LINE_CALL_PDTP_DUMP=<dir>` together with `LINE_CALL_DEBUG=1` appends raw LINE and PLANET stream contents to `<dir>/<service>-<stream>.bin`. These files can contain a participant’s screen share. Use an existing owner-only directory (mode 0700). Capture files are private to the owner. Ordinary call diagnostics report packet sizes, counters and route changes.
 
-[analysis/video-call-wire.md](../../analysis/video-call-wire.md#screen-sharing-presentation) records exactly what has and hasn't been verified against LINE's apps. In short: receiving works, sending a native presentation is only partly working, which is why sharing through the video stream is the default.
+[analysis/video-call-wire.md](../../analysis/video-call-wire.md#screen-sharing-presentation) records exactly what has and hasn't been verified against LINE's apps. The direct-call receive path has been exercised with the official app. Sending a separate native presentation remains experimental.
 
 ## Incoming calls
 

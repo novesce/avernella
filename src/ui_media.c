@@ -2258,7 +2258,8 @@ static gboolean call_connected(void)
 /* Screen sharing needs a connected call; the backend checks the rest. */
 static gboolean call_share_available(void)
 {
-	return m.mode == CALL && call_connected() && !group_call();
+	return m.mode == CALL && call_connected() &&
+	       (!group_call() || m.video_ready || m.self_sharing);
 }
 
 /* Either side may turn its camera on once the call negotiated video. */
@@ -2441,12 +2442,12 @@ void ui_media_call_event(Json *p)
 		return;
 	}
 	if (!strcmp(event, "call_share")) {
-		if (!*chat || *chat == 'c' || g_strcmp0(chat, m.call_chat))
+		if (!*chat || g_strcmp0(chat, m.call_chat))
 			return;
 		Json *peer = ui_field(p, "peerSharing"),
 		     *self = ui_field(p, "selfSharing");
 
-		if (peer) {
+		if (peer && chat[0] != 'c') {
 			gboolean was = m.peer_sharing;
 
 			m.peer_sharing = json_object_get_boolean(peer);
@@ -3217,15 +3218,29 @@ static void draw_group_video_roster(Rect panel)
 	}
 }
 
+static void draw_own_screen(Rect tile)
+{
+	ui_draw_rounded(tile, 8, UI_SIDEBAR);
+	ui_draw_centered(_("You are sharing your screen"),
+			 (Rect){ tile.x + 8, tile.y + tile.h / 2 - 11,
+				 tile.w - 16, 22 },
+			 tile.h > 80 ? 15 : 11, 600, UI_HEADING);
+	live_badge(tile);
+	ui_draw_label(_("Your screen"),
+		      (Rect){ tile.x, tile.y + tile.h + 6, tile.w, 20 }, 13,
+		      600, UI_BODY, FALSE);
+}
+
 static void draw_group_video(Rect stage, int controls_y, const char *self)
 {
 	int gap = 12, top = stage.y + 44;
 	int width = stage.w - 2 * gap;
 	int roster_w = call_roster_count() ? CLAMP(width / 3, 96, 210) : 0;
 	int tiles_w = width - roster_w - gap * (roster_w ? 2 : 1);
+	int local = m.self_sharing ? TILE_OWN_SCREEN : TILE_SELF;
 	int peer_w = tiles_w *
 		     (m.focus == TILE_PEER ? 3 :
-		      m.focus == TILE_SELF ? 1 :
+		      m.focus == local	   ? 1 :
 					     2) /
 		     4;
 	int height = MAX(0, controls_y - top - 28);
@@ -3233,13 +3248,16 @@ static void draw_group_video(Rect stage, int controls_y, const char *self)
 
 	if (peer_w > 0 && tiles_w > peer_w && height > 0) {
 		m.tile_rect[0] = (Rect){ left, top, peer_w, height };
-		m.tile_rect[1] = (Rect){ left + peer_w + gap, top,
-					 tiles_w - peer_w, height };
+		m.tile_rect[local - 1] = (Rect){ left + peer_w + gap, top,
+						 tiles_w - peer_w, height };
 		call_tile(0, &m.call_frame, video_peer_name(),
 			  m.call_video_peer, m.call_frame.pixels != NULL,
 			  FALSE);
-		call_tile(1, &m.self_frame, self, ui.self_id,
-			  m.self_frame.pixels != NULL, FALSE);
+		if (local == TILE_OWN_SCREEN)
+			draw_own_screen(m.tile_rect[local - 1]);
+		else
+			call_tile(1, &m.self_frame, self, ui.self_id,
+				  m.self_frame.pixels != NULL, FALSE);
 	}
 	if (roster_w)
 		draw_group_video_roster(
@@ -3366,20 +3384,8 @@ static void draw_call_stage(void)
 		if (!m.share_in_video)
 			call_tile(1, &m.self_frame, self, ui.self_id,
 				  m.self_frame.pixels != NULL, FALSE);
-		if (m.self_sharing) {
-			/* Your own stream: Discord shows a placeholder too. */
-			Rect t = m.tile_rect[2];
-
-			ui_draw_rounded(t, 8, UI_SIDEBAR);
-			ui_draw_centered(_("You are sharing your screen"),
-					 (Rect){ t.x + 8, t.y + t.h / 2 - 11,
-						 t.w - 16, 22 },
-					 t.h > 80 ? 15 : 11, 600, UI_HEADING);
-			live_badge(t);
-			ui_draw_label(_("Your screen"),
-				      (Rect){ t.x, t.y + t.h + 6, t.w, 20 }, 13,
-				      600, UI_BODY, FALSE);
-		}
+		if (m.self_sharing)
+			draw_own_screen(m.tile_rect[TILE_OWN_SCREEN - 1]);
 		if (m.peer_sharing)
 			call_tile(3, &m.share_frame, peer_screen, m.call_chat,
 				  m.share_frame.pixels != NULL, TRUE);

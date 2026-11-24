@@ -860,10 +860,13 @@ static void share_state(struct voice_call *c)
 			share_setting("LINE_SHARE_HEIGHT", 1080, 240, 2160);
 		guint fps = share_setting("LINE_SHARE_FPS", 30, 1, 60);
 
-		/* The official tablet may leave the presentation channel idle. */
+		/*
+		 * Group data carries conference control. Publish the desktop
+		 * through the negotiated video stream with its display source ID.
+		 */
 		c->share_over_video =
-			c->video &&
-			(!c->data || g_strcmp0(g_getenv("LINE_SHARE_TRANSPORT"),
+			c->video && (c->group || !c->data ||
+				     g_strcmp0(g_getenv("LINE_SHARE_TRANSPORT"),
 					       "presentation"));
 		if (c->share_over_video) {
 			width = MIN(width, c->screen_width);
@@ -2020,7 +2023,7 @@ static gboolean group_tx_request(struct voice_call *c, Slice body, Slice header)
 				camera_modes |= 1u << MIN(encoding, 31);
 				/* START requests a fresh picture. Its encoding option
 				 * controls simulcast, not the negotiated RTP format. */
-				if (c->camera)
+				if (c->camera || share_is_video(c))
 					call_video_keyframe(c->video);
 			}
 		} else if (source && source == c->audio_tx) {
@@ -2213,7 +2216,7 @@ static void group_camera_feedback(struct voice_call *c, Slice packet)
 	struct group_video *v = c->conference_video;
 	guint32 sender;
 
-	if (!v || !c->camera || packet.n < 12)
+	if (!v || (!c->camera && !share_is_video(c)) || packet.n < 12)
 		return;
 	memcpy(&sender, packet.p + 4, sizeof(sender));
 	sender = ntohl(sender);
@@ -3518,9 +3521,12 @@ J *line_call_share(gboolean enabled, GError **error)
 		set_error(error, "There is no active call.");
 		return NULL;
 	}
-	if (active->group) {
-		set_error(error,
-			  "Screen sharing is unavailable in group calls.");
+	if (enabled && active->group &&
+	    (!g_atomic_int_get(&active->group_joined) ||
+	     !g_atomic_int_get(&active->video_ready))) {
+		set_error(
+			error,
+			"Screen sharing requires a connected group video call.");
 		return NULL;
 	}
 	g_atomic_int_set(&active->share_wanted, enabled);

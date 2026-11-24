@@ -311,6 +311,7 @@ $(TESTS):
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
 build/render-bench build/test-ui-call-fullscreen: private LDFLAGS += -Wl,--wrap=SDL_RenderPresent
+build/test-ui-call-fullscreen: private LDFLAGS += -Wl,--wrap=ui_rpc
 build/test-ui-call-fullscreen: tests/ui_call_fullscreen.c build/ui_gpu.o
 build/test-ui-scroll-scene: tests/ui_scroll_scene.c
 build/test-ui-scroll-scene: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time
@@ -386,6 +387,10 @@ vulkan-smoke: build/vulkan-smoke
 
 vulkan-preview: build/vulkan-preview
 	./build/vulkan-preview $(or $(VK_VENDOR),0) $(VK_PREVIEW_ARGS)
+
+.PHONY: check-group-media
+check-group-media: build/test-call-group build/test-call build/test-call-video build/test-ui-call-fullscreen
+	python3 tests/group_media.py
 
 check: $(TESTS)
 	@set -e; for test in $(TESTS); do ./$$test; done

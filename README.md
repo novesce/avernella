@@ -103,13 +103,13 @@ Use the camera button in a one-to-one chat. The client selects baseline VP8 with
 
 ### Screen sharing
 
-During a one-to-one call, press **Share Your Screen** or **Alt+S**. Your desktop portal asks which screen or window to share. Capture uses the XDG Desktop Portal ScreenCast interface and PipeWire, so it works on Wayland and on X11 desktops that run `xdg-desktop-portal` with a ScreenCast backend. Press the share button again to stop.
+During a one-to-one call or a connected group video call, press **Share Your Screen** or **Alt+S**. Your desktop portal asks which screen or window to share. Capture uses the XDG Desktop Portal ScreenCast interface and PipeWire, so it works on Wayland and on X11 desktops that run `xdg-desktop-portal` with a ScreenCast backend. Press the share button again to stop.
 
-By default, the other person sees your screen in your video tile. The encoder uses VP8 screen-content mode and varies the resolution and frame rate to keep text sharp within the peer's advertised bitrate. If your camera was on, the app pauses it while sharing and restores it when you stop. Set `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS` or `LINE_SHARE_KBPS` to cap the capture or encoding budget.
+Avernella sends your screen in your video tile by default. In a group, viewers can select your tile to watch. The encoder uses VP8 screen-content mode and varies the resolution and frame rate to keep text sharp within the peer's advertised bitrate. If your camera was on, the app pauses it while sharing and restores it when you stop. Set `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS` or `LINE_SHARE_KBPS` to cap the capture or encoding budget.
 
 To watch the other person in full screen, double-click their video or click **Full screen** beneath it. **F11** opens the focused video, or the other person's video when the grid is showing. Press **Esc** or click **Exit full screen** to return to the chat and continue the call. A single click still focuses a tile within the call stage.
 
-Incoming LINE presentations appear in the call stage with a **LIVE** badge and support the same fullscreen controls. The window displays the newest decoded frame independently of chat synchronization. The sender's device controls its resolution and frame rate. Set `LINE_SHARE_TRANSPORT=presentation` to try sending a separate native presentation on calls with a PDTP data channel. Native outgoing presentation remains experimental. [Protocol notes and verification](analysis/video-call-wire.md)
+In a one-to-one call, incoming LINE presentations appear in the call stage with a **LIVE** badge and support the same fullscreen controls. The window displays the newest decoded frame independently of chat synchronization. The sender's device controls its resolution and frame rate. Set `LINE_SHARE_TRANSPORT=presentation` to try sending a separate native presentation on one-to-one calls with a PDTP data channel. Native outgoing presentation remains experimental. [Protocol notes and verification](analysis/video-call-wire.md)
 
 Set `LINE_CALL_DEBUG=1` to report video negotiation, call control messages, packet counts every five seconds and first-frame milestones in the terminal.
 

@@ -38,15 +38,15 @@ void __wrap_SDL_RenderPresent(SDL_Renderer *renderer)
 	__real_SDL_RenderPresent(renderer);
 }
 
-static void call_state(const char *state)
+static void call_state(const char *chat, const char *state, gboolean video)
 {
 	Json *p = json_object_new_object();
 
-	json_object_object_add(p, "chat", json_object_new_string("friend"));
+	json_object_object_add(p, "chat", json_object_new_string(chat));
 	json_object_object_add(p, "state", json_object_new_string(state));
-	json_object_object_add(p, "video", json_object_new_boolean(TRUE));
+	json_object_object_add(p, "video", json_object_new_boolean(video));
 	json_object_object_add(p, "cameraEnabled",
-			       json_object_new_boolean(TRUE));
+			       json_object_new_boolean(video));
 	ui_media_call_event(p);
 	json_object_put(p);
 }
@@ -188,7 +188,7 @@ static void peer_fullscreen(void)
 	ui.name = g_strdup("Self");
 	ui.message.value = g_string_new("");
 	ui.search.value = g_string_new("");
-	call_state("connected");
+	call_state("friend", "connected", TRUE);
 	feed_picture(LINE_PREVIEW_REMOTE);
 	feed_picture(LINE_PREVIEW_SELF);
 	ui_draw();
@@ -247,7 +247,7 @@ static void peer_fullscreen(void)
 
 	key(SDLK_F11);
 	g_assert_true(ui_media_fullscreen());
-	call_state("ended");
+	call_state("friend", "ended", TRUE);
 	g_assert_false(ui_media_fullscreen());
 	g_assert_false(SDL_GetWindowFlags(ui.window) & SDL_WINDOW_FULLSCREEN);
 	ui_media_shutdown();
@@ -265,6 +265,86 @@ static void peer_fullscreen(void)
 	json_object_put(ui.history);
 	SDL_DestroyWindow(ui.window);
 	SDL_Quit();
+}
+
+static Json *share_request;
+static guint share_tag;
+
+void __real_ui_rpc(const char *method, Json *params, guint tag);
+
+void __wrap_ui_rpc(const char *method, Json *params, guint tag)
+{
+	if (strcmp(method, "callShare")) {
+		__real_ui_rpc(method, params, tag);
+		return;
+	}
+	g_assert_null(share_request);
+	share_request = params;
+	share_tag = tag;
+}
+
+static void check_share_request(const char *chat, gboolean enable)
+{
+	g_autoptr(J) reply = obj();
+
+	g_assert_nonnull(share_request);
+	g_assert_cmpstr(ui_string(share_request, "chat", ""), ==, chat);
+	g_assert_nonnull(ui_field(share_request, "enabled"));
+	g_assert_cmpint(
+		json_object_get_boolean(ui_field(share_request, "enabled")), ==,
+		enable);
+	json_object_object_add(reply, "pending", json_object_new_boolean(TRUE));
+	json_object_object_add(reply, "selfSharing",
+			       json_object_new_boolean(!enable));
+	ui_media_reply("callShare", share_request, share_tag, reply, NULL);
+	g_clear_pointer(&share_request, json_object_put);
+}
+
+static void group_share_controls(void)
+{
+	static const char chat[] = "c00000000000000000000000000000000";
+	SDL_Event key = { .key = { .type = SDL_KEYDOWN,
+				   .keysym = { .sym = SDLK_s,
+					       .mod = KMOD_ALT } } };
+	g_autoptr(J) share = obj();
+
+	ui.connected = TRUE;
+	call_state(chat, "connecting", TRUE);
+	ui_media_event(&key);
+	g_assert_null(share_request);
+	call_state(chat, "connected", FALSE);
+	ui_media_event(&key);
+	g_assert_null(share_request);
+	call_state(chat, "connected", TRUE);
+	g_assert_true(ui_media_event(&key));
+	check_share_request(chat, TRUE);
+	ui_media_event(&key);
+	g_assert_null(share_request);
+
+	json_object_object_add(share, "event",
+			       json_object_new_string("call_share"));
+	json_object_object_add(share, "chat", json_object_new_string(chat));
+	json_object_object_add(share, "shareInVideo",
+			       json_object_new_boolean(TRUE));
+	json_object_object_add(share, "selfSharing",
+			       json_object_new_boolean(TRUE));
+	ui_media_call_event(share);
+	g_assert_true(ui_media_event(&key));
+	check_share_request(chat, FALSE);
+	json_object_object_add(share, "selfSharing",
+			       json_object_new_boolean(FALSE));
+	json_object_object_add(share, "shareInVideo",
+			       json_object_new_boolean(FALSE));
+	ui_media_call_event(share);
+	g_assert_true(ui_media_event(&key));
+	check_share_request(chat, TRUE);
+
+	call_state(chat, "ended", FALSE);
+	ui_media_event(&key);
+	g_assert_null(share_request);
+	ui_media_shutdown();
+	ui.connected = FALSE;
+	g_clear_pointer(&ui.notice, g_free);
 }
 
 static void group_call_capabilities(void)
@@ -317,6 +397,7 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/call/group-call-capabilities",
 			group_call_capabilities);
+	g_test_add_func("/call/group-share-controls", group_share_controls);
 	g_test_add_func("/call/fullscreen-peer", peer_fullscreen);
 	return g_test_run();
 }

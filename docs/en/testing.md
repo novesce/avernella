@@ -2,7 +2,7 @@
 
 [Index](README.md) · Previous: [Calls](calls.md) · Next: [Contributing](contributing.md)
 
-All tests run **offline**. None of them talk to LINE, and none need an account. They use synthetic accounts, keys, pictures, audio and video, and replace the network or sound card at the edge of the module under test.
+The automated tests run **offline**. None of them talk to LINE, and none need an account. They use synthetic accounts, keys, pictures, audio and video, and replace the network or sound card at the edge of the module under test.
 
 ## Running tests
 
@@ -21,6 +21,24 @@ Some tests need extra tools at run time:
 
 - FFmpeg (`ffmpeg`, `ffprobe`) for `test-video-record` and `test-video-play`.
 - SDL's dummy video driver for the UI tests (they set it themselves).
+
+## Group video and screen sharing
+
+From the repository root, run the following with the local LINE **26.18.2 Android base APK**. Python 3 uses its standard library. The APK stays on your machine and the ordinary `make check` can run without it.
+
+```sh
+make check-group-media LINE_APK=/path/to/LINE.apk
+```
+
+The harness verifies the APK digest, resolves DEX instructions for sending camera state and requesting a participant’s video, and checks the separate Android presentation controls and per-user frame callbacks. An unrecognized APK produces an error. The fixtures then run Avernella’s call worker against a loopback relay using synthetic pictures. They check participant focus, outgoing camera and screen pixels, late viewers of a static share, camera restoration, a canceled picker, and one-to-one presentation start and stop. They also exercise the group share shortcut. A missing or skipped fixture fails the run.
+
+The loopback receiver can decode Avernella’s media without using the public relay. To verify delivery on real devices, build and open the current Avernella binary and start a group video call with two consenting Android participants. Run the following interactive check in a terminal you can share. It checks each direction, the switch back to camera and whether the viewers can read a changing code from the shared terminal.
+
+```sh
+python3 tests/group_media_live.py
+```
+
+A screen sent through a participant’s video tile and an Android native presentation use different paths. Avernella currently has no dedicated receiver for the native group presentation. Add `--native-presentation` to record that as a separate handset observation. Skipped or failed requested checks return a nonzero exit status.
 
 ## The tests
 
