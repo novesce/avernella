@@ -2547,7 +2547,7 @@ void ui_media_call_event(Json *p)
 				m.focus = 0;
 		}
 		if (ui_field(p, "message"))
-			set(&m.call_note, ui_string(p, "message", NULL));
+			set(&m.call_note, _(ui_string(p, "message", NULL)));
 		ui.dirty = TRUE;
 		return;
 	}

@@ -48,9 +48,11 @@ sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat \
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader   # Vulkan module
 sudo pacman -S --needed wpewebkit webkitgtk-6.0                                     # in-app browser
-sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-gtk ffmpeg            # portals, video
+sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-xapp ffmpeg           # Cinnamon Wayland, video
 sudo pacman -S --needed clang linux-headers xorg-server-xvfb                        # development tools
 ```
+
+Use the portal backend for the active desktop. GNOME uses `xdg-desktop-portal-gnome`, Plasma uses `xdg-desktop-portal-kde`, and Hyprland uses `xdg-desktop-portal-hyprland`. With Cinnamon Wayland and XApp, Avernella can ask the user to choose a monitor and share it through Muffin.
 
 On other distributions, install the development packages with the same `pkg-config` names.
 

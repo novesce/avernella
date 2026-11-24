@@ -19,6 +19,7 @@
 #include "talk_sync.h"
 #include "live_sync.h"
 #include "net_route.h"
+#include "monitor_picker.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -2921,6 +2922,8 @@ int main(int argc, char **argv)
 		return worker(-1);
 	if (argc == 2 && !strcmp(argv[1], "--worker-password"))
 		return worker(LINE_CREDENTIAL_FD);
+	if (argc >= 2 && !strcmp(argv[1], "--pick-share-monitor"))
+		return ui_pick_share_monitor(argc - 2, argv + 2);
 	if (argc == 2 &&
 	    (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
 		puts("avernella 0.1 — independent Linux client compatible with LINE\nUsage: avernella");

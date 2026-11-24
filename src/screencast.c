@@ -6,6 +6,7 @@
  * doc-org.freedesktop.portal.ScreenCast.html
  */
 #include "screencast.h"
+#include "screencast_cinnamon.h"
 #include <gio/gio.h>
 #include <gio/gunixfdlist.h>
 #include <pipewire/pipewire.h>
@@ -23,7 +24,6 @@
 struct line_screencast {
 	GThread *thread;
 	GMainContext *context;
-	GMainLoop *loop;
 	GCancellable *cancel;
 	int wake;
 	unsigned int max_width, max_height, fps;
@@ -38,6 +38,7 @@ struct line_screencast {
 	/* Owned by the worker thread. */
 	GDBusConnection *bus;
 	char *session;
+	struct line_cinnamon_cast *cinnamon;
 	struct pw_thread_loop *pw_loop;
 	struct pw_context *pw_context;
 	struct pw_core *pw_core;
@@ -278,7 +279,8 @@ static void on_process(void *data)
 	if (!buffer)
 		return;
 	struct spa_buffer *spa = buffer->buffer;
-	if (!spa->n_datas)
+
+	if (!spa->n_datas || g_cancellable_is_cancelled(c->cancel))
 		goto done;
 	struct spa_data *d = &spa->datas[0];
 	gint64 now = g_get_monotonic_time();
@@ -349,17 +351,22 @@ static gboolean start_pipewire(struct line_screencast *c, int fd, guint32 node,
 	pw_thread_loop_lock(c->pw_loop);
 	c->pw_context =
 		pw_context_new(pw_thread_loop_get_loop(c->pw_loop), NULL, 0);
-	c->pw_core = c->pw_context ?
-			     pw_context_connect_fd(c->pw_context, fd, NULL, 0) :
-			     NULL;
-	fd = -1;
+	if (!c->pw_context)
+		goto unlock;
+	if (fd >= 0) {
+		c->pw_core = pw_context_connect_fd(c->pw_context, fd, NULL, 0);
+		fd = -1;
+	} else {
+		c->pw_core = pw_context_connect(c->pw_context, NULL, 0);
+	}
 	if (!c->pw_core)
 		goto unlock;
 	c->stream = pw_stream_new(
 		c->pw_core, "Avernella screen share",
 		pw_properties_new(PW_KEY_MEDIA_TYPE, "Video",
 				  PW_KEY_MEDIA_CATEGORY, "Capture",
-				  PW_KEY_MEDIA_ROLE, "Screen", NULL));
+				  PW_KEY_MEDIA_ROLE, "Screen",
+				  "node.dont-fallback", "true", NULL));
 	if (!c->stream)
 		goto unlock;
 	pw_stream_add_listener(c->stream, &c->stream_listener, &stream_events,
@@ -379,7 +386,8 @@ static gboolean start_pipewire(struct line_screencast *c, int fd, guint32 node,
 		SPA_POD_CHOICE_RANGE_Fraction(&rate, &rmin, &rmax));
 	if (pw_stream_connect(c->stream, PW_DIRECTION_INPUT, node,
 			      PW_STREAM_FLAG_AUTOCONNECT |
-				      PW_STREAM_FLAG_MAP_BUFFERS,
+				      PW_STREAM_FLAG_MAP_BUFFERS |
+				      PW_STREAM_FLAG_DONT_RECONNECT,
 			      params, 1) < 0)
 		goto unlock;
 	pw_thread_loop_unlock(c->pw_loop);
@@ -485,7 +493,8 @@ static guint32 cursor_modes(struct line_screencast *c)
 		c->bus, PORTAL_NAME, PORTAL_PATH,
 		"org.freedesktop.DBus.Properties", "Get",
 		g_variant_new("(ss)", SCREENCAST, "AvailableCursorModes"),
-		G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL);
+		G_VARIANT_TYPE("(v)"), G_DBUS_CALL_FLAGS_NONE, -1, c->cancel,
+		NULL);
 	g_autoptr(GVariant) inner = NULL;
 
 	if (!v)
@@ -494,6 +503,136 @@ static guint32 cursor_modes(struct line_screencast *c)
 	return g_variant_is_of_type(inner, G_VARIANT_TYPE_UINT32) ?
 		       g_variant_get_uint32(inner) :
 		       0;
+}
+
+static gboolean cinnamon_wayland(void)
+{
+	const char *desktop = g_getenv("XDG_CURRENT_DESKTOP");
+	const char *session = g_getenv("XDG_SESSION_TYPE");
+	gboolean wayland = session ? !strcmp(session, "wayland") :
+				     g_getenv("WAYLAND_DISPLAY") ||
+					     g_getenv("WAYLAND_SOCKET");
+
+	if (wayland && desktop) {
+		g_auto(GStrv) names = g_strsplit(desktop, ":", -1);
+
+		for (char **name = names; *name; name++)
+			if (!g_ascii_strcasecmp(*name, "X-Cinnamon") ||
+			    !g_ascii_strcasecmp(*name, "Cinnamon"))
+				return TRUE;
+	}
+	return FALSE;
+}
+
+/* A missing file lets the portal look at its next candidate. */
+static int cinnamon_preference(const char *directory, const char *filename)
+{
+	g_autofree char *path = g_build_filename(
+		directory, "xdg-desktop-portal", filename, NULL);
+	g_autoptr(GKeyFile) config = g_key_file_new();
+	g_autoptr(GError) error = NULL;
+
+	if (!g_key_file_load_from_file(config, path, G_KEY_FILE_NONE, &error))
+		return g_error_matches(error, G_FILE_ERROR,
+				       G_FILE_ERROR_NOENT) ?
+			       -1 :
+			       FALSE;
+	g_auto(GStrv) backends = g_key_file_get_string_list(
+		config, "preferred", "default", NULL, NULL);
+
+	return backends &&
+	       g_strv_equal((const char *const *)backends,
+			    (const char *[]){ "xapp", "gtk", NULL }) &&
+	       !g_key_file_has_key(config, "preferred",
+				   "org.freedesktop.impl.portal.ScreenCast",
+				   NULL);
+}
+
+/* Match portals.conf(5) search order. Only Cinnamon's stock xapp/gtk
+ * selection is eligible. A user or admin override can disable ScreenCast.
+ */
+static gboolean cinnamon_portal_policy(void)
+{
+	const char *const user[] = { g_get_user_config_dir(), NULL };
+	const char *const system[] = { "/etc", g_get_user_data_dir(), NULL };
+	static const char *const vendor[] = { "/usr/share", NULL };
+	const char *const *dirs[] = { user, g_get_system_config_dirs(), system,
+				      g_get_system_data_dirs(), vendor };
+	g_autofree char *desktop =
+		g_ascii_strdown(g_getenv("XDG_CURRENT_DESKTOP"), -1);
+	g_auto(GStrv) names = g_strsplit(desktop, ":", -1);
+	g_autoptr(GPtrArray) files = g_ptr_array_new_with_free_func(g_free);
+
+	if (strchr(desktop, '/') || g_getenv("XDG_DESKTOP_PORTAL_DIR"))
+		return FALSE;
+	for (char **name = names; *name; name++)
+		if (**name)
+			g_ptr_array_add(files,
+					g_strconcat(*name, "-portals.conf",
+						    NULL));
+	g_ptr_array_add(files, g_strdup("portals.conf"));
+	for (guint i = 0; i < G_N_ELEMENTS(dirs); i++) {
+		for (const char *const *dir = dirs[i]; *dir; dir++) {
+			for (guint j = 0; j < files->len; j++) {
+				int allow = cinnamon_preference(
+					*dir, files->pdata[j]);
+
+				if (allow >= 0)
+					return allow;
+			}
+		}
+	}
+	return FALSE;
+}
+
+static gboolean missing_portal(const GError *error)
+{
+	if (!error || error->domain != G_DBUS_ERROR)
+		return FALSE;
+	switch (error->code) {
+	case G_DBUS_ERROR_SERVICE_UNKNOWN:
+	case G_DBUS_ERROR_NAME_HAS_NO_OWNER:
+	case G_DBUS_ERROR_UNKNOWN_OBJECT:
+	case G_DBUS_ERROR_UNKNOWN_INTERFACE:
+	case G_DBUS_ERROR_UNKNOWN_METHOD:
+		return TRUE;
+	default:
+		return FALSE;
+	}
+}
+
+/* Fall back only if the portal does not implement CreateSession. */
+static gboolean missing_session(struct line_screencast *c, GError **error)
+{
+	if (!error || !missing_portal(*error))
+		return FALSE;
+	gboolean direct = ((*error)->code == G_DBUS_ERROR_UNKNOWN_METHOD ||
+			   (*error)->code == G_DBUS_ERROR_UNKNOWN_INTERFACE) &&
+			  cinnamon_wayland() && !g_getenv("FLATPAK_ID") &&
+			  !g_getenv("SNAP") &&
+			  !g_file_test("/.flatpak-info", G_FILE_TEST_EXISTS) &&
+			  cinnamon_portal_policy();
+
+	g_clear_error(error);
+	if (direct) {
+		guint32 node = PW_ID_ANY;
+
+		if (g_cancellable_set_error_if_cancelled(c->cancel, error))
+			return FALSE;
+		c->cinnamon = line_cinnamon_start(c->context, c->cancel, &node,
+						  error);
+		if (c->cinnamon)
+			return start_pipewire(c, -1, node, error);
+		if (!missing_portal(*error))
+			return FALSE;
+		g_clear_error(error);
+	}
+	g_set_error_literal(
+		error, LINE_ERROR, 1,
+		direct ?
+			"Screen sharing is unavailable in this Cinnamon session. Try GNOME or Plasma Wayland." :
+			"Screen sharing is unavailable. Enable a ScreenCast portal for your desktop.");
+	return FALSE;
 }
 
 static gboolean run_portal(struct line_screencast *c, GError **e)
@@ -517,12 +656,12 @@ static gboolean run_portal(struct line_screencast *c, GError **e)
 		c, "CreateSession", g_variant_new("(a{sv})", &o), t1, e);
 	const char *session = NULL;
 
-	if (!created ||
-	    !g_variant_lookup(created, "session_handle", "&s", &session)) {
-		if (e && !*e)
-			g_set_error_literal(
-				e, LINE_ERROR, 1,
-				"The desktop portal did not open a screen cast session.");
+	if (!created)
+		return missing_session(c, e);
+	if (!g_variant_lookup(created, "session_handle", "&s", &session)) {
+		g_set_error_literal(
+			e, LINE_ERROR, 1,
+			"The desktop portal did not open a screen cast session.");
 		return FALSE;
 	}
 	c->session = g_strdup(session);
@@ -620,10 +759,13 @@ static gpointer worker(gpointer data)
 				  LINE_SCREENCAST_FAILED,
 			  error ? error->message : "Screen sharing failed.");
 	} else {
-		/* Wait until stopped; the portal session stays open meanwhile. */
-		g_main_loop_run(c->loop);
+		while (!g_cancellable_is_cancelled(c->cancel))
+			g_main_context_iteration(c->context, TRUE);
+		set_state(c, LINE_SCREENCAST_STOPPED, "Screen sharing ended.");
 	}
 	stop_pipewire(c);
+	if (c->cinnamon)
+		line_cinnamon_stop(c->cinnamon);
 	close_session(c);
 	g_clear_object(&c->bus);
 	g_main_context_pop_thread_default(c->context);
@@ -643,13 +785,11 @@ struct line_screencast *line_screencast_start(unsigned int max_width,
 	c->state = LINE_SCREENCAST_STARTING;
 	c->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	c->context = g_main_context_new();
-	c->loop = g_main_loop_new(c->context, FALSE);
 	c->cancel = g_cancellable_new();
 	if (c->wake < 0 ||
 	    !(c->thread = g_thread_try_new("line-screencast", worker, c, e))) {
 		if (c->wake >= 0)
 			close(c->wake);
-		g_main_loop_unref(c->loop);
 		g_main_context_unref(c->context);
 		g_object_unref(c->cancel);
 		g_mutex_clear(&c->lock);
@@ -659,22 +799,14 @@ struct line_screencast *line_screencast_start(unsigned int max_width,
 	return c;
 }
 
-static gboolean quit_loop(gpointer data)
-{
-	g_main_loop_quit(data);
-	return G_SOURCE_REMOVE;
-}
-
 void line_screencast_stop(struct line_screencast *c)
 {
 	if (!c)
 		return;
 	g_cancellable_cancel(c->cancel);
-	g_main_context_invoke(c->context, quit_loop, c->loop);
 	g_main_context_wakeup(c->context);
 	g_thread_join(c->thread);
 	close(c->wake);
-	g_main_loop_unref(c->loop);
 	g_main_context_unref(c->context);
 	g_object_unref(c->cancel);
 	g_clear_pointer(&c->frame, g_bytes_unref);
@@ -711,6 +843,8 @@ GBytes *line_screencast_take(struct line_screencast *c, unsigned int *width,
 	g_mutex_lock(&c->lock);
 	GBytes *frame = g_steal_pointer(&c->frame);
 
+	if (g_cancellable_is_cancelled(c->cancel))
+		g_clear_pointer(&frame, g_bytes_unref);
 	*width = c->width;
 	*height = c->height;
 	*time_ns = c->time_ns;

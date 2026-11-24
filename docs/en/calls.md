@@ -182,6 +182,8 @@ With `LINE_GROUP_CALL_STATS=1`, compare `mic-blocks` (complete 40 ms blocks capt
 
 [`screencast.c`](../../src/screencast.c) captures the screen through the XDG Desktop Portal's ScreenCast interface: the portal shows its own picker, then frames arrive through PipeWire, are converted from BGRx/RGBx to I420 with bilinear scaling (`line_screencast_to_i420()`) and fitted to the limits (`LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`).
 
+On Cinnamon Wayland with the default XApp/GTK portal configuration, if the portal omits ScreenCast, the native client can list active monitors from Muffin. Selecting a monitor and confirming **Share your screen** starts a stream for that connector. Cancelling, disconnecting or locking the session stops the operation. A change in the display configuration while the picker is open requires a fresh selection. Window-only sharing uses the standard desktop portal.
+
 There are two ways to send them:
 
 1. **In the video stream** (the default). The shared screen replaces the camera in the sender's video tile. The encoder uses a screen-specific bitrate budget (`call_video_screen()`, `LINE_SHARE_KBPS`) and varies resolution and frame rate to keep text sharp. In a group call, Avernella uses the negotiated group video track. Share a window with **Alt+S** and press it again to stop. Avernella restores the previous camera state. A new subscriber can request a keyframe even while the desktop image stays still.

@@ -105,7 +105,7 @@ Use the camera button in a one-to-one chat. The client selects baseline VP8 with
 
 ### Screen sharing
 
-During a one-to-one call or a connected group video call, press **Share Your Screen** or **Alt+S**. Your desktop portal asks which screen or window to share. Capture uses the XDG Desktop Portal ScreenCast interface and PipeWire, so it works on Wayland and on X11 desktops that run `xdg-desktop-portal` with a ScreenCast backend. Press the share button again to stop.
+During a one-to-one call or a connected group video call, press **Share Your Screen** or **Alt+S**. Choose a screen or window in the desktop picker. On Cinnamon Wayland with its default XApp/GTK portal configuration, Avernella can offer its own monitor picker when the desktop portal lacks ScreenCast. Select a monitor, check its name, then confirm **Share your screen**. Everyone in the call can see that entire monitor. Press the share button again to stop.
 
 Avernella sends your screen in your video tile by default. In a group, viewers can select your tile to watch. The encoder uses VP8 screen-content mode and varies the resolution and frame rate to keep text sharp within the peer's advertised bitrate. If your camera was on, the app pauses it while sharing and restores it when you stop. Set `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS` or `LINE_SHARE_KBPS` to cap the capture or encoding budget.
 
@@ -149,7 +149,7 @@ paru -S avernella-bin
 
 ## Build and test
 
-Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, and pkg-config. Development libraries include SDL2, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Sharing your screen also needs a running `xdg-desktop-portal` with a ScreenCast backend. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. On NVIDIA, video messages use H.264 NVENC when the driver and encoder initialize. Video playback and clip review use the system `ffplay` executable, with NVDEC on NVIDIA or Vulkan Video on supported AMD and Intel drivers. The recording and playback tests use generated audio and video.
+Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, and pkg-config. Development libraries include SDL2, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Screen sharing uses the running desktop portal or the Cinnamon Wayland monitor picker described below. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. On NVIDIA, video messages use H.264 NVENC when the driver and encoder initialize. Video playback and clip review use the system `ffplay` executable, with NVDEC on NVIDIA or Vulkan Video on supported AMD and Intel drivers. The recording and playback tests use generated audio and video.
 
 Install the packages on CachyOS or Arch Linux. The first command is enough to build and run the client.
 
@@ -171,11 +171,13 @@ Add WPE WebKit for the in-app browser on Wayland, and WebKitGTK for fallback or 
 sudo pacman -S --needed wpewebkit webkitgtk-6.0
 ```
 
-Screen sharing and screenshots go through the XDG desktop portal. Install it with the backend for your desktop: `xdg-desktop-portal-gnome`, `xdg-desktop-portal-kde`, `xdg-desktop-portal-hyprland`, `xdg-desktop-portal-wlr` or `xdg-desktop-portal-gtk`.
+Install the portal backend for the session where you run Avernella. On Cinnamon Wayland, use the following command. XApp supplies the screenshot portal. When ScreenCast is missing, Avernella can share one monitor through Cinnamon’s Muffin compositor and PipeWire.
 
 ```sh
-sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-gtk
+sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-xapp
 ```
+
+GNOME, Plasma, Hyprland and Sway use their own ScreenCast backends (`xdg-desktop-portal-gnome`, `xdg-desktop-portal-kde`, `xdg-desktop-portal-hyprland` and `xdg-desktop-portal-wlr`, respectively).
 
 Install FFmpeg before compiling to enable hardware VP8 call encoding and decoding, attachment playback and camera recording. The optional Ubuntu build packages are `libavcodec-dev` and `libavutil-dev`. For software-only VP8 calls, build with `make CALL_HWCODECS=0 CALL_VP8_JETSON=0`.
 

@@ -48,9 +48,11 @@ sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat \
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader   # โมดูล Vulkan
 sudo pacman -S --needed wpewebkit webkitgtk-6.0                                     # เบราว์เซอร์ในแอป
-sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-gtk ffmpeg            # portal และวิดีโอ
+sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-xapp ffmpeg           # Cinnamon Wayland และวิดีโอ
 sudo pacman -S --needed clang linux-headers xorg-server-xvfb                        # เครื่องมือพัฒนา
 ```
+
+เลือก backend ของ portal ให้ตรงกับเดสก์ท็อปที่กำลังใช้งาน GNOME ใช้ `xdg-desktop-portal-gnome`, Plasma ใช้ `xdg-desktop-portal-kde` และ Hyprland ใช้ `xdg-desktop-portal-hyprland` ถ้าใช้ Cinnamon Wayland กับ XApp แอปสามารถให้ผู้ใช้เลือกจอภาพแล้วแชร์ผ่าน Muffin ได้
 
 บนดิสทริบิวชันอื่น ให้ติดตั้งแพ็กเกจสำหรับพัฒนาที่มีชื่อ `pkg-config` ตรงกัน
 

@@ -86,6 +86,9 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-ui-refresh` | `ui_refresh.c` | Retries a failed Flex image, checks the decoded pixel, and exercises late failures and corrupt files |
 | `test-call` | `call.c` | Whole calls against a local relay fixture (wrapped SDL audio) |
 | `test-call-video` | `call_video.c` | VP8 through EVS3 and SRTP, loss, reordering, replay, keyframes, descriptors |
+| `test-screencast-portal` | `screencast.c` | Portal selection, permission denial, cancellation and Cinnamon fallback policy on a private D-Bus |
+| `test-screencast-cinnamon` | `screencast_cinnamon.c` | Monitor selection, display changes, screen lock and capture-session cleanup |
+| `test-monitor-picker` | `ui_monitor_picker.c` | Mouse and keyboard selection, explicit confirmation, cancellation and call teardown |
 | `test-audio` | `call_audio.c` | Opus and EAS2 framing, playout (wrapped `SDL_QueueAudio`) |
 | `test-denoise` | `call_denoise.c` | RNNoise on synthetic audio |
 | `test-video-record` | `video_record.c` | Recording a generated picture and tone, checked with ffprobe, cancellation, cleanup |

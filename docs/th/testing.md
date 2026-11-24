@@ -72,6 +72,9 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-ui-refresh` | `ui_refresh.c` | ลองโหลดรูป Flex ที่เคยล้มเหลว ตรวจพิกเซลของรูปที่ถอดรหัสแล้ว และทดสอบทั้งข้อผิดพลาดที่มาช้ากับไฟล์รูปที่เสียหาย |
 | `test-call` | `call.c` | การโทรครบสายกับ fixture relay ในเครื่อง (ห่อเสียงของ SDL) |
 | `test-call-video` | `call_video.c` | VP8 ผ่าน EVS3 และ SRTP การสูญหาย ลำดับสลับ การเล่นซ้ำ keyframe descriptor |
+| `test-screencast-portal` | `screencast.c` | ทดสอบการเลือกพอร์ทัล การปฏิเสธสิทธิ์ การยกเลิก และเงื่อนไขที่จะใช้ตัวเลือกจอของ Cinnamon ผ่าน D-Bus แยกสำหรับการทดสอบ |
+| `test-screencast-cinnamon` | `screencast_cinnamon.c` | การเลือกจอ การเปลี่ยนจอระหว่างเลือก การล็อกหน้าจอ และการปิดเซสชันแชร์หน้าจอ |
+| `test-monitor-picker` | `ui_monitor_picker.c` | การเลือกด้วยเมาส์และแป้นพิมพ์ การยืนยันก่อนแชร์ การยกเลิก และการปิดตัวเลือกจอเมื่อวางสาย |
 | `test-audio` | `call_audio.c` | การจัดเฟรม Opus และ EAS2 การเล่น (ห่อ `SDL_QueueAudio`) |
 | `test-denoise` | `call_denoise.c` | RNNoise กับเสียงสังเคราะห์ |
 | `test-video-record` | `video_record.c` | อัดภาพและเสียงสังเคราะห์ ตรวจด้วย ffprobe การยกเลิก การเก็บกวาด |
