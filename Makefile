@@ -87,11 +87,12 @@ TESTS += build/test-chat-lists build/test-shared-content build/test-ui-tray buil
 TESTS += build/test-video-play build/test-talk-sync build/test-live-sync
 TESTS += build/test-flex-asset build/test-ui-flex
 TESTS += build/test-ui-refresh build/test-ui-chat-refresh
+TESTS += build/test-ui-worker-stop
 TESTS += build/test-qr-scan
 TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
-TESTS += build/test-ui-theme build/test-ui-lang
+TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -210,7 +211,7 @@ build/test-ui-emoji: tests/ui_emoji.c build/ui_emoji.o $(UI_LANG_OBJECTS)
 build/test-ui-apng: tests/ui_apng.c build/ui_apng.o build/ui_pixels.o
 build/test-emoji: tests/emoji.c build/emoji.o
 build/test-media: tests/media.c build/media.o build/media_crypto.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
-build/test-call: LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_QueueAudio
+build/test-call: LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_QueueAudio,--wrap=SDL_DequeueAudio
 build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o
 build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
@@ -283,6 +284,8 @@ build/test-messaging: tests/messaging.c build/messaging.o build/rich_message.o b
 build/test-friends: tests/friends.c build/friends.o build/thrift.o
 build/test-liff: tests/liff.c build/liff.o build/liff_url.o build/thrift.o
 build/test-chiptune: tests/chiptune.c build/chiptune.o
+build/test-ui-sounds: private LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice
+build/test-ui-sounds: tests/ui_sounds.c build/ui_sounds.o build/chiptune.o
 build/test-denoise: tests/call_denoise.c build/call_denoise.o
 build/test-profile-image: tests/profile_image.c build/profile_image.o
 build/test-rich-message: tests/rich_message.c build/rich_message.o build/liff_url.o
@@ -317,11 +320,14 @@ build/test-ui-refresh: tests/ui_refresh.c build/ui_gpu.o
 build/test-ui-call-fullscreen: tests/ui_call_fullscreen.c build/ui_gpu.o
 build/test-ui-chat-refresh: private LDFLAGS += -Wl,--wrap=SDL_PollEvent
 build/test-ui-chat-refresh: tests/ui_chat_refresh.c build/ui_gpu.o build/tune.o
+build/test-ui-worker-stop: private LDFLAGS += -Wl,--wrap=SDL_PollEvent,--wrap=waitpid
+build/test-ui-worker-stop: tests/ui_worker_stop.c build/ui_gpu.o build/tune.o
 build/test-ui-scroll-scene: tests/ui_scroll_scene.c
 build/test-ui-scroll-scene: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time
 build/render-bench: tests/render_bench.c build/ui_gpu.o
 UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene build/test-ui-refresh
 UI_FIXTURE_TARGETS += build/test-ui-chat-refresh
+UI_FIXTURE_TARGETS += build/test-ui-worker-stop
 $(UI_FIXTURE_TARGETS): build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
 $(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 $(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o

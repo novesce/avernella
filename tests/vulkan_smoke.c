@@ -288,13 +288,15 @@ static VkResult draw(struct render_test *test, uint64_t frame)
  */
 struct vk_present {
 	struct render_test *test;
+	bool stalled;
 	uint64_t frame;
 	VkRect2D damage;
 };
 
-VkResult vk_present_wait(struct vk_present *p)
+VkResult vk_present_wait(struct vk_present *p, uint64_t timeout)
 {
-	(void)p;
+	if (p->stalled)
+		return timeout == 0 ? VK_TIMEOUT : VK_ERROR_UNKNOWN;
 	return VK_SUCCESS;
 }
 
@@ -460,13 +462,27 @@ static VkResult check_canvas(struct render_test *test)
 	const struct ui_prim fill = { .size = { WIDTH, HEIGHT },
 				      .color = 0xff00ff00,
 				      .clip_rect_idx = UI_NO_CLIP };
-	result = draw_readback(test, p.frame, &fill, 1, NULL, 0,
+	result = draw_readback(test, p.frame++, &fill, 1, NULL, 0,
 			       (VkRect2D){ { 2, 1 }, { 3, 2 } },
 			       (VkClearColorValue){ .float32 = { 1, 0, 1, 1 } },
 			       NULL, NULL);
 	if (result != VK_SUCCESS || !check_color(test, 0, 0, 204, 17, 51, 0) ||
 	    !check_color(test, 3, 2, 0, 255, 0, 0) ||
 	    !check_color(test, 5, 2, 0, 0, 0, 0))
+		goto failed;
+	/* The camera leaves while its last frame is still using the texture.
+	 * A skipped draw must preserve the old image until readers retire.
+	 */
+	tile->width = 0;
+	p.stalled = true;
+	uint64_t frame = p.frame;
+
+	result = vk_canvas_draw(canvas, &s);
+	p.stalled = false;
+	if (result != VK_TIMEOUT || p.frame != frame)
+		goto failed;
+	result = vk_canvas_draw(canvas, &s);
+	if (result != VK_SUCCESS || p.frame != frame + 1)
 		goto failed;
 	vk_canvas_close(canvas);
 	return VK_SUCCESS;

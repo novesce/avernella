@@ -65,6 +65,128 @@ static VkResult present(struct preview *p)
 	return result;
 }
 
+/* Fault-inject through volk so the real swapchain, fences and binary
+ * semaphores still have to work on the frame that succeeds the timeout.
+ */
+static unsigned int fence_polls;
+static VkSwapchainKHR old_chain;
+static VkSwapchainKHR queried_chain;
+static bool old_destroyed;
+static PFN_vkDestroySwapchainKHR destroy_chain;
+
+static void VKAPI_CALL observe_destroy(VkDevice device, VkSwapchainKHR chain,
+				       const VkAllocationCallbacks *allocator)
+{
+	if (chain == old_chain)
+		old_destroyed = true;
+	destroy_chain(device, chain, allocator);
+}
+
+static VkResult VKAPI_CALL stall_fence(VkDevice device, uint32_t count,
+				       const VkFence fences[], VkBool32 all,
+				       uint64_t timeout)
+{
+	(void)device;
+	(void)count;
+	(void)fences;
+	(void)all;
+	fence_polls++;
+	return timeout == 0 ? VK_TIMEOUT : VK_ERROR_UNKNOWN;
+}
+
+static VkResult VKAPI_CALL outdated(VkDevice device, VkSwapchainKHR chain,
+				    uint64_t timeout, VkSemaphore sem,
+				    VkFence fence, uint32_t *index)
+{
+	(void)device;
+	queried_chain = chain;
+	(void)timeout;
+	(void)sem;
+	(void)fence;
+	(void)index;
+	return VK_ERROR_OUT_OF_DATE_KHR;
+}
+
+static bool check_stalled_present(struct preview *p)
+{
+	PFN_vkWaitForFences wait = vkWaitForFences;
+	PFN_vkAcquireNextImageKHR acquire = vkAcquireNextImageKHR;
+	bool ok = false;
+
+	destroy_chain = vkDestroySwapchainKHR;
+	vkDestroySwapchainKHR = observe_destroy;
+	vkWaitForFences = stall_fence;
+	/* A freshly acquired image might never have been presented. */
+	for (unsigned int i = 0; i < 16 && !fence_polls; i++) {
+		VkResult r = present(p);
+
+		if (r != VK_SUCCESS && r != VK_TIMEOUT)
+			goto out;
+	}
+	if (!fence_polls)
+		goto out;
+	/* A retry must finish the acquisition it already owns. */
+	vkAcquireNextImageKHR = outdated;
+	if (present(p) != VK_TIMEOUT)
+		goto out;
+	vkWaitForFences = wait;
+	if (present(p) != VK_SUCCESS)
+		goto out;
+	/* On the following frame the forced acquisition error requests a
+	 * rebuild. Simulate a present fence still owned by the compositor.
+	 */
+	if (present(p) != VK_ERROR_OUT_OF_DATE_KHR ||
+	    vk_present_wait(p->presenter, UINT64_MAX) != VK_SUCCESS)
+		goto out;
+	old_chain = queried_chain;
+	vkAcquireNextImageKHR = acquire;
+	vkWaitForFences = stall_fence;
+	fence_polls = 0;
+	if (present(p) != VK_SUCCESS || old_destroyed)
+		goto out;
+	vkAcquireNextImageKHR = outdated;
+	if (vk_present_wait(p->presenter, UINT64_MAX) != VK_SUCCESS ||
+	    present(p) != VK_ERROR_OUT_OF_DATE_KHR || !fence_polls ||
+	    old_destroyed)
+		goto out;
+	vkAcquireNextImageKHR = acquire;
+	if (present(p) != VK_SUCCESS ||
+	    vk_present_wait(p->presenter, UINT64_MAX) != VK_SUCCESS)
+		goto out;
+	/* With two old chains retained, repeated resize requests must
+	 * reuse this replacement until the compositor releases an old one.
+	 */
+	vkAcquireNextImageKHR = outdated;
+	if (present(p) != VK_ERROR_OUT_OF_DATE_KHR)
+		goto out;
+	VkSwapchainKHR replacement = queried_chain;
+
+	for (unsigned int i = 0; i < 8; i++)
+		if (present(p) != VK_ERROR_OUT_OF_DATE_KHR ||
+		    queried_chain != replacement || old_destroyed)
+			goto out;
+	vkAcquireNextImageKHR = acquire;
+	vkWaitForFences = wait;
+	for (unsigned int i = 0; i < 30; i++) {
+		VkResult r = present(p);
+
+		if (r == VK_SUCCESS && old_destroyed) {
+			ok = true;
+			break;
+		}
+		if (r != VK_SUCCESS && r != VK_TIMEOUT && r != VK_NOT_READY)
+			break;
+		SDL_Delay(2);
+	}
+out:
+	vkDestroySwapchainKHR = destroy_chain;
+	vkAcquireNextImageKHR = acquire;
+	vkWaitForFences = wait;
+	puts(ok ? "Stalled presentation and resize resumed." :
+		  "Stalled presentation or resize failed to resume.");
+	return ok;
+}
+
 static bool run(struct preview *p, SDL_Window *window, bool test)
 {
 	bool dirty = true, running = true;
@@ -145,8 +267,9 @@ static bool run(struct preview *p, SDL_Window *window, bool test)
 			received = SDL_PollEvent(&event);
 		}
 	}
-	return !test || (p->frames == TEST_FRAMES && p->rebuilds >= 3 &&
-			 checkpoints == 3 && !show_at);
+	return !test ||
+	       (p->frames == TEST_FRAMES && p->rebuilds >= 3 &&
+		checkpoints == 3 && !show_at && check_stalled_present(p));
 }
 
 int main(int argc, char **argv)

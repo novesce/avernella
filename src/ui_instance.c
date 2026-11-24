@@ -29,6 +29,35 @@ static void instance_error(GError **error)
 		    g_strerror(reason));
 }
 
+/*
+ * While owning the bound socket, hold a shared POSIX record lock on its
+ * inode's byte in the private directory. F_GETLK identifies the owning
+ * process in the caller's PID namespace, even if a driver thread outlives
+ * the main thread and keeps the socket open. This module owns the only FD
+ * for this directory in the UI process: closing another FD for the same
+ * inode would release the POSIX lock. Leave untracked owners alone.
+ */
+static gboolean dead_owner(int dir, ino_t inode)
+{
+	struct flock lock = { .l_type = F_WRLCK,
+			      .l_whence = SEEK_SET,
+			      .l_start = (off_t)inode,
+			      .l_len = 1 };
+	g_autofree char *stat = NULL;
+	char path[64];
+	const char *end;
+
+	if (fcntl(dir, F_GETLK, &lock) || lock.l_type != F_RDLCK ||
+	    lock.l_pid <= 0)
+		return FALSE;
+	g_snprintf(path, sizeof(path), "/proc/%d/stat", lock.l_pid);
+	if (!g_file_get_contents(path, &stat, NULL, NULL))
+		return FALSE;
+	end = strrchr(stat, ')');
+	return end &&
+	       (g_str_has_prefix(end, ") Z ") || g_str_has_prefix(end, ") X "));
+}
+
 /* The directory lock serializes binding, probing and unlinking a dead
  * owner's socket. The kernel queues launches even before SDL is ready.
  */
@@ -51,14 +80,18 @@ static int claim_socket(int dir, int fd)
 		errno = EEXIST;
 		return -1;
 	}
-	char show = 1;
-	ssize_t sent =
-		TEMP_FAILURE_RETRY(sendto(fd, &show, sizeof(show), MSG_NOSIGNAL,
-					  (struct sockaddr *)&addr, len));
+	if (!dead_owner(dir, st.st_ino)) {
+		char show = 1;
+		ssize_t sent = TEMP_FAILURE_RETRY(
+			sendto(fd, &show, sizeof(show), MSG_NOSIGNAL,
+			       (struct sockaddr *)&addr, len));
 
-	if (sent >= 0 || errno == EAGAIN)
-		return 0;
-	if (errno != ECONNREFUSED || unlinkat(dir, ENDPOINT, 0))
+		if (sent >= 0 || errno == EAGAIN)
+			return 0;
+		if (errno != ECONNREFUSED)
+			return -1;
+	}
+	if (unlinkat(dir, ENDPOINT, 0))
 		return -1;
 	return bind(fd, (struct sockaddr *)&addr, len) ? -1 : 1;
 }
@@ -85,6 +118,13 @@ int ui_instance_open(GError **error)
 	if (result == 1 && fstatat(dir, ENDPOINT, &st, AT_SYMLINK_NOFOLLOW))
 		result = -1;
 	if (result == 1) {
+		struct flock lock = { .l_type = F_RDLCK,
+				      .l_whence = SEEK_SET,
+				      .l_start = (off_t)st.st_ino,
+				      .l_len = 1 };
+
+		/* Filesystems without record locks retain ordinary activation. */
+		fcntl(dir, F_SETLK, &lock);
 		instance.dir = dir;
 		instance.fd = fd;
 		instance.inode = st.st_ino;

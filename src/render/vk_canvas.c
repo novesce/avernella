@@ -72,7 +72,7 @@ static VkResult retire(struct uploads *u)
 {
 	if (u->retired)
 		return VK_SUCCESS;
-	VkResult result = vk_present_wait(u->canvas->present);
+	VkResult result = vk_present_wait(u->canvas->present, 0);
 	u->retired = result == VK_SUCCESS;
 	return result;
 }
@@ -477,7 +477,7 @@ void vk_canvas_close(struct vk_canvas *c)
 {
 	if (!c)
 		return;
-	vk_present_wait(c->present);
+	vk_present_wait(c->present, UINT64_MAX);
 	release_texture(c->ctx, &c->canvas);
 	for (uint32_t i = 0; i < VIDEO_COUNT; i++)
 		for (uint32_t j = 0; j < 3; j++)

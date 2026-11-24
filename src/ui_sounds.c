@@ -3,15 +3,14 @@
  * Sound effects for calls and notifications. Each sound is rendered once,
  * on first use, from the emulated NES APU (under 10 ms) and kept as PCM.
  *
- * Playback opens an SDL audio device only when a sound starts. Its
- * callback mixes the looping voice and the effect voice, and once both
- * have finished an SDL timer closes the device: no audio thread waking
- * every few milliseconds to write silence, and no idle PipeWire stream.
- * (Pausing is not enough: SDL 3 keeps a paused stream running.)
+ * The UI publishes the desired loop and latest one-shot. A sound thread
+ * owns the device, including backend operations that may block. It sleeps
+ * until a request, or until it can close the device after the last effect.
  */
 #include "ui_sounds.h"
 #include "ui_chat_lists.h"
 #include <SDL.h>
+#include <string.h>
 
 struct voice {
 	const gint16 *pcm;
@@ -20,14 +19,21 @@ struct voice {
 };
 
 static struct {
-	GMutex lock; /* orders opening, starting and closing the device */
 	SDL_AudioDeviceID device;
-	SDL_TimerID idle_timer;
-	gboolean audio_init, failed;
+	gboolean failed, playing;
 	struct voice loop, effect; /* guarded by the device lock */
 	gint16 *pcm[CHIP_SOUNDS];
 	gsize n[CHIP_SOUNDS];
 } snd;
+
+static struct {
+	GMutex lock;
+	GCond wake;
+	GThread *thread;
+	enum chip_sound loop, effect; /* CHIP_SOUNDS means none */
+	gboolean changed, stop;
+	gboolean audio_init, init_checked; /* main-thread subsystem lifecycle */
+} control = { .loop = CHIP_SOUNDS, .effect = CHIP_SOUNDS };
 
 static void mix(void *data, Uint8 *stream, int len)
 {
@@ -56,38 +62,8 @@ static void mix(void *data, Uint8 *stream, int len)
 	}
 }
 
-/* Closes the device once both voices have finished. Timer thread. */
-static Uint32 idle_check(Uint32 interval, void *data)
+static void open_device(void)
 {
-	(void)data;
-	g_mutex_lock(&snd.lock);
-	SDL_LockAudioDevice(snd.device);
-	gboolean busy = snd.loop.pcm || snd.effect.pcm;
-
-	SDL_UnlockAudioDevice(snd.device);
-	if (!busy) {
-		SDL_CloseAudioDevice(snd.device);
-		snd.device = 0;
-		snd.idle_timer = 0;
-		interval = 0;
-	}
-	g_mutex_unlock(&snd.lock);
-	return interval;
-}
-
-static gboolean open_device(void)
-{
-	if (snd.device)
-		return TRUE;
-	if (snd.failed)
-		return FALSE;
-	if (!snd.audio_init) {
-		if (SDL_InitSubSystem(SDL_INIT_AUDIO) < 0) {
-			snd.failed = TRUE;
-			return FALSE;
-		}
-		snd.audio_init = TRUE;
-	}
 	/* PipeWire lists the stream by name and treats it as an event sound. */
 	SDL_SetHint("SDL_AUDIO_DEVICE_STREAM_NAME", "Avernella sounds");
 	SDL_SetHint("SDL_AUDIO_DEVICE_STREAM_ROLE", "Notification");
@@ -103,9 +79,7 @@ static gboolean open_device(void)
 	if (!snd.device) {
 		g_debug("No audio for sounds: %s", SDL_GetError());
 		snd.failed = TRUE;
-		return FALSE;
 	}
-	return TRUE;
 }
 
 static const gint16 *sound_pcm(enum chip_sound sound, gsize *n)
@@ -116,70 +90,139 @@ static const gint16 *sound_pcm(enum chip_sound sound, gsize *n)
 	return snd.pcm[sound];
 }
 
-static void start(struct voice *voice, enum chip_sound sound, gboolean loop)
+static gint64 apply_sounds(enum chip_sound loop, enum chip_sound effect)
 {
-	gsize n;
-	const gint16 *pcm;
+	struct voice next = { .loop = TRUE }, shot = { 0 };
 
-	if (sound >= CHIP_SOUNDS || !ui_sounds_enabled())
-		return;
-	pcm = sound_pcm(sound, &n);
-	if (!pcm || !n)
-		return;
-	g_mutex_lock(&snd.lock);
-	if (!open_device()) {
-		g_mutex_unlock(&snd.lock);
-		return;
-	}
+	if (loop < CHIP_SOUNDS)
+		next.pcm = sound_pcm(loop, &next.n);
+	if (effect < CHIP_SOUNDS)
+		shot.pcm = sound_pcm(effect, &shot.n);
 	SDL_LockAudioDevice(snd.device);
-	*voice = (struct voice){ .pcm = pcm, .n = n, .loop = loop };
+	if (next.pcm != snd.loop.pcm)
+		snd.loop = next;
+	if (shot.pcm)
+		snd.effect = shot;
+	gboolean looping = snd.loop.pcm != NULL;
+	gboolean busy = looping || snd.effect.pcm;
+
 	SDL_UnlockAudioDevice(snd.device);
-	SDL_PauseAudioDevice(snd.device, 0);
-	if (!snd.idle_timer)
-		snd.idle_timer = SDL_AddTimer(500, idle_check, NULL);
-	g_mutex_unlock(&snd.lock);
+	if (!busy) {
+		SDL_CloseAudioDevice(snd.device);
+		snd.device = 0;
+		snd.playing = FALSE;
+	} else if (!snd.playing) {
+		SDL_PauseAudioDevice(snd.device, 0);
+		snd.playing = TRUE;
+	}
+	return busy && !looping ? g_get_monotonic_time() + 500000 : 0;
+}
+
+static gpointer playback(gpointer unused)
+{
+	gint64 idle_check = 0;
+
+	(void)unused;
+	g_mutex_lock(&control.lock);
+	for (;;) {
+		while (!control.changed && !control.stop) {
+			if (!idle_check)
+				g_cond_wait(&control.wake, &control.lock);
+			else if (!g_cond_wait_until(&control.wake,
+						    &control.lock, idle_check))
+				break;
+		}
+		if (control.stop)
+			break;
+		if (!snd.device && !snd.failed &&
+		    (control.loop < CHIP_SOUNDS ||
+		     control.effect < CHIP_SOUNDS)) {
+			g_mutex_unlock(&control.lock);
+			open_device();
+			g_mutex_lock(&control.lock);
+			/* Ringing may have ended while the backend was opening. */
+			continue;
+		}
+		enum chip_sound loop = control.loop;
+		enum chip_sound effect = control.effect;
+
+		control.changed = FALSE;
+		control.effect = CHIP_SOUNDS;
+		g_mutex_unlock(&control.lock);
+		idle_check = snd.device ? apply_sounds(loop, effect) : 0;
+		g_mutex_lock(&control.lock);
+	}
+	g_mutex_unlock(&control.lock);
+	if (snd.device)
+		SDL_CloseAudioDevice(snd.device);
+	for (int i = 0; i < CHIP_SOUNDS; i++)
+		g_free(snd.pcm[i]);
+	memset(&snd, 0, sizeof(snd));
+	return NULL;
+}
+
+void ui_sound_init(void)
+{
+	if (!control.init_checked) {
+		control.audio_init = SDL_InitSubSystem(SDL_INIT_AUDIO) == 0;
+		control.init_checked = TRUE;
+	}
+}
+
+static void request(enum chip_sound sound, gboolean loop)
+{
+	g_mutex_lock(&control.lock);
+	if (loop && control.loop == sound)
+		goto out;
+	if (!control.thread) {
+		ui_sound_init();
+		if (!control.audio_init)
+			goto out;
+		control.thread = g_thread_try_new("avernella-sound", playback,
+						  NULL, NULL);
+		if (!control.thread)
+			goto out;
+	}
+	if (loop)
+		control.loop = sound;
+	else
+		control.effect = sound;
+	control.changed = TRUE;
+	g_cond_signal(&control.wake);
+out:
+	g_mutex_unlock(&control.lock);
 }
 
 void ui_sound_play(enum chip_sound sound)
 {
-	start(&snd.effect, sound, FALSE);
+	if (sound < CHIP_SOUNDS && ui_sounds_enabled())
+		request(sound, FALSE);
 }
 
 void ui_sound_loop(enum chip_sound sound)
 {
-	g_mutex_lock(&snd.lock);
-	gboolean playing = sound < CHIP_SOUNDS && snd.device && snd.loop.pcm &&
-			   snd.loop.pcm == snd.pcm[sound];
-
-	g_mutex_unlock(&snd.lock);
-	if (!playing)
-		start(&snd.loop, sound, TRUE);
+	if (sound < CHIP_SOUNDS && ui_sounds_enabled())
+		request(sound, TRUE);
 }
 
 void ui_sound_stop_loop(void)
 {
-	g_mutex_lock(&snd.lock);
-	if (snd.device) {
-		SDL_LockAudioDevice(snd.device);
-		snd.loop.pcm = NULL;
-		SDL_UnlockAudioDevice(snd.device);
-	}
-	g_mutex_unlock(&snd.lock);
+	request(CHIP_SOUNDS, TRUE);
 }
 
 void ui_sound_shutdown(void)
 {
-	g_mutex_lock(&snd.lock);
-	if (snd.idle_timer) {
-		SDL_RemoveTimer(snd.idle_timer);
-		snd.idle_timer = 0;
+	if (control.thread) {
+		g_mutex_lock(&control.lock);
+		control.stop = TRUE;
+		g_cond_signal(&control.wake);
+		g_mutex_unlock(&control.lock);
+		g_thread_join(control.thread);
+		control.thread = NULL;
 	}
-	if (snd.device) {
-		SDL_CloseAudioDevice(snd.device);
-		snd.device = 0;
-	}
-	g_mutex_unlock(&snd.lock);
-	snd.loop.pcm = snd.effect.pcm = NULL;
-	for (int i = 0; i < CHIP_SOUNDS; i++)
-		g_clear_pointer(&snd.pcm[i], g_free);
+	if (control.audio_init)
+		SDL_QuitSubSystem(SDL_INIT_AUDIO);
+	control.audio_init = control.init_checked = FALSE;
+	control.stop = control.changed = FALSE;
+	control.loop = control.effect = CHIP_SOUNDS;
 }

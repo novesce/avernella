@@ -4,6 +4,8 @@
 
 Everything on this page runs in the **UI process**. It never talks to LINE directly: it asks the worker (see [Architecture](architecture.md#how-the-ui-and-the-worker-talk)) and draws what comes back.
 
+Opening Avernella again raises the existing window. If the primary UI thread has exited and a driver thread still holds the activation socket, a new launch can reclaim it. A busy, living UI keeps its window.
+
 ## The main loop
 
 `line_ui()` in [`ui.c`](../../src/ui.c) sets up SDL and then loops until `ui.quitting`:
@@ -70,6 +72,7 @@ The module ([`vk_ctx.c`](../../src/render/vk_ctx.c), [`vk_frame.c`](../../src/re
 - One graphics pipeline and one "uber" shader pair ([`ui_uber.vert`](../../src/render/ui_uber.vert), [`ui_uber.frag`](../../src/render/ui_uber.frag)), compiled to SPIR-V at build time, draw every primitive. A primitive (`struct ui_prim` in [`ui_batch.h`](../../src/render/ui_batch.h), 64 bytes) is a quad, glyph, image, dma-buf, the canvas or an I420 video frame. Four vertices per quad, clipping before rasterization, and short paths for the opaque canvas, glyph masks and I420 video.
 - The Cairo canvas lives in a device texture. Only changed regions are uploaded. Two frame slots reuse mapped upload memory, and Synchronization2 barriers order transfers and shader reads.
 - Call video is converted from I420 to RGB in the shader, so the CPU never converts video frames.
+- During a call, a camera texture can change size while the GPU is reading it. The renderer checks for completion and retries on a later frame, so the window can process input in between.
 - On drivers with `VK_KHR_incremental_present`, it tells the compositor which window region changed.
 
 ### Damage: drawing only what changed
@@ -254,6 +257,8 @@ The UI decides when you have *seen* the latest message, and the worker tells LIN
 ### Sounds
 
 [`chiptune.c`](../../src/chiptune.c) is an emulated NES audio chip (two pulse channels, a triangle and a noise channel, ported from the Mesen emulator). Each sound in `enum chip_sound` (ringtone, ringback, connected, hang-up, camera on and off, share start and stop, mute, unmute, message) is written as notes on the chip's registers and rendered once to 48 kHz PCM, in under 10 ms. [`ui_sounds.c`](../../src/ui_sounds.c) plays them through SDL audio: one looping sound (ringtone or ringback) and one effect at a time. The audio device is opened only while a sound plays, under the stream name "Avernella sounds". **User Settings → Notifications → Sounds** turns them off.
+
+A sound thread opens and closes the playback device. If a call connects while the device is opening, the thread plays the current cue and discards the obsolete ringtone.
 
 ### Keyboard shortcuts
 

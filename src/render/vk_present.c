@@ -8,7 +8,6 @@
 #include <string.h>
 
 #define FRAME_WAIT_NS UINT64_C(8000000)
-#define PRESENT_FENCE_WAIT_NS UINT64_C(1000000000)
 
 struct present_image {
 	VkImage image;
@@ -27,11 +26,17 @@ struct frame_slot {
 	uint32_t capacity;
 };
 
+struct swapchain {
+	struct swapchain *next;
+	VkSwapchainKHR handle;
+	struct present_image *images;
+	uint32_t count;
+	bool presented;
+};
+
 struct vk_present {
 	struct vk_ctx ctx;
-	VkSwapchainKHR swapchain;
-	struct present_image *images;
-	uint32_t image_count;
+	struct swapchain *chain, *retired;
 	VkExtent2D extent;
 	VkFormat format;
 	VkPipeline pipeline;
@@ -40,6 +45,8 @@ struct vk_present {
 	SDL_Window *window;
 	VkExtent2D drawable;
 	bool log, opaque, rebuild, previous_present, retain_images;
+	bool acquired, suboptimal;
+	uint32_t acquired_index;
 	VkRect2D damage;
 	struct frame_slot slots[VK_PRESENT_SLOTS];
 	uint64_t submitted;
@@ -138,26 +145,62 @@ static VkResult init_frames(struct vk_present *p)
 	return vkCreateSemaphore(device, &semaphore, NULL, &p->timeline);
 }
 
-static void destroy_swapchain(struct vk_present *p)
+/* Render completion does not retire the presentation engine's references. */
+static VkResult wait_presentations(VkDevice device, struct swapchain *chain,
+				   uint64_t timeout)
+{
+	for (uint32_t i = 0; i < chain->count; i++) {
+		struct present_image *image = &chain->images[i];
+
+		if (!image->pending)
+			continue;
+		VkResult result = vkWaitForFences(device, 1, &image->presented,
+						  VK_TRUE, timeout);
+		if (result != VK_SUCCESS)
+			return result;
+		image->pending = false;
+	}
+	return VK_SUCCESS;
+}
+
+static void retire_swapchain(struct vk_present *p)
+{
+	if (p->chain) {
+		p->chain->next = p->retired;
+		p->retired = p->chain;
+		p->chain = NULL;
+	}
+}
+
+static VkResult collect_swapchains(struct vk_present *p, bool closing)
 {
 	VkDevice device = p->ctx.device;
+	struct swapchain **link = &p->retired;
 
-	/* Presentation fences cover resources that a render timeline alone cannot retire. */
-	for (uint32_t i = 0; i < p->image_count; i++) {
-		struct present_image *image = &p->images[i];
+	while (*link) {
+		struct swapchain *chain = *link;
+		VkResult result = wait_presentations(device, chain,
+						     closing ? UINT64_MAX : 0);
 
-		if (image->pending)
-			vkWaitForFences(device, 1, &image->presented, VK_TRUE,
-					UINT64_MAX);
-		vkDestroyFence(device, image->presented, NULL);
-		vkDestroySemaphore(device, image->ready, NULL);
-		vkDestroyImageView(device, image->view, NULL);
+		if (!closing && result == VK_TIMEOUT) {
+			link = &chain->next;
+			continue;
+		}
+		if (!closing && result != VK_SUCCESS)
+			return result;
+		for (uint32_t i = 0; i < chain->count; i++) {
+			struct present_image *image = &chain->images[i];
+
+			vkDestroyFence(device, image->presented, NULL);
+			vkDestroySemaphore(device, image->ready, NULL);
+			vkDestroyImageView(device, image->view, NULL);
+		}
+		vkDestroySwapchainKHR(device, chain->handle, NULL);
+		*link = chain->next;
+		free(chain->images);
+		free(chain);
 	}
-	free(p->images);
-	p->images = NULL;
-	p->image_count = 0;
-	vkDestroySwapchainKHR(device, p->swapchain, NULL);
-	p->swapchain = VK_NULL_HANDLE;
+	return VK_SUCCESS;
 }
 
 static VkResult init_images(struct vk_present *p, VkFormat format)
@@ -165,7 +208,7 @@ static VkResult init_images(struct vk_present *p, VkFormat format)
 	VkDevice device = p->ctx.device;
 	uint32_t count = 0;
 	VkResult result =
-		vkGetSwapchainImagesKHR(device, p->swapchain, &count, NULL);
+		vkGetSwapchainImagesKHR(device, p->chain->handle, &count, NULL);
 
 	if (result != VK_SUCCESS || !count)
 		return result == VK_SUCCESS ? VK_ERROR_INITIALIZATION_FAILED :
@@ -178,14 +221,15 @@ static VkResult init_images(struct vk_present *p, VkFormat format)
 		free(slots);
 		return VK_ERROR_OUT_OF_HOST_MEMORY;
 	}
-	result = vkGetSwapchainImagesKHR(device, p->swapchain, &count, images);
+	result = vkGetSwapchainImagesKHR(device, p->chain->handle, &count,
+					 images);
 	if (result != VK_SUCCESS) {
 		free(images);
 		free(slots);
 		return result;
 	}
-	p->images = slots;
-	p->image_count = count;
+	p->chain->images = slots;
+	p->chain->count = count;
 	const VkSemaphoreCreateInfo semaphore = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO
 	};
@@ -261,10 +305,9 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 
 	if (!alpha)
 		return VK_ERROR_INITIALIZATION_FAILED;
-	result = vkQueueWaitIdle(ctx->queue);
+	result = vk_present_wait(p, 0);
 	if (result != VK_SUCCESS)
 		return result;
-	destroy_swapchain(p);
 	if (!p->pipeline || p->format != format.format) {
 		vkDestroyPipeline(ctx->device, p->pipeline, NULL);
 		p->pipeline = VK_NULL_HANDLE;
@@ -280,6 +323,7 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	VkSwapchainCreateInfoKHR info = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.surface = ctx->surface,
+		.oldSwapchain = p->chain ? p->chain->handle : VK_NULL_HANDLE,
 		.minImageCount = count,
 		.imageFormat = format.format,
 		.imageColorSpace = format.colorSpace,
@@ -292,9 +336,21 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		/* Reacquired images must also retain previously obscured pixels. */
 		.clipped = !retain,
 	};
-	result = vkCreateSwapchainKHR(ctx->device, &info, NULL, &p->swapchain);
-	if (result != VK_SUCCESS)
+	struct swapchain *chain = calloc(1, sizeof(*chain));
+
+	if (!chain)
+		return VK_ERROR_OUT_OF_HOST_MEMORY;
+	/* Some compositors hold the last presentation until its replacement.
+	 * Keep its fences and semaphores alive while the new chain presents.
+	 */
+	p->rebuild = true;
+	retire_swapchain(p);
+	result = vkCreateSwapchainKHR(ctx->device, &info, NULL, &chain->handle);
+	if (result != VK_SUCCESS) {
+		free(chain);
 		return result;
+	}
+	p->chain = chain;
 	result = init_images(p, format.format);
 	if (result != VK_SUCCESS)
 		return result;
@@ -304,7 +360,7 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	p->rebuild = false;
 	if (p->log)
 		fprintf(stderr, "Vulkan swapchain: %ux%u, %u images, FIFO\n",
-			extent.width, extent.height, p->image_count);
+			extent.width, extent.height, p->chain->count);
 	return VK_SUCCESS;
 }
 
@@ -424,9 +480,9 @@ static VkResult wait_for(struct vk_present *p, uint64_t value, uint64_t timeout)
 	return vkWaitSemaphores(p->ctx.device, &wait, timeout);
 }
 
-VkResult vk_present_wait(struct vk_present *p)
+VkResult vk_present_wait(struct vk_present *p, uint64_t timeout)
 {
-	return wait_for(p, p->submitted, UINT64_MAX);
+	return wait_for(p, p->submitted, timeout);
 }
 
 struct vk_ctx *vk_present_context(struct vk_present *p)
@@ -484,14 +540,26 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	p->previous_present = false;
 	VkDeviceAddress address;
 	VkResult result;
-	if (!drawable.width || !drawable.height)
-		return VK_NOT_READY;
-	if (p->rebuild || drawable.width != p->extent.width ||
-	    drawable.height != p->extent.height) {
-		incremental = false;
-		result = rebuild_swapchain(p, p->window);
+	if (p->retired) {
+		result = collect_swapchains(p, false);
 		if (result != VK_SUCCESS)
 			return result;
+	}
+	if (!drawable.width || !drawable.height)
+		return VK_NOT_READY;
+	if (!p->acquired && (p->rebuild || drawable.width != p->extent.width ||
+			     drawable.height != p->extent.height)) {
+		incremental = false;
+		/* Coalesce resizes if the compositor holds two old chains.
+		 * Keep presenting on the current one while it is usable. A
+		 * chain with no presents can still be replaced immediately.
+		 */
+		if (!p->retired || !p->retired->next || !p->chain ||
+		    !p->chain->presented) {
+			result = rebuild_swapchain(p, p->window);
+			if (result != VK_SUCCESS)
+				return result;
+		}
 	}
 	result = wait_for(p, slot->done, FRAME_WAIT_NS);
 	if (result != VK_SUCCESS)
@@ -499,35 +567,29 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	result = stage_primitives(p, slot, prims, count, &address);
 	if (result != VK_SUCCESS)
 		return result;
-	uint32_t index;
-
-	result = vkAcquireNextImageKHR(device, p->swapchain, FRAME_WAIT_NS,
-				       slot->acquire, VK_NULL_HANDLE, &index);
-	if (result == VK_ERROR_OUT_OF_DATE_KHR) {
-		p->rebuild = true;
-		incremental = false;
-		result = rebuild_swapchain(p, p->window);
-		if (result != VK_SUCCESS)
-			return result;
-		result = vkAcquireNextImageKHR(device, p->swapchain,
+	/* Retain the acquisition across a slow present fence. The acquire
+	 * semaphore is already signalled and must only be consumed once.
+	 */
+	if (!p->acquired) {
+		result = vkAcquireNextImageKHR(device, p->chain->handle,
 					       FRAME_WAIT_NS, slot->acquire,
-					       VK_NULL_HANDLE, &index);
+					       VK_NULL_HANDLE,
+					       &p->acquired_index);
 		if (result == VK_ERROR_OUT_OF_DATE_KHR)
 			p->rebuild = true;
+		if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
+			return result;
+		p->acquired = true;
+		p->suboptimal = result == VK_SUBOPTIMAL_KHR;
 	}
-	if (result != VK_SUCCESS && result != VK_SUBOPTIMAL_KHR)
-		return result;
-	bool suboptimal = result == VK_SUBOPTIMAL_KHR;
-	struct present_image *image = &p->images[index];
+	uint32_t index = p->acquired_index;
+	struct present_image *image = &p->chain->images[index];
 
 	if (image->pending) {
 		result = vkWaitForFences(device, 1, &image->presented, VK_TRUE,
-					 PRESENT_FENCE_WAIT_NS);
+					 0);
 		if (result != VK_SUCCESS)
-			/* This slot already owns an acquired image and semaphore. */
-			return result == VK_TIMEOUT ?
-				       VK_ERROR_INITIALIZATION_FAILED :
-				       result;
+			return result;
 		image->pending = false;
 		result = vkResetFences(device, 1, &image->presented);
 		if (result != VK_SUCCESS)
@@ -543,11 +605,12 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	VkRect2D area = { .extent = p->extent };
 	if (p->retain_images) {
 		/* A fresh chain or unknown delta invalidates every image. */
-		for (uint32_t i = 0; i < p->image_count; i++)
-			p->images[i].repair =
+		for (uint32_t i = 0; i < p->chain->count; i++)
+			p->chain->images[i].repair =
 				incremental ?
-					include_damage(p->images[i].repair,
-						       damage) :
+					include_damage(
+						p->chain->images[i].repair,
+						damage) :
 					area;
 		area = image->repair;
 		image->repair = (VkRect2D){ 0 };
@@ -593,6 +656,7 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	if (result != VK_SUCCESS)
 		return result;
 	slot->done = ++p->submitted;
+	p->acquired = false;
 	/* Damage is relative to the previous present on the swapchain, even
 	 * when a different swapchain image was just acquired and redrawn.
 	 */
@@ -617,7 +681,7 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 		.waitSemaphoreCount = 1,
 		.pWaitSemaphores = &image->ready,
 		.swapchainCount = 1,
-		.pSwapchains = &p->swapchain,
+		.pSwapchains = &p->chain->handle,
 		.pImageIndices = &index,
 	};
 
@@ -627,7 +691,8 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	image->pending = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR ||
 			 result == VK_ERROR_OUT_OF_DATE_KHR ||
 			 result == VK_ERROR_SURFACE_LOST_KHR;
-	p->rebuild = suboptimal || result == VK_SUBOPTIMAL_KHR ||
+	p->chain->presented |= image->pending;
+	p->rebuild = p->suboptimal || result == VK_SUBOPTIMAL_KHR ||
 		     result == VK_ERROR_OUT_OF_DATE_KHR;
 	return result == VK_SUBOPTIMAL_KHR ? VK_SUCCESS : result;
 }
@@ -667,7 +732,8 @@ void vk_present_close(struct vk_present *p)
 		return;
 	if (p->ctx.device) {
 		vkDeviceWaitIdle(p->ctx.device);
-		destroy_swapchain(p);
+		retire_swapchain(p);
+		collect_swapchains(p, true);
 		vkDestroyPipeline(p->ctx.device, p->pipeline, NULL);
 		for (unsigned i = 0; i < VK_PRESENT_SLOTS; i++) {
 			vkDestroySemaphore(p->ctx.device, p->slots[i].acquire,

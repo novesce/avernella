@@ -450,7 +450,7 @@ static void group_send(void)
 	line_audio_close(a);
 }
 
-static void group_microphone(void)
+static void group_microphone(gconstpointer stuck_channel)
 {
 	guint8 key[30] = { 42 }, packet[2048];
 	opus_int16 stereo[2 * 1920], decoded[1920];
@@ -465,6 +465,7 @@ static void group_microphone(void)
 	g_assert_no_error(e);
 	g_assert_nonnull(audio);
 	g_assert_cmpint(rc, ==, OPUS_OK);
+	line_audio_enable_diagnostics(audio);
 	srtp_crypto_policy_set_rtp_default(&policy.rtp);
 	srtp_crypto_policy_set_rtcp_default(&policy.rtcp);
 	policy.key = key;
@@ -474,8 +475,8 @@ static void group_microphone(void)
 		int phase = i % 240;
 		int sample = 4 * (MIN(phase, 240 - phase) - 60);
 
-		/* Equal-energy microphones can be wired with opposite polarity. */
-		stereo[2 * i] = sample;
+		/* One channel can be stuck at DC, or the pair wired in antiphase. */
+		stereo[2 * i] = stuck_channel ? 4096 : sample;
 		stereo[2 * i + 1] = -sample;
 	}
 	captured_pcm = (const guint8 *)stereo;
@@ -531,6 +532,15 @@ static void group_microphone(void)
 	for (guint i = 0; i < G_N_ELEMENTS(decoded); i++)
 		power += (int)decoded[i] * decoded[i];
 	g_assert_cmpuint(power / G_N_ELEMENTS(decoded), >, 500);
+	GPrintFunc previous_handler = g_set_printerr_handler(save_audio_report);
+
+	line_audio_report(audio);
+	g_set_printerr_handler(previous_handler);
+	g_assert_nonnull(audio_report);
+	g_assert_nonnull(
+		strstr(audio_report,
+		       " mic-checks=9 mic-blocks=8 mic-ac-power-max=19202 "));
+	g_clear_pointer(&audio_report, g_free);
 	line_audio_mute(audio, TRUE);
 	g_assert_cmpint(line_audio_capture(audio, packet, sizeof(packet), &e),
 			==, 0);
@@ -571,6 +581,70 @@ static void group_microphone(void)
 	opus_decoder_destroy(decoder);
 	srtp_dealloc(peer);
 	line_audio_close(audio);
+}
+
+static void hear_microphones(const opus_int16 *left, const opus_int16 *right,
+			     opus_int16 *output)
+{
+	LineAudio *audio;
+	guint8 key[30] = { 41 }, packet[2048];
+	opus_int16 stereo[2 * 1920];
+	guint before = frames_40ms;
+	GError *error = NULL;
+
+	audio = line_audio_open_group(key, key, 98, 98, 202, 202, &error);
+	g_assert_no_error(error);
+	g_assert_nonnull(audio);
+	for (int i = 0; i < 1920; i++) {
+		stereo[2 * i] = left[i];
+		stereo[2 * i + 1] = right[i];
+	}
+	hold_playback = TRUE;
+	for (int i = 0; i < 8; i++) {
+		captured_pcm = (const guint8 *)stereo;
+		captured_bytes = sizeof(stereo);
+		int n = line_audio_capture(audio, packet, sizeof(packet),
+					   &error);
+
+		g_assert_no_error(error);
+		g_assert_cmpint(n, >, 0);
+		g_assert_true(line_audio_receive(audio, packet, n));
+	}
+	g_assert_cmpuint(frames_40ms - before, ==, 8);
+	memcpy(output, played_40ms, sizeof(played_40ms));
+	hold_playback = FALSE;
+	captured_pcm = NULL;
+	line_audio_close(audio);
+}
+
+static void group_microphone_clipping(void)
+{
+	opus_int16 voice[1920], clipped[1920], noise[1920];
+	opus_int16 reference[1920], decoded[1920];
+	guint32 random = 1;
+
+	for (int i = 0; i < 1920; i++) {
+		int phase = i % 240;
+
+		voice[i] = 128 * (MIN(phase, 240 - phase) - 60);
+		clipped[i] = phase < 24 ? -32768 :
+			     phase < 48 ? 32767 :
+					  voice[i];
+		random = 1664525 * random + 1013904223;
+		noise[i] = (int)(random >> 18) - 8192;
+	}
+	hear_microphones(voice, voice, reference);
+	guint64 power = 0;
+
+	for (guint i = 0; i < G_N_ELEMENTS(reference); i++)
+		power += (int)reference[i] * reference[i];
+	g_assert_cmpuint(power / G_N_ELEMENTS(reference), >, 500);
+	hear_microphones(clipped, voice, decoded);
+	g_assert_cmpmem(decoded, sizeof(decoded), reference, sizeof(reference));
+	/* The overload alone must not switch the mic to a noise-only channel. */
+	hear_microphones(clipped, clipped, reference);
+	hear_microphones(noise, clipped, decoded);
+	g_assert_cmpmem(decoded, sizeof(decoded), reference, sizeof(reference));
 }
 
 /* Inspect the exact encoded VSD before the receiver's playback processing. */
@@ -974,7 +1048,12 @@ int main(int argc, char **argv)
 	g_test_add_func("/audio/rtp-audio-timeline", rtp_audio_timeline);
 	g_test_add_func("/audio/native-eas2-celt", eas2);
 	g_test_add_func("/audio/conference-eas2-send-and-receive", group_send);
-	g_test_add_func("/audio/conference-microphone", group_microphone);
+	g_test_add_data_func("/audio/conference-microphone", NULL,
+			     group_microphone);
+	g_test_add_data_func("/audio/conference-microphone-stuck-channel",
+			     GINT_TO_POINTER(1), group_microphone);
+	g_test_add_func("/audio/conference-microphone-clipping",
+			group_microphone_clipping);
 	g_test_add_func("/audio/conference-microphone-signals",
 			group_microphone_signals);
 	g_test_add_func("/audio/conference-absorbs-reordered-burst",

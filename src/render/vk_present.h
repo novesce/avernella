@@ -19,7 +19,7 @@ struct vk_present *vk_present_open(SDL_Window *window, uint32_t vendor,
 void vk_present_close(struct vk_present *p);
 VkExtent2D vk_present_extent(struct vk_present *p);
 struct vk_ctx *vk_present_context(struct vk_present *p);
-VkResult vk_present_wait(struct vk_present *p);
+VkResult vk_present_wait(struct vk_present *p, uint64_t timeout);
 /* Changed drawable pixels since the last present. Consumed by the next draw. */
 void vk_present_set_damage(struct vk_present *p, const VkRect2D *changed);
 /* A negative result other than OUT_OF_DATE requires recreating the presenter. */

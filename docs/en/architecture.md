@@ -49,6 +49,7 @@ It never opens a connection to LINE's RPC servers. Everything it needs from LINE
 | ------ | ---------- | --- |
 | main | `line_ui()` | SDL events, layout, drawing, all interface state. **Only this thread may touch `ui` (the `Interface` struct) or request state.** |
 | `line-ipc` | `start_worker()` in `ui.c` | Writes queued requests to the worker, reads replies and events, and receives call video frames. It turns each line into an SDL user event, so the main thread never blocks on a socket. |
+| `avernella-sound` | First sound request in `ui_sounds.c` | Renders call cues, opens and closes the playback device, and sleeps while idle. |
 | image decoder pool (1 thread) | `start_decode()` in [`ui_media.c`](../../src/ui_media.c) | Decodes pictures, thumbnails and animation frames under `SCHED_BATCH` |
 | `avernella-liff` | [`ui_liff.c`](../../src/ui_liff.c) | Sleeps in `recv()` on the browser socket and posts an SDL event when the browser speaks |
 | `line-tray` | [`ui_tray.c`](../../src/ui_tray.c) | Runs the StatusNotifierItem D-Bus service |
@@ -72,6 +73,8 @@ The UI starts the worker on the first sign-in attempt (or at launch, when a save
 3. For email sign-in, it runs `--worker-password` instead. Then fd 3 is a pipe carrying one `struct line_credentials` (email and password, 256 bytes each), and the frame socket moves to fd 4. The worker reads the pipe once, closes it and wipes the buffer with `explicit_bzero`. The UI wipes its own copy too. The password never appears in arguments, the environment or the JSON channel.
 
 The worker's first action is `prctl(PR_SET_PDEATHSIG, SIGTERM)`, so it dies with the window. It then checks that its parent didn't already exit, which closes the race.
+
+The UI starts the worker with `SDL_NO_SIGNAL_HANDLERS=1` so call audio leaves the parent-death signal effective. After forcing a disconnected worker to exit, the UI delegates any remaining `waitpid` to a reaper thread. A slow audio or graphics driver can finish releasing the child while the window continues processing input.
 
 ### The worker's main loop
 

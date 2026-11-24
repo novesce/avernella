@@ -627,15 +627,21 @@ static gpointer pump(gpointer data)
 	return NULL;
 }
 
-static gboolean reap_worker(int options)
+static gboolean reap_worker(pid_t pid, int options)
 {
 	pid_t result;
 
 	do {
-		result = waitpid(wire.pid, NULL, options);
+		result = waitpid(pid, NULL, options);
 	} while (result < 0 && errno == EINTR);
 	/* A failed wait cannot authorize a signal to a reused PID. */
 	return result != 0;
+}
+
+static gpointer finish_reaping(gpointer child)
+{
+	reap_worker(GPOINTER_TO_INT(child), 0);
+	return NULL;
 }
 
 static gboolean wait_worker(gint64 deadline)
@@ -654,10 +660,10 @@ static gboolean wait_worker(gint64 deadline)
 				break;
 		}
 		close(fd);
-		return reap_worker(WNOHANG);
+		return reap_worker(wire.pid, WNOHANG);
 	}
 #endif
-	while (!reap_worker(WNOHANG)) {
+	while (!reap_worker(wire.pid, WNOHANG)) {
 		gint64 remaining = deadline - g_get_monotonic_time();
 
 		if (remaining <= 0)
@@ -683,9 +689,13 @@ static void stop_worker(gboolean orderly)
 			exited = wait_worker(g_get_monotonic_time() +
 					     WORKER_QUIT_GRACE_MS * 1000);
 		shutdown(wire.fd, SHUT_RDWR);
-		if (!exited && !reap_worker(WNOHANG)) {
-			kill(wire.pid, orderly ? SIGKILL : SIGTERM);
-			reap_worker(0);
+		if (!exited && !reap_worker(wire.pid, WNOHANG)) {
+			/* Even SIGKILL may wait for a stuck device to release. */
+			kill(wire.pid, SIGKILL);
+			if (!reap_worker(wire.pid, WNOHANG))
+				g_thread_unref(g_thread_new(
+					"line-reap", finish_reaping,
+					GINT_TO_POINTER(wire.pid)));
 		}
 		g_thread_join(wire.thread);
 		close(wire.fd);
@@ -717,6 +727,8 @@ static char **worker_environment(void)
 	int minor = ui_gpu_render_minor();
 	guint vendor = ui_gpu_device_vendor();
 
+	/* The audio worker has no SDL event loop to consume SDL_QUIT. */
+	env = g_environ_setenv(env, SDL_HINT_NO_SIGNAL_HANDLERS, "1", TRUE);
 	env = g_environ_unsetenv(env, "AVERNELLA_MEDIA_RENDER_NODE");
 	env = g_environ_unsetenv(env, "AVERNELLA_MEDIA_GPU_VENDOR");
 	if (minor >= 0) {
@@ -2841,6 +2853,7 @@ int line_ui(int argc, char **argv)
 		ui_instance_close();
 		return 1;
 	}
+	ui_sound_init();
 	wire.packet_event = SDL_RegisterEvents(4);
 	if (wire.packet_event == (Uint32)-1) {
 		g_printerr("No SDL event IDs are available.\n");
@@ -2975,11 +2988,11 @@ int line_ui(int argc, char **argv)
 	g_string_free(ui.login_email.value, TRUE);
 	g_string_free(ui.login_password.value, TRUE);
 	ui_liff_close();
-	ui_sound_shutdown();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
 	status = 0;
 quit_sdl:
+	ui_sound_shutdown();
 	ui_instance_close();
 	if (ui.window)
 		SDL_DestroyWindow(ui.window);

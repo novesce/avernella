@@ -31,6 +31,7 @@ static EVP_PKEY *relay_key;
 static guint8 relay_public[33];
 static gint playback_frames;
 static gint audio_devices;
+static guint microphone_channels;
 static gboolean bad_route, video_fixture, voice_fallback, migrate_media;
 static gboolean start_with_camera_off;
 static gboolean share_fixture, group_fixture, camera_unavailable;
@@ -368,6 +369,7 @@ SDL_AudioDeviceID __real_SDL_OpenAudioDevice(const char *device, int capture,
 					     int changes);
 void __real_SDL_CloseAudioDevice(SDL_AudioDeviceID dev);
 int __real_SDL_QueueAudio(SDL_AudioDeviceID dev, const void *data, Uint32 len);
+Uint32 __real_SDL_DequeueAudio(SDL_AudioDeviceID dev, void *data, Uint32 len);
 
 SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(const char *name, int input,
 					     const SDL_AudioSpec *want,
@@ -375,6 +377,8 @@ SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(const char *name, int input,
 {
 	SDL_AudioDeviceID device =
 		__real_SDL_OpenAudioDevice(name, input, want, got, flags);
+	if (device && input)
+		microphone_channels = got ? got->channels : want->channels;
 	if (device)
 		g_atomic_int_inc(&audio_devices);
 	return device;
@@ -384,6 +388,26 @@ void __wrap_SDL_CloseAudioDevice(SDL_AudioDeviceID device)
 {
 	__real_SDL_CloseAudioDevice(device);
 	g_atomic_int_add(&audio_devices, -1);
+}
+
+/* Replace the dummy microphone's silence with a quiet 200 Hz test signal. */
+Uint32 __wrap_SDL_DequeueAudio(SDL_AudioDeviceID device, void *data, Uint32 n)
+{
+	Uint32 bytes = __real_SDL_DequeueAudio(device, data, n);
+	gint16 *pcm = data;
+	static guint phase;
+
+	if (!group_fixture)
+		return bytes;
+	g_assert_cmpuint(microphone_channels, >=, 1);
+	for (guint i = microphone_channels - 1; i < bytes / sizeof(*pcm);
+	     i += microphone_channels) {
+		int sample = 24 * (MIN((int)phase, 240 - (int)phase) - 60);
+
+		pcm[i] = sample;
+		phase = (phase + 1) % 240;
+	}
+	return bytes;
 }
 
 int __wrap_SDL_QueueAudio(SDL_AudioDeviceID device, const void *data, Uint32 n)
@@ -1117,8 +1141,11 @@ static void group_call(gconstpointer args)
 	call_group_media_key("AUDIO", remote_key, rx);
 	srtp_t sink = peer_context(tx, FALSE), source = peer_context(rx, TRUE);
 	gboolean heard = FALSE, acknowledged = FALSE;
+	int rc;
+	OpusDecoder *listener = opus_decoder_create(48000, 1, &rc);
 	gint64 end = g_get_monotonic_time() + 2000000;
 
+	g_assert_cmpint(rc, ==, OPUS_OK);
 	while ((!heard || !acknowledged) && readable_until(server_fd, end)) {
 		int n = recv(server_fd, packet, sizeof(packet), 0);
 
@@ -1147,9 +1174,26 @@ static void group_call(gconstpointer args)
 
 		memcpy(&ssrc, packet + 8, sizeof(ssrc));
 		g_assert_cmpuint(ntohl(ssrc), ==, TX_SSRC);
+		g_assert_cmpint(n, >, 28);
+		/* Strip the EAS2 voice bitmap to decode the two Opus frames. */
 		g_assert_cmpuint(packet[25] & 3, ==, 3);
-		heard = TRUE;
+		g_assert_cmphex(packet[25] & 0x80, ==, 0x80);
+		gboolean voiced = ((packet[19] >> 4) & 3) == 2 ||
+				  ((packet[19] >> 2) & 3) == 2;
+		gint16 pcm[1920];
+
+		packet[27] = packet[26];
+		packet[26] = packet[25];
+		g_assert_cmpint(opus_decode(listener, packet + 26, n - 26, pcm,
+					    G_N_ELEMENTS(pcm), 0),
+				==, G_N_ELEMENTS(pcm));
+		for (guint i = 0; voiced && i < G_N_ELEMENTS(pcm); i++)
+			if (ABS((int)pcm[i]) > 100) {
+				heard = TRUE;
+				break;
+			}
 	}
+	opus_decoder_destroy(listener);
 	g_assert_true(heard);
 	g_assert_true(acknowledged);
 	int before = g_atomic_int_get(&playback_frames);

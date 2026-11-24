@@ -160,6 +160,10 @@ Media packets go to the media address the peer's connection signalling gives, wh
 - **Playback.** Received packets are authenticated against the negotiated payload type and SSRC, briefly held to absorb reordering, and played out on schedule (`line_audio_playout()`). Decoder state resets on a gap.
 - **Mute** stops sending microphone audio (`line_audio_mute()`).
 
+For a stereo group-call microphone, Avernella measures the changing part of each channel so a stuck input or a DC offset cannot win the selection. If one channel clips repeatedly and the other has a usable signal, it favors the cleaner channel. If both channels clip, reduce the input gain in the system sound settings.
+
+With `LINE_GROUP_CALL_STATS=1`, compare `mic-blocks` (complete 40 ms blocks captured) and `mic-ac-power-max` (peak block mean-square signal before noise suppression) with `tx-power` (average signal after processing) and `mic-fb-received` (microphone packet arrivals reported by the relay). Listening on a second device verifies the last step.
+
 ## 6. Video
 
 [`call_video.c`](../../src/call_video.c):

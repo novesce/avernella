@@ -78,6 +78,7 @@ struct audio_interval {
 	guint decoded_packets, decoded_samples, decoded_errors;
 	guint missed_ticks, conceal_samples, decoder_resets;
 	guint queued_samples, queue_max, queue_drops, queue_prerolls, trimmed;
+	guint capture_checks, capture_blocks, capture_power_max;
 	guint tx_frames, tx_power_max;
 	guint64 pcm_square_sum, tx_power_sum;
 };
@@ -100,7 +101,7 @@ struct LineAudio {
 	guint32 tx_ssrc, rx_ssrc, timestamp, next_stamp;
 	guint16 seq, received;
 	guint8 tx_pt, rx_pt, group_chunk;
-	guint8 capture_channels, capture_channel;
+	guint8 capture_channels, capture_channel, clean_hold;
 	guint capture_gain;
 	int last_samples;
 	struct audio_packet pending[REORDER_PACKETS];
@@ -135,7 +136,8 @@ void line_audio_report(LineAudio *a)
 	struct audio_interval *s = &d->interval;
 	gint64 now = g_get_monotonic_time();
 
-	if (s->wire || s->decoded_samples || s->conceal_samples || s->tx_frames)
+	if (s->wire || s->decoded_samples || s->conceal_samples ||
+	    s->capture_checks || s->tx_frames)
 		g_printerr(
 			"group-stats audio ms=%" G_GINT64_FORMAT
 			" wire=%u bytes=%u other-ssrc=%u auth=%u reject=%u replay=%u invalid=%u late=%u"
@@ -145,6 +147,7 @@ void line_audio_report(LineAudio *a)
 			" reordered=%u arrival-max-us=%u jitter-us=%u"
 			" decoded=%u samples=%u decode-error=%u power=%" G_GUINT64_FORMAT
 			" missed=%u concealed=%u reset=%u queued=%u queue=%u queue-max=%u drops=%u preroll=%u trim=%u"
+			" mic-checks=%u mic-blocks=%u mic-ac-power-max=%u"
 			" tx-power=%" G_GUINT64_FORMAT
 			" tx-power-max=%u tx-configs=%08x tx-vsd=%u/%u/%u\n",
 			(now - d->report_at) / 1000, s->wire, s->bytes,
@@ -167,9 +170,11 @@ void line_audio_report(LineAudio *a)
 			(guint)(SDL_GetQueuedAudioSize(a->playback) /
 				sizeof(opus_int16)),
 			s->queue_max, s->queue_drops, s->queue_prerolls,
-			s->trimmed, s->tx_power_sum / MAX(1, s->tx_frames),
-			s->tx_power_max, s->tx_configs, s->tx_vsd[0],
-			s->tx_vsd[1], s->tx_vsd[2]);
+			s->trimmed, s->capture_checks, s->capture_blocks,
+			s->capture_power_max,
+			s->tx_power_sum / MAX(1, s->tx_frames), s->tx_power_max,
+			s->tx_configs, s->tx_vsd[0], s->tx_vsd[1],
+			s->tx_vsd[2]);
 	*s = (struct audio_interval){ 0 };
 	d->report_at = now;
 }
@@ -325,6 +330,7 @@ void line_audio_mute(LineAudio *a, gboolean muted)
 		g_clear_pointer(&a->denoise, line_denoise_free);
 		opus_encoder_ctl(a->encoder, OPUS_RESET_STATE);
 		a->capture_gain = CAPTURE_GAIN_ONE;
+		a->clean_hold = 0;
 	}
 	if (!muted) {
 		if (a->group)
@@ -334,23 +340,94 @@ void line_audio_mute(LineAudio *a, gboolean muted)
 	}
 }
 
+enum group_signal {
+	GROUP_SILENCE,
+	GROUP_UNVOICED,
+	GROUP_VOICED,
+};
+
+static enum group_signal group_signal_type(const opus_int16 *pcm, guint stride,
+					   guint64 *squares);
+
+struct channel_level {
+	guint64 energy;
+	guint clipped;
+};
+
+static struct channel_level channel_level(const opus_int16 *pcm, guint stride)
+{
+	struct channel_level level = { 0 };
+	int sum = 0;
+
+	for (guint i = 0; i < GROUP_FRAME; i++) {
+		int sample = pcm[i * stride];
+
+		level.energy += sample * sample;
+		level.clipped += ABS(sample) >= 32000;
+		sum += sample;
+	}
+	/* A constant microphone offset contributes no audible signal. */
+	level.energy -= (gint64)sum * sum / GROUP_FRAME;
+	return level;
+}
+
+static guint choose_microphone(LineAudio *a, const opus_int16 *pcm,
+			       const struct channel_level levels[2])
+{
+	guint current = a->capture_channel, other = current ^ 1;
+	guint pick = levels[other].energy > 2 * levels[current].energy ?
+			     other :
+			     current;
+	guint alt = pick ^ 1;
+
+	/*
+	 * Override the energy preference when one input is hitting the rails
+	 * on at least 3% of samples and the other has comparable speech.
+	 * Retain that choice for up to 120 ms of unvoiced consonants.
+	 */
+	if (levels[pick].clipped >= GROUP_FRAME / 32 &&
+	    levels[pick].clipped >= levels[alt].clipped + GROUP_FRAME / 64 &&
+	    levels[alt].energy * 16 >= levels[pick].energy) {
+		guint64 squares;
+
+		if (group_signal_type(pcm + alt, 2, &squares) == GROUP_VOICED ||
+		    group_signal_type(pcm + 2 * FRAME + alt, 2, &squares) ==
+			    GROUP_VOICED) {
+			a->clean_hold = 3;
+			return alt;
+		}
+		if (current == alt && a->clean_hold) {
+			a->clean_hold--;
+			return alt;
+		}
+	}
+	a->clean_hold = 0;
+	return pick;
+}
+
 static void group_capture_pcm(LineAudio *a, opus_int16 *pcm)
 {
+	guint64 energy = 0;
+
 	if (a->capture_channels == 2) {
-		guint64 power[2] = { 0 };
-		guint current = a->capture_channel, other = current ^ 1;
+		struct channel_level levels[2] = { channel_level(pcm, 2),
+						   channel_level(pcm + 1, 2) };
 
-		for (guint i = 0; i < GROUP_FRAME; i++) {
-			int left = pcm[2 * i], right = pcm[2 * i + 1];
-
-			power[0] += left * left;
-			power[1] += right * right;
-		}
 		/* Keep a stable mono source even on phase-inverted mic arrays. */
-		if (power[other] > 2 * power[current])
-			a->capture_channel = other;
+		a->capture_channel = choose_microphone(a, pcm, levels);
+		energy = levels[a->capture_channel].energy;
 		for (guint i = 0; i < GROUP_FRAME; i++)
 			pcm[i] = pcm[2 * i + a->capture_channel];
+	} else if (a->diagnostics) {
+		energy = channel_level(pcm, 1).energy;
+	}
+	if (a->diagnostics) {
+		struct audio_interval *stats = &a->diagnostics->interval;
+		guint mean_square = energy / GROUP_FRAME;
+
+		stats->capture_blocks++;
+		stats->capture_power_max =
+			MAX(stats->capture_power_max, mean_square);
 	}
 	if (!a->denoise)
 		return;
@@ -378,18 +455,12 @@ static void group_capture_pcm(LineAudio *a, opus_int16 *pcm)
 	line_denoise_frame(a->denoise, pcm, GROUP_FRAME);
 }
 
-enum group_signal {
-	GROUP_SILENCE,
-	GROUP_UNVOICED,
-	GROUP_VOICED,
-};
-
 /*
  * VSD distinguishes voiced frames from active but unvoiced frames. Stock
  * Opus has no public encoder voicing query. Look for a repeating waveform
  * in the 80–500 Hz pitch range of the processed microphone signal.
  */
-static enum group_signal group_signal_type(const opus_int16 pcm[FRAME],
+static enum group_signal group_signal_type(const opus_int16 *pcm, guint stride,
 					   guint64 *squares)
 {
 	enum {
@@ -404,7 +475,7 @@ static enum group_signal group_signal_type(const opus_int16 pcm[FRAME],
 		int sum = 0;
 
 		for (int j = 0; j < STRIDE; j++) {
-			int sample = pcm[i * STRIDE + j];
+			int sample = pcm[(i * STRIDE + j) * stride];
 
 			*squares += sample * sample;
 			sum += sample;
@@ -451,8 +522,9 @@ static int encode_group(LineAudio *a, guint8 *packet,
 	    opus_packet_get_samples_per_frame(first, RATE) != FRAME)
 		return -1;
 	guint64 squared1, squared2;
-	enum group_signal signal1 = group_signal_type(pcm, &squared1);
-	enum group_signal signal2 = group_signal_type(pcm + FRAME, &squared2);
+	enum group_signal signal1 = group_signal_type(pcm, 1, &squared1);
+	enum group_signal signal2 =
+		group_signal_type(pcm + FRAME, 1, &squared2);
 	guint64 loudest = MAX(squared1, squared2);
 	guint active1 = signal1 != GROUP_SILENCE;
 	guint active2 = signal2 != GROUP_SILENCE;
@@ -520,6 +592,8 @@ int line_audio_capture(LineAudio *a, guint8 *packet, gsize capacity, GError **e)
 	const gsize frame_bytes = FRAME * stride;
 	Uint32 available = SDL_GetQueuedAudioSize(a->capture);
 
+	if (a->diagnostics)
+		a->diagnostics->interval.capture_checks++;
 	if (available > frame_bytes * 50) {
 		SDL_ClearQueuedAudio(a->capture);
 		a->timestamp += available / stride;
