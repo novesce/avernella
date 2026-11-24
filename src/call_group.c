@@ -910,7 +910,7 @@ static gboolean member_id(Slice id, char out[34])
 	return TRUE;
 }
 
-static gboolean video_source(Slice body, guint32 *ssrc)
+static gboolean member_source(Slice body, struct call_group_member *member)
 {
 	Slice name = { 0 };
 	guint32 source = 0;
@@ -929,7 +929,10 @@ static gboolean video_source(Slice body, guint32 *ssrc)
 			source = field.value;
 		}
 	}
-	if (name.n == 1 && *name.p == 'V') {
+	if (name.n == 1 && (*name.p == 'V' || *name.p == 'D')) {
+		guint32 *ssrc = *name.p == 'V' ? &member->ssrc :
+						 &member->data_ssrc;
+
 		if (*ssrc && source && *ssrc != source)
 			return FALSE;
 		*ssrc = source;
@@ -958,7 +961,7 @@ static gboolean presence_member(Slice body, gboolean subgroup,
 			state = field.value;
 		} else if (field.field == source_field) {
 			if (field.type != 2 ||
-			    !video_source(field.data, &member->ssrc))
+			    !member_source(field.data, member))
 				return FALSE;
 		}
 	}
@@ -967,6 +970,8 @@ static gboolean presence_member(Slice body, gboolean subgroup,
 	 */
 	member_id(id, member->mid);
 	member->active = member->ssrc && state;
+	if (!state)
+		member->data_ssrc = 0;
 	return TRUE;
 }
 

@@ -226,7 +226,7 @@ def check_managed(apk, version):
 BUNDLE_SHA256 = "4a82c3173a935c52dbe96b8768b73a2dda7284b860f37e4982d72b5672dbf1af"
 
 
-def check_bundle(bundle, video_test):
+def check_bundle(bundle, video_test, execute_codec):
     from group_media_native import check_native
 
     # Inner APKs are deflated. Spool one at a time so seeking to DEX or ELF
@@ -240,7 +240,7 @@ def check_bundle(bundle, video_test):
                 if name == "base.apk":
                     check_managed(apk, "26.16.0")
                 else:
-                    check_native(apk.read("lib/arm64-v8a/libandromeda.so"), video_test)
+                    check_native(apk.read("lib/arm64-v8a/libandromeda.so"), video_test, execute_codec)
 
 
 def main():
@@ -248,6 +248,9 @@ def main():
     parser.add_argument("artifact", help="26.18.2 base APK or 26.16.0 APKM")
     parser.add_argument("--check-sender", action="store_true",
                         help="compare Linux sender packets when the native ARM64 split is present")
+    parser.add_argument("--execute-presentation-codec", action="store_true",
+                        help="run the 26.16.0 ARM64 presentation codec on Linux receiver output "
+                             "(requires Python Unicorn, test-call and test-call-video)")
     args = parser.parse_args()
     with open(args.artifact, "rb") as source:
         digest = hashlib.sha256()
@@ -264,8 +267,11 @@ def main():
         with zipfile.ZipFile(source) as artifact:
             if version == "26.16.0":
                 video_test = Path(__file__).resolve().parents[1] / "build/test-call-video"
-                check_bundle(artifact, video_test if args.check_sender else None)
+                check = args.check_sender or args.execute_presentation_codec
+                check_bundle(artifact, video_test if check else None, args.execute_presentation_codec)
             else:
+                if args.execute_presentation_codec:
+                    raise CheckError("ARM64 control replay needs the 26.16.0 APKM split bundle")
                 check_managed(artifact, version)
     print(f"PASS LINE Android {version} ({identity})")
     print("Relay and handset playback require a live call.")

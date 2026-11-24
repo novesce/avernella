@@ -33,7 +33,8 @@ J *line_voice_decline(const char *caller, GError **error);
 struct line_preview_frame;
 GBytes *line_call_take_frame(const char *chat, struct line_preview_frame *info);
 /* Takes the latest frame of the peer's screen share as packed I420. */
-GBytes *line_call_take_share_frame(const char *chat, int *width, int *height,
-				   int *rotation, gboolean *sharing);
+GBytes *line_call_take_share_frame(const char *chat,
+				   struct line_preview_frame *info,
+				   gboolean *sharing);
 /* Takes the latest local camera frame while the camera is on. */
 GBytes *line_call_take_self_frame(const char *chat, int *width, int *height);

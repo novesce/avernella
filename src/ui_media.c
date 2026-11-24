@@ -2192,8 +2192,7 @@ static void sync_call_preview(void)
 {
 	gboolean paused = m.window_hidden || m.mode != CALL;
 
-	if (!m.call_chat || !call_connected() ||
-	    (group_call() && !m.video_ready) || m.preview_paused == paused)
+	if (!m.call_chat || !call_connected() || m.preview_paused == paused)
 		return;
 	m.preview_paused = paused;
 	if (!paused)
@@ -2215,13 +2214,18 @@ void ui_media_window_visibility(gboolean visible)
 }
 
 static void request_self_frame(const char *chat);
+static void request_share_frame(const char *chat);
 
 static void show_call(void)
 {
 	if (m.mode == CALL)
 		return;
 	begin(CALL, m.call_chat, NULL, m.call_name);
-	if (m.window_hidden || (group_call() && !m.video_ready))
+	if (m.window_hidden)
+		return;
+	if (m.peer_sharing)
+		request_share_frame(m.call_chat);
+	if (group_call() && !m.video_ready)
 		return;
 	ui_rpc("callFrame", args(m.call_chat, NULL), m.serial);
 	request_self_frame(m.call_chat);
@@ -2329,7 +2333,7 @@ static void request_share_frame(const char *chat)
 	Json *share = args(chat, NULL);
 
 	json_object_object_add(share, "share", json_object_new_boolean(TRUE));
-	ui_rpc("callFrame", share, m.serial);
+	ui_rpc("callFrame", share, m.call_serial);
 }
 
 static void stop_picture(struct call_picture *picture, enum stage_tile tile)
@@ -2447,25 +2451,32 @@ void ui_media_call_event(Json *p)
 		Json *peer = ui_field(p, "peerSharing"),
 		     *self = ui_field(p, "selfSharing");
 
-		if (peer && chat[0] != 'c') {
+		if (peer) {
 			gboolean was = m.peer_sharing;
+			gboolean sharing = json_object_get_boolean(peer);
 
-			m.peer_sharing = json_object_get_boolean(peer);
+			if (!sharing) {
+				gint64 stop = json_object_get_int64(
+					ui_field(p, "changedAt"));
+
+				m.share_ended_at =
+					stop ? stop : g_get_monotonic_time();
+				/* A newer share can arrive on the frame socket first. */
+				sharing = m.share_frame.decoded_at >
+					  m.share_ended_at;
+			}
+			m.peer_sharing = sharing;
 			if (m.peer_sharing != was)
 				ui_sound_play(m.peer_sharing ?
 						      CHIP_SHARE_START :
 						      CHIP_SHARE_STOP);
 			if (m.peer_sharing) {
 				/* Like Discord, a new stream takes the stage. */
-				m.focus = 4;
+				if (!was)
+					m.focus = TILE_PEER_SCREEN;
 			} else {
-				m.share_ended_at = json_object_get_int64(
-					ui_field(p, "changedAt"));
-				if (!m.share_ended_at)
-					m.share_ended_at =
-						g_get_monotonic_time();
 				stop_picture(&m.share_frame, TILE_PEER_SCREEN);
-				if (m.focus == 4)
+				if (m.focus == TILE_PEER_SCREEN)
 					m.focus = 0;
 			}
 		}
@@ -2636,6 +2647,10 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 				gboolean camera_enabled, gboolean screen,
 				gint64 decoded_at)
 {
+	if (share && (decoded_at < m.call_frames_since ||
+		      decoded_at <= m.share_ended_at ||
+		      decoded_at < m.share_frame.decoded_at))
+		return;
 	if (!self && !share && decoded_at &&
 	    (decoded_at < m.call_frames_since ||
 	     decoded_at < m.peer_video_since ||
@@ -2689,7 +2704,7 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 
 	if (share) {
 		if (!m.peer_sharing)
-			m.focus = 4;
+			m.focus = TILE_PEER_SCREEN;
 		m.peer_sharing = TRUE;
 		if (!visible)
 			return;
@@ -2726,9 +2741,6 @@ void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
 
 	if (m.mode != CALL || g_strcmp0(frame->chat, m.call_chat) ||
 	    frame->decoded_at < m.call_frames_since ||
-	    (!self && frame->decoded_at < m.peer_video_since) ||
-	    (share && group_call()) ||
-	    (share && frame->decoded_at < m.share_ended_at) ||
 	    (self && (!m.camera_enabled || m.share_in_video)))
 		return;
 	update_call_picture(fd, frame->width, frame->height, frame->rotation,
@@ -3271,30 +3283,47 @@ static void draw_group_video(Rect stage, int controls_y, const char *self)
 	int gap = 12, top = stage.y + 44;
 	int width = stage.w - 2 * gap;
 	int roster_w = call_roster_count() ? CLAMP(width / 3, 96, 210) : 0;
-	int tiles_w = width - roster_w - gap * (roster_w ? 2 : 1);
 	int local = m.self_sharing ? TILE_OWN_SCREEN : TILE_SELF;
-	int peer_w = tiles_w *
-		     (m.focus == TILE_PEER ? 3 :
-		      m.focus == local	   ? 1 :
-					     2) /
-		     4;
+	int tiles[] = { TILE_PEER_SCREEN, TILE_PEER, local };
+	int first = m.peer_sharing ? 0 : 1;
+	int end = m.peer_sharing && !m.video_call && !m.self_sharing ? 1 : 3;
+	int count = end - first;
+	int tiles_w =
+		width - roster_w - (roster_w ? gap : 0) - gap * (count - 1);
 	int height = MAX(0, controls_y - top - 28);
 	int left = stage.x + gap;
+	int weights = count;
 
-	if (peer_w > 0 && tiles_w > peer_w && height > 0) {
-		m.tile_rect[0] = (Rect){ left, top, peer_w, height };
-		m.tile_rect[local - 1] = (Rect){ left + peer_w + gap, top,
-						 tiles_w - peer_w, height };
-		g_autofree char *label = NULL;
+	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
+	for (int i = first; i < end; i++)
+		if (tiles[i] == m.focus)
+			weights += 2;
+	for (int i = first; i < end && tiles_w > 0 && height > 0; i++) {
+		int tile = tiles[i];
+		int weight = tile == m.focus ? 3 : 1;
+		int w = tiles_w * weight / weights;
 
-		call_tile(0, &m.call_frame, video_peer_name(&label),
-			  m.call_video_peer, m.call_frame.pixels != NULL,
-			  m.call_frame.screen);
-		if (local == TILE_OWN_SCREEN)
-			draw_own_screen(m.tile_rect[local - 1]);
-		else
+		m.tile_rect[tile - 1] = (Rect){ left, top, w, height };
+		left += w + gap;
+		tiles_w -= w;
+		weights -= weight;
+		if (tile == TILE_PEER_SCREEN) {
+			call_tile(tile - 1, &m.share_frame, _("Shared screen"),
+				  m.call_chat, m.share_frame.pixels != NULL,
+				  TRUE);
+		} else if (tile == TILE_PEER) {
+			g_autofree char *label = NULL;
+
+			call_tile(0, &m.call_frame, video_peer_name(&label),
+				  m.call_video_peer,
+				  m.call_frame.pixels != NULL,
+				  m.call_frame.screen);
+		} else if (tile == TILE_OWN_SCREEN) {
+			draw_own_screen(m.tile_rect[tile - 1]);
+		} else {
 			call_tile(1, &m.self_frame, self, ui.self_id,
 				  m.self_frame.pixels != NULL, FALSE);
+		}
 	}
 	if (roster_w)
 		draw_group_video_roster(
@@ -3611,12 +3640,15 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		return;
 	}
 	if (!strcmp(method, "callFrame")) {
-		if (!error && m.mode == CALL && tag == m.serial &&
+		gboolean share = json_object_get_boolean(ui_field(p, "share"));
+
+		if (!error && m.mode == CALL &&
+		    tag == (share ? m.call_serial : m.serial) &&
 		    !g_strcmp0(ui_string(p, "chat", NULL), m.call_chat))
 			video_frame(
 				result,
 				json_object_get_boolean(ui_field(p, "self")),
-				json_object_get_boolean(ui_field(p, "share")));
+				share);
 		Json *lease = ui_field(result, "lease");
 
 		if (lease) {

@@ -134,6 +134,8 @@ The harness accepts the 26.16.0 APKM (version code `261600106`, SHA-256 `4a82c31
 
 In this build, `bv7.c$b$a.streamSourceEvent` checks the participant and the `VIRTUAL_DISPLAY` source in `classes4.dex`. The separate presentation start, stop and per-user frame callbacks are in `bv7.c$d` in `classes8.dex`. On the native side, `PlanetVideoInterface::writeVideo` supplies the capture generation and source, and `evs3_codec_header_decode` reads a compact or wide picture length. The offline run compares those fields with bytes emitted by Avernella for synthetic camera and screen pictures. Instructions and the separate handset test are in the [testing guide](../docs/en/testing.md#group-video-and-screen-sharing).
 
+For a native group presentation, `jup_conf_request_presentation` looks up the conference member’s DATA service (media kind 4, service 1) and resumes the incoming stream 4. The receiver sends `REQ_RESUME_USER` (9) with the presenter’s source and the source offset. The relay can announce both in `DATA_AVAIL` (12). With test source 801 and offset zero, the Android ARM64 control writer produced `04 02 00 09 43 21 00` for the resume and `04 01 00 0c 43 21 00` for the announcement. Both round-tripped through the Android control reader. These bytes describe control elements inside an authenticated packet. They do not include the RTP or PDTP headers.
+
 ## Group call history and participant video
 
 JADX on LINE Android 26.18.2 build 261820153 (base APK SHA-256 `5432c8ad902609b4ce4773d834206da63f5c441610346bec0249235116b2e4c5`) shows the following paths.

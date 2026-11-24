@@ -1651,14 +1651,13 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "callFrame")) {
 		int width = 0, height = 0, rotation = 0;
 		struct line_preview_frame info = { 0 };
-		gboolean self = json_object_get_boolean(
-			json_object_object_get(params, "self"));
 		gboolean share = json_object_get_boolean(
 			json_object_object_get(params, "share"));
+		gboolean self = !share &&
+				json_object_get_boolean(field(params, "self"));
 		gboolean sharing = FALSE;
 		g_autoptr(GBytes) frame =
-			share ? line_call_take_share_frame(chat, &width,
-							   &height, &rotation,
+			share ? line_call_take_share_frame(chat, &info,
 							   &sharing) :
 			self  ? line_call_take_self_frame(chat, &width,
 							  &height) :
@@ -1666,7 +1665,7 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 
 		if (!frame)
 			return obj();
-		if (!self && !share) {
+		if (!self) {
 			width = info.width;
 			height = info.height;
 			rotation = info.rotation;
@@ -1685,7 +1684,7 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			json_object_object_add(
 				video, "cameraEnabled",
 				json_object_new_boolean(info.camera_enabled));
-			if (!self && !share) {
+			if (!self) {
 				json_object_object_add(
 					video, "decodedAt",
 					json_object_new_int64(info.decoded_at));

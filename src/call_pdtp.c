@@ -39,6 +39,7 @@ enum {
 struct rx_segment {
 	guint64 offset, time;
 	guint flags;
+	guint32 source;
 	GBytes *bytes;
 };
 
@@ -47,6 +48,7 @@ struct rx_stream {
 	guint64 id;
 	char service[MAX_SERVICE];
 	guint64 delivered, window_sent;
+	guint32 source;
 	gboolean window_due;
 	GArray *segments; /* struct rx_segment, sorted by offset */
 };
@@ -93,6 +95,16 @@ struct call_pdtp {
 	guint8 pt;
 	guint32 tx_ssrc, rx_ssrc;
 	gboolean group;
+	call_pdtp_member_fn member;
+	guint32 packet_source, delivery_source;
+	gboolean room_packet;
+	struct {
+		guint32 source;
+		guint64 offset, first_pn;
+		gint64 due;
+		guint attempts;
+		gboolean receiving, advertised;
+	} presentation;
 	gboolean trace;
 	call_pdtp_stream_fn on_data;
 	call_pdtp_event_fn on_event;
@@ -257,15 +269,22 @@ static struct rx_stream *rx_stream(struct call_pdtp *d, guint64 id,
 {
 	struct rx_stream *free_slot = NULL;
 
+	/* Conference DATA also carries relay control and application traffic.
+	 * Only presentation streams have a receiver and need a receive window.
+	 */
+	if (d->group &&
+	    (strcmp(service, "PLANET") || (id != PDTP_PRESENTATION_CONTROL &&
+					   id != PDTP_PRESENTATION_VIDEO)))
+		return NULL;
 	for (guint i = 0; i < MAX_STREAMS; i++) {
 		struct rx_stream *s = &d->rx_streams[i];
 
-		if (s->used && s->id == id)
+		if (s->used && s->id == id && !strcmp(service, s->service))
 			return s;
 		if (!s->used && !free_slot)
 			free_slot = s;
 	}
-	if (!create || !free_slot || d->group)
+	if (!create || !free_slot)
 		return NULL;
 	*free_slot = (struct rx_stream){ .used = TRUE, .id = id };
 	g_strlcpy(free_slot->service, service, sizeof(free_slot->service));
@@ -285,6 +304,22 @@ static void rx_stream_clear(struct rx_stream *s)
 			g_array_index(s->segments, struct rx_segment, i).bytes);
 	g_array_free(s->segments, TRUE);
 	*s = (struct rx_stream){ 0 };
+}
+
+/* The room reuses the two PLANET stream IDs for the next presenter. */
+static void bind_stream_source(struct rx_stream *s, guint32 source)
+{
+	if (s->source && s->source != source) {
+		for (guint i = 0; i < s->segments->len; i++)
+			g_bytes_unref(
+				g_array_index(s->segments, struct rx_segment, i)
+					.bytes);
+		g_array_set_size(s->segments, 0);
+		s->delivered = 0;
+		s->window_sent = DEFAULT_WINDOW;
+		s->window_due = TRUE;
+	}
+	s->source = source;
 }
 
 static struct tx_stream *tx_stream(struct call_pdtp *d, guint64 id)
@@ -370,6 +405,58 @@ struct call_pdtp *call_pdtp_open_group(const guint8 tx[30], const guint8 rx[30],
 	return pdtp_open(tx, rx, pt, tx_ssrc, rx_ssrc, TRUE, e);
 }
 
+void call_pdtp_set_group_members(struct call_pdtp *d, call_pdtp_member_fn check)
+{
+	d->member = check;
+}
+
+static gboolean known_source(struct call_pdtp *d, guint32 source)
+{
+	if (d->presentation.source)
+		return source == d->presentation.source;
+	return source && d->member && d->member(source, d->user);
+}
+
+static gboolean group_presenter(struct call_pdtp *d, guint32 source,
+				guint64 offset)
+{
+	if (!source)
+		return FALSE;
+	if (d->presentation.source)
+		return source == d->presentation.source;
+	if (!d->member || !d->member(source, d->user))
+		return FALSE;
+	d->presentation.source = source;
+	d->presentation.offset = offset;
+	return TRUE;
+}
+
+static void forget_presenter(struct call_pdtp *d)
+{
+	memset(&d->presentation, 0, sizeof(d->presentation));
+}
+
+gboolean call_pdtp_group_presenter_left(struct call_pdtp *d)
+{
+	if (!d || !d->presentation.source || !d->member ||
+	    d->member(d->presentation.source, d->user))
+		return FALSE;
+	forget_presenter(d);
+	return TRUE;
+}
+
+gboolean call_pdtp_watch_presentation(struct call_pdtp *d, gboolean watch)
+{
+	if (!d->group)
+		return TRUE;
+	if (watch)
+		return group_presenter(d, d->delivery_source, 0);
+	if (!d->delivery_source || d->delivery_source != d->presentation.source)
+		return FALSE;
+	forget_presenter(d);
+	return TRUE;
+}
+
 gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *d)
 {
 	return d && d->group_setup.acknowledged;
@@ -430,7 +517,7 @@ static void note_packet(struct call_pdtp *d, guint64 pn, gint64 now)
 
 static void consume_segment(struct call_pdtp *d, struct rx_stream *s,
 			    guint64 offset, guint64 time, guint flags,
-			    const guint8 *p, gsize size)
+			    guint32 source, const guint8 *p, gsize size)
 {
 	if (offset + size <= s->delivered)
 		return;
@@ -438,7 +525,14 @@ static void consume_segment(struct call_pdtp *d, struct rx_stream *s,
 
 	if (skip)
 		flags &= ~PDTP_MESSAGE_START;
-	if (d->on_data)
+	d->delivery_source = source;
+	if (d->group && s->id == PDTP_PRESENTATION_VIDEO &&
+	    source == d->presentation.source) {
+		d->presentation.due = G_MAXINT64;
+		d->presentation.receiving = TRUE;
+	}
+	if (d->on_data && (!d->group || s->id == PDTP_PRESENTATION_CONTROL ||
+			   source == d->presentation.source))
 		d->on_data(s->id, s->service, s->delivered, time, flags,
 			   p + skip, size - skip, d->user);
 	s->delivered = offset + size;
@@ -454,8 +548,8 @@ static void deliver(struct call_pdtp *d, struct rx_stream *s)
 
 		if (seg->offset > s->delivered)
 			break;
-		consume_segment(d, s, seg->offset, seg->time, seg->flags, p,
-				size);
+		consume_segment(d, s, seg->offset, seg->time, seg->flags,
+				seg->source, p, size);
 		g_bytes_unref(seg->bytes);
 		g_array_remove_index(s->segments, 0);
 	}
@@ -472,7 +566,8 @@ static void stream_data(struct call_pdtp *d, struct rx_stream *s,
 		return;
 	/* In-order data is borrowed from the authenticated packet. */
 	if (offset <= s->delivered) {
-		consume_segment(d, s, offset, time, flags, p, n);
+		consume_segment(d, s, offset, time, flags, d->packet_source, p,
+				n);
 		deliver(d, s);
 		return;
 	}
@@ -486,7 +581,8 @@ static void stream_data(struct call_pdtp *d, struct rx_stream *s,
 	if (i < s->segments->len &&
 	    g_array_index(s->segments, struct rx_segment, i).offset == offset)
 		return; /* Duplicate retransmission. */
-	struct rx_segment seg = { offset, time, flags, g_bytes_new(p, n) };
+	struct rx_segment seg = { offset, time, flags, d->packet_source,
+				  g_bytes_new(p, n) };
 
 	g_array_insert_val(s->segments, i, seg);
 	deliver(d, s);
@@ -622,10 +718,11 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 						p += len;
 					continue;
 				}
+				if ((guint64)(end - p) < len)
+					return FALSE;
 				const guint8 *value_end = p + len;
 
-				if ((guint64)(end - p) < len ||
-				    !call_pdtp_read_varint(&p, value_end,
+				if (!call_pdtp_read_varint(&p, value_end,
 							   &value))
 					return FALSE;
 				ext[bit] = value;
@@ -655,8 +752,13 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				stream, service_label(service), flags, offset,
 				length, ext[0], ext[6], ext[5], ext[4], ext[3],
 				ext[2], ext[1]);
-		if (s)
+		if (s && (!d->group || (known_source(d, d->packet_source) &&
+					(stream == PDTP_PRESENTATION_CONTROL ||
+					 d->presentation.source)))) {
+			if (d->group)
+				bind_stream_source(s, d->packet_source);
 			stream_data(d, s, offset, ext[0], flags, p, length);
+		}
 		p += length;
 		break;
 	}
@@ -667,7 +769,7 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 		 * stream with REQ_PAUSE (6) and REQ_RESUME (7); the sender
 		 * answers PAUSE (1) or RESUME (2).
 		 */
-		guint64 ctrl;
+		guint64 ctrl, source = 0, source_offset = 0;
 
 		if (!call_pdtp_read_varint(&p, end, &stream) || p >= end)
 			return FALSE;
@@ -683,6 +785,47 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				" control=%u\n",
 				stream, service_label(service), dir, a,
 				(guint)ctrl);
+		/* Each counted control ends at its own fields. User-directed
+		 * pause/resume responses also carry a NUL-terminated reason.
+		 */
+		if (ctrl == 9 || ctrl == 12) {
+			if (!call_pdtp_read_varint(&p, end, &source) ||
+			    source > G_MAXUINT32 ||
+			    !call_pdtp_read_varint(&p, end, &source_offset))
+				return FALSE;
+		} else if (ctrl == 8 || ctrl == 10 || ctrl == 11) {
+			guint64 ignored;
+
+			for (guint i = 0; i < 3; i++)
+				if (!call_pdtp_read_varint(&p, end, &ignored))
+					return FALSE;
+			const guint8 *nul = memchr(p, 0, end - p);
+
+			if (!nul)
+				return FALSE;
+			p = nul + 1;
+		}
+		if (d->group && dir == 1 && ctrl == 12 &&
+		    stream == PDTP_PRESENTATION_VIDEO &&
+		    !strcmp(service, "PLANET") &&
+		    (!d->packet_source || source == d->packet_source) &&
+		    group_presenter(d, source, source_offset)) {
+			struct rx_stream *rx =
+				rx_stream(d, stream, service, TRUE);
+
+			if (rx)
+				bind_stream_source(rx, source);
+			if (!d->presentation.receiving &&
+			    (!d->presentation.advertised ||
+			     (d->presentation.due == G_MAXINT64 &&
+			      source_offset > d->presentation.offset))) {
+				d->presentation.offset = source_offset;
+				d->presentation.first_pn = 0;
+				d->presentation.attempts = 0;
+				d->presentation.due = 0;
+			}
+			d->presentation.advertised = TRUE;
+		}
 		struct tx_stream *s = tx_stream(d, stream);
 
 		if (s && dir == 2 && (ctrl == 6 || ctrl == 7)) {
@@ -695,8 +838,6 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 							PDTP_EVENT_RESUME,
 					    d->user);
 		}
-		/* Extra fields of the _USER controls end with the group. */
-		p = end;
 		break;
 	}
 	case PDTP_STREAM_OPEN:
@@ -714,8 +855,16 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 			struct rx_stream *s =
 				rx_stream(d, stream, service, TRUE);
 
-			if (s && !s->delivered && !s->segments->len)
-				s->delivered = b;
+			if (s && d->group && d->packet_source) {
+				if (!known_source(d, d->packet_source))
+					break;
+				bind_stream_source(s, d->packet_source);
+			}
+			if (s) {
+				if (!s->delivered && !s->segments->len)
+					s->delivered = b;
+				s->window_due = TRUE;
+			}
 		}
 		if (d->on_event)
 			d->on_event(stream, service, type, d->user);
@@ -764,19 +913,50 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 			return FALSE;
 		p = end;
 		break;
+	case PDTP_STREAM_CLOSE:
+	case PDTP_STREAM_RESET: {
+		if (!call_pdtp_read_varint(&p, end, &stream) || p == end)
+			return FALSE;
+		guint dir = *p++;
+
+		if (dir != 1 && dir != 2)
+			return FALSE;
+		if (type == PDTP_STREAM_RESET &&
+		    !call_pdtp_read_varint(&p, end, &a))
+			return FALSE;
+		const guint8 *reason_end = memchr(p, 0, end - p);
+
+		if (!reason_end)
+			return FALSE;
+		p = reason_end + 1;
+		if (dir != 1)
+			break;
+		struct rx_stream *rx = rx_stream(d, stream, service, FALSE);
+
+		if (!rx)
+			break;
+		if (d->group) {
+			/* STOP can precede CLOSE. The stream retains its owner's
+			 * source until closure or a new presenter binds it.
+			 */
+			guint32 owner = rx->source ? rx->source :
+						     d->presentation.source;
+
+			if (d->packet_source && d->packet_source != owner)
+				break;
+			d->delivery_source = owner;
+		}
+		rx_stream_clear(rx);
+		if (d->on_event)
+			d->on_event(stream, service, type, d->user);
+		break;
+	}
 	default:
-		/* Closes and resets: skipped by the group length. */
 		if (d->trace)
 			g_printerr(
 				"line-call pdtp element=%u service=%s bytes=%zu\n",
 				type, service_label(service), (gsize)(end - p));
 		p = end;
-		if (d->on_event && type <= PDTP_STREAM_RESET) {
-			const guint8 *q = *pp;
-
-			if (call_pdtp_read_varint(&q, end, &stream))
-				d->on_event(stream, service, type, d->user);
-		}
 		break;
 	}
 	*pp = p;
@@ -816,7 +996,8 @@ static gboolean parse_packet(struct call_pdtp *d, const guint8 *p, gsize n,
 	p = nul + 1;
 	guint mask = read16(p);
 
-	if (d->group && (mask & 0x8000))
+	if (d->group && ((mask & 0x8000) ||
+			 (!d->room_packet && !strcmp(service, "PLANET"))))
 		return FALSE;
 	p += 2;
 	gboolean eliciting = FALSE, setup_acked = FALSE;
@@ -849,8 +1030,9 @@ static gboolean parse_packet(struct call_pdtp *d, const guint8 *p, gsize n,
 		}
 		if (type != PDTP_ACK && type != PDTP_WINDOW_UPDATE)
 			eliciting = TRUE;
-		for (guint64 i = 0; i < count && p < group_end; i++)
-			if (!element(d, type, service, &p, group_end, now,
+		for (guint64 i = 0; i < count; i++)
+			if (p == group_end ||
+			    !element(d, type, service, &p, group_end, now,
 				     &setup_acked))
 				return FALSE;
 		/* Counted groups end after their last element, see above. */
@@ -875,6 +1057,28 @@ static gboolean parse_packet(struct call_pdtp *d, const guint8 *p, gsize n,
 	return TRUE;
 }
 
+/* Conference transport words precede other optional RTP extension data.
+ * Main-room presentations have channel zero and target us or the room.
+ */
+static gboolean main_room_packet(const guint8 *ext, guint words, guint32 local)
+{
+	guint flags = ext[1], count = flags & 15;
+	guint index = !!(flags & 0x10);
+	const guint8 *route = ext + 4;
+
+	if (ext[0] != 2 || count > words || index + !!(flags & 0x20) > count)
+		return FALSE;
+	if ((flags & 0x20) && read32(route + 4 * index++))
+		return FALSE;
+	if ((flags & 0x40) && index < count) {
+		guint32 target = read32(route + 4 * index);
+
+		if (target && target != local)
+			return FALSE;
+	}
+	return TRUE;
+}
+
 gboolean call_pdtp_receive(struct call_pdtp *d, const guint8 *packet,
 			   gsize size, gint64 now)
 {
@@ -888,13 +1092,23 @@ gboolean call_pdtp_receive(struct call_pdtp *d, const guint8 *packet,
 	if (srtp_unprotect(d->rx, buf, &plain) != srtp_err_status_ok)
 		return FALSE;
 	pos = RTP_HEADER + 4u * (buf[0] & 15);
+	d->room_packet = TRUE;
 	if (buf[0] & 0x10) {
 		if ((gsize)plain < pos + 4)
 			return FALSE;
-		pos += 4u + 4u * read16(buf + pos + 2);
+		const guint8 *ext = buf + pos;
+		guint words = read16(ext + 2);
+
+		pos += 4u + 4u * words;
+		if ((gsize)plain <= pos)
+			return FALSE;
+		if (d->group)
+			d->room_packet =
+				main_room_packet(ext, words, d->tx_ssrc);
 	}
 	if ((gsize)plain <= pos)
 		return FALSE;
+	d->packet_source = buf[0] & 15 ? read32(buf + RTP_HEADER) : 0;
 	if (d->trace && d->traced++ < 400)
 		g_printerr("line-call pdtp rx bytes=%zu\n", plain - pos);
 	if (parse_packet(d, buf + pos, plain - pos, read16(buf + 2), now))
@@ -1032,6 +1246,39 @@ static void send_group_setup(struct call_pdtp *d, gint64 now,
 		d->group_setup.due = G_MAXINT64;
 	else
 		d->group_setup.due = now + delay;
+}
+
+static void resume_group_presentation(struct call_pdtp *d, gint64 now,
+				      call_pdtp_send_fn send, gpointer data)
+{
+	struct rx_stream *s =
+		rx_stream(d, PDTP_PRESENTATION_VIDEO, "PLANET", TRUE);
+	g_autofree struct builder *b = g_new0(struct builder, 1);
+	guint8 el[48];
+	gsize n = 0;
+
+	if (!s)
+		return;
+	g_strlcpy(b->service, s->service, sizeof(b->service));
+	n += call_pdtp_varint(el + n, s->id);
+	el[n++] = 2; /* From the receiver. */
+	n += call_pdtp_varint(el + n,
+			      0); /* No outgoing bytes on this stream. */
+	n += call_pdtp_varint(el + n, 9); /* REQ_RESUME_USER */
+	n += call_pdtp_varint(el + n, d->presentation.source);
+	n += call_pdtp_varint(el + n, d->presentation.offset);
+	add(b, PDTP_STREAM_CTRL, el, n);
+	if (d->presentation.first_pn) {
+		n = call_pdtp_varint(el, d->presentation.first_pn);
+		add(b, PDTP_INCLUDE_RETRANS, el, n);
+	}
+	guint64 pn = d->next_pn;
+
+	if (emit(d, b, now, send, data, NULL) && !d->presentation.first_pn)
+		d->presentation.first_pn = pn;
+	d->presentation.due = now + (d->rto << d->presentation.attempts);
+	if (++d->presentation.attempts == GROUP_SETUP_ATTEMPTS)
+		d->presentation.due = G_MAXINT64;
 }
 
 static gboolean send_ack(struct call_pdtp *d, gint64 now,
@@ -1454,6 +1701,8 @@ gint64 call_pdtp_poll(struct call_pdtp *d, gint64 now, call_pdtp_send_fn send,
 	if (d->group && d->group_setup.attempts < GROUP_SETUP_ATTEMPTS &&
 	    now >= d->group_setup.due)
 		send_group_setup(d, now, send, data);
+	if (d->presentation.source && now >= d->presentation.due)
+		resume_group_presentation(d, now, send, data);
 	detect_loss(d, now);
 	if (d->ack_pending && now >= d->ack_due)
 		send_ack(d, now, send, data);
@@ -1461,6 +1710,8 @@ gint64 call_pdtp_poll(struct call_pdtp *d, gint64 now, call_pdtp_send_fn send,
 	send_streams(d, now, send, data);
 	gint64 next = d->group ? d->group_setup.due : G_MAXINT64;
 
+	if (d->presentation.source)
+		next = MIN(next, d->presentation.due);
 	if (d->ack_pending)
 		next = MIN(next, d->ack_due);
 	for (guint i = 0; i < d->inflight->len; i++)

@@ -714,6 +714,9 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 				 enum call_video_rtp_extension format);
 static void group_share_exchange(struct fake_relay *relay, const guint8 *local,
 				 guint8 pt, guint32 rx_ssrc, guint32 ssrc);
+static void receive_presentation(int fd, struct fake_relay *relay,
+				 const guint8 key[30], guint8 pt, guint32 ssrc,
+				 const char *chat, srtp_t feedback);
 static void expect_camera_control(struct fake_relay *relay, guint action,
 				  guint32 tx_ssrc, gboolean expect_report);
 
@@ -866,12 +869,37 @@ static void group_release_ack(struct fake_relay *relay, Slice request,
 			==, (int)wire.n);
 }
 
+enum {
+	FIRST_PRESENTER = 801,
+	UNKNOWN_PRESENTER = 802,
+	NEXT_PRESENTER = 803
+};
+
+static void fixture_member(Pb *presence, const char *mid, const char *media,
+			   guint32 ssrc)
+{
+	Pb member = { 0 }, source = { 0 };
+
+	pb_text(&member, 1, mid);
+	pb_uint(&member, 2, 3);
+	pb_uint(&member, 3, 1);
+	pb_text(&source, 1, media);
+	pb_uint(&source, 2, ssrc);
+	pb_msg(&member, 10, &source);
+	pb_msg(presence, 50, &member);
+}
+
 static void group_call(gconstpointer args)
 {
 	guint mode = GPOINTER_TO_UINT(args);
 
 	if (!g_test_subprocess()) {
-		g_test_trap_subprocess(NULL, 10000000, 0);
+		GTestSubprocessFlags flags = G_TEST_SUBPROCESS_DEFAULT;
+
+		if (mode == 12 &&
+		    !g_strcmp0(g_getenv("AVERNELLA_TEST_MEDIA_CONTRACT"), "1"))
+			flags = G_TEST_SUBPROCESS_INHERIT_STDOUT;
+		g_test_trap_subprocess(NULL, 10000000, flags);
 		g_test_trap_assert_passed();
 		return;
 	}
@@ -910,10 +938,11 @@ static void group_call(gconstpointer args)
 		format = CALL_VIDEO_RTP_EXT_VFD;
 		map = CALL_GROUP_VIDEO_SVC_SW;
 	}
-	video_fixture = mode != 0 && mode != 3;
+	video_fixture = mode != 0 && mode != 3 && mode != 13;
 	voice_fallback = mode == 2;
 	camera_unavailable = mode == 6 || mode == 11;
 	share_fixture = mode == 10 || mode == 11;
+	peer_share_fixture = mode == 12 || mode == 13;
 	if (share_fixture)
 		g_setenv("LINE_SHARE_TRANSPORT", "presentation", TRUE);
 	fixture_camera_width = mode == 8 ? 640 : 160;
@@ -1155,10 +1184,29 @@ static void group_call(gconstpointer args)
 	expect_playback(before);
 	g_assert_false(readable_until(mixer, g_get_monotonic_time() + 60000));
 	close(mixer);
-	if (!video_fixture)
+	if (!video_fixture && !peer_share_fixture)
 		group_data_exchange(&relay, local_key.p, remote_key, RTP_PT + 2,
 				    RX_SSRC + 2, TX_SSRC + 2);
-	if (share_fixture)
+	if (peer_share_fixture) {
+		guint8 key[30], local_data[30];
+		srtp_t feedback;
+		Pb presence = { 0 }, push = { 0 };
+
+		pb_uint(&presence, 1, 1);
+		pb_uint(&presence, 2, 1);
+		fixture_member(&presence, peer, "D", FIRST_PRESENTER);
+		fixture_member(&presence, other, "D", NEXT_PRESENTER);
+		pb_uint(&push, 1, 1);
+		pb_msg(&push, 2, &presence);
+		emit_peer(&relay, CALL_GROUP_PUSH_REQ, 0x2150, &push, FALSE);
+		call_group_media_key("DATA", remote_key, key);
+		call_group_media_key("DATA", local_key.p, local_data);
+		g_assert_true(call_srtp_open(&feedback, local_data,
+					     ssrc_specific, TX_SSRC + 2));
+		receive_presentation(server_fd, &relay, key, RTP_PT + 2,
+				     RX_SSRC + 2, group, feedback);
+		srtp_dealloc(feedback);
+	} else if (share_fixture)
 		group_share_exchange(&relay, local_key.p, RTP_PT + 1,
 				     RX_SSRC + 1, TX_SSRC + 1);
 	else if (video_fixture && !voice_fallback && !camera_unavailable)
@@ -1295,19 +1343,6 @@ static void peer_display(const struct line_camera_frame *frame, gpointer data)
 	g_assert_cmpuint(frame->width, ==, width);
 	g_assert_cmpuint(frame->height, ==, width * 3 / 4);
 	endpoint->got_frame = TRUE;
-}
-
-static void fixture_video_member(Pb *presence, const char *mid, guint32 ssrc)
-{
-	Pb member = { 0 }, source = { 0 };
-
-	pb_text(&member, 1, mid);
-	pb_uint(&member, 2, 3);
-	pb_uint(&member, 3, 1);
-	pb_text(&source, 1, "V");
-	pb_uint(&source, 2, ssrc);
-	pb_msg(&member, 10, &source);
-	pb_msg(presence, 50, &member);
 }
 
 static void expect_subscription(struct fake_relay *relay, guint32 ssrc,
@@ -1570,9 +1605,9 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 
 	pb_uint(&presence, 1, 1);
 	pb_uint(&presence, 2, 1);
-	fixture_video_member(&presence, self, tx_ssrc);
-	fixture_video_member(&presence, peer, FIRST_CAMERA);
-	fixture_video_member(&presence, other, SECOND_CAMERA);
+	fixture_member(&presence, self, "V", tx_ssrc);
+	fixture_member(&presence, peer, "V", FIRST_CAMERA);
+	fixture_member(&presence, other, "V", SECOND_CAMERA);
 	pb_uint(&push, 1, 1);
 	pb_msg(&push, 2, &presence);
 	emit_peer(relay, CALL_GROUP_PUSH_REQ, 0x2150, &push, FALSE);
@@ -2113,28 +2148,208 @@ static void share_exchange(int fd, const struct fake_relay *r, EVP_PKEY *media,
  * is a synthetic 32x48, two-band I420 card encoded once with ffmpeg/libvpx.
  * Keep both the PDTP packet writer and the picture independent of our sender.
  */
-static void send_planet_packet(int fd, const struct sockaddr_in *client,
-			       srtp_t tx, guint16 seq, guint8 mask,
-			       const guint8 *elements, gsize size)
-{
-	guint8 packet[256] = {
-		0x80, 0x80 | 98, seq >> 8, seq, 0,    0, 0,    0,
-		0,    0,	 0,	   122, 0x80, 0, 'P',  'L',
-		'A',  'N',	 'E',	   'T', 0,    0, mask,
-	};
-	int n = 24 + size;
+struct presentation_peer {
+	struct fake_relay *relay;
+	int fd;
+	guint8 pt;
+	guint32 ssrc, contributor;
+	guint32 channel, destination;
+	guint16 seq;
+	gboolean conference;
+	srtp_t tx;
+};
 
+static void send_presentation_packet(struct presentation_peer *sender,
+				     const char *service, guint8 mask,
+				     const guint8 *elements, gsize size)
+{
+	guint8 packet[256] = { 0 };
+	guint32 ssrc = htonl(sender->ssrc);
+	guint16 seq = htons(++sender->seq);
+	gsize pos = 12, service_size = strlen(service) + 1;
+
+	packet[0] = sender->conference ? 0x90 : 0x80;
+	packet[1] = 0x80 | sender->pt;
+	memcpy(packet + 2, &seq, sizeof(seq));
+	memcpy(packet + 8, &ssrc, sizeof(ssrc));
+	if (sender->contributor) {
+		guint32 source = htonl(sender->contributor);
+
+		packet[0] |= 1;
+		memcpy(packet + pos, &source, sizeof(source));
+		pos += sizeof(source);
+	}
+	if (sender->conference) {
+		guint words = !!sender->channel + !!sender->destination;
+
+		packet[pos++] = 2;
+		packet[pos++] = 0x40 | (sender->channel ? 0x20 : 0) | words;
+		pos++;
+		packet[pos++] = words;
+		if (sender->channel) {
+			guint32 channel = htonl(sender->channel);
+
+			memcpy(packet + pos, &channel, sizeof(channel));
+			pos += sizeof(channel);
+		}
+		if (sender->destination) {
+			guint32 destination = htonl(sender->destination);
+
+			memcpy(packet + pos, &destination, sizeof(destination));
+			pos += sizeof(destination);
+		}
+	}
 	g_assert_cmpuint(size, <, 64);
-	packet[23] = size;
-	memcpy(packet + 24, elements, size);
-	g_assert_cmpint(srtp_protect(tx, packet, &n), ==, srtp_err_status_ok);
-	g_assert_cmpint(sendto(fd, packet, n, 0, (const void *)client,
-			       sizeof(*client)),
+	g_assert_cmpuint(pos + service_size + size + 5 + SRTP_MAX_TRAILER_LEN,
+			 <=, sizeof(packet));
+	packet[pos++] = 0x80;
+	pos++; /* high bits of packet number */
+	memcpy(packet + pos, service, service_size);
+	pos += service_size;
+	pos++; /* high byte of element mask */
+	packet[pos++] = mask;
+	packet[pos++] = size;
+	memcpy(packet + pos, elements, size);
+	int n = pos + size;
+
+	g_assert_cmpint(srtp_protect(sender->tx, packet, &n), ==,
+			srtp_err_status_ok);
+	g_assert_cmpint(sendto(sender->fd, packet, n, 0,
+			       (const void *)&sender->relay->remote,
+			       sender->relay->remote_len),
 			==, n);
 }
 
-static void receive_presentation(int fd, const struct fake_relay *r,
-				 EVP_PKEY *media, Slice material)
+static guint64 fixture_varint(const guint8 **p, const guint8 *end)
+{
+	guint64 n;
+
+	g_assert_true(call_pdtp_read_varint(p, end, &n));
+	return n;
+}
+
+static void expect_targeted_resume(const guint8 **p, const guint8 *end,
+				   guint32 contributor, guint64 source_offset)
+{
+	const guint8 *start = *p;
+
+	g_assert_cmpuint(fixture_varint(p, end), ==, 4);
+	g_assert_true(*p < end);
+	g_assert_cmpuint(*(*p)++, ==, 2);
+	g_assert_cmpuint(fixture_varint(p, end), ==, 0);
+	g_assert_cmpuint(fixture_varint(p, end), ==, 9);
+	g_assert_cmpuint(fixture_varint(p, end), ==, contributor);
+	g_assert_cmpuint(fixture_varint(p, end), ==, source_offset);
+	if (!g_strcmp0(g_getenv("AVERNELLA_TEST_MEDIA_CONTRACT"), "1")) {
+		g_autoptr(GString) hex = g_string_new(NULL);
+
+		while (start < *p)
+			g_string_append_printf(hex, "%02x", *start++);
+		g_print("# group-resume %s %u %" G_GUINT64_FORMAT "\n",
+			hex->str, contributor, source_offset);
+	}
+}
+
+/* A relay waits for both receive credit and a request naming the presenter. */
+static void expect_presentation_request(const struct presentation_peer *sender,
+					srtp_t feedback, guint64 source_offset)
+{
+	gboolean credit = FALSE;
+	guint attempts = 0, first_packet = 0;
+	/* Lose one request in the voice-only call before forwarding any data. */
+	guint required =
+		!video_fixture && sender->contributor == FIRST_PRESENTER ? 2 :
+									   1;
+	gint64 deadline = g_get_monotonic_time() + G_USEC_PER_SEC * 2;
+
+	while ((!credit || attempts < required) &&
+	       readable_until(sender->fd, deadline)) {
+		guint8 pkt[2048];
+		int n = recv(sender->fd, pkt, sizeof(pkt), 0);
+
+		if (n < 32 || (pkt[0] >> 6) != 2 ||
+		    (pkt[1] & 127) != sender->pt)
+			continue;
+		g_assert_cmpint(srtp_unprotect(feedback, pkt, &n), ==,
+				srtp_err_status_ok);
+		gsize header = 12u + 4u * (pkt[0] & 15);
+
+		g_assert_cmpuint(header, <=, (gsize)n);
+		const guint8 *p = pkt + header, *end = pkt + n;
+
+		g_assert_true(pkt[0] & 0x10);
+		g_assert_cmpint(end - p, >=, 4);
+		g_assert_cmpmem(p, 2, "\x02\x40", 2);
+		gsize ext = 4u + 4u * ((p[2] << 8) | p[3]);
+
+		g_assert_cmpuint(ext, <=, (gsize)(end - p));
+		p += ext;
+		/* Short test calls use a four-byte packet number (two in RTP). */
+		if (end - p < 11 || p[0] != 0x80 || memcmp(p + 2, "PLANET", 7))
+			continue;
+		p += 9;
+		guint mask = p[0] << 8 | p[1];
+		guint packet = pkt[2] << 8 | pkt[3];
+
+		p += 2;
+		for (int bit = 14; bit >= 0; bit--) {
+			if (!(mask & (1u << bit)))
+				continue;
+			guint64 size = fixture_varint(&p, end);
+
+			g_assert_cmpuint(size, <=, (guint64)(end - p));
+			const guint8 *next = p + size;
+
+			if (bit == 8) {
+				g_assert_cmpuint(fixture_varint(&p, next), ==,
+						 first_packet);
+				g_assert_true(p == next);
+			} else if (bit == 12 || bit == 2) {
+				guint64 count = fixture_varint(&p, next);
+
+				for (guint64 i = 0; i < count; i++) {
+					if (bit == 12) {
+						guint64 stream = fixture_varint(
+							&p, next);
+						guint64 limit = fixture_varint(
+							&p, next);
+
+						credit |= stream == 4 &&
+							  limit >= 115;
+						continue;
+					}
+					expect_targeted_resume(
+						&p, next, sender->contributor,
+						source_offset);
+					if (attempts++)
+						g_assert_true(mask & (1u << 8));
+					else
+						first_packet = packet;
+				}
+				g_assert_true(p == next);
+			}
+			p = next;
+		}
+	}
+	g_assert_true(credit);
+	g_assert_cmpuint(attempts, >=, required);
+}
+
+static void announce_presentation(struct presentation_peer *sender,
+				  guint32 source, guint64 source_offset)
+{
+	/* An ordinary PAUSE and a source-specific DATA_AVAIL share a packet. */
+	guint8 element[32] = { 2, 4, 1, 0, 1, 4, 1, 0, 12 };
+	gsize n = 9;
+
+	n += call_pdtp_varint(element + n, source);
+	n += call_pdtp_varint(element + n, source_offset);
+	send_presentation_packet(sender, "PLANET", 4, element, n);
+}
+
+static void exchange_presentation(struct presentation_peer *sender,
+				  srtp_t feedback, const char *chat,
+				  guint32 source, guint64 source_offset)
 {
 	static const guint8 open[] = { 2, 3, 0x12, 0, 4, 0x12, 0 };
 	/* count, stream, flags, start/end extensions, offset, length, data */
@@ -2152,37 +2367,76 @@ static void receive_presentation(int fd, const struct fake_relay *r,
 		0x00, 0x08, 0x0f, 0x42, 0x43, 0x22, 0x22, 0xff, 0x51, 0xb8,
 		0x00, 0xfe, 0xfe, 0xf9, 0x79, 0xfb, 0xff, 0xd8, 0x80, 0x00,
 	};
-	guint8 send_key[30], recv_key[30];
-	guint16 seq = 1;
-	srtp_t tx;
-	int width, height, rotation;
+	g_autofree char *frame_event =
+		g_strdup_printf("call_share_frame %s", chat);
+	struct line_preview_frame info;
 	gboolean sharing;
 
-	g_assert_true(call_data_keys(
-		media, r->info.pub, pb_data(material, 1).p, r->info.media_nonce,
-		pb_data(material, 3).p, r->info.media_id,
-		pb_number(material, 2, 0), send_key, recv_key));
-	g_assert_true(call_srtp_open(&tx, send_key, ssrc_specific, 122));
-	send_planet_packet(fd, &r->remote, tx, seq++, 8, open, sizeof(open));
-	send_planet_packet(fd, &r->remote, tx, seq++, 1, start, sizeof(start));
+	sender->contributor = 0;
+	send_presentation_packet(sender, "PLANET", 8, open, sizeof(open));
+	if (sender->conference) {
+		/* DATA_AVAIL arrives on the relay SSRC before tagged media. */
+		announce_presentation(sender, UNKNOWN_PRESENTER, 0);
+		announce_presentation(sender, source, source_offset);
+		sender->contributor = source;
+		expect_presentation_request(sender, feedback, source_offset);
+	}
+	if (source == NEXT_PRESENTER) {
+		/* One START command delivered in two ordered stream chunks. */
+		const guint8 command[] = { 1, 3, 0x08, 0, 0, 1, 1 };
+		const guint8 media[] = { 1, 3, 0x04, 0, 1, 1, 1 };
+
+		send_presentation_packet(sender, "PLANET", 1, command,
+					 sizeof(command));
+		send_presentation_packet(sender, "PLANET", 1, media,
+					 sizeof(media));
+	} else {
+		send_presentation_packet(sender, "PLANET", 1, start,
+					 sizeof(start));
+	}
 	expect_event("call_share peer-started");
 
-	send_planet_packet(fd, &r->remote, tx, seq++, 1, first, sizeof(first));
-	send_planet_packet(fd, &r->remote, tx, seq++, 1, last, sizeof(last));
-	expect_event("call_share_frame u22222222222222222222222222222222");
-	g_autoptr(GBytes) image = line_call_take_share_frame(
-		peer, &width, &height, &rotation, &sharing);
+	if (sender->conference) {
+		/* An idle member cannot stop the current presenter. */
+		sender->contributor = source == FIRST_PRESENTER ?
+					      NEXT_PRESENTER :
+					      FIRST_PRESENTER;
+		send_presentation_packet(sender, "PLANET", 1, stop,
+					 sizeof(stop));
+		sender->contributor = source;
+		/* A valid STOP for another route leaves the main room untouched. */
+		sender->channel = 444;
+		send_presentation_packet(sender, "PLANET", 1, stop,
+					 sizeof(stop));
+		sender->channel = 0;
+		sender->destination = UNKNOWN_PRESENTER;
+		send_presentation_packet(sender, "PLANET", 1, stop,
+					 sizeof(stop));
+		sender->destination = 0;
+		/* LINE control streams may use the same numeric ID as PLANET. */
+		send_presentation_packet(sender, "LINE", 1, stop, sizeof(stop));
+		/* The second fragment arrives early and is retransmitted below. */
+		send_presentation_packet(sender, "PLANET", 1, last,
+					 sizeof(last));
+	}
+	send_presentation_packet(sender, "PLANET", 1, first, sizeof(first));
+	send_presentation_packet(sender, "PLANET", 1, last, sizeof(last));
+	expect_event(frame_event);
+	g_autoptr(GBytes) image =
+		line_call_take_share_frame(chat, &info, &sharing);
 
 	g_assert_true(sharing);
 	g_assert_nonnull(image);
-	g_assert_cmpint(width, ==, 32);
-	g_assert_cmpint(height, ==, 48);
-	g_assert_cmpint(rotation, ==, 0);
+	g_assert_cmpuint(info.source, ==, LINE_PREVIEW_SCREEN);
+	g_assert_cmpstr(info.chat, ==, chat);
+	g_assert_cmpint(info.width, ==, 32);
+	g_assert_cmpint(info.height, ==, 48);
+	g_assert_cmpint(info.rotation, ==, 0);
 	g_assert_cmpuint(g_bytes_get_size(image), ==, 32 * 48 * 3 / 2);
 	const guint8 *y = g_bytes_get_data(image, NULL);
 
-	g_assert_cmpint(ABS((int)y[width * 12] - 50), <=, 3);
-	g_assert_cmpint(ABS((int)y[width * 36] - 194), <=, 3);
+	g_assert_cmpint(ABS((int)y[info.width * 12] - 50), <=, 3);
+	g_assert_cmpint(ABS((int)y[info.width * 36] - 194), <=, 3);
 
 	/* Leave a second complete picture queued, as on a slow UI thread. */
 	guint8 whole[63] = { 1, 4, 0x0c, 0, 0, 59, 56 };
@@ -2191,14 +2445,63 @@ static void receive_presentation(int fd, const struct fake_relay *r,
 	memcpy(whole + sizeof(first), last + 10, sizeof(last) - 10);
 	whole[7] = 0xbe; /* Single-fragment keyframe. */
 	whole[9] = 2;
-	send_planet_packet(fd, &r->remote, tx, seq++, 1, whole, sizeof(whole));
-	expect_event("call_share_frame u22222222222222222222222222222222");
-	send_planet_packet(fd, &r->remote, tx, seq++, 1, stop, sizeof(stop));
+	send_presentation_packet(sender, "PLANET", 1, whole, sizeof(whole));
+	expect_event(frame_event);
+	if (source == NEXT_PRESENTER) {
+		/* The second participant leaves without sending STOP. */
+		Pb presence = { 0 }, push = { 0 };
+
+		pb_uint(&presence, 1, 1);
+		pb_uint(&presence, 2, 2);
+		fixture_member(&presence, peer, "D", FIRST_PRESENTER);
+		pb_uint(&push, 1, 1);
+		pb_msg(&push, 2, &presence);
+		emit_peer(sender->relay, CALL_GROUP_PUSH_REQ, 0x2150, &push,
+			  FALSE);
+	} else if (sender->conference && !video_fixture) {
+		/* Both incoming streams close, then this member may open them again. */
+		const guint8 close[] = { 2, 3, 1, 0, 4, 1, 0 };
+
+		if (source_offset)
+			send_presentation_packet(sender, "PLANET", 1, stop,
+						 sizeof(stop));
+		send_presentation_packet(sender, "PLANET", 2, close,
+					 sizeof(close));
+	} else {
+		send_presentation_packet(sender, "PLANET", 1, stop,
+					 sizeof(stop));
+	}
 	expect_event("call_share peer-stopped");
-	g_assert_null(line_call_take_share_frame(peer, &width, &height,
-						 &rotation, &sharing));
+	g_assert_null(line_call_take_share_frame(chat, &info, &sharing));
 	g_assert_false(sharing);
-	srtp_dealloc(tx);
+}
+
+static void receive_presentation(int fd, struct fake_relay *r,
+				 const guint8 key[30], guint8 pt, guint32 ssrc,
+				 const char *chat, srtp_t feedback)
+{
+	struct presentation_peer sender = {
+		.relay = r,
+		.fd = fd,
+		.pt = pt,
+		.ssrc = ssrc,
+		.conference = feedback != NULL,
+	};
+
+	g_assert_true(call_srtp_open(&sender.tx, key, ssrc_specific, ssrc));
+	if (feedback) {
+		/* A late subscriber, then a new presenter starting at byte zero. */
+		exchange_presentation(&sender, feedback, chat, FIRST_PRESENTER,
+				      1234);
+		if (!video_fixture)
+			exchange_presentation(&sender, feedback, chat,
+					      FIRST_PRESENTER, 0);
+		exchange_presentation(&sender, feedback, chat, NEXT_PRESENTER,
+				      0);
+	} else {
+		exchange_presentation(&sender, NULL, chat, 0, 0);
+	}
+	srtp_dealloc(sender.tx);
 }
 
 static gboolean reported_running;
@@ -2456,9 +2759,17 @@ static void outgoing(void)
 	if (r.info.video && !start_with_camera_off)
 		video_exchange(media_fd, &r, media, client_material, 109, FALSE,
 			       TRUE);
-	if (peer_share_fixture)
-		receive_presentation(media_fd, &r, media, client_material);
-	else if (share_fixture)
+	if (peer_share_fixture) {
+		guint8 data_tx[30], data_rx[30];
+
+		g_assert_true(call_data_keys(
+			media, r.info.pub, pb_data(client_material, 1).p,
+			r.info.media_nonce, pb_data(client_material, 3).p,
+			r.info.media_id, pb_number(client_material, 2, 0),
+			data_tx, data_rx));
+		receive_presentation(media_fd, &r, data_tx, 98, 122, peer,
+				     NULL);
+	} else if (share_fixture)
 		share_exchange(media_fd, &r, media, client_material);
 	if (voice_fallback) {
 		g_autoptr(GError) e = NULL;
@@ -3091,6 +3402,10 @@ int main(int argc, char **argv)
 			     group_call);
 	g_test_add_data_func("/call/group-share/no-camera",
 			     GUINT_TO_POINTER(11), group_call);
+	g_test_add_data_func("/call/group-share/native-presentation",
+			     GUINT_TO_POINTER(12), group_call);
+	g_test_add_data_func("/call/group-share/native-presentation-voice",
+			     GUINT_TO_POINTER(13), group_call);
 	g_test_add_data_func("/call/group-video-software-svc",
 			     GUINT_TO_POINTER(8), group_call);
 	g_test_add_data_func("/call/group-video-legacy-svc",

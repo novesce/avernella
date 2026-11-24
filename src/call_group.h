@@ -83,7 +83,7 @@ struct call_group_feedback {
 
 struct call_group_member {
 	char mid[34];
-	guint32 ssrc, channel;
+	guint32 ssrc, data_ssrc, channel;
 	gboolean active;
 };
 

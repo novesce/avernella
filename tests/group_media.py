@@ -26,10 +26,13 @@ CASES = {
         "/call/group-video-voice-fallback",
         "/call/group-share/camera",
         "/call/group-share/no-camera",
+        "/call/group-share/native-presentation",
+        "/call/group-share/native-presentation-voice",
         "/call/share-to-tablet/video",
         "/call/share-to-tablet/voice",
         "/call/share-from-tablet",
     ],
+    "test-pdtp": ["/pdtp/group-ack"],
     "test-call-video": [
         "/video/conference-independent-stream-directions",
         "/video/group-source-visibility",

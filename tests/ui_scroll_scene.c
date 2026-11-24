@@ -413,13 +413,14 @@ static gboolean stage_has_avatar(const char *id)
 	return stage_has_color(ui_avatar_shade(id));
 }
 
-static void group_picture(const char *chat, gint64 decoded, gboolean screen)
+static void group_preview(const char *chat, gint64 decoded,
+			  enum line_preview_source source, gboolean screen)
 {
 	struct line_preview_frame preview = {
 		.decoded_at = decoded,
 		.width = 2,
 		.height = 2,
-		.source = LINE_PREVIEW_REMOTE,
+		.source = source,
 		.screen = screen,
 	};
 	const guint8 pixels[6] = { 80, 80, 200, 200, 128, 128 };
@@ -439,6 +440,11 @@ static void group_picture(const char *chat, gint64 decoded, gboolean screen)
 	close(fd);
 	close(pair[1]);
 	close(pair[0]);
+}
+
+static void group_picture(const char *chat, gint64 decoded, gboolean screen)
+{
+	group_preview(chat, decoded, LINE_PREVIEW_REMOTE, screen);
 }
 
 static void group_stage_picture(gboolean present)
@@ -477,6 +483,60 @@ static guint32 peer_caption_checksum(gboolean expect_badge)
 	return sum;
 }
 
+static void check_group_presentation(const char *chat, Json *focus)
+{
+	g_autoptr(J) state = obj();
+	struct gpu_scene scene = { .width = W, .height = H };
+	gint64 frame_time = ++scene_time;
+
+	json_object_object_add(state, "event",
+			       json_object_new_string("call_share"));
+	json_object_object_add(state, "chat", json_object_new_string(chat));
+	json_object_object_add(state, "peerSharing",
+			       json_object_new_boolean(TRUE));
+	ui_media_call_event(state);
+
+	/* Switching camera focus cannot invalidate an independent display. */
+	json_object_object_add(focus, "changedAt",
+			       json_object_new_int64(++scene_time));
+	ui_media_call_event(focus);
+	group_picture(chat, scene_time, FALSE);
+	group_preview(chat, frame_time, LINE_PREVIEW_SCREEN, FALSE);
+	ui_draw();
+	ui_media_gpu_video(&scene, 0);
+	g_assert_nonnull(scene.video[0].plane[0]);
+	g_assert_nonnull(scene.video[2].plane[0]);
+	g_assert_cmpfloat(scene.video[2].x + scene.video[2].w, <=,
+			  scene.video[0].x);
+	g_assert_true(stage_has_color(0xda373c));
+
+	SDL_Event expand = { .key = { .type = SDL_KEYDOWN,
+				      .keysym.sym = SDLK_F11 } };
+
+	g_assert_true(ui_media_event(&expand));
+	g_assert_true(ui_media_fullscreen());
+	scene = (struct gpu_scene){ .width = W, .height = H };
+	ui_draw();
+	ui_media_gpu_video(&scene, 0);
+	g_assert_null(scene.video[0].plane[0]);
+	g_assert_nonnull(scene.video[2].plane[0]);
+
+	/* STOP wins over a frame queued on the separate preview socket. */
+	json_object_object_add(state, "peerSharing",
+			       json_object_new_boolean(FALSE));
+	json_object_object_add(state, "changedAt",
+			       json_object_new_int64(++scene_time));
+	ui_media_call_event(state);
+	g_assert_false(ui_media_fullscreen());
+	group_preview(chat, frame_time, LINE_PREVIEW_SCREEN, FALSE);
+	scene = (struct gpu_scene){ .width = W, .height = H };
+	ui_draw();
+	ui_media_gpu_video(&scene, 0);
+	g_assert_nonnull(scene.video[0].plane[0]);
+	g_assert_null(scene.video[2].plane[0]);
+	g_assert_false(stage_has_color(0xda373c));
+}
+
 static void check_group_call_roster(void)
 {
 	const guint live_badge = 0xda373c;
@@ -502,6 +562,21 @@ static void check_group_call_roster(void)
 	g_assert_true(stage_has_avatar(ada));
 	g_assert_true(stage_has_avatar(grace));
 	g_assert_true(stage_has_avatar(edsger));
+
+	/* A group voice call can receive a presentation before any camera. */
+	group_preview(group, ++scene_time, LINE_PREVIEW_SCREEN, FALSE);
+	ui_draw();
+	settle();
+	struct gpu_scene voice = { .width = W, .height = H };
+
+	ui_media_gpu_video(&voice, 0);
+	g_assert_null(voice.video[0].plane[0]);
+	g_assert_nonnull(voice.video[2].plane[0]);
+	g_autoptr(J) stop = json_tokener_parse(
+		"{\"event\":\"call_share\",\"peerSharing\":false}");
+
+	json_object_object_add(stop, "chat", json_object_new_string(group));
+	ui_media_call_event(stop);
 
 	/* Video keeps the full small roster beside the camera tiles. */
 	json_object_object_add(event, "video", json_object_new_boolean(TRUE));
@@ -567,6 +642,7 @@ static void check_group_call_roster(void)
 	group_stage_picture(TRUE);
 	g_assert_true(stage_has_color(live_badge));
 
+	check_group_presentation(group, focus);
 	json_object_object_add(event, "event",
 			       json_object_new_string("call_participants"));
 	json_object_object_del(event, "state");

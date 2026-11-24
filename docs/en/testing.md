@@ -33,7 +33,13 @@ make check-group-media LINE_APK="/path/to/LINE-26.18.2.apk"
 
 The harness recognizes the artifact by SHA-256, so the filename can change. It reads the official DEX instructions for camera state, participant selection and presentation callbacks in each build. For the APKM it also inspects the matching ARM64 call library and compares its packet format with 30 synthetic pictures from the Linux sender. Each of five conference formats switches from camera to screen and back. Temporary copies of the nested APKs are removed after inspection. The regular `make check` runs without either download.
 
-The fixtures run Avernella’s call worker against a loopback relay. They check participant focus, the sharing indicator on decoded frames, missing or late source metadata, late viewers of a static share, camera restoration, a canceled picker, one-to-one presentation start and stop, and the group share controls. A missing or skipped required case fails the run.
+The fixtures run Avernella’s call worker against a loopback relay. They check participant focus, the sharing indicator on decoded frames, missing or late source metadata, late viewers of a static share, camera restoration, a canceled picker, one-to-one presentation start and stop, and the group share controls. For a native group presentation the relay waits for the Linux receiver to request the presenter before sending a synthetic VP8 picture. The fixture checks its decoded pixels and stops the presentation. The scene test checks that the shared screen and camera appear together and that a delayed frame cannot reopen a stopped share. A missing or skipped required case fails the run.
+
+With the Python `unicorn` module installed, you can also run the control reader and writer from the supplied Android ARM64 split against the Linux receiver’s requests. Build the fixture binaries first with `make check-group-media`.
+
+```sh
+python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.16.0.apkm"
+```
 
 To exercise artifact selection and its rejection paths with both files available, run:
 
@@ -47,7 +53,7 @@ The loopback receiver can decode Avernella’s media without using the public re
 python3 tests/group_media_live.py
 ```
 
-A screen sent through a participant’s video tile and an Android native presentation use different paths. Avernella currently has no dedicated receiver for the native group presentation. Add `--native-presentation` to record that as a separate handset observation. Skipped or failed requested checks return a nonzero exit status.
+Add `--native-presentation` to the handset check to verify that Android’s **Share screen** action opens a separate tile on Linux, that it updates when the presenter scrolls, and that it closes on stop. Skipped or failed requested checks return a nonzero exit status.
 
 ## The tests
 

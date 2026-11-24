@@ -30,6 +30,11 @@ enum call_pdtp_element {
 	PDTP_EVENT_RESUME = 101,
 };
 
+enum {
+	PDTP_PRESENTATION_CONTROL = 3,
+	PDTP_PRESENTATION_VIDEO = 4,
+};
+
 struct call_pdtp;
 
 typedef gboolean (*call_pdtp_send_fn)(const guint8 *packet, gsize size,
@@ -55,10 +60,17 @@ typedef void (*call_pdtp_event_fn)(guint64 stream, const char *service,
 struct call_pdtp *call_pdtp_open(const guint8 tx[30], const guint8 rx[30],
 				 guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
 				 GError **error);
-/* Group DATA negotiates ACK timing and acknowledges received packets. */
+/* Conference DATA receives presentations and negotiates ACK timing. */
 struct call_pdtp *call_pdtp_open_group(const guint8 tx[30], const guint8 rx[30],
 				       guint8 pt, guint32 tx_ssrc,
 				       guint32 rx_ssrc, GError **error);
+/* The call worker validates presenter source IDs against conference presence. */
+typedef gboolean (*call_pdtp_member_fn)(guint32 source, gpointer data);
+void call_pdtp_set_group_members(struct call_pdtp *pdtp,
+				 call_pdtp_member_fn check);
+gboolean call_pdtp_group_presenter_left(struct call_pdtp *pdtp);
+/* Select or stop the source of the current in-order presentation command. */
+gboolean call_pdtp_watch_presentation(struct call_pdtp *pdtp, gboolean watch);
 gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *pdtp);
 void call_pdtp_close(struct call_pdtp *pdtp);
 void call_pdtp_set_trace(struct call_pdtp *pdtp, gboolean trace);

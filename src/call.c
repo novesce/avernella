@@ -41,9 +41,8 @@ struct call_task {
 	GBytes *frame, *self_frame, *share_frame;
 	char video_focus[MID_LENGTH + 1];
 	gint64 frame_notified, self_notified, share_notified;
-	struct line_preview_frame frame_info;
+	struct line_preview_frame frame_info, share_info;
 	int self_width, self_height;
-	int share_width, share_height, share_rotation;
 	/* The peer is presenting its screen (PLANET presentation streams). */
 	gint peer_sharing;
 	/* The user asked to share this desktop. */
@@ -124,11 +123,10 @@ struct media_route {
 
 struct group_video {
 	struct call_video *receiver;
-	GArray *members;
 	GBytes *camera_report;
 	struct call_group_member peer;
 	gint64 retry_at, last_rtp;
-	guint32 version, sequence, request_sequence;
+	guint32 sequence, request_sequence;
 	guint32 layer_sequence;
 	guint attempts;
 	guint8 rx_key[30], request_id[16];
@@ -143,6 +141,8 @@ struct voice_call {
 	CallInfo info;
 	struct call_group_route group_route;
 	GBytes *group_report;
+	GArray *group_members;
+	guint32 group_version;
 	struct call_group_feedback *feedback;
 	gint64 next_group_feedback;
 	struct group_video *conference_video;
@@ -154,6 +154,10 @@ struct voice_call {
 	struct call_pdtp *data;
 	struct call_share_decoder *share_rx;
 	GByteArray *share_message;
+	gboolean share_stopped;
+	/* Command, media and optional STOP reason are three varint62s. */
+	guint8 share_command[3 * 8];
+	guint share_command_len;
 	struct line_screencast *cast;
 	struct call_share_encoder *share_tx;
 	gboolean share_streams, self_sharing;
@@ -381,12 +385,13 @@ static void free_call(struct voice_call *c)
 	call_wire_clear(&c->wire);
 	call_group_route_clear(&c->group_route);
 	g_clear_pointer(&c->group_report, g_bytes_unref);
+	g_clear_pointer(&c->group_members, g_array_unref);
 	g_free(c->feedback);
 	if (c->conference_video) {
 		struct group_video *v = c->conference_video;
 
 		call_video_close(v->receiver);
-		g_array_unref(v->members);
+
 		g_clear_pointer(&v->camera_report, g_bytes_unref);
 		OPENSSL_cleanse(v, sizeof(*v));
 		g_free(v);
@@ -531,6 +536,8 @@ static gboolean send_data_packet(const guint8 *data, gsize size, gpointer user)
 }
 
 static GBytes *pack_i420(const struct line_camera_frame *image);
+static void group_reception(struct voice_call *c,
+			    enum line_media_reception state);
 
 static void emit_share_state(struct voice_call *c, const char *key,
 			     gboolean sharing, const char *message)
@@ -558,6 +565,11 @@ static void peer_share_state(struct voice_call *c, gboolean sharing)
 {
 	struct call_task *task = c->task;
 
+	if (!sharing) {
+		g_clear_pointer(&c->share_rx, call_share_decoder_free);
+		if (c->share_message)
+			g_byte_array_set_size(c->share_message, 0);
+	}
 	if (g_atomic_int_get(&task->peer_sharing) == sharing)
 		return;
 	g_atomic_int_set(&task->peer_sharing, sharing);
@@ -565,8 +577,6 @@ static void peer_share_state(struct voice_call *c, gboolean sharing)
 		g_mutex_lock(&task->frame_lock);
 		g_clear_pointer(&task->share_frame, g_bytes_unref);
 		g_mutex_unlock(&task->frame_lock);
-		if (c->share_message)
-			g_byte_array_set_size(c->share_message, 0);
 	}
 	if (c->video_trace.enabled)
 		g_printerr("line-call peer screen share %s\n",
@@ -605,13 +615,17 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
 {
 	struct voice_call *c = user;
 	struct call_task *task = c->task;
+	struct line_preview_frame info;
 
-	if (!g_atomic_int_get(&task->preview_visible) ||
-	    !line_camera_frame_size_valid(image->width, image->height))
+	if (!line_camera_frame_size_valid(image->width, image->height))
+		return;
+	group_reception(c, LINE_MEDIA_PLAYABLE);
+	peer_share_state(c, TRUE);
+	if (!g_atomic_int_get(&task->preview_visible))
 		return;
 	gint64 now = g_get_monotonic_time();
 
-	if (send_preview(c, LINE_PREVIEW_SCREEN, image, now, NULL))
+	if (send_preview(c, LINE_PREVIEW_SCREEN, image, now, &info))
 		return;
 	GBytes *frame = pack_i420(image);
 
@@ -621,9 +635,7 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
 	GBytes *previous = task->share_frame;
 
 	task->share_frame = frame;
-	task->share_width = image->width;
-	task->share_height = image->height;
-	task->share_rotation = image->rotation;
+	task->share_info = info;
 	if (notify)
 		task->share_notified = now;
 	g_mutex_unlock(&task->frame_lock);
@@ -638,8 +650,6 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
  * per PDTP message.
  */
 enum {
-	SHARE_CONTROL_STREAM = 3,
-	SHARE_VIDEO_STREAM = 4,
 	SHARE_STREAM_FLAGS = 0x12,
 	SHARE_START = 1,
 	SHARE_STOP = 2,
@@ -647,25 +657,38 @@ enum {
 };
 
 /* jup_presn_ctrl_send_cmmd: command, media, then a STOP reason code. */
-static void share_control(struct voice_call *c, const guint8 *p, gsize n)
+static void share_control(struct voice_call *c, const guint8 *bytes, gsize size,
+			  guint64 offset, guint flags)
 {
-	const guint8 *end = p + n;
-	guint64 command;
+	if (!offset || (flags & PDTP_MESSAGE_START))
+		c->share_command_len = 0;
+	while (size--) {
+		const guint8 *p = c->share_command;
+		guint64 command, media, code = 0;
 
-	while (p < end && call_pdtp_read_varint(&p, end, &command)) {
-		guint64 media = 0, code = 0;
+		c->share_command[c->share_command_len++] = *bytes++;
+		const guint8 *end = p + c->share_command_len;
 
-		if (!call_pdtp_read_varint(&p, end, &media))
-			return;
-		if (command == SHARE_STOP)
-			call_pdtp_read_varint(&p, end, &code);
+		if (!call_pdtp_read_varint(&p, end, &command) ||
+		    !call_pdtp_read_varint(&p, end, &media) ||
+		    (command == SHARE_STOP &&
+		     !call_pdtp_read_varint(&p, end, &code)))
+			continue;
+		c->share_command_len = 0;
 		if (c->video_trace.enabled)
 			g_printerr(
 				"line-call share command=%u media=%u code=%u\n",
 				(guint)command, (guint)media, (guint)code);
-		if (command == SHARE_START || command == SHARE_STOP)
+		if (media == SHARE_MEDIA_VIDEO &&
+		    (command == SHARE_START || command == SHARE_STOP) &&
+		    call_pdtp_watch_presentation(c->data,
+						 command == SHARE_START)) {
+			c->share_stopped = command == SHARE_STOP;
 			peer_share_state(c, command == SHARE_START);
+		}
 	}
+	if (flags & PDTP_MESSAGE_END)
+		c->share_command_len = 0;
 }
 
 static void data_stream(guint64 stream, const char *service, guint64 offset,
@@ -673,18 +696,18 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 			gsize size, gpointer user)
 {
 	struct voice_call *c = user;
-	(void)offset;
 	(void)time;
 	if (c->video_trace.enabled)
 		call_pdtp_dump_stream(g_getenv("LINE_CALL_PDTP_DUMP"), service,
 				      stream, bytes, size);
 	if (strcmp(service, "PLANET"))
 		return;
-	if (stream == SHARE_CONTROL_STREAM) {
-		share_control(c, bytes, size);
+	if (stream == PDTP_PRESENTATION_CONTROL) {
+		share_control(c, bytes, size, offset, flags);
 		return;
 	}
-	if (stream != SHARE_VIDEO_STREAM)
+	if (stream != PDTP_PRESENTATION_VIDEO ||
+	    (!c->group && c->share_stopped))
 		return;
 	if (!c->share_rx)
 		c->share_rx = call_share_decoder_new();
@@ -693,21 +716,24 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 		/* Most PDTP messages fit in one packet. Borrow its bytes. */
 		if (c->share_message)
 			g_byte_array_set_size(c->share_message, 0);
-		peer_share_state(c, TRUE);
 		call_share_decode(c->share_rx, bytes, size, display_share, c);
 		return;
 	}
-	if (!c->share_message)
-		c->share_message = g_byte_array_new();
-	if (flags & PDTP_MESSAGE_START)
-		g_byte_array_set_size(c->share_message, 0);
-	if (c->share_message->len + size > (1u << 20))
+	if (flags & PDTP_MESSAGE_START) {
+		if (!c->share_message)
+			c->share_message = g_byte_array_new();
+		else
+			g_byte_array_set_size(c->share_message, 0);
+	} else if (!c->share_message || !c->share_message->len) {
 		return;
+	}
+	if (c->share_message->len + size > (1u << 20)) {
+		g_byte_array_set_size(c->share_message, 0);
+		return;
+	}
 	g_byte_array_append(c->share_message, bytes, size);
 	if (!(flags & PDTP_MESSAGE_END))
 		return;
-	/* Video before a START command still means the peer is sharing. */
-	peer_share_state(c, TRUE);
 	call_share_decode(c->share_rx, c->share_message->data,
 			  c->share_message->len, display_share, c);
 	g_byte_array_set_size(c->share_message, 0);
@@ -718,13 +744,16 @@ static void data_event(guint64 stream, const char *service, int element,
 {
 	struct voice_call *c = user;
 
-	if (strcmp(service, "PLANET") || stream != SHARE_VIDEO_STREAM)
+	if (strcmp(service, "PLANET") || stream != PDTP_PRESENTATION_VIDEO)
 		return;
 	/* The viewer resumed our share: start it with a keyframe. */
 	if (element == PDTP_EVENT_RESUME)
 		call_share_encoder_keyframe(c->share_tx);
-	if (element == PDTP_STREAM_CLOSE || element == PDTP_STREAM_RESET)
+	if ((element == PDTP_STREAM_CLOSE || element == PDTP_STREAM_RESET) &&
+	    call_pdtp_watch_presentation(c->data, FALSE)) {
+		c->share_stopped = TRUE;
 		peer_share_state(c, FALSE);
+	}
 }
 
 /* ---- Sharing this desktop ---- */
@@ -733,7 +762,7 @@ static void send_share_command(struct voice_call *c, guint command)
 {
 	guint8 cmd[3] = { command, SHARE_MEDIA_VIDEO, 0 };
 
-	call_pdtp_stream_send(c->data, SHARE_CONTROL_STREAM, cmd,
+	call_pdtp_stream_send(c->data, PDTP_PRESENTATION_CONTROL, cmd,
 			      command == SHARE_STOP ? 3 : 2, 0);
 }
 
@@ -743,7 +772,7 @@ static gboolean share_fragment(const guint8 *fragment, gsize size, gboolean key,
 	struct voice_call *c = user;
 
 	(void)key;
-	return call_pdtp_stream_send(c->data, SHARE_VIDEO_STREAM, fragment,
+	return call_pdtp_stream_send(c->data, PDTP_PRESENTATION_VIDEO, fragment,
 				     size, c->share_time);
 }
 
@@ -965,9 +994,10 @@ static void share_capture(struct voice_call *c, gint64 now)
 	}
 	if (!c->share_streams) {
 		c->share_streams =
-			call_pdtp_stream_open(c->data, SHARE_CONTROL_STREAM,
+			call_pdtp_stream_open(c->data,
+					      PDTP_PRESENTATION_CONTROL,
 					      "PLANET", SHARE_STREAM_FLAGS) &&
-			call_pdtp_stream_open(c->data, SHARE_VIDEO_STREAM,
+			call_pdtp_stream_open(c->data, PDTP_PRESENTATION_VIDEO,
 					      "PLANET", SHARE_STREAM_FLAGS);
 		if (!c->share_streams) {
 			stop_sharing(
@@ -994,8 +1024,8 @@ static void share_capture(struct voice_call *c, gint64 now)
 	 * Skip frames while the viewer has paused the stream or the link
 	 * drains, instead of queueing latency.
 	 */
-	if (call_pdtp_stream_paused(c->data, SHARE_VIDEO_STREAM) ||
-	    call_pdtp_stream_backlog(c->data, SHARE_VIDEO_STREAM) >
+	if (call_pdtp_stream_paused(c->data, PDTP_PRESENTATION_VIDEO) ||
+	    call_pdtp_stream_backlog(c->data, PDTP_PRESENTATION_VIDEO) >
 		    (2u << 20)) {
 		call_share_encoder_keyframe(c->share_tx);
 		return;
@@ -1812,8 +1842,6 @@ static void setup_group_video(struct voice_call *c,
 	call_group_register(&request, answer, TRUE);
 	Slice report = pb_data(PB_SLICE(request), 4);
 
-	v->members =
-		g_array_new(FALSE, FALSE, sizeof(struct call_group_member));
 	v->camera_report = g_bytes_new(report.p, report.n);
 	v->vp8a = answer->video_vp8a;
 	call_group_media_key("VIDEO", answer->secret.p, v->rx_key);
@@ -1886,12 +1914,14 @@ static void group_select_video(struct voice_call *c)
 	const struct call_group_member *first = NULL, *selected = NULL;
 	char focus[MID_LENGTH + 1];
 
+	if (!v)
+		return;
 	g_mutex_lock(&c->task->frame_lock);
 	memcpy(focus, c->task->video_focus, sizeof(focus));
 	g_mutex_unlock(&c->task->frame_lock);
-	for (guint i = 0; i < v->members->len; i++) {
-		const struct call_group_member *m =
-			&g_array_index(v->members, struct call_group_member, i);
+	for (guint i = 0; i < c->group_members->len; i++) {
+		const struct call_group_member *m = &g_array_index(
+			c->group_members, struct call_group_member, i);
 
 		if (!m->active || !m->ssrc || m->ssrc == c->video_tx ||
 		    m->ssrc == c->audio_rx || !strcmp(m->mid, c->info.local))
@@ -1936,12 +1966,25 @@ static void group_select_video(struct voice_call *c)
 	group_clear_frame(c, v->peer.mid);
 }
 
+static gboolean group_data_source(guint32 source, gpointer user)
+{
+	struct voice_call *c = user;
+
+	for (guint i = 0; i < c->group_members->len; i++) {
+		const struct call_group_member *m = &g_array_index(
+			c->group_members, struct call_group_member, i);
+
+		if (m->data_ssrc == source && strcmp(m->mid, c->info.local))
+			return TRUE;
+	}
+	return FALSE;
+}
+
 static void group_presence(struct voice_call *c, Slice body, guint choice)
 {
-	struct group_video *v = c->conference_video;
 	struct call_group_presence presence;
 
-	if (!v || !call_group_presence(body, choice, &presence))
+	if (!c->group_members || !call_group_presence(body, choice, &presence))
 		return;
 	if (c->stats.next) {
 		guint cameras = 0;
@@ -1959,30 +2002,33 @@ static void group_presence(struct voice_call *c, Slice body, guint choice)
 	g_autoptr(GArray) updates = presence.members;
 
 	/* Camera subscriptions currently cover the main conference. */
-	if (presence.channel || (presence.version && v->version &&
-				 (gint32)(presence.version - v->version) <= 0))
+	if (presence.channel ||
+	    (presence.version && c->group_version &&
+	     (gint32)(presence.version - c->group_version) <= 0))
 		return;
 	if (presence.version)
-		v->version = presence.version;
+		c->group_version = presence.version;
 	if (presence.full)
-		g_array_set_size(v->members, 0);
+		g_array_set_size(c->group_members, 0);
 	for (guint i = 0; i < updates->len; i++) {
 		struct call_group_member *m =
 			&g_array_index(updates, struct call_group_member, i);
 		guint j;
 
-		for (j = 0; j < v->members->len; j++) {
+		for (j = 0; j < c->group_members->len; j++) {
 			struct call_group_member *old = &g_array_index(
-				v->members, struct call_group_member, j);
+				c->group_members, struct call_group_member, j);
 
 			if (!strcmp(old->mid, m->mid)) {
 				*old = *m;
 				break;
 			}
 		}
-		if (j == v->members->len && j < 500)
-			g_array_append_val(v->members, *m);
+		if (j == c->group_members->len && j < 500)
+			g_array_append_val(c->group_members, *m);
 	}
+	if (call_pdtp_group_presenter_left(c->data))
+		peer_share_state(c, FALSE);
 	group_select_video(c);
 }
 
@@ -2146,8 +2192,10 @@ static gboolean join_group(struct voice_call *c,
 			CRYPTO_memcmp(c->info.media_secret, answer->secret.p,
 				      30) == 0);
 	}
+	c->group_members =
+		g_array_new(FALSE, FALSE, sizeof(struct call_group_member));
 	c->data_pt = answer->data_payload;
-	/* The negotiated data channel carries reliable conference control. */
+	/* The negotiated data channel carries control and presentations. */
 	if (answer->data_supported) {
 		call_group_media_key("DATA", c->info.media_secret, tx);
 		call_group_media_key("DATA", answer->secret.p, rx);
@@ -2158,6 +2206,11 @@ static gboolean join_group(struct voice_call *c,
 		OPENSSL_cleanse(rx, sizeof(rx));
 		if (!c->data)
 			return FALSE;
+		c->data_rx = answer->data_rx;
+		c->data_tx = answer->data_tx;
+		call_pdtp_set_trace(c->data, c->video_trace.enabled);
+		call_pdtp_set_handlers(c->data, data_stream, data_event, c);
+		call_pdtp_set_group_members(c->data, group_data_source);
 		c->data_route.current = c->relay;
 	}
 	/* The local receive agent reports arrivals for the negotiated source. */
@@ -2234,14 +2287,14 @@ static void group_camera_feedback(struct voice_call *c, Slice packet)
 	    (!c->feedback || sender != c->feedback->ssrc)) {
 		guint i;
 
-		for (i = 0; i < v->members->len; i++) {
+		for (i = 0; i < c->group_members->len; i++) {
 			const struct call_group_member *member = &g_array_index(
-				v->members, struct call_group_member, i);
+				c->group_members, struct call_group_member, i);
 
 			if (member->ssrc == sender && !member->channel)
 				break;
 		}
-		if (i == v->members->len)
+		if (i == c->group_members->len)
 			return;
 	}
 	call_video_receive_group_feedback(c->video, packet.p, packet.n, sender,
@@ -3452,17 +3505,17 @@ GBytes *line_call_take_frame(const char *chat, struct line_preview_frame *info)
 	return frame;
 }
 
-GBytes *line_call_take_share_frame(const char *chat, int *width, int *height,
-				   int *rotation, gboolean *sharing)
+GBytes *line_call_take_share_frame(const char *chat,
+				   struct line_preview_frame *info,
+				   gboolean *sharing)
 {
 	if (!active || g_strcmp0(chat, active->target))
 		return NULL;
 	g_mutex_lock(&active->frame_lock);
 	GBytes *frame = g_steal_pointer(&active->share_frame);
 
-	*width = active->share_width;
-	*height = active->share_height;
-	*rotation = active->share_rotation;
+	if (frame && info)
+		*info = active->share_info;
 	if (sharing)
 		*sharing = g_atomic_int_get(&active->peer_sharing);
 	g_mutex_unlock(&active->frame_lock);
