@@ -435,6 +435,21 @@ static void legacy(void)
 
 	g_assert_no_error(error);
 	g_assert_cmpstr(name, ==, "file.txt");
+	/* A sender's hidden or disguised name is never offered for saving. */
+	const char *const unsafe[] = { ".bash_profile", "photo\u202egpj.sh",
+				       "a\nb" };
+
+	for (gsize i = 0; i < G_N_ELEMENTS(unsafe); i++) {
+		json_object_object_add(meta, "FILE_NAME",
+				       json_object_new_string(unsafe[i]));
+		g_autofree char *named =
+			line_attachment_filename(&session, msg, &error);
+
+		g_assert_no_error(error);
+		g_assert_cmpstr(named, ==, "attachment");
+	}
+	json_object_object_add(meta, "FILE_NAME",
+			       json_object_new_string("file.txt"));
 	download_count = 0;
 	g_autoptr(GBytes) file =
 		line_download_attachment(&session, msg, &error);

@@ -105,18 +105,6 @@ static const char *image_format(GBytes *bytes)
 	return NULL;
 }
 
-static gboolean safe_filename(const char *name)
-{
-	if (!name || !*name || !g_utf8_validate(name, -1, NULL) ||
-	    strlen(name) > 255 || !strcmp(name, ".") || !strcmp(name, "..") ||
-	    strpbrk(name, "/\\"))
-		return FALSE;
-	for (const char *p = name; *p; p = g_utf8_next_char(p))
-		if (g_unichar_iscntrl(g_utf8_get_char(p)))
-			return FALSE;
-	return TRUE;
-}
-
 static J *image_info(GBytes *image, const char *format)
 {
 	gsize n;
@@ -265,8 +253,8 @@ static J *send_attachment_bytes(Line *s, const char *chat, GBytes *bytes,
 		media_error(error, "Choose a JPEG, PNG, GIF or WebP image.");
 		return NULL;
 	}
-	const char *basename = safe_filename(filename) ? filename :
-							 "attachment";
+	const char *basename = line_safe_filename(filename) ? filename :
+							      "attachment";
 	guint8 material[32];
 
 	if (RAND_bytes(material, 32) != 1) {
@@ -565,7 +553,7 @@ char *line_attachment_filename(Line *s, J *message, GError **error)
 						(size_t)json_object_get_string_len(
 							field(meta,
 							      "FILE_NAME")) &&
-					safe_filename(name) ?
+					line_received_filename(name) ?
 				name :
 				"attachment");
 	}
@@ -577,7 +565,7 @@ char *line_attachment_filename(Line *s, J *message, GError **error)
 	if (name &&
 	    strlen(name) == (size_t)json_object_get_string_len(
 				    field(payload, "fileName")) &&
-	    safe_filename(name))
+	    line_received_filename(name))
 		return g_strdup(name);
 	return g_strdup("attachment");
 }

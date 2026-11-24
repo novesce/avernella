@@ -9,6 +9,41 @@ struct notice {
 };
 
 static gint in_flight;
+/* 0 until the server answers GetCapabilities, then 1 plain or 2 markup. */
+static gint markup_known;
+
+char *ui_notification_text(const char *text, gboolean markup)
+{
+	return markup ? g_markup_escape_text(text, -1) : g_strdup(text);
+}
+
+/*
+ * Servers that announce body-markup read <a href>, <img> and the like in
+ * the body, which carries other people's names. Escape for those, and
+ * when the question goes unanswered.
+ */
+static gboolean body_markup(GDBusConnection *bus)
+{
+	gint known = g_atomic_int_get(&markup_known);
+
+	if (known)
+		return known == 2;
+	g_autoptr(GVariant) reply = g_dbus_connection_call_sync(
+		bus, "org.freedesktop.Notifications",
+		"/org/freedesktop/Notifications",
+		"org.freedesktop.Notifications", "GetCapabilities", NULL,
+		G_VARIANT_TYPE("(as)"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 1200,
+		NULL, NULL);
+
+	if (!reply)
+		return TRUE;
+	g_autofree const char **caps = NULL;
+
+	g_variant_get(reply, "(^a&s)", &caps);
+	known = caps && g_strv_contains(caps, "body-markup") ? 2 : 1;
+	g_atomic_int_set(&markup_known, known);
+	return known == 2;
+}
 
 static gpointer notify(gpointer data)
 {
@@ -19,9 +54,11 @@ static gpointer notify(gpointer data)
 
 	if (bus) {
 		const char *summary = notice->name;
-		const char *body = notice->body ? notice->body :
-				   notice->call ? _("Incoming LINE call") :
-						  _("New LINE message");
+		g_autofree char *body = ui_notification_text(
+			notice->body ? notice->body :
+			notice->call ? _("Incoming LINE call") :
+				       _("New LINE message"),
+			body_markup(bus));
 		GVariantBuilder hints;
 
 		g_variant_builder_init(&hints, G_VARIANT_TYPE_VARDICT);

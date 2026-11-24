@@ -793,10 +793,48 @@ static void call_and_chat_notices(void)
 	g_clear_pointer(&s.profiles, g_hash_table_unref);
 }
 
+/* Names from other people cannot hide, disguise or escape a folder. */
+static void received_filenames(void)
+{
+	static const char *const good[] = { "report.pdf", "写真 1.jpg", "a..b",
+					    "notes v2.txt" };
+	static const char *const bad[] = {
+		"",
+		".",
+		"..",
+		"../x",
+		"a/b",
+		"a\\b",
+		"line\nbreak",
+		"tab\there",
+		"invoice\u202efdp.exe",
+		"a\u2066b",
+		"a\u200fb",
+		"\xff\xfe",
+		NULL,
+	};
+
+	for (gsize i = 0; i < G_N_ELEMENTS(good); i++) {
+		g_assert_true(line_safe_filename(good[i]));
+		g_assert_true(line_received_filename(good[i]));
+	}
+	for (gsize i = 0; i < G_N_ELEMENTS(bad); i++) {
+		g_assert_false(line_safe_filename(bad[i]));
+		g_assert_false(line_received_filename(bad[i]));
+	}
+	/* A hidden file can be sent, never suggested for saving. */
+	g_assert_true(line_safe_filename(".bash_profile"));
+	g_assert_false(line_received_filename(".bash_profile"));
+	g_autofree char *long_name = g_strnfill(256, 'a');
+
+	g_assert_false(line_safe_filename(long_name));
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/messaging/chats", chat_list);
+	g_test_add_func("/messaging/received-filenames", received_filenames);
 	g_test_add_func("/messaging/read-watermark", checked_watermark);
 	g_test_add_func("/messaging/peer-read-counts", peer_read_counts);
 	g_test_add_func("/messaging/history", recent_messages);

@@ -97,6 +97,7 @@ TESTS += build/test-friends build/test-groups build/test-ui-friends build/test-u
 TESTS += build/test-stickers build/test-call-video
 TESTS += build/test-call-group build/test-pdtp
 TESTS += build/test-chat-lists build/test-shared-content build/test-ui-tray build/test-ui-instance
+TESTS += build/test-ui-notifications
 TESTS += build/test-video-play build/test-talk-sync build/test-live-sync
 TESTS += build/test-flex-asset build/test-ui-flex
 TESTS += build/test-ui-refresh build/test-ui-chat-refresh
@@ -312,6 +313,7 @@ build/test-shared-content: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_ea
 build/test-shared-content: tests/shared_content.c build/shared_content.o build/http_tune.o
 build/test-ui-instance: tests/ui_instance.c build/ui_instance.o
 build/test-ui-tray: tests/ui_tray.c build/ui_tray.o build/ui_logo.o build/ui_pixels.o $(UI_LANG_OBJECTS)
+build/test-ui-notifications: tests/ui_notifications.c build/ui_notifications.o $(UI_LANG_OBJECTS)
 build/test-ui-friends: tests/ui_friends.c build/ui_friends.o $(UI_LANG_OBJECTS)
 build/test-ui-read: tests/ui_read.c
 build/test-stickers: tests/stickers.c build/stickers.o build/thrift.o

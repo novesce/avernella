@@ -252,7 +252,7 @@ The UI decides when you have *seen* the latest message, and the worker tells LIN
 
 ### Notifications
 
-[`ui_notifications.c`](../../src/ui_notifications.c) calls `org.freedesktop.Notifications.Notify` on a short-lived thread. Notifications show the chat name without a message preview, appear only while the window is in the background, and respect per-chat mutes and the Notifications switch.
+[`ui_notifications.c`](../../src/ui_notifications.c) calls `org.freedesktop.Notifications.Notify` on a short-lived thread. Notifications show the chat name without a message preview, appear only while the window is in the background, and respect per-chat mutes and the Notifications switch. A body can carry someone else's name (a friend request), so it is escaped with `g_markup_escape_text()` when the notification server announces `body-markup`, or doesn't answer `GetCapabilities`.
 
 ### Sounds
 

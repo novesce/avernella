@@ -570,6 +570,37 @@ static int message_order(const void *a, const void *b)
 	return (li > ri) - (li < ri);
 }
 
+/* Embeddings, overrides, isolates and marks that reorder displayed text. */
+static gboolean bidi_control(gunichar c)
+{
+	return (c >= 0x202a && c <= 0x202e) || (c >= 0x2066 && c <= 0x2069) ||
+	       c == 0x200e || c == 0x200f || c == 0x061c;
+}
+
+gboolean line_safe_filename(const char *name)
+{
+	if (!name || !*name || !g_utf8_validate(name, -1, NULL) ||
+	    strlen(name) > 255 || !strcmp(name, ".") || !strcmp(name, "..") ||
+	    strpbrk(name, "/\\"))
+		return FALSE;
+	for (const char *p = name; *p; p = g_utf8_next_char(p)) {
+		gunichar c = g_utf8_get_char(p);
+
+		if (g_unichar_iscntrl(c) || bidi_control(c))
+			return FALSE;
+	}
+	return TRUE;
+}
+
+/*
+ * A hidden name like .bash_profile, saved into the home folder, could run
+ * at the next login.
+ */
+gboolean line_received_filename(const char *name)
+{
+	return line_safe_filename(name) && *name != '.';
+}
+
 /*
  * LINE's sticon ranges refer to UTF-16 code units in the visible fallback
  * text. Advance once through the UTF-8 body for an ordered run of ranges.
@@ -1138,6 +1169,9 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 			text = alt;
 		const char *filename = nonempty(metadata, "FILE_NAME"),
 			   *related = nonempty(msg, "21");
+		/* main.c names an unsafe one "attachment" when it lists it. */
+		if (filename && !line_received_filename(filename))
+			filename = NULL;
 		if (type == 2) {
 			guint64 duration;
 			const char *ms = nonempty(metadata, "DURATION");

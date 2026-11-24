@@ -136,7 +136,7 @@ On the way:
 - **Flex** (22): `add_flex()` validates `FLEX_JSON` (at most 64 KiB) and puts it in the row. The text becomes the alternative text.
 - **Rich** (17): `line_rich_parse()` ([`rich_message.c`](../../src/rich_message.c)) builds a compact layout. See [Media](media.md#rich-messages).
 - **Video** (2): `DURATION` becomes `durationMs`.
-- **Files and videos**: `FILE_NAME` becomes `filename`.
+- **Files and videos**: `FILE_NAME` becomes `filename` when `line_received_filename()` accepts it: valid UTF-8 of at most 255 bytes, no slash, backslash, control character or bidirectional override, and no leading dot, so a sender can't disguise an extension or suggest a hidden file such as `.bash_profile`. Other names are shown and saved as `attachment`.
 - **Location** (15), **contact** (13): the address or display name becomes the text.
 - **Reactions**: counted by type.
 - **Names**: senders are resolved through the profile cache, and your own messages say "You".

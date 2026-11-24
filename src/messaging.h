@@ -6,6 +6,14 @@
  * Results are owned by the caller. History is the newest 50 messages, in
  * chronological order. The caller selects a chat from this session's list.
  */
+/*
+ * A file name to send: valid UTF-8, at most 255 bytes, not "." or "..",
+ * with no slash, backslash, control character or bidirectional override
+ * (which can disguise an extension).
+ */
+gboolean line_safe_filename(const char *name);
+/* A name from someone else, which also may not start with a dot. */
+gboolean line_received_filename(const char *name);
 J *line_chats(Line *s, GError **error);
 J *line_mark_read(Line *s, const char *chat, const char *id,
 		  gint32 reserved_seq, GError **error);
