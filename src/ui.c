@@ -12,6 +12,7 @@
 #include "flex_asset.h"
 #include "ui_chat_lists.h"
 #include "ui_tray.h"
+#include "ui_instance.h"
 #include "ui_chat_tools.h"
 #include "ui_emoji.h"
 #include "ui_friends.h"
@@ -2558,8 +2559,15 @@ static int hover_target(int x, int y)
 	return 0;
 }
 
+static Uint32 activate_event;
+
 static void event(SDL_Event *e)
 {
+	if (activate_event && e->type == activate_event) {
+		ui_present_window(ui.window);
+		ui.dirty = TRUE;
+		return;
+	}
 	if (ui_tray_event(e, ui.window, &ui.quitting))
 		return;
 	if (e->type == wire.preview_event) {
@@ -2776,8 +2784,18 @@ void ui_restore_input(void)
 
 int line_ui(int argc, char **argv)
 {
+	g_autoptr(GError) error = NULL;
+	int primary = ui_instance_open(&error);
+	int status = 1;
+
 	(void)argc;
 	(void)argv;
+	if (primary < 0) {
+		g_printerr("Avernella: %s\n", error->message);
+		return 1;
+	}
+	if (!primary)
+		return 0;
 	if ((g_getenv("WAYLAND_DISPLAY") || g_getenv("WAYLAND_SOCKET") ||
 	     !g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "wayland")) &&
 	    !g_getenv("SDL_VIDEODRIVER") && !g_getenv("SDL_VIDEO_DRIVER"))
@@ -2797,7 +2815,20 @@ int line_ui(int argc, char **argv)
 	SDL_SetHint("SDL_VIDEO_X11_WMCLASS", "avernella");
 	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
 		g_printerr("SDL: %s\n", SDL_GetError());
+		ui_instance_close();
 		return 1;
+	}
+	wire.packet_event = SDL_RegisterEvents(4);
+	if (wire.packet_event == (Uint32)-1) {
+		g_printerr("No SDL event IDs are available.\n");
+		goto quit_sdl;
+	}
+	wire.refresh_event = wire.packet_event + 1;
+	wire.preview_event = wire.packet_event + 2;
+	activate_event = wire.packet_event + 3;
+	if (!ui_instance_watch(activate_event, &error)) {
+		g_printerr("Avernella: %s\n", error->message);
+		goto quit_sdl;
 	}
 	/* The Wayland window-surface fallback still uses SDL presentation. */
 	gboolean wayland = g_strcmp0(SDL_GetCurrentVideoDriver(), "wayland") ==
@@ -2814,10 +2845,7 @@ int line_ui(int argc, char **argv)
 		SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI);
 	if (!ui.window || !ui_draw_init()) {
 		g_printerr("Window: %s\n", SDL_GetError());
-		if (ui.window)
-			SDL_DestroyWindow(ui.window);
-		SDL_Quit();
-		return 1;
+		goto quit_sdl;
 	}
 	SDL_SetWindowMinimumSize(ui.window, 360, 480);
 	wire.requests = g_hash_table_new_full(g_direct_hash, g_direct_equal,
@@ -2831,13 +2859,6 @@ int line_ui(int argc, char **argv)
 	ui.message.value = g_string_new("");
 	ui.login_email.value = g_string_new("");
 	ui.login_password.value = g_string_sized_new(LINE_CREDENTIAL_LIMIT + 1);
-	wire.packet_event = SDL_RegisterEvents(3);
-	if (wire.packet_event == (Uint32)-1) {
-		g_printerr("No SDL event IDs are available.\n");
-		return 1;
-	}
-	wire.refresh_event = wire.packet_event + 1;
-	wire.preview_event = wire.packet_event + 2;
 	ui_tray_start();
 	display_rate();
 	ui_motion_refresh_preferences();
@@ -2934,9 +2955,13 @@ int line_ui(int argc, char **argv)
 	ui_sound_shutdown();
 	ui_draw_shutdown();
 	ui_motion_shutdown();
-	SDL_DestroyWindow(ui.window);
+	status = 0;
+quit_sdl:
+	ui_instance_close();
+	if (ui.window)
+		SDL_DestroyWindow(ui.window);
 	SDL_Quit();
-	return 0;
+	return status;
 }
 
 void ui_sign_out(void)

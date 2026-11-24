@@ -599,6 +599,17 @@ void ui_tray_stop(void)
 	memset(tray.hosts, 0, sizeof(tray.hosts));
 }
 
+void ui_present_window(SDL_Window *window)
+{
+	Uint32 flags = SDL_GetWindowFlags(window);
+
+	if (flags & SDL_WINDOW_HIDDEN)
+		SDL_ShowWindow(window);
+	if (flags & SDL_WINDOW_MINIMIZED)
+		SDL_RestoreWindow(window);
+	SDL_RaiseWindow(window);
+}
+
 gboolean ui_tray_hide(SDL_Window *window)
 {
 	if (!g_atomic_int_get(&tray.available))
@@ -620,11 +631,9 @@ gboolean ui_tray_event(const SDL_Event *event, SDL_Window *window,
 	else if (action == SHOW ||
 		 (action == HOST_GONE && hidden &&
 		  !g_atomic_int_get(&tray.available)) ||
-		 (action == TOGGLE && hidden)) {
-		SDL_ShowWindow(window);
-		SDL_RestoreWindow(window);
-		SDL_RaiseWindow(window);
-	} else if (action == TOGGLE || action == HIDE)
+		 (action == TOGGLE && hidden))
+		ui_present_window(window);
+	else if (action == TOGGLE || action == HIDE)
 		ui_tray_hide(window);
 	return TRUE;
 }
