@@ -208,6 +208,32 @@ make vulkan-preview VK_PREVIEW_ARGS=--test          # ตัวนำเสน�
 
 รันพร้อม validation layer ทุกครั้งที่แก้ `src/render/`
 
+## การฟัซ
+
+ตัวแยกวิเคราะห์ที่อ่านข้อมูลจากเครือข่ายมีฟัซเซอร์แบบนำทางด้วย coverage อยู่ใน [`fuzz/`](../../fuzz) ฟัซเซอร์เหล่านี้ไม่ได้อยู่ใน `make check`
+
+| ฟัซเซอร์ | ครอบคลุม |
+| -------- | -------- |
+| `fuzz-pdtp` | `call_pdtp_receive()`: SRTP, RTP และคำเส้นทางของห้องประชุม, หมายเลขแพ็กเก็ต, ทุกองค์ประกอบ, การประกอบสตรีม, ACK, การเลือกผู้นำเสนอ |
+| `fuzz-video` | `call_video_receive()`: ตัวบรรยาย EVS3 และ RFC 7741, การประกอบชิ้นส่วน, การถอดรหัส VP8 และ `call_share_decode()` |
+| `fuzz-pb` | `pb_next()` และผู้ใช้ใน `call_wire.c` และ `call_schema.c` รวมถึงเฟรมสัญญาณที่เข้ารหัส |
+| `fuzz-group` | คำตอบของการโทรกลุ่ม, presence, คำขอสตรีมและกล้อง, RTCP feedback ใน `call_group.c` |
+| `fuzz-thrift` | ตัวอ่าน Compact และ Binary ใน `thrift.c` |
+
+```sh
+make fuzz                       # บิลด์ลง build-fuzz/ และเขียนอินพุตตั้งต้น
+make fuzz-run FUZZ_TIME=600     # รันทุกฟัซเซอร์พร้อมกันตัวละ 10 นาที
+make fuzz-run-pdtp              # ฟัซเซอร์ตัวเดียว
+make fuzz-check                 # เล่นอินพุตตั้งต้นและ corpus ที่เก็บไว้ซ้ำหนึ่งรอบ
+./build-fuzz/fuzz-pdtp build-fuzz/artifacts/pdtp-crash-…   # ทำให้ความล้มเหลวเกิดซ้ำ
+```
+
+GCC ไม่มี libFuzzer ดังนั้น [`fuzz/driver.c`](../../fuzz/driver.c) จึงเป็นเอนจิน `-fsanitize-coverage=trace-pc,trace-cmp` ของ GCC ส่ง edge coverage และค่าทั้งสองฝั่งของการเปรียบเทียบที่ไม่ผ่านให้เอนจิน ทุกอย่างบิลด์ด้วย AddressSanitizer และ UndefinedBehaviorSanitizer ใน `build-fuzz/` แยกจาก `build/` ฮาร์เนสใช้ `LLVMFuzzerTestOneInput()` ของ libFuzzer และไดรเวอร์รับแฟล็กหลักของ libFuzzer (`-max_total_time`, `-runs`, `-max_len`, `-timeout`, `-artifact_prefix`) ส่งแฟล็กเพิ่มผ่าน `FUZZ_ARGS`
+
+คอมเมนต์ของฟัซเซอร์แต่ละตัวอธิบายรูปแบบอินพุต ฟัซเซอร์ PDTP และวิดีโอถือคีย์ SRTP สังเคราะห์ชุดเดียวกับ `tests/pdtp.c` และ `tests/call_video.c` จึงเข้ารหัสข้อความที่ฟัซก่อนส่งถึงตัวแยกวิเคราะห์ [`fuzz/seeds.c`](../../fuzz/seeds.c) เขียนอินพุตตั้งต้น โดยสร้าง fixture ของเทสต์ขึ้นใหม่ และบันทึกสิ่งที่ตัวเข้ารหัสของ Avernella ส่งออกเมื่อใช้คีย์และภาพสังเคราะห์ชุดเดียวกัน
+
+อินพุตใหม่สะสมใน `build-fuzz/corpus/NAME/` และ log อยู่ใน `build-fuzz/NAME.log` อินพุตที่ทำให้แครช หน่วยความจำรั่ว หมดเวลา หรือหน่วยความจำไม่พอ จะถูกบันทึกเป็น `build-fuzz/artifacts/NAME-crash-HASH` (`leak-`, `timeout-`, `oom-`) แก้ด้วยเทสต์ถดถอยในไฟล์ `tests/` ที่ตรงกัน
+
 ## สิ่งที่เทสต์ครอบคลุมไม่ได้
 
 การทำงานร่วมกับ LINE จริง: การลงชื่อเข้าใช้จริง การส่งถึงบัญชีอื่น มีเดียบนเซิร์ฟเวอร์ของ LINE การโทรกับแอป LINE บนโทรศัพท์และเดสก์ท็อป สิ่งเหล่านี้ต้องใช้บัญชีจริงและอุปกรณ์เครื่องที่สอง [analysis/desktop-features.md](../../analysis/desktop-features.md) และ [analysis/video-call-wire.md](../../analysis/video-call-wire.md) บันทึกว่าอะไรยืนยันกับของจริงแล้ว เมื่อคุณยืนยันอะไรกับของจริง ให้บันทึกไว้ที่นั่นโดยไม่มีข้อมูลส่วนตัว

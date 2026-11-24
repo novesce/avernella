@@ -77,13 +77,16 @@ GNU Make 4.3 and newer runs one job per CPU (`nproc`) by default, because the Ma
 | `all` (default) | Builds `avernella` and every optional program whose SDK is installed |
 | `check` | Builds every test in `TESTS` and runs them one after another, stopping at the first failure |
 | `bench` | Builds and runs `build/render-bench` |
+| `fuzz` | Builds the sanitizer fuzzers and their seed inputs in `build-fuzz/`. See [Fuzzing](testing.md#fuzzing). |
+| `fuzz-run`, `fuzz-run-NAME` | Runs every fuzzer, or one, for `FUZZ_TIME` seconds (600 by default) |
+| `fuzz-check` | Replays each fuzzer's seeds and saved corpus once |
 | `vulkan-smoke` | Offscreen Vulkan renderer test. `VK_VENDOR=<PCI vendor ID>`, such as `0x10de` (NVIDIA) or `0x1002` (AMD), picks a GPU. |
 | `vulkan-preview` | Vulkan presenter test in a real window. Pass `VK_PREVIEW_ARGS=--test` for the automatic version. |
 | `format` | Rewrites all sources in place with `clang-format` |
 | `format-check` | Fails if any source isn't formatted |
 | `checkpatch` | Runs the Linux kernel's `checkpatch.pl` on every source, one file per run |
 | `install`, `uninstall` | See [Installing](#installing) |
-| `clean` | Removes build products |
+| `clean` | Removes build products. It keeps the fuzzing corpus; `fuzz-clean` removes all of `build-fuzz/`. |
 
 ### Build options
 

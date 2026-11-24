@@ -222,6 +222,32 @@ make vulkan-preview VK_PREVIEW_ARGS=--test          # the real presenter: resize
 
 Run them with the validation layer whenever you touch `src/render/`.
 
+## Fuzzing
+
+The parsers that read network data have coverage-guided fuzzers in [`fuzz/`](../../fuzz). They are not part of `make check`.
+
+| Fuzzer | Covers |
+| ------ | ------ |
+| `fuzz-pdtp` | `call_pdtp_receive()`: SRTP, RTP and conference route words, packet numbers, every element, reassembly, ACKs, presenter selection |
+| `fuzz-video` | `call_video_receive()`: EVS3 and RFC 7741 descriptors, fragment assembly, VP8 decode, and `call_share_decode()` |
+| `fuzz-pb` | `pb_next()` and its users in `call_wire.c` and `call_schema.c`, and sealed signaling frames |
+| `fuzz-group` | The group answer, presence, stream and camera requests, RTCP feedback in `call_group.c` |
+| `fuzz-thrift` | The Compact and Binary readers in `thrift.c` |
+
+```sh
+make fuzz                       # build into build-fuzz/ and write the seed inputs
+make fuzz-run FUZZ_TIME=600     # run every fuzzer for 10 minutes, side by side
+make fuzz-run-pdtp              # one fuzzer
+make fuzz-check                 # replay the seeds and saved corpus once
+./build-fuzz/fuzz-pdtp build-fuzz/artifacts/pdtp-crash-…   # reproduce a failure
+```
+
+GCC has no libFuzzer, so [`fuzz/driver.c`](../../fuzz/driver.c) is the engine. GCC's `-fsanitize-coverage=trace-pc,trace-cmp` feeds it edge coverage and the operands of failed comparisons. Everything is built with AddressSanitizer and UndefinedBehaviorSanitizer in `build-fuzz/`, apart from `build/`. The harnesses use libFuzzer's `LLVMFuzzerTestOneInput()`, and the driver accepts libFuzzer's main flags (`-max_total_time`, `-runs`, `-max_len`, `-timeout`, `-artifact_prefix`). Pass extra flags with `FUZZ_ARGS`.
+
+Each fuzzer's comment explains its input format. The PDTP and video fuzzers hold the synthetic SRTP keys of `tests/pdtp.c` and `tests/call_video.c`, so they encrypt fuzzed plaintext before it reaches the parser. [`fuzz/seeds.c`](../../fuzz/seeds.c) writes the seed inputs. It rebuilds the test fixtures and records what Avernella's own encoders send with the same synthetic keys and pictures.
+
+New inputs collect in `build-fuzz/corpus/NAME/` and log in `build-fuzz/NAME.log`. A crash, leak, timeout or out-of-memory input is saved as `build-fuzz/artifacts/NAME-crash-HASH` (`leak-`, `timeout-`, `oom-`). Fix it with a regression test in the matching `tests/` file.
+
 ## What tests can't cover
 
 Live interoperability with LINE: real sign-in, delivery to another account, media on LINE's servers, calls with LINE's phone and desktop apps. Those need a real account and a second device. [analysis/desktop-features.md](../../analysis/desktop-features.md) and [analysis/video-call-wire.md](../../analysis/video-call-wire.md) record what has been verified live. When you verify something live, say so there, without any personal data.

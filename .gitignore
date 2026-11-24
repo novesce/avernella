@@ -17,3 +17,4 @@ session.new
 /analysis/chat-preview.png
 /analysis/emoji-picker.png
 /src/emoji_defaults.inc
+/build-fuzz/

@@ -77,13 +77,16 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 | `all` (ค่าเริ่มต้น) | build `avernella` และโปรแกรมเสริมทุกตัวที่มี SDK ติดตั้งอยู่ |
 | `check` | build ทุกเทสต์ใน `TESTS` แล้วรันทีละตัว หยุดเมื่อเจอตัวแรกที่ล้มเหลว |
 | `bench` | build และรัน `build/render-bench` |
+| `fuzz` | build ฟัซเซอร์ที่มี sanitizer และอินพุตตั้งต้นลงใน `build-fuzz/` ดู [การฟัซ](testing.md#การฟัซ) |
+| `fuzz-run`, `fuzz-run-NAME` | รันทุกฟัซเซอร์หรือตัวเดียวเป็นเวลา `FUZZ_TIME` วินาที (ค่าเริ่มต้น 600) |
+| `fuzz-check` | เล่นอินพุตตั้งต้นและ corpus ที่เก็บไว้ของแต่ละฟัซเซอร์ซ้ำหนึ่งรอบ |
 | `vulkan-smoke` | เทสต์ตัววาด Vulkan แบบไม่แสดงผลบนจอ ใช้ `VK_VENDOR=<PCI vendor ID>` เช่น `0x10de` (NVIDIA) หรือ `0x1002` (AMD) เพื่อเลือก GPU |
 | `vulkan-preview` | เทสต์ตัวนำเสนอ Vulkan ในหน้าต่างจริง ใส่ `VK_PREVIEW_ARGS=--test` สำหรับแบบอัตโนมัติ |
 | `format` | จัดรูปแบบซอร์สทั้งหมดด้วย `clang-format` ทับไฟล์เดิม |
 | `format-check` | ล้มเหลวถ้ามีซอร์สที่ยังไม่ได้จัดรูปแบบ |
 | `checkpatch` | รัน `checkpatch.pl` ของเคอร์เนล Linux กับทุกซอร์ส ทีละไฟล์ |
 | `install`, `uninstall` | ดูหัวข้อ "การติดตั้ง" ด้านล่าง |
-| `clean` | ลบผลลัพธ์จากการ build |
+| `clean` | ลบผลลัพธ์จากการ build แต่เก็บ corpus ของการฟัซไว้ `fuzz-clean` ลบ `build-fuzz/` ทั้งหมด |
 
 ### ตัวเลือกการ build
 

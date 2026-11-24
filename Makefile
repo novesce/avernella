@@ -27,7 +27,7 @@ CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -Werror=format-security -
 LDLIBS += $(shell pkg-config --libs $(PKGS)) -pthread -ldl
 
 # Check the driver itself so GCC aliases and wrappers also work.
-ifneq ($(filter-out clean format format-check checkpatch install uninstall,$(or $(MAKECMDGOALS),all)),)
+ifneq ($(filter-out clean fuzz-clean format format-check checkpatch install uninstall,$(or $(MAKECMDGOALS),all)),)
 ifeq ($(shell LC_ALL=C $(CC) -v 2>&1 | awk '/^gcc version [0-9]/ { print "yes"; exit }'),)
 $(error GNU GCC is required to build Avernella. Set CC=gcc or choose another GCC driver)
 endif
@@ -79,7 +79,7 @@ OBJECTS = $(SOURCES:%=build/%.o)
 GIT_COMMIT := $(if $(wildcard .git),$(shell git rev-parse HEAD 2>/dev/null | cut -c1-7))
 COMMIT_DEFINE := \#define LINE_BUILD_COMMIT "$(or $(GIT_COMMIT),unknown commit)"
 CLANG_FORMAT ?= clang-format
-STYLE_SOURCES := $(sort $(wildcard src/*.c src/*.h src/render/*.c src/render/*.h tests/*.c tests/*.h))
+STYLE_SOURCES := $(sort $(wildcard src/*.c src/*.h src/render/*.c src/render/*.h tests/*.c tests/*.h fuzz/*.c fuzz/*.h))
 # The kernel's own style checker, from linux-headers or a kernel tree.
 CHECKPATCH ?= $(firstword $(shell command -v checkpatch.pl 2>/dev/null) \
 	$(wildcard /usr/lib/modules/$(shell uname -r)/build/scripts/checkpatch.pl \
@@ -115,7 +115,7 @@ TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
 LIFF_WPE_PKGS = wpe-webkit-2.0 wpe-platform-wayland-2.0 gio-unix-2.0
 LIFF_GTK_PKGS = webkitgtk-6.0 gio-unix-2.0
 LIFF_BROWSER ?= 1
-ifneq ($(filter-out clean format format-check checkpatch install uninstall,$(or $(MAKECMDGOALS),all)),)
+ifneq ($(filter-out clean fuzz-clean format format-check checkpatch install uninstall,$(or $(MAKECMDGOALS),all)),)
 ifeq ($(LIFF_BROWSER),1)
 LIFF_WPE ?= $(shell pkg-config --exists $(LIFF_WPE_PKGS) && echo 1)
 LIFF_GTK ?= $(shell pkg-config --exists $(LIFF_GTK_PKGS) && echo 1)
@@ -147,7 +147,7 @@ checkpatch:
 	for f in $(filter src/%,$(STYLE_SOURCES)); do \
 		perl "$(CHECKPATCH)" $(CHECKPATCH_FLAGS) "$$f" || status=1; \
 	done; \
-	for f in $(filter tests/%,$(STYLE_SOURCES)); do \
+	for f in $(filter tests/% fuzz/%,$(STYLE_SOURCES)); do \
 		perl "$(CHECKPATCH)" $(CHECKPATCH_TEST_FLAGS) "$$f" || status=1; \
 	done; \
 	rm -f .checkpatch-camelcase.git.; exit $$status
@@ -428,11 +428,101 @@ check-group-media: build/test-call-group build/test-call build/test-call-video b
 check: $(TESTS)
 	@set -e; for test in $(TESTS); do ./$$test; done
 
+# Coverage-guided fuzzing of the parsers that read network data, outside
+# make check. GCC has no libFuzzer, so fuzz/driver.c is the engine, fed by
+# -fsanitize-coverage. Sanitizer objects stay in build-fuzz/, apart from
+# build/. See docs/en/testing.md#fuzzing.
+FUZZERS = pdtp video pb group thrift
+FUZZ_DIR = build-fuzz
+FUZZ_CFLAGS ?= -O1 -g -fno-omit-frame-pointer
+FUZZ_TIME ?= 600
+FUZZ_ARGS ?=
+# Video inputs carry several fragments of a picture.
+FUZZ_MAX_LEN = $(if $(filter video,$*),16384,4096)
+FUZZ_WARNINGS = -std=c17 -Wall -Wextra -Wpedantic -Wformat=2
+FUZZ_SANITIZE = $(FUZZ_WARNINGS) $(FUZZ_CFLAGS) -fsanitize=address,undefined -fno-sanitize-recover=all
+FUZZ_COVERAGE = -fsanitize-coverage=trace-pc,trace-cmp
+FUZZ_CPPFLAGS = $(CPPFLAGS) -Ifuzz -I$(FUZZ_DIR)
+FUZZ_BINARIES = $(FUZZERS:%=$(FUZZ_DIR)/fuzz-%)
+FUZZ_ENGINE = $(FUZZ_DIR)/obj/fuzz-driver.o $(FUZZ_DIR)/obj/fuzz-coverage.o
+FUZZ_RUNS = $(FUZZERS:%=fuzz-run-%)
+FUZZ_CHECKS = $(FUZZERS:%=fuzz-check-%)
+
+.PHONY: fuzz fuzz-run fuzz-check fuzz-clean $(FUZZ_RUNS) $(FUZZ_CHECKS)
+fuzz: $(FUZZ_BINARIES) $(FUZZ_DIR)/seeds/.stamp
+
+$(FUZZ_DIR)/obj:
+	mkdir -p $@
+
+$(FUZZ_DIR)/obj/%.o: src/%.c Makefile | $(FUZZ_DIR)/obj
+	$(CC) $(FUZZ_CPPFLAGS) $(FUZZ_SANITIZE) $(FUZZ_COVERAGE) -MMD -MP -c $< -o $@
+
+$(FUZZ_DIR)/obj/fuzz-%.o: fuzz/%.c Makefile | $(FUZZ_DIR)/obj
+	$(CC) $(FUZZ_CPPFLAGS) $(FUZZ_SANITIZE) $(FUZZ_COVERAGE) -MMD -MP -c $< -o $@
+
+# The engine itself is not traced. The coverage callbacks run on every basic
+# block, so they are built without sanitizers too.
+$(FUZZ_DIR)/obj/fuzz-driver.o: fuzz/driver.c Makefile | $(FUZZ_DIR)/obj
+	$(CC) $(FUZZ_CPPFLAGS) $(FUZZ_SANITIZE) -MMD -MP -c $< -o $@
+
+$(FUZZ_DIR)/obj/fuzz-coverage.o: fuzz/coverage.c Makefile | $(FUZZ_DIR)/obj
+	$(CC) $(FUZZ_CPPFLAGS) $(FUZZ_WARNINGS) -O2 -g -MMD -MP -c $< -o $@
+
+# Software VP8 only: the fuzzers never probe GPUs.
+$(FUZZ_DIR)/call_hwdecode_config.h: | $(FUZZ_DIR)/obj
+	@printf '%s\n' '#define CALL_HWDECODE 0' > $@
+$(FUZZ_DIR)/call_jetson_config.h: | $(FUZZ_DIR)/obj
+	@printf '%s\n' '#define CALL_VP8_JETSON 0' > $@
+$(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_encode.o: $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h
+
+$(FUZZ_DIR)/fuzz-pdtp: $(FUZZ_DIR)/obj/fuzz-pdtp.o $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o
+$(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/fuzz-video.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/call_srtp.o
+$(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o
+$(FUZZ_DIR)/fuzz-pb: $(FUZZ_DIR)/obj/fuzz-pb.o $(FUZZ_DIR)/obj/call_wire.o $(FUZZ_DIR)/obj/call_schema.o
+$(FUZZ_DIR)/fuzz-group: $(FUZZ_DIR)/obj/fuzz-group.o $(FUZZ_DIR)/obj/call_group.o $(FUZZ_DIR)/obj/call_schema.o $(FUZZ_DIR)/obj/call_wire.o
+$(FUZZ_DIR)/fuzz-thrift: $(FUZZ_DIR)/obj/fuzz-thrift.o $(FUZZ_DIR)/obj/thrift.o
+$(FUZZ_BINARIES): $(FUZZ_ENGINE)
+	$(CC) $(FUZZ_SANITIZE) $(LDFLAGS) -Wl,--as-needed $^ $(LDLIBS) -o $@
+
+# Seed inputs rebuilt from the synthetic fixtures in tests/.
+$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/fuzz-seeds.o $(FUZZ_DIR)/obj/call_group.o $(FUZZ_DIR)/obj/call_schema.o $(FUZZ_DIR)/obj/call_wire.o
+$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/thrift.o
+$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o $(FUZZ_DIR)/obj/fuzz-coverage.o
+	$(CC) $(FUZZ_SANITIZE) $(LDFLAGS) -Wl,--as-needed $^ $(LDLIBS) -o $@
+
+$(FUZZ_DIR)/seeds/.stamp: $(FUZZ_DIR)/fuzz-seeds
+	$(RM) -r $(FUZZ_DIR)/seeds
+	./$< $(FUZZ_DIR)/seeds
+	touch $@
+
+# Each fuzzer runs for FUZZ_TIME seconds; make -j runs them side by side.
+# New inputs collect in build-fuzz/corpus/NAME, failures in artifacts/.
+fuzz-run: $(FUZZ_RUNS)
+$(FUZZ_RUNS): fuzz-run-%: $(FUZZ_DIR)/fuzz-% $(FUZZ_DIR)/seeds/.stamp
+	@mkdir -p $(FUZZ_DIR)/corpus/$* $(FUZZ_DIR)/artifacts
+	@echo "fuzzing $* for $(FUZZ_TIME) s, log in $(FUZZ_DIR)/$*.log"
+	@./$< -max_total_time=$(FUZZ_TIME) -max_len=$(FUZZ_MAX_LEN) -artifact_prefix=$(FUZZ_DIR)/artifacts/$*- $(FUZZ_ARGS) \
+		$(FUZZ_DIR)/corpus/$* $(FUZZ_DIR)/seeds/$* > $(FUZZ_DIR)/$*.log 2>&1 || \
+		{ tail -n 60 $(FUZZ_DIR)/$*.log; exit 1; }
+	@tail -n 2 $(FUZZ_DIR)/$*.log
+
+# Replays the seeds and the saved corpus once, without mutation.
+fuzz-check: $(FUZZ_CHECKS)
+$(FUZZ_CHECKS): fuzz-check-%: $(FUZZ_DIR)/fuzz-% $(FUZZ_DIR)/seeds/.stamp
+	@mkdir -p $(FUZZ_DIR)/corpus/$*
+	./$< -runs=0 -max_len=$(FUZZ_MAX_LEN) $(FUZZ_DIR)/corpus/$* $(FUZZ_DIR)/seeds/$*
+
+fuzz-clean:
+	$(RM) -r $(FUZZ_DIR)
+
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
 	$(RM) build/test-call_vp8_encode.o build/test-call_vp8_encode.d build/call_vp8_jetson.o build/call_vp8_jetson.d build/call_jetson_config.h
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
 	$(RM) build/vulkan-smoke build/vulkan-preview build/volk.o build/line_ui_spirv.h build/ui_uber.vert.spv build/ui_uber.frag.spv
+	$(RM) -r $(FUZZ_DIR)/obj $(FUZZ_DIR)/seeds
+	$(RM) $(FUZZ_BINARIES) $(FUZZ_DIR)/fuzz-seeds $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h
 
 -include $(OBJECTS:.o=.d) build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
+-include $(wildcard $(FUZZ_DIR)/obj/*.d)
