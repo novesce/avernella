@@ -180,7 +180,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | -------- | ------ |
 | `LINE_EXPERIMENTAL_VIDEO=0` | Turns off video calls (voice still works) |
 | `LINE_NOISE_SUPPRESSION=0` | Sends the raw microphone, without RNNoise |
-| `LINE_CALL_VIDEO_KBPS=<n>` | Overrides the video sending bitrate |
+| `LINE_CALL_VIDEO_KBPS=<n>` | Overrides the video sending bitrate. Direct calls send at least 1500 kbit/s HD unless this is set lower |
 | `LINE_CAMERA_DEVICE=<path>` | Camera device (default `/dev/video0`) |
 | `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`, `LINE_SHARE_KBPS` | Caps on screen-share capture and encoding |
 | `LINE_SHARE_TRANSPORT=presentation` | Sends a screen share as a native PDTP presentation instead of in the video stream (experimental) |

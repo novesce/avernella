@@ -220,7 +220,9 @@ static void pair(Pb *out, guint field, guint first, guint second)
 static void offer_stream(Pb *offer, guint index, gboolean video)
 {
 	static const char *const labels[] = { "A", "V", "D" };
-	static const guint bitrates[] = { 32, 800, 2000 };
+	/* Video offers the HD layer ceiling of LINE Android: 3000 kbit/s at
+	 * 30 frames/s. Viewers request smaller layers for their tile sizes. */
+	static const guint bitrates[] = { 32, 3000, 2000 };
 	static const guint codecs[] = { 1, CALL_GROUP_VIDEO_SVC, 6 };
 	guint receive = 103 + 10 * index, transmit = 203 + 10 * index;
 	Pb record = { 0 }, codec = { 0 }, path = { 0 };
@@ -230,8 +232,8 @@ static void offer_stream(Pb *offer, guint index, gboolean video)
 	pb_uint(&codec, 3, index != 1 || video);
 	pb_uint(&codec, 4, bitrates[index]);
 	if (index == 1) {
-		pb_uint(&codec, 5, 15);
-		pb_uint(&codec, 6, 2);
+		pb_uint(&codec, 5, 30);
+		pb_uint(&codec, 6, 3); /* HD_FHD */
 	}
 	pb_uint(&codec, 50, codecs[index]);
 	if (index == 1) {

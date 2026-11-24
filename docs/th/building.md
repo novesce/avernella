@@ -180,7 +180,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | ------ | -- |
 | `LINE_EXPERIMENTAL_VIDEO=0` | ปิดวิดีโอคอล (โทรเสียงยังใช้ได้) |
 | `LINE_NOISE_SUPPRESSION=0` | ส่งเสียงไมค์ดิบ ไม่ผ่าน RNNoise |
-| `LINE_CALL_VIDEO_KBPS=<n>` | กำหนดบิตเรตการส่งวิดีโอเอง |
+| `LINE_CALL_VIDEO_KBPS=<n>` | กำหนดบิตเรตการส่งวิดีโอเอง การโทรแบบตัวต่อตัวส่ง HD อย่างน้อย 1500 kbit/s เว้นแต่ตั้งค่านี้ให้ต่ำกว่า |
 | `LINE_CAMERA_DEVICE=<path>` | อุปกรณ์กล้อง (ค่าเริ่มต้น `/dev/video0`) |
 | `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`, `LINE_SHARE_KBPS` | เพดานของการจับและเข้ารหัสภาพตอนแชร์หน้าจอ |
 | `LINE_SHARE_TRANSPORT=presentation` | ส่งการแชร์หน้าจอเป็น presentation ผ่าน PDTP แบบเนทีฟแทนการส่งในสตรีมวิดีโอ (ทดลอง) |

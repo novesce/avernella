@@ -26,6 +26,9 @@ enum {
 	MEDIA_CONTROL_STREAMS = MEDIA_CONTROL_HEADER + 12,
 	GROUP_RELEASE_TIMEOUT_US = 2 * G_USEC_PER_SEC,
 	GROUP_RELEASE_RETRY_US = 500 * 1000,
+	/* The least a direct call sends: 1280x720 (resolution class 3). */
+	DIRECT_HD_KBPS = 1500,
+	DIRECT_HD_CLASS = 3,
 };
 
 /* A worker owns at most one call. Receiving a message cannot initiate a call. */
@@ -924,7 +927,8 @@ static void share_state(struct voice_call *c)
 
 		/*
 		 * Group data carries conference control. Publish the desktop
-		 * through the negotiated video stream with its display source ID.
+		 * through the negotiated video stream, tagged as camera video
+		 * so LINE's mobile apps display it.
 		 */
 		c->share_over_video =
 			c->video && (c->group || !c->data ||
@@ -1281,6 +1285,15 @@ static void choose_send_limits(struct voice_call *c, Slice peer)
 	const char *kbps_override = g_getenv("LINE_CALL_VIDEO_KBPS");
 
 	call_video_peer_limits(peer, &limits);
+	/*
+	 * LINE's apps advertise 400 kbit/s and VGA even with HD calls on
+	 * Wi-Fi, then display 1280x720 at 1.5 Mbit/s. Direct calls send at
+	 * least that; LINE_CALL_VIDEO_KBPS can lower it for a slow link.
+	 */
+	if (!c->group) {
+		limits.kbps = MAX(limits.kbps, DIRECT_HD_KBPS);
+		limits.resolution = MAX(limits.resolution, DIRECT_HD_CLASS);
+	}
 	c->send_kbps = CLAMP(limits.kbps ? limits.kbps : 800, 150, 4000);
 	if (kbps_override && *kbps_override)
 		c->send_kbps = CLAMP(g_ascii_strtoull(kbps_override, NULL, 10),

@@ -133,7 +133,9 @@ def check_native(data, video_test=None, execute_codec=False):
         return
     env = {k: v for k, v in os.environ.items() if not k.startswith(("LINE_", "AVERNELLA_"))}
     env.update(LINE_DISABLE_GPU="1", AVERNELLA_TEST_MEDIA_CONTRACT="1")
-    pictures = ((1, 0), (1, 0), (2, 1), (2, 1), (2, 1), (3, 0))
+    # Android shows group video only with the camera source tag, so a
+    # screen share keeps tag 0 and starts a new capture generation.
+    pictures = ((1, 0), (1, 0), (2, 0), (2, 0), (2, 0), (3, 0))
     profiles = (
         ("/video/conference-evs3-send", False),
         ("/video/conference-vp8-compact-vfd", False),

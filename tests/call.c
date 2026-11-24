@@ -1372,6 +1372,40 @@ static gboolean send_peer_video(const guint8 *packet, gsize size, gpointer data)
 		      sizeof(*endpoint->client)) == (ssize_t)size;
 }
 
+/*
+ * Avernella tags every group picture as camera video. A peer that tags a
+ * shared screen as a display is simulated by rewriting that record.
+ */
+struct display_peer {
+	struct video_peer *endpoint;
+	srtp_t open, seal;
+	guint tagged;
+};
+
+static gboolean send_peer_display(const guint8 *packet, gsize size,
+				  gpointer data)
+{
+	struct display_peer *peer = data;
+	guint8 copy[1500];
+	int n = size;
+
+	g_assert_cmpuint(size, <=, sizeof(copy));
+	memcpy(copy, packet, size);
+	g_assert_cmpint(srtp_unprotect(peer->open, copy, &n), ==,
+			srtp_err_status_ok);
+	for (int i = 12; i + 6 <= MIN(n, 96); i++) {
+		if (copy[i] == 0x80 && copy[i + 1] == 4 && copy[i + 2] == 1 &&
+		    copy[i + 4] == 2 && !copy[i + 5]) {
+			copy[i + 5] = 1;
+			peer->tagged++;
+			break;
+		}
+	}
+	g_assert_cmpint(srtp_protect(peer->seal, copy, &n), ==,
+			srtp_err_status_ok);
+	return send_peer_video(copy, n, peer->endpoint);
+}
+
 static void peer_display(const struct line_camera_frame *frame, gpointer data)
 {
 	struct video_peer *endpoint = data;
@@ -1589,8 +1623,9 @@ static void expect_group_camera_restart(struct fake_relay *relay,
 	gboolean acknowledged = FALSE;
 
 	g_assert_nonnull(receiver);
+	/* A 640x480 camera fills class 1 at 480x360. */
 	if (format == CALL_VIDEO_RTP_EXT_VED)
-		decoded.expected_width = 320;
+		decoded.expected_width = 480;
 	request_group_camera(relay, ssrc, encoding, format);
 	while (!decoded.got_frame && readable_until(server_fd, end)) {
 		Pb packet = receive_packet(relay), control = { 0 };
@@ -1771,13 +1806,21 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 
 	/* The focused participant can publish a display on this same stream. */
 	g_autoptr(GBytes) desktop = fixture_screen_pixels();
+	struct display_peer display = {
+		.endpoint = &endpoint,
+		.open = peer_context(tx, FALSE),
+		.seal = peer_context(tx, TRUE),
+	};
 
 	line_camera_i420_frame(&frame, g_bytes_get_data(desktop, NULL),
 			       SCREEN_WIDTH, SCREEN_HEIGHT);
 	call_video_screen(sender, 600, 10);
 	g_assert_true(call_video_encode(sender, &frame, g_get_monotonic_time(),
-					send_peer_video, &endpoint, &error));
+					send_peer_display, &display, &error));
 	g_assert_no_error(error);
+	g_assert_cmpuint(display.tagged, ==, 1);
+	srtp_dealloc(display.open);
+	srtp_dealloc(display.seal);
 	expect_event("call_frame c33333333333333333333333333333333");
 	g_clear_pointer(&image, g_bytes_unref);
 	image = line_call_take_frame(group, &info);

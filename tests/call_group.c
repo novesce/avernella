@@ -225,9 +225,10 @@ static void participate(void)
 
 		if (item.field != 1 || name.n != 1 || *name.p != 'V')
 			continue;
-		g_assert_cmpuint(pb_number(codec, 4, 0), ==, 800);
-		g_assert_cmpuint(pb_number(codec, 5, 0), ==, 15);
-		g_assert_cmpuint(pb_number(codec, 6, 0), ==, 2);
+		/* The HD layer ceiling of LINE Android. */
+		g_assert_cmpuint(pb_number(codec, 4, 0), ==, 3000);
+		g_assert_cmpuint(pb_number(codec, 5, 0), ==, 30);
+		g_assert_cmpuint(pb_number(codec, 6, 0), ==, 3);
 		while (pb_next(&codec, &field)) {
 			if (field.field != 50)
 				continue;

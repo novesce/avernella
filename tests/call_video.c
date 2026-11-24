@@ -923,7 +923,7 @@ static void group_resolution(void)
 		gboolean key;
 	} phases[] = {
 		{ -1, 640, 480, 2, 20, TRUE }, { 0, 160, 120, 0, 7, TRUE },
-		{ 0, 160, 120, 0, 7, FALSE },  { 1, 320, 240, 1, 15, TRUE },
+		{ 0, 160, 120, 0, 7, FALSE },  { 1, 480, 360, 1, 15, TRUE },
 		{ -1, 640, 480, 2, 20, TRUE }, { 4, 640, 480, 2, 20, FALSE },
 	};
 	struct loop loop = { 0 };
@@ -1025,8 +1025,9 @@ static void group_resolution_aspect(void)
 	static const struct {
 		guint width, height, output_width, output_height;
 	} cases[] = {
-		{ 640, 360, 320, 180 },	 { 1280, 720, 320, 180 },
-		{ 720, 1280, 180, 320 }, { 1920, 1080, 480, 270 },
+		/* Class 1 holds up to 172,800 pixels in the source's shape. */
+		{ 640, 360, 554, 310 },	 { 1280, 720, 554, 310 },
+		{ 720, 1280, 310, 554 }, { 1920, 1080, 554, 310 },
 		{ 160, 120, 160, 120 },
 	};
 	struct loop loop = { 0 };
@@ -1078,9 +1079,10 @@ static void group_evs3_tx(gconstpointer data)
 		guint8 generation, source, ved_rate, vfd_rate;
 		gboolean key;
 	} pictures[] = {
-		{ 0, 1, 0, 15, 37, TRUE },	{ 0, 1, 0, 15, 37, FALSE },
-		{ 400, 2, 1, 20, 50, TRUE },	{ 500, 2, 1, 25, 62, TRUE },
-		{ 8000, 2, 1, 255, 255, TRUE }, { 0, 3, 0, 15, 37, TRUE },
+		/* A 320x240 screen keeps the 300 kbit/s class 1 budget. */
+		{ 0, 1, 0, 15, 37, TRUE },    { 0, 1, 0, 15, 37, FALSE },
+		{ 400, 2, 0, 15, 37, TRUE },  { 500, 2, 0, 15, 37, TRUE },
+		{ 8000, 2, 0, 15, 37, TRUE }, { 0, 3, 0, 15, 37, TRUE },
 	};
 	struct loop loop = { 0 };
 	srtp_t observer;

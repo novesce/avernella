@@ -32,6 +32,7 @@ enum {
 	EVS3_GROUP_LAYER_SYNC = 0x10,
 	EVS3_PROFILE_HEADER = 6,
 	EVS3_CAPTURE_SOURCE_SIZE = 6,
+	EVS3_SOURCE_CAMERA = 0,
 	EVS3_ENCODE_DELAY_SIZE = 4,
 	EVS3_BASE_LAYER_SIZE = 3,
 	EVS3_RTP_VFD_SIZE = 12,
@@ -552,9 +553,10 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 	guint fps = screen ? v->screen_fps : v->fps;
 
 	/* The negotiated stream rate is a ceiling for the whole conference
-	 * video. The published SVC camera layer has its own rate budget.
+	 * video. The published SVC layer has its own rate budget, whether it
+	 * carries the camera or a shared screen.
 	 */
-	if (v->group_profile && !screen) {
+	if (v->group_profile) {
 		static const guint max_kbps[] = { 150, 300, 800, 3000 };
 		guint layer = resolution_class(pixels);
 
@@ -562,6 +564,11 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 			kbps = MIN(kbps, max_kbps[layer]);
 		if (!layer)
 			fps = MIN(fps, 15u);
+		/* Text stays sharper with more bits for each picture. */
+		if (screen)
+			fps = MIN(fps, kbps < 1200 ? 12u :
+				       kbps < 2400 ? 20u :
+						     30u);
 	}
 	if (s->ready && w == s->width && h == s->height && kbps == s->kbps &&
 	    fps == s->fps)
@@ -623,21 +630,24 @@ static gboolean group_encoder_image(struct call_video *v, vpx_image_t *img)
 		guint source = resolution_class(w * h);
 		guint target = v->requested_resolution;
 
-		if (target < source && v->screen_kbps) {
-			double ratio = sqrt((double)resolution_pixels[target] /
-					    (w * h));
+		/*
+		 * Fill the requested class with the source's shape. LINE
+		 * Android displays any size within the class, so a grid tile
+		 * gets 554x310 from 720p instead of the 320x180 that halving
+		 * each dimension per class would give.
+		 */
+		if (target < source) {
+			guint limit = resolution_pixels[target];
+			double ratio = sqrt((double)limit / (w * h));
 
 			w = MAX(2u, (guint)(w * ratio) & ~1u);
 			h = MAX(2u, (guint)(h * ratio) & ~1u);
-		} else if (target < source) {
-			/* LINE's camera transcoder halves both dimensions per class.
-			 * Align the full-size image before reducing to even I420 planes.
-			 */
-			guint mask = (1u << MAX(source, 1u)) - 1;
-			guint shift = source - target;
-
-			w = MAX(2u, ((w & ~mask) >> shift) & ~1u);
-			h = MAX(2u, ((h & ~mask) >> shift) & ~1u);
+			if (w * h > limit) {
+				if (w >= h)
+					w -= 2;
+				else
+					h -= 2;
+			}
 		}
 	}
 	if (w == img->w && h == img->h && img->stride[1] == img->stride[2]) {
@@ -705,8 +715,14 @@ static gsize write_descriptor(const struct call_video *v, guint8 *p, guint16 id,
 		p[pos++] = 4;
 		p[pos++] = 1;
 		p[pos++] = v->capture_generation;
+		/*
+		 * LINE Android leaves a group participant's tile on the
+		 * avatar for any source other than a camera, so a shared
+		 * screen is published as camera video. The generation still
+		 * marks each switch between webcam and desktop capture.
+		 */
 		p[pos++] = 2;
-		p[pos++] = v->capture_source;
+		p[pos++] = EVS3_SOURCE_CAMERA;
 		p[pos++] = 5;
 		p[pos++] = v->group_profile ? 2 : 0x82;
 		write16(p + pos, delay_ms);
@@ -828,7 +844,7 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 		v->tx_extension == CALL_VIDEO_RTP_EXT_VED ? EVS3_RTP_VED_SIZE :
 							    0;
 	guint16 id = v->picture++;
-	guint8 source = v->screen_kbps != 0; /* Camera 0, virtual display 1. */
+	guint8 source = v->screen_kbps != 0; /* Local webcam 0, desktop 1. */
 
 	if (size > FRAME_LIMIT) {
 		v->sender.force_key = TRUE;
