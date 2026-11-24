@@ -1602,15 +1602,14 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 					send_peer_video, &endpoint, &error));
 	g_assert_no_error(error);
 	expect_event("call_frame c33333333333333333333333333333333");
-	int width, height, rotation;
-	gboolean camera;
+	struct line_preview_frame info;
 
-	image = line_call_take_frame(group, &width, &height, &rotation,
-				     &camera);
+	image = line_call_take_frame(group, &info);
 	g_assert_nonnull(image);
-	g_assert_cmpint(width, ==, 160);
-	g_assert_cmpint(height, ==, 120);
-	g_assert_true(camera);
+	g_assert_cmpuint(info.width, ==, 160);
+	g_assert_cmpuint(info.height, ==, 120);
+	g_assert_true(info.camera_enabled);
+	g_assert_false(info.screen);
 	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
 
 	while (!endpoint.got_frame && readable_until(server_fd, end)) {
@@ -1689,12 +1688,12 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 	g_assert_no_error(error);
 	expect_event("call_frame c33333333333333333333333333333333");
 	g_clear_pointer(&image, g_bytes_unref);
-	image = line_call_take_frame(group, &width, &height, &rotation,
-				     &camera);
+	image = line_call_take_frame(group, &info);
 	g_assert_nonnull(image);
-	g_assert_false(camera);
-	g_assert_cmpint(width, ==, 320);
-	g_assert_cmpint(height, ==, 240);
+	g_assert_false(info.camera_enabled);
+	g_assert_false(info.screen);
+	g_assert_cmpuint(info.width, ==, 320);
+	g_assert_cmpuint(info.height, ==, 240);
 
 	/* The focused participant can publish a display on this same stream. */
 	g_autoptr(GBytes) desktop = fixture_screen_pixels();
@@ -1707,18 +1706,33 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 	g_assert_no_error(error);
 	expect_event("call_frame c33333333333333333333333333333333");
 	g_clear_pointer(&image, g_bytes_unref);
-	image = line_call_take_frame(group, &width, &height, &rotation,
-				     &camera);
+	image = line_call_take_frame(group, &info);
 	g_assert_nonnull(image);
-	g_assert_cmpint(width, ==, SCREEN_WIDTH);
-	g_assert_cmpint(height, ==, SCREEN_HEIGHT);
+	g_assert_cmpuint(info.width, ==, SCREEN_WIDTH);
+	g_assert_cmpuint(info.height, ==, SCREEN_HEIGHT);
 	g_assert_cmpuint(g_bytes_get_size(image), ==,
 			 g_bytes_get_size(desktop));
 	const guint8 *pixels = g_bytes_get_data(image, NULL);
 
 	g_assert_cmpint(ABS((int)pixels[0] - 168), <=, 8);
-	g_assert_cmpint(ABS((int)pixels[width * (height - 1)] - 72), <=, 8);
-	g_assert_false(camera);
+	g_assert_cmpint(ABS((int)pixels[info.width * (info.height - 1)] - 72),
+			<=, 8);
+	g_assert_false(info.camera_enabled);
+	g_assert_true(info.screen);
+
+	call_video_screen(sender, 0, 0);
+	synthetic_frame(&frame, 320);
+	g_assert_true(call_video_encode(sender, &frame, g_get_monotonic_time(),
+					send_peer_video, &endpoint, &error));
+	g_assert_no_error(error);
+	expect_event("call_frame c33333333333333333333333333333333");
+	g_clear_pointer(&image, g_bytes_unref);
+	image = line_call_take_frame(group, &info);
+	g_assert_nonnull(image);
+	g_assert_false(info.screen);
+	g_assert_cmpuint(info.width, ==, 320);
+	g_assert_cmpuint(info.height, ==, 240);
+
 	g_autoptr(J) enabled = line_call_camera(TRUE, &error);
 
 	g_assert_no_error(error);
@@ -1730,8 +1744,7 @@ static void group_video_exchange(struct fake_relay *relay, const guint8 *local,
 	call_video_close(receiver);
 }
 
-static GBytes *direct_video(int *width, int *height, int *rotation,
-			    gboolean *camera_enabled)
+static GBytes *direct_video(struct line_preview_frame *info)
 {
 	struct pollfd input = { .fd = preview_fd, .events = POLLIN };
 	gint64 end = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
@@ -1756,10 +1769,7 @@ static GBytes *direct_video(int *width, int *height, int *rotation,
 			g_assert_cmpint(read(fd, pixels, size), ==, size);
 			g_clear_pointer(&remote, g_bytes_unref);
 			remote = g_bytes_new_take(pixels, size);
-			*width = msg.width;
-			*height = msg.height;
-			*rotation = msg.rotation;
-			*camera_enabled = msg.camera_enabled;
+			*info = msg;
 		} else {
 			guint8 y;
 
@@ -1823,31 +1833,29 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	g_assert_true(call_video_encode(video, &frame, g_get_monotonic_time(),
 					send_peer_video, &endpoint, &error));
 	g_assert_no_error(error);
-	int width = 0, height = 0, rotation = -1;
-	gboolean camera_enabled = FALSE;
+	struct line_preview_frame info = { 0 };
 
 	g_autoptr(GBytes) picture = NULL;
 
 	if (preview_fd >= 0)
-		picture = direct_video(&width, &height, &rotation,
-				       &camera_enabled);
+		picture = direct_video(&info);
 	else {
 		expect_event("call_frame u22222222222222222222222222222222");
-		picture = line_call_take_frame(peer, &width, &height, &rotation,
-					       &camera_enabled);
+		picture = line_call_take_frame(peer, &info);
 	}
 
 	g_assert_nonnull(picture);
-	g_assert_cmpint(camera_enabled, ==, local_camera);
-	g_assert_cmpint(rotation, ==, 0);
-	g_assert_cmpint(width, ==, WIDTH);
-	g_assert_cmpint(height, ==, HEIGHT);
+	g_assert_cmpint(info.camera_enabled, ==, local_camera);
+	g_assert_false(info.screen);
+	g_assert_cmpuint(info.rotation, ==, 0);
+	g_assert_cmpuint(info.width, ==, WIDTH);
+	g_assert_cmpuint(info.height, ==, HEIGHT);
 	g_assert_cmpuint(g_bytes_get_size(picture), ==,
 			 WIDTH * HEIGHT + 2 * CHROMA * CHROMA_ROWS);
 	struct line_camera_frame decoded;
 
-	line_camera_i420_frame(&decoded, g_bytes_get_data(picture, NULL), width,
-			       height);
+	line_camera_i420_frame(&decoded, g_bytes_get_data(picture, NULL),
+			       info.width, info.height);
 	const guint expected[] = { 96, 80, 160 };
 
 	for (unsigned int i = 0; i < G_N_ELEMENTS(expected); i++) {
@@ -1860,8 +1868,7 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 			ABS((int)decoded.plane[i][size - 1] - (int)expected[i]),
 			<=, 8);
 	}
-	g_assert_null(
-		line_call_take_frame(peer, &width, &height, &rotation, NULL));
+	g_assert_null(line_call_take_frame(peer, &info));
 	if (!local_camera) {
 		call_video_close(video);
 		return;
@@ -1897,6 +1904,7 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	}
 	g_assert_true(endpoint.got_frame);
 	/* The same captured frames feed the window's local preview. */
+	int width = 0, height = 0;
 	g_autoptr(GBytes) self =
 		line_call_take_self_frame(peer, &width, &height);
 

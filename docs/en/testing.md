@@ -24,13 +24,22 @@ Some tests need extra tools at run time:
 
 ## Group video and screen sharing
 
-From the repository root, run the following with the local LINE **26.18.2 Android base APK**. Python 3 uses its standard library. The APK stays on your machine and the ordinary `make check` can run without it.
+Supply either the LINE **26.16.0 APKM** (version code `261600106`, with its ARM64 split) or the **26.18.2 base APK**. Use the APKM for the native packet comparison. That check needs LLVM’s `llvm-objdump` on your PATH. Both use Python 3 and the usual project build dependencies.
 
 ```sh
-make check-group-media LINE_APK=/path/to/LINE.apk
+make check-group-media LINE_APK="/path/to/LINE-26.16.0.apkm"
+make check-group-media LINE_APK="/path/to/LINE-26.18.2.apk"
 ```
 
-The harness verifies the APK digest, resolves DEX instructions for sending camera state and requesting a participant’s video, and checks the separate Android presentation controls and per-user frame callbacks. An unrecognized APK produces an error. The fixtures then run Avernella’s call worker against a loopback relay using synthetic pictures. They check participant focus, outgoing camera and screen pixels, late viewers of a static share, camera restoration, a canceled picker, and one-to-one presentation start and stop. They also exercise the group share shortcut. A missing or skipped fixture fails the run.
+The harness recognizes the artifact by SHA-256, so the filename can change. It reads the official DEX instructions for camera state, participant selection and presentation callbacks in each build. For the APKM it also inspects the matching ARM64 call library and compares its packet format with 30 synthetic pictures from the Linux sender. Each of five conference formats switches from camera to screen and back. Temporary copies of the nested APKs are removed after inspection. The regular `make check` runs without either download.
+
+The fixtures run Avernella’s call worker against a loopback relay. They check participant focus, the sharing indicator on decoded frames, missing or late source metadata, late viewers of a static share, camera restoration, a canceled picker, one-to-one presentation start and stop, and the group share controls. A missing or skipped required case fails the run.
+
+To exercise artifact selection and its rejection paths with both files available, run:
+
+```sh
+python3 tests/test_group_media_artifact.py "/path/to/LINE-26.16.0.apkm" "/path/to/LINE-26.18.2.apk"
+```
 
 The loopback receiver can decode Avernella’s media without using the public relay. To verify delivery on real devices, build and open the current Avernella binary and start a group video call with two consenting Android participants. Run the following interactive check in a terminal you can share. It checks each direction, the switch back to camera and whether the viewers can read a changing code from the shared terminal.
 

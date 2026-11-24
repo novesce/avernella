@@ -30,8 +30,8 @@ gint64 line_voice_tick(void);
 J *line_voice_answer(const char *caller, GError **error);
 J *line_voice_decline(const char *caller, GError **error);
 /* Takes the latest pending remote frame as tightly packed I420. */
-GBytes *line_call_take_frame(const char *chat, int *width, int *height,
-			     int *rotation, gboolean *camera_enabled);
+struct line_preview_frame;
+GBytes *line_call_take_frame(const char *chat, struct line_preview_frame *info);
 /* Takes the latest frame of the peer's screen share as packed I420. */
 GBytes *line_call_take_share_frame(const char *chat, int *width, int *height,
 				   int *rotation, gboolean *sharing);

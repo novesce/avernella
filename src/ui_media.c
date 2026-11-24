@@ -114,7 +114,7 @@ struct call_picture {
 	SDL_Texture *texture;
 	cairo_surface_t *surface;
 	SDL_FRect view;
-	gboolean upload, convert, texture_failed;
+	gboolean upload, convert, texture_failed, screen;
 };
 
 enum stage_tile {
@@ -2633,8 +2633,14 @@ void ui_media_call_event(Json *p)
 
 static void update_call_picture(int fd, int width, int height, int rotation,
 				gboolean self, gboolean share,
-				gboolean camera_enabled, gint64 decoded_at)
+				gboolean camera_enabled, gboolean screen,
+				gint64 decoded_at)
 {
+	if (!self && !share && decoded_at &&
+	    (decoded_at < m.call_frames_since ||
+	     decoded_at < m.peer_video_since ||
+	     decoded_at < m.call_frame.decoded_at))
+		return;
 	if (m.window_hidden)
 		return;
 	if (rotation < 0 || rotation >= 360 || rotation % 90)
@@ -2657,6 +2663,7 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 				       self  ? &m.self_frame :
 					       &m.call_frame;
 	gboolean first = !picture->pixels;
+	gboolean source_changed = picture->screen != screen;
 
 	if (picture->frame.width != (unsigned int)width ||
 	    picture->frame.height != (unsigned int)height)
@@ -2666,6 +2673,7 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	if (picture->frame.rotation != (unsigned int)rotation)
 		picture->view.w = 0;
 	picture->pixels = pixels;
+	picture->screen = screen;
 	picture->decoded_at = decoded_at;
 	static uint64_t generation;
 
@@ -2704,7 +2712,8 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 		return;
 	if (first && !g_strcmp0(g_getenv("LINE_CALL_DEBUG"), "1"))
 		g_printerr("line-call video first frame reached window\n");
-	if ((ui.renderer || ui_gpu_active()) && picture->view.w > 0)
+	if (!source_changed && (ui.renderer || ui_gpu_active()) &&
+	    picture->view.w > 0)
 		ui.video_dirty = TRUE;
 	else
 		ui.dirty = TRUE;
@@ -2724,6 +2733,7 @@ void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
 		return;
 	update_call_picture(fd, frame->width, frame->height, frame->rotation,
 			    self, share, frame->camera_enabled,
+			    frame->screen && group_call() && !self && !share,
 			    frame->decoded_at);
 }
 
@@ -2743,7 +2753,10 @@ static void video_frame(Json *result, gboolean self, gboolean share)
 	update_call_picture(
 		fd, width, height,
 		json_object_get_int(ui_field(result, "rotation")), self, share,
-		json_object_get_boolean(ui_field(result, "cameraEnabled")), 0);
+		json_object_get_boolean(ui_field(result, "cameraEnabled")),
+		!self && !share && group_call() &&
+			json_object_get_boolean(ui_field(result, "screen")),
+		json_object_get_int64(ui_field(result, "decodedAt")));
 	close(fd);
 }
 
@@ -2870,7 +2883,7 @@ static Rect fullscreen_exit(void)
 	return (Rect){ ui.width - w - 6, 4, w, FULLSCREEN_BAR_H - 8 };
 }
 
-static const char *video_peer_name(void)
+static const char *video_peer_name(char **label)
 {
 	if (!group_call())
 		return m.call_name;
@@ -2884,9 +2897,15 @@ static const char *video_peer_name(void)
 		const char *id = ui_string(member, "id", "");
 		const char *name = ui_string(member, "name", "");
 
-		if (!strcmp(id, m.call_video_peer) && *name)
-			return name;
+		if (!strcmp(id, m.call_video_peer) && *name) {
+			if (!m.call_frame.screen)
+				return name;
+			*label = g_strdup_printf(_("%s's screen"), name);
+			return *label;
+		}
 	}
+	if (m.call_frame.screen)
+		return _("Shared screen");
 	return m.call_frame.pixels ? _("Video call") : _("Waiting for video…");
 }
 
@@ -2896,11 +2915,12 @@ void ui_media_draw_fullscreen(void)
 	Rect exit = fullscreen_exit();
 	Rect area = { 0, FULLSCREEN_BAR_H, ui.width,
 		      MAX(0, ui.height - FULLSCREEN_BAR_H) };
+	g_autofree char *label = NULL;
 	const char *name = m.fullscreen_tile == TILE_SELF ?
 				   (ui.name ? ui.name : _("You")) :
 			   m.fullscreen_tile == TILE_PEER_SCREEN ?
 				   _("Shared screen") :
-				   video_peer_name();
+				   video_peer_name(&label);
 
 	m.call_frame.view.w = m.self_frame.view.w = m.share_frame.view.w = 0;
 	ui_draw_box((Rect){ 0, 0, ui.width, ui.height }, 0);
@@ -3003,9 +3023,9 @@ void ui_media_draw_call_dock(void)
 }
 
 /* Discord marks a tile that is streaming a screen with a red LIVE pill. */
-static void live_badge(Rect tile)
+static void live_badge(int x, int y)
 {
-	Rect pill = { tile.x + 10, tile.y + 10, 40, 20 };
+	Rect pill = { x, y, 40, 20 };
 
 	ui_draw_rounded(pill, 4, 0xda373c);
 	ui_draw_centered("LIVE", (Rect){ pill.x, pill.y + 1, pill.w, pill.h },
@@ -3041,6 +3061,7 @@ static void call_tile(int index, struct call_picture *picture, const char *name,
 		      const char *seed, gboolean live, gboolean streaming)
 {
 	Rect tile = m.tile_rect[index];
+	gboolean group_screen = streaming && group_call();
 
 	ui_draw_rounded(tile, 8, UI_SIDEBAR);
 	gboolean shown = live && draw_call_frame(picture, tile);
@@ -3055,16 +3076,30 @@ static void call_tile(int index, struct call_picture *picture, const char *name,
 					       tile.y + (tile.h - side) / 2,
 					       side, side });
 	}
-	if (streaming)
-		live_badge(tile);
+	if (streaming && !group_screen)
+		live_badge(tile.x + 10, tile.y + 10);
 	int label_w = tile.w;
-	if (shown && tile.w >= 24) {
-		int w = tile.w >= 128 ? 72 : 24;
+	if (shown && tile.w >= (group_screen ? 48 : 24)) {
+		int w = tile.w >= (group_screen ? 160 : 128) ? 72 : 24;
 		Rect r = { tile.x + tile.w - w, tile.y + tile.h + 2, w, 22 };
 
 		m.fullscreen_button[index] = r;
 		draw_expand_button(r);
 		label_w -= w + 4;
+	}
+	if (group_screen) {
+		/* SDL and Vulkan present the video over the stage texture. */
+		int right = tile.x + label_w;
+		int top = tile.y + tile.h + 3;
+
+		if (label_w >= 72) {
+			live_badge(right - 40, top);
+			label_w -= 44;
+		} else if (label_w >= 6) {
+			ui_draw_rounded((Rect){ right - 6, top + 7, 6, 6 }, 3,
+					0xda373c);
+			label_w -= 10;
+		}
 	}
 	if (label_w > 0)
 		ui_draw_label(name,
@@ -3225,7 +3260,7 @@ static void draw_own_screen(Rect tile)
 			 (Rect){ tile.x + 8, tile.y + tile.h / 2 - 11,
 				 tile.w - 16, 22 },
 			 tile.h > 80 ? 15 : 11, 600, UI_HEADING);
-	live_badge(tile);
+	live_badge(tile.x + 10, tile.y + 10);
 	ui_draw_label(_("Your screen"),
 		      (Rect){ tile.x, tile.y + tile.h + 6, tile.w, 20 }, 13,
 		      600, UI_BODY, FALSE);
@@ -3250,9 +3285,11 @@ static void draw_group_video(Rect stage, int controls_y, const char *self)
 		m.tile_rect[0] = (Rect){ left, top, peer_w, height };
 		m.tile_rect[local - 1] = (Rect){ left + peer_w + gap, top,
 						 tiles_w - peer_w, height };
-		call_tile(0, &m.call_frame, video_peer_name(),
+		g_autofree char *label = NULL;
+
+		call_tile(0, &m.call_frame, video_peer_name(&label),
 			  m.call_video_peer, m.call_frame.pixels != NULL,
-			  FALSE);
+			  m.call_frame.screen);
 		if (local == TILE_OWN_SCREEN)
 			draw_own_screen(m.tile_rect[local - 1]);
 		else

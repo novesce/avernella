@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Check the group media paths in a locally supplied LINE 26.18.2 Android APK."""
+"""Check group media in a local LINE Android base APK or split APKM bundle."""
 
 import argparse
 import hashlib
+from pathlib import Path
+import shutil
 import struct
+import subprocess
 import sys
+import tempfile
 import zipfile
 
 
@@ -16,7 +20,6 @@ JNI = BASE + "jni/SessionJNIImpl;"
 EXT = BASE + "jni/SessionExtensionJNIImpl;"
 STRING = "Ljava/lang/String;"
 INFO = BASE + "VideoControl$StreamInfo;"
-CMD = "Le40/d$a;"
 SOURCE = BASE + "video/p;"
 PARTY = BASE + "VideoControl$Group$b$a;"
 DIRECTION = BASE + "core/session/a$b;"
@@ -130,89 +133,147 @@ class Dex:
                 raise CheckError(f"{owner}->{signature} at {offset:#x}: expected {target}, got {reference}")
 
 
-def group_video(dex):
-    dispatch = SESSION + "->g(Le40/d;)Z"
+def group_video(dex, command, requester, get_frame, update_info):
+    cmd = command + "$a;"
+    dispatch = SESSION + "->g(" + command + ";)Z"
     request = BASE + "core/session/ServiceSession$UserVideoRequest"
     request_constructor = (request + ";-><init>(" + STRING + STRING + request
                            + "$RequestType;" + BASE + "core/session/constant/VideoResolution;)V")
     dex.check(SESSION, "h(ZZ)V", [
-        (0x02, SGET_OBJECT, CMD + "->SET_VIDEO_SEND_STATE:" + CMD),
+        (0x02, SGET_OBJECT, cmd + "->SET_VIDEO_SEND_STATE:" + cmd),
         (0x14, VIRTUAL, dispatch),
     ])
-    dex.check(BASE + "core/k;", "k(Ljava/util/HashSet;)Z", [
+    dex.check(BASE + "core/" + requester + ";", "k(Ljava/util/HashSet;)Z", [
         (0x2c, DIRECT, request_constructor),
-        (0x65, SGET_OBJECT, CMD + "->REQUEST_PARTICIPANT_VIDEO:" + CMD),
+        (0x65, SGET_OBJECT, cmd + "->REQUEST_PARTICIPANT_VIDEO:" + cmd),
         (0x92, VIRTUAL, dispatch),
     ])
-    dex.check(JNI, "S0(J" + STRING + ")Ljava/lang/Object;", [
+    dex.check(JNI, get_frame + "(J" + STRING + ")Ljava/lang/Object;", [
         (0x00, STATIC, JNI + "->nVideoStreamGetUserFrame(J" + STRING + ")Ljava/lang/Object;"),
     ])
-    dex.check(JNI, "W0(J" + INFO + ")V", [
+    dex.check(JNI, update_info + "(J" + INFO + ")V", [
         (0x00, STATIC, JNI + "->nVideoStreamUpdateLocalStreamInfo(JLjava/lang/Object;)V"),
     ])
 
 
-def presentation_controls(dex):
+def presentation_controls(dex, wrappers):
     controls = (
-        ("o1(J)Z", 0, "nSessionExtensionIsPresentationSupported(J)Z"),
-        ("Q1(J)Z", 1, "nSessionExtensionStartPresentation(JZ)Z"),
-        ("R1(IJ)Z", 0, "nSessionExtensionStopPresentation(JI)Z"),
-        ("z1(J" + STRING + ")Z", 0, "nSessionExtensionPausePresentation(J" + STRING + ")Z"),
-        ("K1(J" + STRING + ")Z", 0, "nSessionExtensionResumePresentation(J" + STRING + ")Z"),
+        ("(J)Z", 0, "nSessionExtensionIsPresentationSupported(J)Z"),
+        ("(J)Z", 1, "nSessionExtensionStartPresentation(JZ)Z"),
+        ("(IJ)Z", 0, "nSessionExtensionStopPresentation(JI)Z"),
+        ("(J" + STRING + ")Z", 0, "nSessionExtensionPausePresentation(J" + STRING + ")Z"),
+        ("(J" + STRING + ")Z", 0, "nSessionExtensionResumePresentation(J" + STRING + ")Z"),
     )
-    for wrapper, offset, function in controls:
+    for index, (signature, offset, function) in enumerate(controls):
         flags, code = dex.declared(EXT, function)
         if not flags & 0x100 or code:
             raise CheckError(f"expected native declaration for {function}")
-        dex.check(EXT, wrapper, [(offset, STATIC, EXT + "->" + function)])
+        dex.check(EXT, wrappers[index] + signature, [(offset, STATIC, EXT + "->" + function)])
 
 
-def receiving_screen_share(dex):
+def group_screen_source(dex, manager, participant):
     group_change = BASE + "VideoControl$Group$StreamChangeEvent;"
-    dex.check("Luw7/b$b$a;", "streamSourceEvent(" + group_change + ")V", [
+    dex.check(manager + "$b$a;", "streamSourceEvent(" + group_change + ")V", [
         (0x09, SGET_OBJECT, PARTY + "->PARTICIPANT:" + PARTY),
         (0x0d, VIRTUAL, INFO + "->d()" + SOURCE),
         (0x11, SGET_OBJECT, SOURCE + "->VIRTUAL_DISPLAY:" + SOURCE),
-        (0x22, VIRTUAL, "Luw7/b$b;->d(" + STRING + ")Liy8/c3;"),
+        (0x22, VIRTUAL, manager + "$b;->d(" + STRING + ")" + participant),
     ])
+
+
+def presentation_events(dex, manager):
     receive = (0x05, SGET_OBJECT, DIRECTION + "->RX:" + DIRECTION)
     for event, parameter, callback in (("Start", "e", "b"), ("Stop", "f", "a")):
-        dex.check("Luw7/b$d;", "onPresentation" + event + "(" + BASE + "e$" + parameter + ";)V", [
+        dex.check(manager + "$d;", "onPresentation" + event + "(" + BASE + "e$" + parameter + ";)V", [
             receive,
-            (0x11, INTERFACE, "Luw7/b$a;->" + callback + "(" + STRING + ")V"),
+            (0x11, INTERFACE, manager + "$a;->" + callback + "(" + STRING + ")V"),
         ])
-    dex.check("Luw7/b$d;", "onPresentationFrameEvent(" + BASE + "e$c;)V", [
+    dex.check(manager + "$d;", "onPresentationFrameEvent(" + BASE + "e$c;)V", [
         receive,
         (0x11, IGET_OBJECT, FRAME + "->userId:" + STRING),
-        (0x19, INTERFACE_RANGE, "Luw7/b$a;->c(IJI" + STRING + ")V"),
+        (0x19, INTERFACE_RANGE, manager + "$a;->c(IJI" + STRING + ")V"),
     ])
+
+
+def check_managed(apk, version):
+    # R8 moved the same contracts between DEX files and renamed their wrappers.
+    if version == "26.16.0":
+        core_file = events_file = "classes8.dex"
+        source_file = "classes4.dex"
+        camera = ("Lj40/d", "n", "C0", "G0")
+        controls = ("K", "e0", "f0", "V", "Z")
+        manager, participant = "Lbv7/c", "Luw8/e3;"
+    elif version == "26.18.2":
+        core_file = "classes4.dex"
+        source_file = events_file = "classes12.dex"
+        camera = ("Le40/d", "k", "S0", "W0")
+        controls = ("o1", "Q1", "R1", "z1", "K1")
+        manager, participant = "Luw7/b", "Liy8/c3;"
+    else:
+        raise CheckError(f"no managed media contract for LINE {version}")
+
+    files = {name: Dex(apk.read(name)) for name in {core_file, source_file, events_file}}
+    group_video(files[core_file], *camera)
+    presentation_controls(files[core_file], controls)
+    group_screen_source(files[source_file], manager, participant)
+    presentation_events(files[events_file], manager)
+    print(f"{core_file}: camera send state, participant video requests and per-user frames")
+    print(f"{core_file}: presentation capability, start, pause, resume and stop JNI calls")
+    print(f"{source_file}: group virtual-display selection")
+    print(f"{events_file}: per-user presentation callbacks")
+
+
+BUNDLE_SHA256 = "4a82c3173a935c52dbe96b8768b73a2dda7284b860f37e4982d72b5672dbf1af"
+
+
+def check_bundle(bundle, video_test):
+    from group_media_native import check_native
+
+    # Inner APKs are deflated. Spool one at a time so seeking to DEX or ELF
+    # members neither inflates the outer member repeatedly nor buffers it in RAM.
+    for name in ("base.apk", "split_config.arm64_v8a.apk"):
+        with tempfile.TemporaryFile() as tmp:
+            with bundle.open(name) as member:
+                shutil.copyfileobj(member, tmp, length=1024 * 1024)
+            tmp.seek(0)
+            with zipfile.ZipFile(tmp) as apk:
+                if name == "base.apk":
+                    check_managed(apk, "26.16.0")
+                else:
+                    check_native(apk.read("lib/arm64-v8a/libandromeda.so"), video_test)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("apk", help="path to your local LINE.apk")
+    parser.add_argument("artifact", help="26.18.2 base APK or 26.16.0 APKM")
+    parser.add_argument("--check-sender", action="store_true",
+                        help="compare Linux sender packets when the native ARM64 split is present")
     args = parser.parse_args()
-    with open(args.apk, "rb") as source:
+    with open(args.artifact, "rb") as source:
         digest = hashlib.sha256()
         for chunk in iter(lambda: source.read(1024 * 1024), b""):
             digest.update(chunk)
-        if digest.hexdigest() != APK_SHA256:
-            raise CheckError(f"unsupported APK SHA-256 {digest.hexdigest()} (expected {APK_SHA256})")
+        identity = digest.hexdigest()
+        if identity == APK_SHA256:
+            version = "26.18.2"
+        elif identity == BUNDLE_SHA256:
+            version = "26.16.0"
+        else:
+            raise CheckError(f"unsupported APK or APKM SHA-256 {identity}")
         source.seek(0)
-        with zipfile.ZipFile(source) as apk:
-            dex = Dex(apk.read("classes4.dex"))
-            group_video(dex)
-            presentation_controls(dex)
-            receiving_screen_share(Dex(apk.read("classes12.dex")))
-    print(f"PASS LINE Android 26.18.2 ({APK_SHA256})")
-    print("classes4.dex: camera send state, participant video requests and per-user frames")
-    print("classes4.dex: presentation capability, start, pause, resume and stop JNI calls")
-    print("classes12.dex: group virtual-display selection and per-user presentation callbacks")
-    print("These are static Android code paths. Relay and device delivery require a live call.")
+        with zipfile.ZipFile(source) as artifact:
+            if version == "26.16.0":
+                video_test = Path(__file__).resolve().parents[1] / "build/test-call-video"
+                check_bundle(artifact, video_test if args.check_sender else None)
+            else:
+                check_managed(artifact, version)
+    print(f"PASS LINE Android {version} ({identity})")
+    print("Relay and handset playback require a live call.")
 
 
 if __name__ == "__main__":
     try:
         main()
-    except (OSError, KeyError, zipfile.BadZipFile, CheckError) as error:
+    except (OSError, KeyError, zipfile.BadZipFile, CheckError, ValueError,
+            subprocess.SubprocessError) as error:
         sys.exit(f"APK check failed: {error}")

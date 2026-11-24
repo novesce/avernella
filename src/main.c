@@ -1649,8 +1649,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "callDecline"))
 		return line_voice_decline(chat, error);
 	if (!strcmp(method, "callFrame")) {
-		int width, height, rotation = 0;
-		gboolean camera_enabled = FALSE;
+		int width = 0, height = 0, rotation = 0;
+		struct line_preview_frame info = { 0 };
 		gboolean self = json_object_get_boolean(
 			json_object_object_get(params, "self"));
 		gboolean share = json_object_get_boolean(
@@ -1660,13 +1660,17 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			share ? line_call_take_share_frame(chat, &width,
 							   &height, &rotation,
 							   &sharing) :
-			self ? line_call_take_self_frame(chat, &width,
-							 &height) :
-			       line_call_take_frame(chat, &width, &height,
-						    &rotation, &camera_enabled);
+			self  ? line_call_take_self_frame(chat, &width,
+							  &height) :
+				line_call_take_frame(chat, &info);
 
 		if (!frame)
 			return obj();
+		if (!self && !share) {
+			width = info.width;
+			height = info.height;
+			rotation = info.rotation;
+		}
 		J *video = line_media_lease(w->leases, frame, error);
 
 		if (video) {
@@ -1680,7 +1684,15 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 					       json_object_new_int(rotation));
 			json_object_object_add(
 				video, "cameraEnabled",
-				json_object_new_boolean(camera_enabled));
+				json_object_new_boolean(info.camera_enabled));
+			if (!self && !share) {
+				json_object_object_add(
+					video, "decodedAt",
+					json_object_new_int64(info.decoded_at));
+				json_object_object_add(
+					video, "screen",
+					json_object_new_boolean(info.screen));
+			}
 			if (share)
 				json_object_object_add(
 					video, "peerSharing",

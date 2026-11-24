@@ -128,6 +128,12 @@ On Android, `bv7.q` computes the share support state from `isSupportPresentation
 
 Outgoing shares now use the negotiated call video stream by default when it is available. The tablet sees the screen in the sender's video tile. Local relay fixtures cover both camera-on and camera-off calls, including repeat delivery when the portal stops supplying frames and restoring the previous camera state after sharing. Live tablet verification of this path is pending. The native PDTP sender remains selectable for testing.
 
+### Reproducing the Android 26.16.0 checks
+
+The harness accepts the 26.16.0 APKM (version code `261600106`, SHA-256 `4a82c3173a935c52dbe96b8768b73a2dda7284b860f37e4982d72b5672dbf1af`). Its `base.apk` supplies the DEX. Its `split_config.arm64_v8a.apk` supplies `lib/arm64-v8a/libandromeda.so` (SHA-256 `27bed6d41ad1ba14b7f81dc2ad197b4872261e5a3842c3457f3a9e69bb32f8db`).
+
+In this build, `bv7.c$b$a.streamSourceEvent` checks the participant and the `VIRTUAL_DISPLAY` source in `classes4.dex`. The separate presentation start, stop and per-user frame callbacks are in `bv7.c$d` in `classes8.dex`. On the native side, `PlanetVideoInterface::writeVideo` supplies the capture generation and source, and `evs3_codec_header_decode` reads a compact or wide picture length. The offline run compares those fields with bytes emitted by Avernella for synthetic camera and screen pictures. Instructions and the separate handset test are in the [testing guide](../docs/en/testing.md#group-video-and-screen-sharing).
+
 ## Group call history and participant video
 
 JADX on LINE Android 26.18.2 build 261820153 (base APK SHA-256 `5432c8ad902609b4ce4773d834206da63f5c441610346bec0249235116b2e4c5`) shows the following paths.

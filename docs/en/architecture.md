@@ -177,7 +177,7 @@ The UI opens that path (it runs as the same user), maps or reads it, and sends `
 
 ### Call video frames
 
-Call video is the one stream that bypasses JSON. The call thread writes each decoded frame (I420 planes) straight into a fresh sealed memfd with `pwritev`, then sends the descriptor over the `SOCK_SEQPACKET` frame socket with `SCM_RIGHTS`, together with a small `struct line_preview_frame` header (size, rotation, source, chat, decode time). There are three sources: the peer's camera, your own camera and the peer's screen.
+Call video is the one stream that bypasses JSON. The call thread writes each decoded frame (I420 planes) straight into a fresh sealed memfd with `pwritev`, then sends the descriptor over the `SOCK_SEQPACKET` frame socket with `SCM_RIGHTS`, together with a small `struct line_preview_frame` header (size, rotation, source, chat, decode time). There are three preview slots for remote video, your camera and a separate presentation. A group participant’s camera and shared display use the same remote slot. Its header identifies which source produced the decoded picture. The `callFrame` JSON fallback carries the same screen flag and decode time.
 
 The UI's `line-ipc` thread receives the descriptor in `pump_preview()` and keeps **only the newest frame per source**: if a frame is already waiting, the older descriptor is closed. The main thread then uploads the frame as a texture. The socket's send buffer is deliberately small (4 KiB), so a busy window never builds up a backlog of old frames. Hiding the window or the call stage stops preview transfers while the call continues (`callPreview`).
 

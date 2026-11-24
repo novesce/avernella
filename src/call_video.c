@@ -54,7 +54,14 @@ struct video_fragment {
 	gboolean marker;
 };
 
+enum video_source {
+	VIDEO_SOURCE_UNKNOWN,
+	VIDEO_SOURCE_CAMERA,
+	VIDEO_SOURCE_DISPLAY,
+};
+
 struct video_payload {
+	enum video_source source;
 	gsize offset, expected;
 	gboolean start, end;
 	guint rotation;
@@ -351,6 +358,7 @@ struct call_video {
 	gint64 epoch, last_encoded, next_layer_frame;
 	gint64 group_fir_at;
 	enum video_format framing, rx_format;
+	enum video_source picture_source, displayed_source;
 	gboolean have_ts, have_last, have_previous_end, finished, group_rx;
 	gboolean group_rx_trace;
 	gsize received, expected;
@@ -410,6 +418,7 @@ static void clear_picture(struct call_video *v)
 	}
 	v->received = v->expected = 0;
 	v->framing = VIDEO_UNKNOWN;
+	v->picture_source = VIDEO_SOURCE_UNKNOWN;
 	v->have_last = FALSE;
 }
 
@@ -960,8 +969,14 @@ static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 		v->stats.deltas++;
 		return TRUE;
 	}
+	enum video_source previous = v->displayed_source;
+
+	if (v->group_rx && v->picture_source != VIDEO_SOURCE_UNKNOWN)
+		v->displayed_source = v->picture_source;
 	shown = call_vp8_decode(v->dec, p, n, key, v->rx_rotation, display,
 				data);
+	if (shown <= 0)
+		v->displayed_source = previous;
 	if (shown < 0) {
 		v->stats.decode++;
 		v->need_key = TRUE;
@@ -970,6 +985,11 @@ static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 	v->need_key = FALSE;
 	v->stats.hidden += !shown;
 	return TRUE;
+}
+
+gboolean call_video_frame_is_screen(const struct call_video *v)
+{
+	return v && v->displayed_source == VIDEO_SOURCE_DISPLAY;
 }
 
 static guint32 evs3_compact_length(const guint8 *p)
@@ -988,6 +1008,7 @@ static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 	gsize pos = 3, expected = 0;
 	guint flags, rotation = 0;
 	guint32 extended_size = 0;
+	enum video_source source = VIDEO_SOURCE_UNKNOWN;
 	gboolean ext = FALSE;
 
 	if (n <= pos || !(p[0] & 0x80))
@@ -1025,6 +1046,10 @@ static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 		pos += 2;
 		if (len > n - pos)
 			return FALSE;
+		/* PLANET user data carries the capture generation and source. */
+		if (type == 0x80 && len == 4 && p[pos] == 1 && p[pos + 2] == 2)
+			source = p[pos + 3] == 1 ? VIDEO_SOURCE_DISPLAY :
+						   VIDEO_SOURCE_CAMERA;
 		if (type == 9 && len == 4)
 			extended_size = read32(p + pos);
 		pos += len;
@@ -1047,7 +1072,8 @@ static gboolean parse_evs3_framed(const guint8 *p, gsize n, gboolean length,
 				       .start = !!(flags & 8),
 				       .end = !!(flags & 4),
 				       .rotation = rotation,
-				       .extended_size = extended_size };
+				       .extended_size = extended_size,
+				       .source = source };
 	return TRUE;
 }
 
@@ -1368,6 +1394,7 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 		v->expected = payload.expected;
 		v->extended_size = payload.extended_size;
 		v->rx_rotation = payload.rotation;
+		v->picture_source = payload.source;
 		v->first = seq;
 		if (!find_early_end(v))
 			goto invalid;

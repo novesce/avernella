@@ -1,14 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#include "camera.h"
 #include "media_io.h"
 #include "ui_private.h"
 #include "ui_gpu.h"
 #include "ui_motion.h"
 #include "ui_sounds.h"
-#include <fcntl.h>
 #include <gmodule.h>
 #include <string.h>
-#include <sys/mman.h>
+#include <sys/socket.h>
 #include <unistd.h>
+#include <zlib.h>
 
 enum {
 	W = 910,
@@ -394,12 +395,11 @@ static void settle(void)
 	g_assert_cmpint(ui_animation_deadline(scene_time), ==, 0);
 }
 
-static gboolean stage_has_avatar(const char *id)
+static gboolean stage_has_color(guint shade)
 {
 	int top = (UI_HEADER_H + 1) * H / ui.height;
 	int bottom = (UI_HEADER_H + 1 + ui.stage_h - 76) * H / ui.height;
 	int left = ui.conversation.x * W / ui.width;
-	guint shade = ui_avatar_shade(id);
 
 	for (int y = top; y < bottom; y++)
 		for (int x = left; x < W; x++)
@@ -408,25 +408,37 @@ static gboolean stage_has_avatar(const char *id)
 	return FALSE;
 }
 
-static void group_picture(const char *chat, gint64 decoded)
+static gboolean stage_has_avatar(const char *id)
+{
+	return stage_has_color(ui_avatar_shade(id));
+}
+
+static void group_picture(const char *chat, gint64 decoded, gboolean screen)
 {
 	struct line_preview_frame preview = {
 		.decoded_at = decoded,
 		.width = 2,
 		.height = 2,
 		.source = LINE_PREVIEW_REMOTE,
+		.screen = screen,
 	};
 	const guint8 pixels[6] = { 80, 80, 200, 200, 128, 128 };
-	int fd = memfd_create("group-preview", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	struct line_camera_frame image;
+	struct line_preview_frame received;
+	int pair[2], fd;
 
-	g_assert_cmpint(fd, >=, 0);
-	g_assert_cmpint(write(fd, pixels, sizeof(pixels)), ==, sizeof(pixels));
-	g_assert_cmpint(fcntl(fd, F_ADD_SEALS,
-			      F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK),
-			==, 0);
 	g_strlcpy(preview.chat, chat, sizeof(preview.chat));
-	ui_media_preview_frame(&preview, fd);
+	line_camera_i420_frame(&image, pixels, 2, 2);
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+				   pair),
+			==, 0);
+	g_assert_true(line_media_send_frame(pair[0], &preview, &image));
+	fd = line_media_recv_frame(pair[1], &received);
+	g_assert_cmpint(fd, >=, 0);
+	ui_media_preview_frame(&received, fd);
 	close(fd);
+	close(pair[1]);
+	close(pair[0]);
 }
 
 static void group_stage_picture(gboolean present)
@@ -438,8 +450,36 @@ static void group_stage_picture(gboolean present)
 	g_assert_cmpint(scene.video[0].plane[0] != NULL, ==, present);
 }
 
+/* Compare the caption below the video plane, where every backend displays it. */
+static guint32 peer_caption_checksum(gboolean expect_badge)
+{
+	struct gpu_scene scene = { .width = W, .height = H };
+	const struct gpu_video *view = &scene.video[0];
+	int left = ui.conversation.x * W / ui.width;
+	int bottom = (UI_HEADER_H + 1 + ui.stage_h - 76) * H / ui.height;
+	guint32 sum = 0;
+	gboolean badge = FALSE;
+
+	ui_media_gpu_video(&scene, 0);
+	g_assert_nonnull(view->plane[0]);
+	int top = (int)(view->y + view->h) + 1;
+	int right = (int)(view->x + view->w);
+
+	g_assert_cmpint(top, <, bottom);
+	g_assert_cmpint(left, <, right);
+	for (int y = top; y < bottom; y++) {
+		sum = crc32(sum, (const Bytef *)&presented[y][left],
+			    (right - left) * sizeof(presented[0][0]));
+		for (int x = left; x < W; x++)
+			badge |= presented[y][x] == 0xda373c;
+	}
+	g_assert_cmpint(badge, ==, expect_badge);
+	return sum;
+}
+
 static void check_group_call_roster(void)
 {
+	const guint live_badge = 0xda373c;
 	static const char group[] = "c00000000000000000000000000000000";
 	static const char ada[] = "u00000000000000000000000000000000";
 	static const char grace[] = "u00000000000000000000000000000001";
@@ -482,8 +522,27 @@ static void check_group_call_roster(void)
 	json_object_object_add(focus, "changedAt",
 			       json_object_new_int64(scene_time));
 	ui_media_call_event(focus);
-	group_picture(group, scene_time);
+	group_picture(group, scene_time, FALSE);
 	group_stage_picture(TRUE);
+	g_assert_false(stage_has_color(live_badge));
+	guint32 caption = peer_caption_checksum(FALSE);
+
+	group_picture(group, ++scene_time, TRUE);
+	group_stage_picture(TRUE);
+	g_assert_true(stage_has_color(live_badge));
+	g_assert_cmpuint(peer_caption_checksum(TRUE), !=, caption);
+	group_picture(group, ++scene_time, FALSE);
+	group_stage_picture(TRUE);
+	g_assert_false(stage_has_color(live_badge));
+	g_assert_cmpuint(peer_caption_checksum(FALSE), ==, caption);
+
+	/* A delayed frame reply must not revive the previous screen label. */
+	group_picture(group, scene_time - 1, TRUE);
+	group_stage_picture(TRUE);
+	g_assert_false(stage_has_color(live_badge));
+	group_picture(group, ++scene_time, TRUE);
+	group_stage_picture(TRUE);
+	g_assert_true(stage_has_color(live_badge));
 
 	scene_time += 2000;
 	json_object_object_add(focus, "id", json_object_new_string(grace));
@@ -491,19 +550,22 @@ static void check_group_call_roster(void)
 			       json_object_new_int64(scene_time));
 	ui_media_call_event(focus);
 	group_stage_picture(FALSE);
-	group_picture(group, scene_time - 1);
+	g_assert_false(stage_has_color(live_badge));
+	group_picture(group, scene_time - 1, TRUE);
 	group_stage_picture(FALSE);
-	group_picture(group, scene_time);
+	g_assert_false(stage_has_color(live_badge));
+	group_picture(group, scene_time, FALSE);
 	group_stage_picture(TRUE);
 
-	/* The frame and the matching peer event can arrive on either socket first. */
+	/* The next presenter’s frame can reach its socket before the focus event. */
 	scene_time += 2000;
-	group_picture(group, scene_time);
+	group_picture(group, scene_time, TRUE);
 	json_object_object_add(focus, "id", json_object_new_string(ada));
 	json_object_object_add(focus, "changedAt",
 			       json_object_new_int64(scene_time - 1));
 	ui_media_call_event(focus);
 	group_stage_picture(TRUE);
+	g_assert_true(stage_has_color(live_badge));
 
 	json_object_object_add(event, "event",
 			       json_object_new_string("call_participants"));

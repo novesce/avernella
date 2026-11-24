@@ -495,6 +495,109 @@ static void recovery(void)
 	done(&loop);
 }
 
+struct source_view {
+	struct call_video *rx;
+	guint frames;
+	gboolean screen;
+};
+
+static void source_display(const struct line_camera_frame *frame, gpointer data)
+{
+	struct source_view *view = data;
+
+	g_assert_cmpuint(frame->width, ==, 16);
+	g_assert_cmpuint(frame->height, ==, 16);
+	view->screen = call_video_frame_is_screen(view->rx);
+	view->frames++;
+}
+
+/* A known VP8 keyframe with a compact EVS3 header. First and last
+ * fragments can be submitted independently of camera capture or encoding.
+ */
+static gboolean source_fragment(struct source_view *view, srtp_t sender,
+				guint8 seq, guint8 picture, int source,
+				guint offset, guint length)
+{
+	guint8 packet[128] = { 0x80, 121, 0, seq, 0,	0, 0,	   picture,
+			       0,    0,	  0, 101, 0x80, 0, picture };
+	int n = 15;
+
+	g_assert_cmpuint(offset + length, <=, sizeof(gray_key));
+	if (offset + length == sizeof(gray_key)) {
+		packet[1] |= 0x80;
+		packet[12] |= 0x04;
+	}
+	if (!offset) {
+		unsigned int size = sizeof(gray_key) + 3;
+
+		packet[12] |= 0x3a;
+		packet[n++] = 0x10;
+		packet[n++] = source < 0 ? 0x20 : 0x21;
+		if (source >= 0) {
+			guint8 tag[] = { 0x80, 0x84, 1, picture, 2, source };
+
+			memcpy(packet + n, tag, sizeof(tag));
+			n += sizeof(tag);
+		}
+		packet[n++] = 0x08 | (size & 3);
+		packet[n++] = size >> 2;
+		packet[n++] = size >> 10;
+	}
+	memcpy(packet + n, gray_key + offset, length);
+	n += length;
+	g_assert_cmpint(srtp_protect(sender, packet, &n), ==,
+			srtp_err_status_ok);
+	return call_video_receive(view->rx, packet, n, source_display, view);
+}
+
+static void group_source_visibility(void)
+{
+	enum {
+		FULL = sizeof(gray_key),
+		FIRST = 18,
+		TAIL = FULL - FIRST
+	};
+	static const struct {
+		guint8 seq, picture;
+		int source;
+		guint offset, length, displayed;
+		gboolean screen, accepted;
+	} packets[] = {
+		{ 1, 1, 0, 0, FULL, 1, FALSE, TRUE },
+		/* Lose the end of a screen picture. The next key has no source. */
+		{ 2, 2, 1, 0, FIRST, 1, FALSE, TRUE },
+		{ 4, 3, -1, 0, FULL, 2, FALSE, TRUE },
+		{ 3, 2, -1, FIRST, TAIL, 2, FALSE, FALSE },
+		/* Reorder a complete screen picture, then omit its optional tag. */
+		{ 6, 4, -1, FIRST, TAIL, 2, FALSE, TRUE },
+		{ 5, 4, 1, 0, FIRST, 3, TRUE, TRUE },
+		{ 7, 5, -1, 0, FULL, 4, TRUE, TRUE },
+		/* Keep the screen visible until the camera keyframe completes. */
+		{ 8, 6, 0, 0, FIRST, 4, TRUE, TRUE },
+		{ 9, 6, -1, FIRST, TAIL, 5, FALSE, TRUE },
+	};
+	struct source_view view = { 0 };
+	srtp_t sender;
+
+	view.rx = call_video_open_group_rx(key_a, 121, 101, NULL);
+	g_assert_nonnull(view.rx);
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < G_N_ELEMENTS(packets); i++) {
+		gboolean accepted =
+			source_fragment(&view, sender, packets[i].seq,
+					packets[i].picture, packets[i].source,
+					packets[i].offset, packets[i].length);
+
+		g_assert_cmpint(accepted, ==, packets[i].accepted);
+		g_assert_cmpuint(view.frames, ==, packets[i].displayed);
+		g_assert_cmpint(view.screen, ==, packets[i].screen);
+		g_assert_cmpint(call_video_frame_is_screen(view.rx), ==,
+				packets[i].screen);
+	}
+	srtp_dealloc(sender);
+	call_video_close(view.rx);
+}
+
 static void evs3_picture_metadata(void)
 {
 	struct loop loop = { 0 };
@@ -981,6 +1084,8 @@ static void group_evs3_tx(gconstpointer data)
 	srtp_t observer;
 	guint16 layer_seq = 0;
 	const struct group_test_format *format = data;
+	gboolean report =
+		!g_strcmp0(g_getenv("AVERNELLA_TEST_MEDIA_CONTRACT"), "1");
 	enum call_video_rtp_extension extension = format->extension;
 	guint profile = format->vp8a ? 4 : 3;
 
@@ -995,6 +1100,7 @@ static void group_evs3_tx(gconstpointer data)
 		gboolean key = pictures[frame].key;
 		gboolean single = frame + 1 == G_N_ELEMENTS(pictures);
 		guint32 total = 0, profile_size = 0, codec_size = 0;
+		guint8 source_record[4] = { 0 }, codec_header[4] = { 0 };
 
 		if (single)
 			memset(loop.pixels, 120, W * H);
@@ -1106,6 +1212,8 @@ static void group_evs3_tx(gconstpointer data)
 				g_assert_cmpmem(packet + descriptor,
 						sizeof(capture), capture,
 						sizeof(capture));
+				memcpy(source_record, packet + descriptor + 2,
+				       sizeof(source_record));
 				descriptor += sizeof(capture);
 				g_assert_cmphex(packet[descriptor], ==, 5);
 				g_assert_cmphex(packet[descriptor + 1], ==,
@@ -1150,6 +1258,8 @@ static void group_evs3_tx(gconstpointer data)
 					g_assert_cmpuint(declared, >, 3);
 					codec_size = declared - 3;
 				}
+				memcpy(codec_header, packet + descriptor,
+				       offset - descriptor);
 				g_assert_cmpuint(packet[offset] & 1, ==, !key);
 			}
 			total += n - offset;
@@ -1158,6 +1268,14 @@ static void group_evs3_tx(gconstpointer data)
 			g_assert_cmpuint(GUINT32_FROM_BE(profile_size), ==,
 					 total + (format->vp8a ? 4 : 3));
 		g_assert_cmpuint(codec_size, ==, total);
+		if (report)
+			g_test_message("group-media %u %u %02x%02x%02x%02x "
+				       "%02x%02x%02x%02x",
+				       frame, total, source_record[0],
+				       source_record[1], source_record[2],
+				       source_record[3], codec_header[0],
+				       codec_header[1], codec_header[2],
+				       codec_header[3]);
 		for (guint i = loop.packets->len; i--;)
 			g_assert_true(deliver(&loop, i));
 		g_assert_cmpuint(loop.count, ==, frame + 1);
@@ -2103,6 +2221,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/video/conference-independent-stream-directions",
 			conference_directions);
 	g_test_add_func("/video/evs3-picture-metadata", evs3_picture_metadata);
+	g_test_add_func("/video/group-source-visibility",
+			group_source_visibility);
 	g_test_add_func("/video/authentication-loss-and-keyframe-recovery",
 			recovery);
 	g_test_add_func("/video/standard-vp8-reordering", standard_vp8);

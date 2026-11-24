@@ -32,6 +32,7 @@ CASES = {
     ],
     "test-call-video": [
         "/video/conference-independent-stream-directions",
+        "/video/group-source-visibility",
         "/video/conference-evs3-send-vfd",
         "/video/conference-evs3-send-ved",
         "/video/conference-vp8-compact-vfd",
@@ -40,6 +41,7 @@ CASES = {
         "/video/screen-share-official-layout",
         "/video/screen-capture-conversion",
     ],
+    "test-ui-scroll-scene": ["/ui-scroll/scene-matches-full-repaint"],
     "test-ui-call-fullscreen": [
         "/call/group-share-controls",
         "/call/fullscreen-peer",
@@ -59,20 +61,21 @@ def run_cases(binary, paths, env):
         sys.stderr.write(run.stdout)
         missing = sorted(set(paths) - set(passed))
         raise SystemExit(f"{binary} failed (exit {run.returncode}, missing passes {missing})")
-    print(f"{binary}: {len(passed)} cases passed", flush=True)
+    print(f"{binary}: {len(passed)} passed", flush=True)
 
 
 def main():
     apk = os.environ.get("LINE_APK")
     if not apk:
-        raise SystemExit("Supply the local Android base APK with LINE_APK=/path/to/LINE.apk")
-    subprocess.run([sys.executable, ROOT / "tests/group_media_apk.py", apk], check=True)
+        raise SystemExit("Supply a local Android base APK or APKM bundle with LINE_APK=/path/to/file")
     env = {key: val for key, val in os.environ.items()
            if not key.startswith(("LINE_", "AVERNELLA_"))}
     env.update(LINE_DISABLE_GPU="1", SDL_VIDEODRIVER="dummy", SDL_AUDIODRIVER="dummy")
     with TemporaryDirectory(prefix="avernella-group-media-") as tmp:
         for kind in ("CONFIG", "CACHE", "STATE", "DATA"):
             env[f"XDG_{kind}_HOME"] = str(Path(tmp) / kind.lower())
+        subprocess.run([sys.executable, ROOT / "tests/group_media_apk.py", "--check-sender", apk],
+                       env=env, check=True)
         for binary, paths in CASES.items():
             run_cases(binary, paths, env)
     print("Offline media checks passed. Android playback on a live call requires a handset test.")

@@ -22,6 +22,7 @@ struct line_preview_frame {
 	gint64 decoded_at;
 	guint32 width, height, rotation;
 	guint8 source, camera_enabled;
+	guint8 screen; /* The selected remote group video is a virtual display. */
 	char chat[34];
 };
 

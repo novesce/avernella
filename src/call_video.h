@@ -44,6 +44,8 @@ gboolean call_video_encode(struct call_video *video,
 gboolean call_video_receive(struct call_video *video, const guint8 *packet,
 			    gsize size, call_video_display_fn display,
 			    gpointer data);
+/* Source of the decoded group picture, read during its display callback. */
+gboolean call_video_frame_is_screen(const struct call_video *video);
 gboolean call_video_needs_keyframe(const struct call_video *video);
 guint call_video_authenticated_packets(const struct call_video *video);
 void call_video_report(const struct call_video *video, gboolean group);

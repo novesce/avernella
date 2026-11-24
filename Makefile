@@ -389,7 +389,7 @@ vulkan-preview: build/vulkan-preview
 	./build/vulkan-preview $(or $(VK_VENDOR),0) $(VK_PREVIEW_ARGS)
 
 .PHONY: check-group-media
-check-group-media: build/test-call-group build/test-call build/test-call-video build/test-ui-call-fullscreen
+check-group-media: build/test-call-group build/test-call build/test-call-video build/test-ui-call-fullscreen build/test-ui-scroll-scene
 	python3 tests/group_media.py
 
 check: $(TESTS)
