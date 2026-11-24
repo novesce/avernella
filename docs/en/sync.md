@@ -72,6 +72,8 @@ The long poll can't start until the client knows where "now" is. Otherwise, on f
 4. **When the network is down,** it shows "Automatic chat refresh is unavailable" once and backs off: 3, 6, 12, 24, then every 30 seconds.
 5. **When LINE rejects the session,** it forgets it and sends `signed_out`.
 
+The first successful sync after an outage sends `reconnected` even if the revision is unchanged. A brief Wi-Fi interruption can leave the long poll alive. When Linux reports that a default route returned, the worker schedules a revision check to confirm LINE is reachable. The window then refreshes the chat list and the selected chat’s latest page, and retries visible images that failed to download.
+
 The `foreground` request from the UI tells the worker whether the window is focused. When it becomes focused, the worker re-arms the timer to check sooner.
 
 ## Applying operations

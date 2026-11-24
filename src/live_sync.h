@@ -29,6 +29,7 @@ struct line_live_batch {
 	char *access_from; /* worker token the pending rotation started from */
 	gint64 revision; /* the cursor after these operations */
 	gboolean failing; /* recent requests failed: poll as a fallback */
+	gint64 recovered_since; /* start of a recovered outage, or 0 */
 	/* LINE refused the session's credentials; the thread has stopped polling. */
 	gboolean denied;
 };

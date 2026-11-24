@@ -24,6 +24,7 @@ struct line_live_sync {
 	gboolean denied; /* LINE refused the token: no more requests */
 	gint64 revision;
 	guint failures;
+	gint64 failed_since, recovered_since;
 	struct line_talk_sync sync; /* owned by the thread */
 };
 
@@ -152,10 +153,14 @@ static gpointer run(gpointer data)
 						ops, i)));
 			l->reload |= reload;
 			l->revision = l->sync.revision;
-			if (l->failures)
+			if (l->failures) {
+				l->recovered_since = l->failed_since;
 				news = TRUE;
+			}
 			l->failures = 0;
 		} else if (!idle_timeout) {
+			if (!l->failures)
+				l->failed_since = started + took;
 			l->failures = MIN(l->failures + 1, 6u);
 			news = TRUE;
 		}
@@ -264,6 +269,10 @@ void line_live_sync_take(struct line_live_sync *l,
 	batch->access_from = g_steal_pointer(&l->rotated_from);
 	batch->revision = l->revision;
 	batch->failing = l->failures >= 2;
+	if (!l->failures) {
+		batch->recovered_since = l->recovered_since;
+		l->recovered_since = 0;
+	}
 	batch->denied = l->denied;
 	l->reload = FALSE;
 	g_mutex_unlock(&l->lock);

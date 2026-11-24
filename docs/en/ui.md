@@ -151,7 +151,8 @@ Each feature module follows the same pattern, so once you know one you know them
 ### Chat list
 
 - **Drawing:** `chats_panel()` and `line_chat_row()` in `ui_draw.c`. The time stamp follows LINE's rules (`list_stamp()`: time today, then "Yesterday", a weekday, a date). The latest message text is shown only for chats opened in this session, because the chat-list RPC carries only the message ID (`remember_preview()`).
-- **Data:** `refresh()` sends `chats`, and `show_chats()` replaces `ui.chats`. `chat_message()` moves one row on a new message without a full reload.
+- `refresh()` requests the chat list. Once the directory replies, the UI requests the open conversation’s latest page using the updated delivery ID. An earlier page stays open while the list updates. `chat_message()` moves one row when a new message arrives.
+- The refresh button, **Ctrl+R**, and a recovered connection also retry failed image downloads as they come into view. Images already loaded stay cached.
 - **Filtering:** typing in the search box (Ctrl+F) filters by name (`ui_refilter_chats()`).
 - **Folders and pins:** [`ui_chat_lists.c`](../../src/ui_chat_lists.c) draws the folder selector and its menu, and [`chat_lists.c`](../../src/chat_lists.c) stores folders, pins, mutes and shortcuts per account. Right-click a chat to pin, mute or add it to a folder.
 - **Unread badges and read receipts:** see [Read receipts](#read-receipts) below.

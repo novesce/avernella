@@ -85,13 +85,20 @@ struct file_item {
 	gboolean dir;
 };
 
+enum thumbnail_state {
+	THUMB_LOADING,
+	THUMB_LOADING_AT_REFRESH,
+	THUMB_SETTLED,
+	THUMB_DOWNLOAD_FAILED,
+};
+
 struct media_thumbnail {
 	cairo_surface_t *image;
 	char *reason, *version;
 	gsize bytes;
 	guint serial, used, seen;
 	gboolean sticker;
-	gboolean settled; /* a result arrived, with or without a picture */
+	enum thumbnail_state state;
 };
 
 struct decode_job {
@@ -372,12 +379,52 @@ static void store_thumbnail(struct media_thumbnail *t, cairo_surface_t **image)
 			      0;
 
 	m.cache_bytes -= t->bytes;
-	t->settled = TRUE;
+	t->state = THUMB_SETTLED;
 	g_clear_pointer(&t->image, cairo_surface_destroy);
 	if (bytes && bytes <= t->bytes)
 		t->image = g_steal_pointer(image);
 	t->bytes = t->image ? bytes : 0;
 	m.cache_bytes += t->bytes;
+}
+
+static void thumbnail_unavailable(GHashTable *cache, const char *key,
+				  struct media_thumbnail *t, const char *error,
+				  const char *fallback)
+{
+	if (error && t->state == THUMB_LOADING_AT_REFRESH) {
+		/* The old request failed after the connection came back. */
+		g_hash_table_remove(cache, key);
+		ui.dirty = TRUE;
+		return;
+	}
+	store_thumbnail(t, NULL);
+	if (error)
+		t->state = THUMB_DOWNLOAD_FAILED;
+	set(&t->reason, error ? error : fallback);
+}
+
+static gboolean refresh_thumbnail(gpointer key, gpointer value, gpointer unused)
+{
+	struct media_thumbnail *t = value;
+
+	(void)key;
+	(void)unused;
+	if (t->state == THUMB_LOADING)
+		t->state = THUMB_LOADING_AT_REFRESH;
+	return t->state == THUMB_DOWNLOAD_FAILED;
+}
+
+void ui_media_refresh(void)
+{
+	GHashTable *caches[] = { m.thumbs, m.avatars, m.emoji, m.flex_images };
+
+	for (guint i = 0; i < G_N_ELEMENTS(caches); i++)
+		if (caches[i])
+			g_hash_table_foreach_remove(caches[i],
+						    refresh_thumbnail, NULL);
+	/* Emoji load failures can change a cached message layout. */
+	ui_forget_history();
+	ui.dirty = TRUE;
 }
 
 static void item_free(gpointer p)
@@ -1546,7 +1593,9 @@ gboolean ui_flex_image_failed(const char *url)
 		m.flex_images && url ? g_hash_table_lookup(m.flex_images, url) :
 				       NULL;
 
-	return entry && entry->settled && !entry->image;
+	return entry && !entry->image &&
+	       (entry->state == THUMB_SETTLED ||
+		entry->state == THUMB_DOWNLOAD_FAILED);
 }
 
 void ui_emoji_frame_start(gint64 now, gboolean full)
@@ -3633,7 +3682,8 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		if (current && error)
 			media_debug("download failed");
 		if (current && !start_decode(fd, FLEX_IMAGE, url, tag, FALSE)) {
-			store_thumbnail(entry, NULL);
+			thumbnail_unavailable(m.flex_images, url, entry, error,
+					      NULL);
 			m.flex_busy = FALSE;
 			ui.dirty = TRUE;
 		}
@@ -3762,10 +3812,9 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			return;
 		if (fd >= 0 && start_decode(fd, EMOJI, key, tag, TRUE))
 			return;
-		store_thumbnail(owner, NULL);
+		thumbnail_unavailable(m.emoji, key, owner, error,
+				      _("Could not load this image."));
 		m.emoji_busy = FALSE;
-		set(&owner->reason,
-		    error ? error : _("Could not load this image."));
 		ui_forget_history();
 		return;
 	}
@@ -3812,21 +3861,20 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			return;
 		if (error && fd >= 0)
 			close(fd);
-		const char *reason = error ? error :
-					     _("Could not open this image.");
+		const char *fallback = _("Could not open this image.");
+
 		if (avatar) {
 			m.avatar_busy = FALSE;
-			store_thumbnail(owner, NULL);
-			set(&owner->reason, reason);
+			thumbnail_unavailable(m.avatars, id, owner, error,
+					      fallback);
 		} else if (tag) {
 			m.working = FALSE;
-			set(&m.note, reason);
+			set(&m.note, error ? error : fallback);
 		} else {
 			m.thumb_busy = FALSE;
-			if (thumb) {
-				store_thumbnail(thumb, NULL);
-				set(&thumb->reason, reason);
-			}
+			if (thumb)
+				thumbnail_unavailable(m.thumbs, id, thumb,
+						      error, fallback);
 		}
 		return;
 	}

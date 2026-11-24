@@ -313,7 +313,7 @@ static struct {
 	GHashTable *requests;
 	guint generation, seq, newest_history, rendered_history;
 	guint history_pending;
-	gboolean history_again, chats_again;
+	gboolean history_again, chats_again, refresh_notice;
 	gint stopping;
 	GHashTable *read_marks;
 	Json *selected_summary; /* borrowed from ui.chats; rebound when the list changes */
@@ -1036,6 +1036,8 @@ void ui_rpc(const char *name, Json *args, guint tag)
 
 static void set_string(char **dest, const char *s)
 {
+	if (dest == &ui.notice)
+		wire.refresh_notice = FALSE;
 	if (!g_strcmp0(*dest, s))
 		return;
 	char *copy = g_strdup(s);
@@ -1043,6 +1045,12 @@ static void set_string(char **dest, const char *s)
 	g_free(*dest);
 	*dest = copy;
 	ui.dirty = TRUE;
+}
+
+static void set_refresh_notice(const char *s)
+{
+	set_string(&ui.notice, s);
+	wire.refresh_notice = TRUE;
 }
 
 static gboolean set_json(Json **dest, Json *value)
@@ -1291,16 +1299,20 @@ static void request_history(void)
 		request(HISTORY, ui.selected, NULL);
 }
 
+static void refresh_visible_history(void)
+{
+	if (!ui.selected || ui.older_page || ui.older_pending)
+		return;
+	if (wire.history_pending)
+		wire.history_again = TRUE;
+	else
+		request_history();
+}
+
 static void refresh(void)
 {
-	if (!ui.connected)
+	if (!ui.connected || ui.logging_out)
 		return;
-	if (ui.selected && !ui.older_page && !ui.older_pending) {
-		if (wire.history_pending)
-			wire.history_again = TRUE;
-		else
-			request_history();
-	}
 	if (ui.getting_chats)
 		wire.chats_again = TRUE;
 	else {
@@ -1392,8 +1404,11 @@ static void retry_read_receipt(void)
 		cursor->attempted = cursor->confirmed;
 }
 
-static void manual_refresh(void)
+static void refresh_content(void)
 {
+	if (!ui.connected || ui.logging_out)
+		return;
+	ui_media_refresh();
 	retry_read_receipt();
 	refresh();
 }
@@ -1755,7 +1770,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		g_clear_pointer(&ui.qr, QRcode_free);
 		g_clear_pointer(&ui.pin, g_free);
 		set_string(&ui.name, ui_string(result, "name", "LINE"));
-		set_string(&ui.notice, _("Loading chats…"));
+		set_refresh_notice(_("Loading chats…"));
 		ui_lists_login(ui.self_id);
 		ui_profile_login();
 		ui_layout();
@@ -1766,17 +1781,21 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 	case CHATS:
 		ui.getting_chats = FALSE;
 		if (error || !json_object_is_type(result, json_type_array))
-			set_string(&ui.notice,
-				   error ? error :
-					   _("Could not read the chat list."));
+			set_refresh_notice(
+				error ? error :
+					_("Could not read the chat list."));
 		else {
+			if (wire.refresh_notice)
+				set_string(&ui.notice, "");
 			notify_unread(result);
 			show_chats(result);
 		}
 		if (wire.chats_again && ui.connected && !ui.logging_out) {
 			wire.chats_again = FALSE;
-			ui.getting_chats = TRUE;
-			request(CHATS, NULL, NULL);
+			refresh();
+		} else if (ui.connected && !ui.logging_out) {
+			/* Empty pages need the directory's latest delivery ID. */
+			refresh_visible_history();
 		}
 		break;
 	case HISTORY:
@@ -1989,8 +2008,12 @@ static void handle_packet(Json *packet)
 			   _("Enter this code in LINE on your phone."));
 	} else if (!strcmp(event, "status"))
 		set_string(&ui.notice, ui_string(packet, "message", ""));
+	else if (!strcmp(event, "sync_unavailable") && ui.connected)
+		set_refresh_notice(ui_string(packet, "message", ""));
 	else if (!strcmp(event, "changed") && ui.connected && !ui.logging_out)
 		refresh();
+	else if (!strcmp(event, "reconnected"))
+		refresh_content();
 	else if (!strcmp(event, "chat_message") && ui.connected &&
 		 !ui.logging_out)
 		chat_message(packet);
@@ -2225,7 +2248,7 @@ static void key(SDL_KeyboardEvent k)
 	int shortcut = ui_list_shortcut(k);
 
 	if (shortcut == LIST_REFRESH) {
-		manual_refresh();
+		refresh_content();
 		return;
 	}
 	if (ctrl && (code == SDLK_PAGEUP || code == SDLK_END) &&
@@ -2295,7 +2318,7 @@ static void key(SDL_KeyboardEvent k)
 		else if (ui.focus == F_SEND || ui.focus == F_MESSAGE)
 			send_message();
 		else if (ui.focus == F_RELOAD)
-			manual_refresh();
+			refresh_content();
 		else if (ui.focus == F_LOGOUT)
 			logout();
 		return;
@@ -2472,7 +2495,7 @@ static void click(int x, int y)
 	else if (ui_list_visible() && inside(ui.logout, x, y))
 		logout();
 	else if (ui_list_visible() && inside(ui.reload, x, y))
-		manual_refresh();
+		refresh_content();
 	else if ((ui_list_visible() && inside(ui.search_box, x, y)) ||
 		 (ui_chat_visible() && ui.selected && inside(ui.entry, x, y))) {
 		gboolean search = ui_list_visible() &&

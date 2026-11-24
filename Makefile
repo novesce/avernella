@@ -45,7 +45,7 @@ PACKED_RELOCS := $(shell printf '\043include <features.h>\n\043if __GLIBC_PREREQ
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
-SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync tune http_tune
+SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode
 # Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
 JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
@@ -86,6 +86,7 @@ TESTS += build/test-call-group build/test-pdtp
 TESTS += build/test-chat-lists build/test-shared-content build/test-ui-tray build/test-ui-instance
 TESTS += build/test-video-play build/test-talk-sync build/test-live-sync
 TESTS += build/test-flex-asset build/test-ui-flex
+TESTS += build/test-ui-refresh build/test-ui-chat-refresh
 TESTS += build/test-qr-scan
 TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
@@ -311,15 +312,20 @@ $(TESTS):
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
 build/render-bench build/test-ui-call-fullscreen: private LDFLAGS += -Wl,--wrap=SDL_RenderPresent
-build/test-ui-call-fullscreen: private LDFLAGS += -Wl,--wrap=ui_rpc
+build/test-ui-call-fullscreen build/test-ui-refresh: private LDFLAGS += -Wl,--wrap=ui_rpc
+build/test-ui-refresh: tests/ui_refresh.c build/ui_gpu.o
 build/test-ui-call-fullscreen: tests/ui_call_fullscreen.c build/ui_gpu.o
+build/test-ui-chat-refresh: private LDFLAGS += -Wl,--wrap=SDL_PollEvent
+build/test-ui-chat-refresh: tests/ui_chat_refresh.c build/ui_gpu.o build/tune.o
 build/test-ui-scroll-scene: tests/ui_scroll_scene.c
 build/test-ui-scroll-scene: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time
 build/render-bench: tests/render_bench.c build/ui_gpu.o
-build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
-build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
-build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene: build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o $(UI_LANG_OBJECTS)
+UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene build/test-ui-refresh
+UI_FIXTURE_TARGETS += build/test-ui-chat-refresh
+$(UI_FIXTURE_TARGETS): build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
+$(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
+$(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
+$(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o $(UI_LANG_OBJECTS)
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 

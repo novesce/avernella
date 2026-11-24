@@ -67,7 +67,9 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-rich-message` | `rich_message.c` | การแยกวิเคราะห์ markup ของ imagemap |
 | `test-flex-asset` | `flex_asset.c` | โฮสต์ที่อนุญาต การตรวจที่อยู่สาธารณะ redirect (ห่อ libcurl) |
 | `test-talk-sync` | `talk_sync.c` | ตัวชี้ตำแหน่ง การแบ่งหน้า full และ partial resync |
-| `test-live-sync` | `live_sync.c` | เธรด long poll การรวมชุด การหมุนเวียนโทเค็น จังหวะเมื่อล้มเหลว |
+| `test-live-sync` | `live_sync.c` | เธรด long poll การรวมชุด การหมุนเวียนโทเค็น และการกู้คืนการเชื่อมต่อเมื่อ revision เท่าเดิม |
+| `test-ui-chat-refresh` | `ui_chat_refresh.c` | ใช้หน้าต่างแชทแบบไม่แสดงผลกับ worker จำลอง ทดสอบการรีเฟรชอัตโนมัติและการกดรีเฟรช ตรวจว่าข้อความร่างและหน้าข้อความย้อนหลังยังคงอยู่เมื่อเชื่อมต่ออีกครั้ง |
+| `test-ui-refresh` | `ui_refresh.c` | ลองโหลดรูป Flex ที่เคยล้มเหลว ตรวจพิกเซลของรูปที่ถอดรหัสแล้ว และทดสอบทั้งข้อผิดพลาดที่มาช้ากับไฟล์รูปที่เสียหาย |
 | `test-call` | `call.c` | การโทรครบสายกับ fixture relay ในเครื่อง (ห่อเสียงของ SDL) |
 | `test-call-video` | `call_video.c` | VP8 ผ่าน EVS3 และ SRTP การสูญหาย ลำดับสลับ การเล่นซ้ำ keyframe descriptor |
 | `test-audio` | `call_audio.c` | การจัดเฟรม Opus และ EAS2 การเล่น (ห่อ `SDL_QueueAudio`) |

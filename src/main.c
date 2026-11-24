@@ -18,6 +18,7 @@
 #include "stickers.h"
 #include "talk_sync.h"
 #include "live_sync.h"
+#include "net_route.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -53,7 +54,8 @@ struct line_worker {
 	struct line_talk_sync sync;
 	/* Long-poll sync thread; the timer polls only while it fails. */
 	struct line_live_sync *live;
-	gboolean live_failing;
+	gboolean live_failing, route_lost, route_probe;
+	gint64 recovered_at;
 	/* Monotonic time the long poll started failing, or 0. */
 	gint64 live_failing_since;
 	gint64 displayed_revision;
@@ -215,7 +217,8 @@ static void clear_view(struct line_worker *w)
 	line_talk_sync_clear(&w->sync);
 	cache_clear(w);
 	g_clear_pointer(&w->live, line_live_sync_stop);
-	w->live_failing = FALSE;
+	w->live_failing = w->route_lost = w->route_probe = FALSE;
+	w->recovered_at = 0;
 	w->live_failing_since = 0;
 	w->sync_failures = 0;
 	w->refresh_retry = w->save_retry = 0;
@@ -2596,6 +2599,15 @@ static gboolean social_operation(struct line_worker *w, J *op)
 	return TRUE;
 }
 
+/* A revision probe and the long poll can confirm the same recovery. */
+static void reconnected(struct line_worker *w)
+{
+	w->recovered_at = g_get_monotonic_time();
+	w->route_probe = FALSE;
+	w->sync_failures = 0;
+	line_event("reconnected", NULL, NULL);
+}
+
 /* Operations from the long-poll thread: apply them and refresh at once. */
 static void live_operations(struct line_worker *w)
 {
@@ -2658,14 +2670,16 @@ static void live_operations(struct line_worker *w)
 	if (batch.reload && s->profiles)
 		g_hash_table_remove_all(s->profiles);
 	w->sync.revision = MAX(w->sync.revision, batch.revision);
-	if (count || batch.reload)
+	if (count || batch.reload || batch.recovered_since)
 		w->displayed_revision =
 			MAX(w->displayed_revision, batch.revision);
 	/*
 	 * New messages update the chat list in the window directly and the
 	 * open chat refetches its page; anything else reloads both.
 	 */
-	if (other)
+	if (batch.recovered_since > w->recovered_at)
+		reconnected(w);
+	else if (other)
 		line_event("changed", NULL, NULL);
 	else if (open_chat)
 		revalidate_history(w, open_chat);
@@ -2700,7 +2714,7 @@ static void sync_revision(struct line_worker *w)
 
 	if (!w->ready || read(w->timer, &tick, sizeof(tick)) != sizeof(tick))
 		return;
-	if (w->live && !w->live_failing)
+	if (w->live && !w->live_failing && !w->route_probe)
 		return;
 	Line *s = &w->session;
 	int wait = line_transport_retry_after();
@@ -2718,14 +2732,14 @@ static void sync_revision(struct line_worker *w)
 		gint64 current = json_object_get_int64(revision);
 		gboolean reload = FALSE, catch_up = FALSE;
 
-		w->sync_failures = 0;
 		if (w->sync.revision < 0) {
 			/*
 			 * Establish the start cursor once. Account history before sign-in
 			 * must never create an incoming call on this desktop.
 			 */
 			w->sync.revision = current;
-		} else if (w->sync.more || current > w->sync.revision) {
+		} else if ((!w->live || w->live_failing) &&
+			   (w->sync.more || current > w->sync.revision)) {
 			/* A revision probe reports activity, never an acknowledged page. */
 			catch_up = poll_call_operations(w, &reload);
 			if (reload)
@@ -2737,9 +2751,10 @@ static void sync_revision(struct line_worker *w)
 		if (!w->live && s->access)
 			w->live =
 				line_live_sync_start(&w->sync, s->access, NULL);
-		if (reload || w->displayed_revision == -2 ||
-		    (w->displayed_revision >= 0 &&
-		     current > w->displayed_revision))
+		if (w->route_probe || w->sync_failures)
+			reconnected(w);
+		else if (reload || (w->displayed_revision >= 0 &&
+				    current > w->displayed_revision))
 			line_event("changed", NULL, NULL);
 		w->displayed_revision = MAX(w->displayed_revision, current);
 		if (!w->live || w->live_failing)
@@ -2749,7 +2764,7 @@ static void sync_revision(struct line_worker *w)
 	} else {
 		if (w->displayed_revision != -2)
 			line_event(
-				"status", "message",
+				"sync_unavailable", "message",
 				"Automatic chat refresh is unavailable. Use Refresh to try again.");
 		w->displayed_revision = -2;
 		w->sync_failures = MIN(w->sync_failures + 1, 5u);
@@ -2807,7 +2822,8 @@ static int worker(int credentials_fd)
 				{ .fd = w.timer, .events = POLLIN },
 				{ .fd = w.image_wake, .events = POLLIN },
 				{ .fd = -1, .events = POLLIN },
-				{ .fd = w.renewal_timer, .events = POLLIN } };
+				{ .fd = w.renewal_timer, .events = POLLIN },
+				{ .fd = line_route_open(), .events = POLLIN } };
 	for (;;) {
 		int timeout = maintenance_wait(&w);
 
@@ -2841,6 +2857,13 @@ static int worker(int credentials_fd)
 		}
 		if (fds[2].revents & POLLIN)
 			finish_images(&w);
+		if ((fds[5].revents & (POLLIN | POLLERR)) &&
+		    line_route_restored(fds[5].fd, &w.route_lost) &&
+		    w.ready && !w.route_probe) {
+			/* A long poll can survive a brief link loss. */
+			w.route_probe = TRUE;
+			wake_after(&w, 1);
+		}
 		if (fds[3].revents & POLLIN && w.live)
 			live_operations(&w);
 		if (fds[0].revents || fds[3].revents)
@@ -2855,6 +2878,8 @@ static int worker(int credentials_fd)
 		}
 		update_peer_reads(&w);
 	}
+	if (fds[5].fd >= 0)
+		close(fds[5].fd);
 	line_voice_close();
 	g_clear_pointer(&w.live, line_live_sync_stop);
 	if (w.image_thread) {

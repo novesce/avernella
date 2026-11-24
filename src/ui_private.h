@@ -285,6 +285,7 @@ void ui_edit_key(Editor *edit, SDL_KeyboardEvent key);
 void ui_insert(Editor *edit, const char *text);
 void ui_mention_member(const char *id, const char *name);
 void ui_media_login(Json *result);
+void ui_media_refresh(void);
 void ui_media_reset(void);
 void ui_media_shutdown(void);
 void ui_media_screenshot(void);

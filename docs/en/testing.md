@@ -81,7 +81,9 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-rich-message` | `rich_message.c` | Imagemap markup parsing |
 | `test-flex-asset` | `flex_asset.c` | Allowed hosts, public-address checks, redirects (wrapped libcurl) |
 | `test-talk-sync` | `talk_sync.c` | Cursor, paging, full and partial resync |
-| `test-live-sync` | `live_sync.c` | The long-poll thread, batching, rotation, failure pacing |
+| `test-live-sync` | `live_sync.c` | The long-poll thread, batching, token rotation, and recovery with an unchanged revision |
+| `test-ui-chat-refresh` | `ui_chat_refresh.c` | A headless chat window and a synthetic worker exercise automatic and manual refresh, draft retention, and reading an earlier page during reconnect |
+| `test-ui-refresh` | `ui_refresh.c` | Retries a failed Flex image, checks the decoded pixel, and exercises late failures and corrupt files |
 | `test-call` | `call.c` | Whole calls against a local relay fixture (wrapped SDL audio) |
 | `test-call-video` | `call_video.c` | VP8 through EVS3 and SRTP, loss, reordering, replay, keyframes, descriptors |
 | `test-audio` | `call_audio.c` | Opus and EAS2 framing, playout (wrapped `SDL_QueueAudio`) |
