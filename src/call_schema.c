@@ -221,9 +221,10 @@ void call_video_describe(Slice description, const char *role)
 			continue;
 		while (head.n && pb_next(&head, &field))
 			if (field.field == 50 && field.type == 0)
-				g_string_append_printf(
-					maps, "%s%" G_GUINT64_FORMAT,
-					maps->len ? "," : "", field.value);
+				g_string_append_printf(maps,
+						       "%s%" G_GUINT64_FORMAT,
+						       maps->len ? "," : "",
+						       field.value);
 		while (stream.n && pb_next(&stream, &field))
 			if (field.field == 51 && field.type == 2)
 				g_string_append_printf(

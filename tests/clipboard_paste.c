@@ -30,7 +30,6 @@ static void copied_files(void)
 	g_autoptr(GError) error = NULL;
 	g_autofree char *file = g_build_filename(runtime, "a b.txt", NULL);
 
-
 	g_assert_true(g_file_set_contents(file, "x", 1, &error));
 	g_autofree char *uri = g_filename_to_uri(file, NULL, &error);
 	g_autofree char *list = g_strdup_printf(

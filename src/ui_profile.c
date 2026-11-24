@@ -936,9 +936,8 @@ static void draw_settings(void)
 		      0xfa777c, FALSE);
 	control(out, A_LOGOUT, 0);
 	y += 48;
-	ui_draw_label("Avernella",
-		      (Rect){ nav_x + 10, y, nav_w - 20, 16 }, 12, 400, FAINT,
-		      FALSE);
+	ui_draw_label("Avernella", (Rect){ nav_x + 10, y, nav_w - 20, 16 }, 12,
+		      400, FAINT, FALSE);
 	ui_draw_label(ui_build_commit(),
 		      (Rect){ nav_x + 10, y + 16, nav_w - 20, 16 }, 12, 400,
 		      FAINT, FALSE);

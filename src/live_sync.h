@@ -12,20 +12,18 @@ struct line_live_sync;
 
 /* Starts after the worker established the cursor; 'access' is copied. */
 struct line_live_sync *line_live_sync_start(const struct line_talk_sync *from,
-					    const char *access,
-					    GError **error);
+					    const char *access, GError **error);
 /* Detaches the thread; it exits after its current request. */
 void line_live_sync_stop(struct line_live_sync *live);
 /* Readable when operations or a token are waiting. */
 int line_live_sync_fd(const struct line_live_sync *live);
 /* Shares a token the worker renewed or rotated. */
-void line_live_sync_set_access(struct line_live_sync *live,
-			       const char *access);
+void line_live_sync_set_access(struct line_live_sync *live, const char *access);
 
 struct line_live_batch {
-	J *ops;		/* array of operations in revision order, or NULL */
+	J *ops; /* array of operations in revision order, or NULL */
 	gboolean reload; /* a full or partial resync is due */
-	char *access;	/* a token LINE rotated on this connection, or NULL */
+	char *access; /* a token LINE rotated on this connection, or NULL */
 	char *access_from; /* worker token the pending rotation started from */
 	gint64 revision; /* the cursor after these operations */
 	gboolean failing; /* recent requests failed: poll as a fallback */

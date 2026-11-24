@@ -166,8 +166,8 @@ static GVariant *property(GDBusConnection *bus, const char *sender,
 	if (!strcmp(name, "Menu"))
 		return g_variant_new_object_path(MENU_PATH);
 	if (!strcmp(name, "ToolTip"))
-		return g_variant_new("(s@a(iiay)ss)", "avernella", pixmaps(FALSE),
-				     "Avernella", "");
+		return g_variant_new("(s@a(iiay)ss)", "avernella",
+				     pixmaps(FALSE), "Avernella", "");
 	if (g_str_has_suffix(name, "Pixmap"))
 		return pixmaps(!strcmp(name, "IconPixmap"));
 	return g_variant_new_string("");
