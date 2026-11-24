@@ -205,6 +205,43 @@ static gboolean video_profile(Slice description, gboolean initial_offer,
 	return TRUE;
 }
 
+/* Lists the peer's video payload maps and session features for debugging. */
+void call_video_describe(Slice description, const char *role)
+{
+	PbField record, field;
+	GString *maps = g_string_new(NULL), *features = g_string_new(NULL);
+
+	while (description.n && pb_next(&description, &record)) {
+		if (record.field != 1 || record.type != 2)
+			continue;
+		Slice head = pb_data(record.data, 1), name = pb_data(head, 1);
+		Slice stream = record.data;
+
+		if (name.n != 1 || *name.p != 'V')
+			continue;
+		while (head.n && pb_next(&head, &field))
+			if (field.field == 50 && field.type == 0)
+				g_string_append_printf(
+					maps, "%s%" G_GUINT64_FORMAT,
+					maps->len ? "," : "", field.value);
+		while (stream.n && pb_next(&stream, &field))
+			if (field.field == 51 && field.type == 2)
+				g_string_append_printf(
+					features,
+					"%s%" G_GUINT64_FORMAT
+					":%" G_GUINT64_FORMAT,
+					features->len ? "," : "",
+					pb_number(field.data, 1, 0),
+					pb_number(field.data, 2, 0));
+		break;
+	}
+	g_printerr("line-call %s video maps=%s features=%s\n", role,
+		   maps->len ? maps->str : "-",
+		   features->len ? features->str : "-");
+	g_string_free(maps, TRUE);
+	g_string_free(features, TRUE);
+}
+
 void call_video_peer_limits(Slice description, struct call_video_limits *limits)
 {
 	PbField record;

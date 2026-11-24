@@ -1349,6 +1349,8 @@ static gboolean setup_video(struct voice_call *c, Slice offer, Slice key,
 
 	choose_send_limits(c, offer);
 
+	if (c->video_trace.enabled && !c->incoming)
+		call_video_describe(offer, "answered");
 	if (c->incoming) {
 		call_answer_offer(&answer, &c->info);
 		offer = PB_SLICE(answer);
@@ -2685,6 +2687,8 @@ static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 			guint8 video_pt;
 			guint32 video_ssrc, remote_ssrc;
 
+			if (c->video_trace.enabled)
+				call_video_describe(offer, "offered");
 			if (call_video_offer_profile(offer, &video_pt,
 						     &video_ssrc, &remote_ssrc))
 				c->info.video_payload = video_pt;

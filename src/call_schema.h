@@ -43,6 +43,7 @@ struct call_video_limits {
 };
 void call_video_peer_limits(Slice description,
 			    struct call_video_limits *limits);
+void call_video_describe(Slice description, const char *role);
 
 /* What this client asks to receive: HD/FHD (resolution class 3), 30 fps. */
 enum {

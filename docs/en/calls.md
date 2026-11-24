@@ -233,7 +233,7 @@ An incoming call is a sync operation. `line_voice_operation()` (called for every
 
 Set `LINE_CALL_DEBUG=1`. The terminal shows negotiation (payload types, SSRCs, limits), each control message by plane and field, packet counts every five seconds, and first-frame milestones. Common findings:
 
-- **No video but audio works:** the peer declined the VP8 profile, or no keyframe arrived. Look for the negotiated payload and "first frame".
+- **No video but audio works:** the peer declined the VP8 profile, or no keyframe arrived. Look for the negotiated payload and "first frame". The `offered video` or `answered video` line lists the peer's video payload maps and session features, such as `maps=2 features=0:1` for baseline VP8.
 - **No audio:** check that packets authenticate. A wrong SSRC or payload type makes every packet fail SRTP.
 - **The call never connects:** the relay or media address isn't reachable over UDP from your network.
 
