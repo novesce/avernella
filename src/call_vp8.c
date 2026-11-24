@@ -15,6 +15,7 @@ struct call_vp8_decoder {
 	guint8 *converted;
 	gsize capacity;
 	const char *backend;
+	gboolean presentation;
 #if CALL_HWDECODE
 	struct AVCodecContext *codec;
 	AVBufferRef *device;
@@ -26,7 +27,7 @@ struct call_vp8_decoder {
 #endif
 };
 
-struct call_vp8_decoder *call_vp8_open(guint threads)
+struct call_vp8_decoder *call_vp8_open(guint threads, gboolean presentation)
 {
 	struct call_vp8_decoder *d = g_new0(struct call_vp8_decoder, 1);
 	vpx_codec_dec_cfg_t config = { .threads = threads };
@@ -35,6 +36,7 @@ struct call_vp8_decoder *call_vp8_open(guint threads)
 		g_free(d);
 		return NULL;
 	}
+	d->presentation = presentation;
 	return d;
 }
 
@@ -72,8 +74,8 @@ static gboolean display_frame(struct call_vp8_decoder *d,
 	guint cw = (w + 1) / 2, ch = (h + 1) / 2;
 	gsize chroma = (gsize)cw * ch;
 
-	if (!line_camera_frame_size_valid(w, h) || !frame.plane[0] ||
-	    !frame.plane[1] || frame.stride[0] < (int)w ||
+	if (!line_preview_size_valid(w, h, d->presentation) ||
+	    !frame.plane[0] || !frame.plane[1] || frame.stride[0] < (int)w ||
 	    frame.stride[1] < (int)(nv12 ? 2 * cw : cw) ||
 	    (!nv12 && (!frame.plane[2] || frame.stride[2] < (int)cw)))
 		return FALSE;
@@ -209,7 +211,11 @@ static void open_hardware(struct call_vp8_decoder *d, guint width, guint height)
 	d->codec->thread_count = 1;
 	d->codec->thread_type = 0;
 	d->codec->apply_cropping = 0;
-	d->codec->max_pixels = 1920 * 1088;
+	/* Drivers can align a presentation surface beyond its visible edges. */
+	d->codec->max_pixels =
+		d->presentation ?
+			((width + 63u) & ~63u) * ((height + 63u) & ~63u) :
+			1920 * 1088;
 	d->codec->flags |= AV_CODEC_FLAG_LOW_DELAY;
 	d->codec->opaque = d;
 	d->codec->get_format = hardware_format;

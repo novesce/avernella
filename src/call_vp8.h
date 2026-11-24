@@ -4,7 +4,7 @@
 
 struct call_vp8_decoder;
 
-struct call_vp8_decoder *call_vp8_open(guint threads);
+struct call_vp8_decoder *call_vp8_open(guint threads, gboolean presentation);
 void call_vp8_close(struct call_vp8_decoder *decoder);
 const char *call_vp8_backend(const struct call_vp8_decoder *decoder);
 /* The caller validates keyframe dimensions and handles keyframe requests. */

@@ -200,6 +200,11 @@ struct voice_call {
 		guint mic_retransmits_requested, camera_retransmits_requested;
 		guint rtcp_types, feedback_other_slots, rtcp_other_port;
 		guint udp_received, control_opened, unclassified_relay;
+		guint cast_requests, cast_frames, cast_errors;
+		guint screen_packets_sent, screen_pictures_sent;
+		guint screen_video_received, presentation_chunks,
+			presentation_frames;
+		guint presentation_messages, presentation_rejected;
 	} stats;
 	struct call_endpoint relay, media;
 	struct media_route audio_route, video_route, data_route;
@@ -518,8 +523,13 @@ static gboolean send_video_packet(const guint8 *data, gsize size, gpointer user)
 		send_to(c, &c->video_route.current, (Slice){ data, size });
 
 	if (sent && c->stats.next && size >= 12 &&
-	    (data[1] & 127) == c->video_pt)
+	    (data[1] & 127) == c->video_pt) {
 		c->stats.camera_sent++;
+		if (c->self_sharing && c->share_over_video) {
+			c->stats.screen_packets_sent++;
+			c->stats.screen_pictures_sent += !!(data[1] & 0x80);
+		}
+	}
 	return sent;
 }
 
@@ -617,8 +627,10 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
 	struct call_task *task = c->task;
 	struct line_preview_frame info;
 
-	if (!line_camera_frame_size_valid(image->width, image->height))
+	if (!line_preview_size_valid(image->width, image->height, TRUE))
 		return;
+	if (c->stats.next)
+		c->stats.presentation_frames++;
 	group_reception(c, LINE_MEDIA_PLAYABLE);
 	peer_share_state(c, TRUE);
 	if (!g_atomic_int_get(&task->preview_visible))
@@ -691,6 +703,18 @@ static void share_control(struct voice_call *c, const guint8 *bytes, gsize size,
 		c->share_command_len = 0;
 }
 
+static void decode_share_message(struct voice_call *c, const guint8 *bytes,
+				 gsize size)
+{
+	gboolean accepted =
+		call_share_decode(c->share_rx, bytes, size, display_share, c);
+
+	if (c->stats.next) {
+		c->stats.presentation_messages++;
+		c->stats.presentation_rejected += !accepted;
+	}
+}
+
 static void data_stream(guint64 stream, const char *service, guint64 offset,
 			guint64 time, guint flags, const guint8 *bytes,
 			gsize size, gpointer user)
@@ -709,6 +733,8 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 	if (stream != PDTP_PRESENTATION_VIDEO ||
 	    (!c->group && c->share_stopped))
 		return;
+	if (c->stats.next)
+		c->stats.presentation_chunks++;
 	if (!c->share_rx)
 		c->share_rx = call_share_decoder_new();
 	if ((flags & (PDTP_MESSAGE_START | PDTP_MESSAGE_END)) ==
@@ -716,7 +742,7 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 		/* Most PDTP messages fit in one packet. Borrow its bytes. */
 		if (c->share_message)
 			g_byte_array_set_size(c->share_message, 0);
-		call_share_decode(c->share_rx, bytes, size, display_share, c);
+		decode_share_message(c, bytes, size);
 		return;
 	}
 	if (flags & PDTP_MESSAGE_START) {
@@ -734,8 +760,7 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 	g_byte_array_append(c->share_message, bytes, size);
 	if (!(flags & PDTP_MESSAGE_END))
 		return;
-	call_share_decode(c->share_rx, c->share_message->data,
-			  c->share_message->len, display_share, c);
+	decode_share_message(c, c->share_message->data, c->share_message->len);
 	g_byte_array_set_size(c->share_message, 0);
 }
 
@@ -911,11 +936,16 @@ static void share_state(struct voice_call *c)
 			fps = MIN(fps, c->screen_fps);
 			c->screen_fps = fps;
 		}
+		if (c->stats.next)
+			c->stats.cast_requests++;
 		c->cast = line_screencast_start(width, height, fps, &error);
-		if (!c->cast)
+		if (!c->cast) {
+			if (c->stats.next)
+				c->stats.cast_errors++;
 			stop_sharing(c,
 				     error ? error->message :
 					     "Could not start screen capture.");
+		}
 	}
 }
 
@@ -931,11 +961,28 @@ static gboolean video_requested(const struct voice_call *c)
 	return share_is_video(c) || g_atomic_int_get(&c->task->camera_enabled);
 }
 
+/* A static desktop has no next capture to service a viewer's request. */
+static void refresh_shared_screen(struct voice_call *c, gint64 now)
+{
+	if (!c->share_video_frame)
+		return;
+	gint64 due = now + G_USEC_PER_SEC / c->screen_fps;
+
+	c->share_video_repeat = MIN(c->share_video_repeat, due);
+}
+
 static gboolean send_share_video(struct voice_call *c, gint64 now)
 {
 	struct line_camera_frame image;
 	g_autoptr(GError) error = NULL;
 
+	/* Screen damage can arrive too slowly for frame-count based keyframes
+	 * while still arriving often enough to prevent idle repeats.
+	 */
+	if (now >= c->share_video_keyframe) {
+		call_video_keyframe(c->video);
+		c->share_video_keyframe = now + 3 * G_USEC_PER_SEC;
+	}
 	line_camera_i420_frame(&image,
 			       g_bytes_get_data(c->share_video_frame, NULL),
 			       c->share_video_width, c->share_video_height);
@@ -957,6 +1004,8 @@ static void share_capture(struct voice_call *c, gint64 now)
 
 	if (state == LINE_SCREENCAST_FAILED ||
 	    state == LINE_SCREENCAST_STOPPED) {
+		if (c->stats.next && state == LINE_SCREENCAST_FAILED)
+			c->stats.cast_errors++;
 		if (c->video_trace.enabled)
 			g_printerr("line-call screen capture ended: %s\n",
 				   message ? message : "");
@@ -972,6 +1021,8 @@ static void share_capture(struct voice_call *c, gint64 now)
 
 	if (!frame)
 		return;
+	if (c->stats.next)
+		c->stats.cast_frames++;
 	if (c->share_over_video) {
 		gboolean first = !c->self_sharing;
 
@@ -1078,8 +1129,12 @@ static void display_video(const struct line_camera_frame *image, gpointer user)
 	c->video_start_retry = 0;
 	if (c->video_trace.enabled && ++c->video_trace.frames == 1)
 		g_printerr("line-call video first frame decoded\n");
-	if (c->stats.next)
+	if (c->stats.next) {
 		c->stats.frames++;
+		if (c->conference_video &&
+		    call_video_frame_is_screen(c->conference_video->receiver))
+			c->stats.screen_video_received++;
+	}
 	if (!g_atomic_int_get(&task->preview_visible))
 		return;
 	gint64 now = g_get_monotonic_time();
@@ -1800,8 +1855,10 @@ static void group_camera_start_reply(struct voice_call *c, Slice header,
 	/* 203 means at least one start failed. Only successful sources are
 	 * listed, so a partial reply can still accept the transmitter. */
 	if (!result && !release && dispatch == 2 && valid && tx &&
-	    (!code || code == 203))
+	    (!code || code == 203)) {
 		call_video_keyframe(c->video);
+		refresh_shared_screen(c, g_get_monotonic_time());
+	}
 }
 
 static void setup_group_video(struct voice_call *c,
@@ -2027,7 +2084,7 @@ static void group_presence(struct voice_call *c, Slice body, guint choice)
 		if (j == c->group_members->len && j < 500)
 			g_array_append_val(c->group_members, *m);
 	}
-	if (call_pdtp_group_presenter_left(c->data))
+	if (call_pdtp_group_members_changed(c->data))
 		peer_share_state(c, FALSE);
 	group_select_video(c);
 }
@@ -2077,8 +2134,11 @@ static gboolean group_tx_request(struct voice_call *c, Slice body, Slice header)
 				camera_modes |= 1u << MIN(encoding, 31);
 				/* START requests a fresh picture. Its encoding option
 				 * controls simulcast, not the negotiated RTP format. */
-				if (c->camera || share_is_video(c))
+				if (c->camera || share_is_video(c)) {
 					call_video_keyframe(c->video);
+					refresh_shared_screen(
+						c, g_get_monotonic_time());
+				}
 			}
 		} else if (source && source == c->audio_tx) {
 			audio++;
@@ -2297,8 +2357,11 @@ static void group_camera_feedback(struct voice_call *c, Slice packet)
 		if (i == c->group_members->len)
 			return;
 	}
-	call_video_receive_group_feedback(c->video, packet.p, packet.n, sender,
-					  g_get_monotonic_time());
+	gint64 now = g_get_monotonic_time();
+
+	if (call_video_receive_group_feedback(c->video, packet.p, packet.n,
+					      sender, now))
+		refresh_shared_screen(c, now);
 }
 
 static gboolean handle_group(struct voice_call *c,
@@ -2914,6 +2977,32 @@ static void group_packet_received(struct voice_call *c, const guint8 *packet,
 		c->next_group_feedback = now + 1000 * c->feedback->interval_ms;
 }
 
+/* Only count decoded pictures and RTP fragments handed to the socket.
+ * Seeing the desktop on a handset is a separate end-to-end check.
+ */
+static void report_group_share(struct voice_call *c)
+{
+	struct group_video *v = c->conference_video;
+	struct call_pdtp_share_rx rx;
+
+	call_pdtp_share_rx_stats(c->data, &rx);
+	g_printerr(
+		"group-stats share requests=%u capture-open=%d captured=%u capture-errors=%u "
+		"screen-tx-rtp=%u screen-tx-frames=%u subscribed=%d "
+		"screen-rx-frames=%u native-rx-chunks=%u native-rx-messages=%u "
+		"native-rx-rejected=%u native-rx-frames=%u native-need-key=%d preview=%d "
+		"untagged=%u other-source=%u attributed=%u in-order=%u delivered=%u\n",
+		c->stats.cast_requests, !!c->cast, c->stats.cast_frames,
+		c->stats.cast_errors, c->stats.screen_packets_sent,
+		c->stats.screen_pictures_sent, !!(v && v->peer.ssrc),
+		c->stats.screen_video_received, c->stats.presentation_chunks,
+		c->stats.presentation_messages, c->stats.presentation_rejected,
+		c->stats.presentation_frames,
+		c->share_rx && call_share_decoder_keyframe_needed(c->share_rx),
+		g_atomic_int_get(&c->task->preview_visible), rx.untagged,
+		rx.other_source, rx.attributed, rx.in_order, rx.delivered);
+}
+
 static gboolean run_call(struct voice_call *c, GError **e)
 {
 	Pb setup = { 0 };
@@ -3035,6 +3124,7 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		}
 		if (c->stats.next && now >= c->stats.next) {
 			struct group_video *v = c->conference_video;
+			report_group_share(c);
 			g_printerr(
 				"group-stats mic-packets=%u mic-above-noise=%u audio-rx=%u video-rtp=%u video-auth=%u frames=%u subscribed=%d muted=%d camera-tx=%u data-rtp=%u\n",
 				c->stats.audio_sent, c->stats.audio_active,
@@ -3071,15 +3161,8 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			next = MIN(next, c->stats.next);
 		share_state(c);
 		camera_state(c);
-		if (c->share_video_repeat && now >= c->share_video_repeat) {
-			/* A late viewer can catch up even on a static desktop. */
-			if (now >= c->share_video_keyframe) {
-				call_video_keyframe(c->video);
-				c->share_video_keyframe =
-					now + 3 * G_USEC_PER_SEC;
-			}
+		if (c->share_video_repeat && now >= c->share_video_repeat)
 			send_share_video(c, now);
-		}
 		if (c->share_video_repeat)
 			next = MIN(next, c->share_video_repeat);
 		fds[3].fd = line_screencast_fd(c->cast);
@@ -3427,6 +3510,8 @@ static gpointer voice_thread(gpointer data)
 	g_autoptr(GError) e = NULL;
 	gboolean ok = run_call(c, &e);
 
+	if (c->stats.next)
+		report_group_share(c);
 	if (c->video_trace.enabled && c->video)
 		report_video(c);
 	gboolean group_leave = c->group && c->invited && !c->remote_end;

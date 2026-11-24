@@ -68,7 +68,13 @@ struct call_pdtp *call_pdtp_open_group(const guint8 tx[30], const guint8 rx[30],
 typedef gboolean (*call_pdtp_member_fn)(guint32 source, gpointer data);
 void call_pdtp_set_group_members(struct call_pdtp *pdtp,
 				 call_pdtp_member_fn check);
-gboolean call_pdtp_group_presenter_left(struct call_pdtp *pdtp);
+/* Returns true when the presenter from the previous roster has left. */
+gboolean call_pdtp_group_members_changed(struct call_pdtp *pdtp);
+struct call_pdtp_share_rx {
+	guint untagged, other_source, attributed, in_order, delivered;
+};
+void call_pdtp_share_rx_stats(const struct call_pdtp *pdtp,
+			      struct call_pdtp_share_rx *out);
 /* Select or stop the source of the current in-order presentation command. */
 gboolean call_pdtp_watch_presentation(struct call_pdtp *pdtp, gboolean watch);
 gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *pdtp);

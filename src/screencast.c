@@ -46,6 +46,7 @@ struct line_screencast {
 	struct spa_hook stream_listener;
 	struct spa_video_info_raw format;
 	gint64 last_frame;
+	gboolean trace, first_buffer;
 	guint8 *scratch;
 	gsize scratch_size;
 };
@@ -241,6 +242,10 @@ static void on_param_changed(void *data, uint32_t id,
 	    spa_format_video_raw_parse(param, &info.info.raw) < 0)
 		return;
 	c->format = info.info.raw;
+	if (c->trace)
+		g_printerr("group-stats capture format=%u width=%u height=%u\n",
+			   c->format.format, c->format.size.width,
+			   c->format.size.height);
 	/* Shared memory only: DMA-BUF frames would need a GPU readback. */
 	params[0] = spa_pod_builder_add_object(
 		&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
@@ -280,6 +285,15 @@ static void on_process(void *data)
 		return;
 	struct spa_buffer *spa = buffer->buffer;
 
+	if (c->trace && !c->first_buffer && spa->n_datas) {
+		const struct spa_data *plane = &spa->datas[0];
+
+		c->first_buffer = TRUE;
+		g_printerr("group-stats capture mapped=%d stride=%d bytes=%u\n",
+			   plane->data != NULL,
+			   plane->chunk ? plane->chunk->stride : 0,
+			   plane->chunk ? plane->chunk->size : 0);
+	}
 	if (!spa->n_datas || g_cancellable_is_cancelled(c->cancel))
 		goto done;
 	struct spa_data *d = &spa->datas[0];
@@ -779,6 +793,7 @@ struct line_screencast *line_screencast_start(unsigned int max_width,
 	struct line_screencast *c = g_new0(struct line_screencast, 1);
 
 	g_mutex_init(&c->lock);
+	c->trace = !g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1");
 	c->max_width = CLAMP(max_width, 16, 3840);
 	c->max_height = CLAMP(max_height, 16, 2160);
 	c->fps = CLAMP(fps, 1, 60);

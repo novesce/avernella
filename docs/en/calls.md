@@ -164,6 +164,8 @@ For a stereo group-call microphone, Avernella measures the changing part of each
 
 With `LINE_GROUP_CALL_STATS=1`, compare `mic-blocks` (complete 40 ms blocks captured) and `mic-ac-power-max` (peak block mean-square signal before noise suppression) with `tx-power` (average signal after processing) and `mic-fb-received` (microphone packet arrivals reported by the relay). Listening on a second device verifies the last step.
 
+For group screen sharing, the `group-stats share` line appears every three seconds and at hangup. `captured` counts frames taken from the desktop. `screen-tx-frames` counts complete screen pictures sent on the video track. `screen-rx-frames` counts decoded pictures marked as a display on that track. `native-rx-chunks` and `native-rx-frames` count native presentation chunks delivered to the call worker and pictures the decoder produced. Compare `native-rx-messages` with `native-rx-rejected` to check whether complete messages reached the decoder and whether it accepted their framing and video data. These totals cover the current call. To check playback on the other device, have its user open the sender’s tile.
+
 ## 6. Video
 
 [`call_video.c`](../../src/call_video.c):
@@ -190,6 +192,8 @@ There are two ways to send them:
 2. **As a native presentation in a one-to-one call** (`LINE_SHARE_TRANSPORT=presentation`, experimental), the way LINE's apps share: over **PDTP** in the **D** session.
 
 Avernella shows an incoming native presentation in a separate **LIVE** tile. In a group call the presentation stays visible when you select another participant’s camera. You can open the shared screen in fullscreen. When the presenter stops, the tile closes. Some peers share through their camera track instead. In that case the focused participant’s video tile carries the **LIVE** badge until they switch back to the camera. The receiver follows one presenter in the main group call. It can receive the screen even when the laptop joined by voice. Separate side rooms are outside this implementation. The group path has offline relay coverage and still needs a live Android playback check. [Group media tests](testing.md#group-video-and-screen-sharing)
+
+If LINE announces a presentation before sending the group roster, Avernella waits for the roster to identify the presenter and then requests the stream. Incoming native presentations support portrait and landscape frames up to 4,096 pixels on either edge, with a total limit of 3,840 × 2,160 pixels. For an outgoing screen share, a new viewer can request an immediate keyframe even while the desktop is still.
 
 ### PDTP
 

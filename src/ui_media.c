@@ -2710,7 +2710,7 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	if (rotation < 0 || rotation >= 360 || rotation % 90)
 		rotation = 0;
 
-	if (!line_camera_frame_size_valid(width, height))
+	if (!line_preview_size_valid(width, height, share))
 		return;
 	size_t size = line_camera_i420_size(width, height);
 	struct stat st;
@@ -2752,6 +2752,10 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	gboolean visible = !m.fullscreen_tile || m.fullscreen_tile == tile;
 
 	if (share) {
+		if (first && !g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1"))
+			g_printerr(
+				"group-stats share-window width=%d height=%d visible=%d\n",
+				width, height, visible);
 		if (!m.peer_sharing)
 			m.focus = TILE_PEER_SCREEN;
 		m.peer_sharing = TRUE;
@@ -2803,7 +2807,7 @@ static void video_frame(Json *result, gboolean self, gboolean share)
 	int width = json_object_get_int(ui_field(result, "width"));
 	int height = json_object_get_int(ui_field(result, "height"));
 
-	if (!line_camera_frame_size_valid(width, height) ||
+	if (!line_preview_size_valid(width, height, share) ||
 	    strcmp(ui_string(result, "format", ""), "i420"))
 		return;
 	int fd = open_regular(ui_string(result, "path", NULL),

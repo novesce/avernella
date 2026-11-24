@@ -291,7 +291,7 @@ struct line_screencast *line_screencast_start(unsigned int width,
 	g_assert_cmpuint(height, >=, SCREEN_HEIGHT);
 	g_assert_cmpuint(fps, <=, 30);
 	struct line_screencast *cast = g_new0(struct line_screencast, 1);
-	static const struct itimerspec first = { .it_value.tv_nsec = 1000000 };
+	struct itimerspec first = { .it_value.tv_nsec = 1000000 };
 
 	cast->fd = g_atomic_int_get(&picker_fd);
 	if (cast->fd >= 0) {
@@ -301,6 +301,9 @@ struct line_screencast *line_screencast_start(unsigned int width,
 	}
 	cast->fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
 	g_assert_cmpint(cast->fd, >=, 0);
+	/* Small regular compositor updates suppress the idle repeat timer. */
+	if (group_fixture && camera_unavailable)
+		first.it_interval.tv_nsec = 250000000;
 	g_assert_cmpint(timerfd_settime(cast->fd, 0, &first, NULL), ==, 0);
 	return cast;
 }
@@ -1234,15 +1237,7 @@ static void group_call(gconstpointer args)
 	if (peer_share_fixture) {
 		guint8 key[30], local_data[30];
 		srtp_t feedback;
-		Pb presence = { 0 }, push = { 0 };
 
-		pb_uint(&presence, 1, 1);
-		pb_uint(&presence, 2, 1);
-		fixture_member(&presence, peer, "D", FIRST_PRESENTER);
-		fixture_member(&presence, other, "D", NEXT_PRESENTER);
-		pb_uint(&push, 1, 1);
-		pb_msg(&push, 2, &presence);
-		emit_peer(&relay, CALL_GROUP_PUSH_REQ, 0x2150, &push, FALSE);
 		call_group_media_key("DATA", remote_key, key);
 		call_group_media_key("DATA", local_key.p, local_data);
 		g_assert_true(call_srtp_open(&feedback, local_data,
@@ -2094,7 +2089,22 @@ static void group_share_exchange(struct fake_relay *relay, const guint8 *local,
 			       3 * G_USEC_PER_SEC);
 	g_assert_cmpuint(screen.received, ==, 2);
 
-	/* A new receiver has no reference frame for this static desktop. */
+	/* A receiver that missed the first picture needs a recovery frame
+	 * even on a slowly updating screen and without a viewer request.
+	 */
+	if (camera_unavailable) {
+		call_video_close(viewer);
+		viewer = call_video_open_group_rx(rx, pt, ssrc, &error);
+		g_assert_no_error(error);
+		g_assert_nonnull(viewer);
+		struct share_picture late = screen;
+
+		late.received = 0;
+		receive_share_pictures(server_fd, viewer, &late, 1,
+				       2 * G_USEC_PER_SEC);
+		g_assert_cmpuint(late.received, ==, 1);
+	}
+	/* An explicit request should also refresh a static desktop promptly. */
 	call_video_close(viewer);
 	viewer = call_video_open_group_rx(rx, pt, ssrc, &error);
 	g_assert_no_error(error);
@@ -2112,7 +2122,7 @@ static void group_share_exchange(struct fake_relay *relay, const guint8 *local,
 	} else {
 		request_group_camera(relay, ssrc, 1, CALL_VIDEO_RTP_EXT_NONE);
 	}
-	receive_share_pictures(server_fd, viewer, &screen, 3, 1800000);
+	receive_share_pictures(server_fd, viewer, &screen, 3, 800000);
 	g_assert_cmpuint(screen.received, ==, 3);
 
 	g_autoptr(J) stop = line_call_share(FALSE, &error);
@@ -2422,6 +2432,21 @@ static void exchange_presentation(struct presentation_peer *sender,
 		/* DATA_AVAIL arrives on the relay SSRC before tagged media. */
 		announce_presentation(sender, UNKNOWN_PRESENTER, 0);
 		announce_presentation(sender, source, source_offset);
+		if (source == FIRST_PRESENTER && source_offset) {
+			/* The reliable D announcement and CC roster use separate
+			 * channels. Deliver DATA_AVAIL first, exactly once.
+			 */
+			Pb presence = { 0 }, push = { 0 };
+
+			pb_uint(&presence, 1, 1);
+			pb_uint(&presence, 2, 1);
+			fixture_member(&presence, peer, "D", FIRST_PRESENTER);
+			fixture_member(&presence, other, "D", NEXT_PRESENTER);
+			pb_uint(&push, 1, 1);
+			pb_msg(&push, 2, &presence);
+			emit_peer(sender->relay, CALL_GROUP_PUSH_REQ, 0x2150,
+				  &push, FALSE);
+		}
 		sender->contributor = source;
 		expect_presentation_request(sender, feedback, source_offset);
 	}

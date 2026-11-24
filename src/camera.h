@@ -19,6 +19,17 @@ static inline gboolean line_camera_frame_size_valid(unsigned int width,
 	       width * height <= 1920 * 1080;
 }
 
+/* A phone presentation can carry its full portrait display over PDTP. */
+static inline gboolean line_preview_size_valid(unsigned int width,
+					       unsigned int height,
+					       gboolean presentation)
+{
+	if (!presentation)
+		return line_camera_frame_size_valid(width, height);
+	return width >= 2 && height >= 2 && width <= 4096 && height <= 4096 &&
+	       width * height <= 3840 * 2160;
+}
+
 /* Tightly packed I420 has consecutive Y, U and V planes. */
 static inline gsize line_camera_i420_size(unsigned int width,
 					  unsigned int height)

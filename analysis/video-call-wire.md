@@ -136,6 +136,8 @@ In this build, `bv7.c$b$a.streamSourceEvent` checks the participant and the `VIR
 
 For a native group presentation, `jup_conf_request_presentation` looks up the conference member’s DATA service (media kind 4, service 1) and resumes the incoming stream 4. The receiver sends `REQ_RESUME_USER` (9) with the presenter’s source and the source offset. The relay can announce both in `DATA_AVAIL` (12). With test source 801 and offset zero, the Android ARM64 control writer produced `04 02 00 09 43 21 00` for the resume and `04 01 00 0c 43 21 00` for the announcement. Both round-tripped through the Android control reader. These bytes describe control elements inside an authenticated packet. They do not include the RTP or PDTP headers.
 
+In Android 26.16.0, `vns_pdtp_packet_create_with_rtp_frame` reads the first RTP contributing source when the CSRC count is nonzero (`0x82420c–0x824218`). The transport extension supplies the target and channel separately. Avernella checks the presenter against the conference roster before requesting their screen. The relay fixtures deliver a single `DATA_AVAIL` before the roster update on the separate call-control channel and verify that the receiver still requests the presentation and decodes the expected picture.
+
 ## Group call history and participant video
 
 JADX on LINE Android 26.18.2 build 261820153 (base APK SHA-256 `5432c8ad902609b4ce4773d834206da63f5c441610346bec0249235116b2e4c5`) shows the following paths.

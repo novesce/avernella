@@ -418,18 +418,23 @@ static void group_preview(const char *chat, gint64 decoded,
 {
 	struct line_preview_frame preview = {
 		.decoded_at = decoded,
-		.width = 2,
-		.height = 2,
+		.width = source == LINE_PREVIEW_SCREEN ? 1080 : 2,
+		.height = source == LINE_PREVIEW_SCREEN ? 2408 : 2,
 		.source = source,
 		.screen = screen,
 	};
-	const guint8 pixels[6] = { 80, 80, 200, 200, 128, 128 };
+	unsigned int luma = preview.width * preview.height;
+	gsize bytes = line_camera_i420_size(preview.width, preview.height);
+	g_autofree guint8 *pixels = g_malloc(bytes);
 	struct line_camera_frame image;
 	struct line_preview_frame received;
 	int pair[2], fd;
 
 	g_strlcpy(preview.chat, chat, sizeof(preview.chat));
-	line_camera_i420_frame(&image, pixels, 2, 2);
+	memset(pixels, 80, luma / 2);
+	memset(pixels + luma / 2, 200, luma - luma / 2);
+	memset(pixels + luma, 128, bytes - luma);
+	line_camera_i420_frame(&image, pixels, preview.width, preview.height);
 	g_assert_cmpint(socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
 				   pair),
 			==, 0);
@@ -506,6 +511,8 @@ static void check_group_presentation(const char *chat, Json *focus)
 	ui_media_gpu_video(&scene, 0);
 	g_assert_nonnull(scene.video[0].plane[0]);
 	g_assert_nonnull(scene.video[2].plane[0]);
+	g_assert_cmpuint(scene.video[2].width, ==, 1080);
+	g_assert_cmpuint(scene.video[2].height, ==, 2408);
 	g_assert_cmpfloat(scene.video[2].x + scene.video[2].w, <=,
 			  scene.video[0].x);
 	g_assert_true(stage_has_color(0xda373c));

@@ -105,6 +105,14 @@ struct call_pdtp {
 		guint attempts;
 		gboolean receiving, advertised;
 	} presentation;
+	/* The relay may introduce a presenter before CC delivers its roster. */
+	struct {
+		guint32 source;
+		guint64 offset;
+		gint64 expires;
+	} pending_presenter;
+	struct call_pdtp_share_rx share_rx;
+	gboolean collect_share_stats;
 	gboolean trace;
 	call_pdtp_stream_fn on_data;
 	call_pdtp_event_fn on_event;
@@ -380,6 +388,8 @@ static struct call_pdtp *pdtp_open(const guint8 tx[30], const guint8 rx[30],
 	d->tx_ssrc = tx_ssrc;
 	d->rx_ssrc = rx_ssrc;
 	d->group = group;
+	d->collect_share_stats =
+		group && !g_strcmp0(g_getenv("LINE_GROUP_CALL_STATS"), "1");
 	/* The official engine starts its packet numbers at 1. */
 	d->next_pn = 1;
 	(void)first;
@@ -436,13 +446,46 @@ static void forget_presenter(struct call_pdtp *d)
 	memset(&d->presentation, 0, sizeof(d->presentation));
 }
 
-gboolean call_pdtp_group_presenter_left(struct call_pdtp *d)
+static gboolean advertise_presenter(struct call_pdtp *d, guint32 source,
+				    guint64 offset)
 {
-	if (!d || !d->presentation.source || !d->member ||
-	    d->member(d->presentation.source, d->user))
+	if (!group_presenter(d, source, offset))
 		return FALSE;
-	forget_presenter(d);
+	d->pending_presenter.source = 0;
+	struct rx_stream *rx =
+		rx_stream(d, PDTP_PRESENTATION_VIDEO, "PLANET", TRUE);
+
+	if (rx)
+		bind_stream_source(rx, source);
+	if (!d->presentation.receiving && (!d->presentation.advertised ||
+					   (d->presentation.due == G_MAXINT64 &&
+					    offset > d->presentation.offset))) {
+		d->presentation.offset = offset;
+		d->presentation.first_pn = 0;
+		d->presentation.attempts = 0;
+		d->presentation.due = 0;
+	}
+	d->presentation.advertised = TRUE;
 	return TRUE;
+}
+
+gboolean call_pdtp_group_members_changed(struct call_pdtp *d)
+{
+	if (!d || !d->member)
+		return FALSE;
+	gboolean left = d->presentation.source &&
+			!d->member(d->presentation.source, d->user);
+
+	if (left)
+		forget_presenter(d);
+	if (d->pending_presenter.source) {
+		if (g_get_monotonic_time() >= d->pending_presenter.expires)
+			d->pending_presenter.source = 0;
+		else
+			advertise_presenter(d, d->pending_presenter.source,
+					    d->pending_presenter.offset);
+	}
+	return left;
 }
 
 gboolean call_pdtp_watch_presentation(struct call_pdtp *d, gboolean watch)
@@ -455,6 +498,12 @@ gboolean call_pdtp_watch_presentation(struct call_pdtp *d, gboolean watch)
 		return FALSE;
 	forget_presenter(d);
 	return TRUE;
+}
+
+void call_pdtp_share_rx_stats(const struct call_pdtp *d,
+			      struct call_pdtp_share_rx *out)
+{
+	*out = d ? d->share_rx : (struct call_pdtp_share_rx){ 0 };
 }
 
 gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *d)
@@ -530,6 +579,8 @@ static void consume_segment(struct call_pdtp *d, struct rx_stream *s,
 	    source == d->presentation.source) {
 		d->presentation.due = G_MAXINT64;
 		d->presentation.receiving = TRUE;
+		if (d->collect_share_stats)
+			d->share_rx.delivered++;
 	}
 	if (d->on_data && (!d->group || s->id == PDTP_PRESENTATION_CONTROL ||
 			   source == d->presentation.source))
@@ -752,6 +803,19 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				stream, service_label(service), flags, offset,
 				length, ext[0], ext[6], ext[5], ext[4], ext[3],
 				ext[2], ext[1]);
+		if (d->collect_share_stats && s &&
+		    stream == PDTP_PRESENTATION_VIDEO) {
+			if (!d->packet_source)
+				d->share_rx.untagged++;
+			else if (d->packet_source != d->presentation.source)
+				d->share_rx.other_source++;
+			else {
+				d->share_rx.attributed++;
+				if (offset <= s->delivered &&
+				    offset + length > s->delivered)
+					d->share_rx.in_order++;
+			}
+		}
 		if (s && (!d->group || (known_source(d, d->packet_source) &&
 					(stream == PDTP_PRESENTATION_CONTROL ||
 					 d->presentation.source)))) {
@@ -805,26 +869,20 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 				return FALSE;
 			p = nul + 1;
 		}
-		if (d->group && dir == 1 && ctrl == 12 &&
+		if (d->group && dir == 1 && ctrl == 12 && source &&
 		    stream == PDTP_PRESENTATION_VIDEO &&
 		    !strcmp(service, "PLANET") &&
 		    (!d->packet_source || source == d->packet_source) &&
-		    group_presenter(d, source, source_offset)) {
-			struct rx_stream *rx =
-				rx_stream(d, stream, service, TRUE);
-
-			if (rx)
-				bind_stream_source(rx, source);
-			if (!d->presentation.receiving &&
-			    (!d->presentation.advertised ||
-			     (d->presentation.due == G_MAXINT64 &&
-			      source_offset > d->presentation.offset))) {
-				d->presentation.offset = source_offset;
-				d->presentation.first_pn = 0;
-				d->presentation.attempts = 0;
-				d->presentation.due = 0;
-			}
-			d->presentation.advertised = TRUE;
+		    !advertise_presenter(d, source, source_offset) &&
+		    !d->presentation.source && !d->packet_source) {
+			/* The transport ACK covers DATA_AVAIL even if the roster
+			 * push has not arrived. Keep only the relay's latest
+			 * announcement. Media still requires a confirmed member.
+			 */
+			d->pending_presenter.source = source;
+			d->pending_presenter.offset = source_offset;
+			d->pending_presenter.expires =
+				now + 15 * G_USEC_PER_SEC;
 		}
 		struct tx_stream *s = tx_stream(d, stream);
 
@@ -931,6 +989,11 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 		p = reason_end + 1;
 		if (dir != 1)
 			break;
+		if (d->group && stream == PDTP_PRESENTATION_VIDEO &&
+		    !strcmp(service, "PLANET") &&
+		    (!d->packet_source ||
+		     d->packet_source == d->pending_presenter.source))
+			d->pending_presenter.source = 0;
 		struct rx_stream *rx = rx_stream(d, stream, service, FALSE);
 
 		if (!rx)

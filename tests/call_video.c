@@ -7,6 +7,8 @@
 #include "call_vp8_encode.h"
 #include "screencast.h"
 #include <string.h>
+#include <vpx/vp8cx.h>
+#include <vpx/vpx_encoder.h>
 #if CALL_HWDECODE
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
@@ -341,7 +343,7 @@ static void decoder_visible_dimensions(void)
 		0x00,
 	};
 	struct loop loop = { .rotation = 270, .color_tolerance = 3 };
-	struct call_vp8_decoder *decoder = call_vp8_open(1);
+	struct call_vp8_decoder *decoder = call_vp8_open(1, FALSE);
 	const char *initial = NULL;
 
 	g_assert_nonnull(decoder);
@@ -1866,7 +1868,7 @@ static void native_hardware_vp8(void)
 		return;
 	}
 
-	struct call_vp8_decoder *dec = call_vp8_open(1);
+	struct call_vp8_decoder *dec = call_vp8_open(1, FALSE);
 	struct loop loop = { .color_tolerance = 12 };
 	const int strides[] = { W + 9, W / 2 + 3, W / 2 + 11 };
 	g_autofree guint8 *storage =
@@ -1972,6 +1974,77 @@ static void screen_share_official_layout(void)
 					 share_display, &loop));
 	g_ptr_array_unref(loop.fragments);
 	call_share_encoder_free(enc);
+	call_share_decoder_free(dec);
+}
+
+/* Generate a phone-size presentation independently of our camera encoder. */
+static void screen_share_portrait(void)
+{
+	enum {
+		WIDTH = 1080,
+		HEIGHT = 2408
+	};
+	const guint8 header[] = { 0x8c, 0, 1 };
+	const guint8 samples[] = { 96, 80, 160 };
+	vpx_codec_ctx_t encoder;
+	vpx_codec_enc_cfg_t cfg;
+	vpx_image_t image;
+	vpx_codec_iter_t iter = NULL;
+	const vpx_codec_cx_pkt_t *packet;
+	struct loop loop = { .frame = { .width = WIDTH, .height = HEIGHT },
+			     .color_tolerance = 3 };
+	struct call_share_decoder *dec = call_share_decoder_new();
+	g_autoptr(GByteArray) frag = g_byte_array_new();
+
+	g_assert_false(line_preview_size_valid(WIDTH, HEIGHT, FALSE));
+	g_assert_true(line_preview_size_valid(3840, 2160, TRUE));
+	g_assert_true(line_preview_size_valid(4096, 2025, TRUE));
+	g_assert_nonnull(dec);
+	g_assert_cmpint(vpx_codec_enc_config_default(vpx_codec_vp8_cx(), &cfg,
+						     0),
+			==, VPX_CODEC_OK);
+	cfg.g_w = WIDTH;
+	cfg.g_h = HEIGHT;
+	cfg.g_lag_in_frames = 0;
+	g_assert_cmpint(vpx_codec_enc_init(&encoder, vpx_codec_vp8_cx(), &cfg,
+					   0),
+			==, VPX_CODEC_OK);
+	g_assert_nonnull(
+		vpx_img_alloc(&image, VPX_IMG_FMT_I420, WIDTH, HEIGHT, 1));
+	for (unsigned int i = 0; i < G_N_ELEMENTS(samples); i++)
+		memset(image.planes[i], samples[i],
+		       image.stride[i] * (i ? HEIGHT / 2 : HEIGHT));
+	g_assert_cmpint(vpx_codec_encode(&encoder, &image, 0, 1,
+					 VPX_EFLAG_FORCE_KF, VPX_DL_REALTIME),
+			==, VPX_CODEC_OK);
+	g_byte_array_append(frag, header, sizeof(header));
+	while ((packet = vpx_codec_get_cx_data(&encoder, &iter))) {
+		if (packet->kind == VPX_CODEC_CX_FRAME_PKT)
+			g_byte_array_append(frag, packet->data.frame.buf,
+					    packet->data.frame.sz);
+	}
+	vpx_img_free(&image);
+	vpx_codec_destroy(&encoder);
+	g_assert_cmpuint(frag->len, >, sizeof(header) + 10);
+	g_assert_true(call_share_decode(dec, frag->data, frag->len,
+					check_visible_edges, &loop));
+	g_assert_cmpuint(loop.count, ==, 1);
+	/* The source dimensions are little-endian in a VP8 keyframe. */
+	guint8 *size = frag->data + sizeof(header) + 6;
+
+	const guint invalid[][2] = { { 4097, 1000 },
+				     { WIDTH, 4097 },
+				     { 3840, 2161 } };
+	for (guint i = 0; i < G_N_ELEMENTS(invalid); i++) {
+		size[0] = invalid[i][0] & 255;
+		size[1] = invalid[i][0] >> 8;
+		size[2] = invalid[i][1] & 255;
+		size[3] = invalid[i][1] >> 8;
+		g_assert_false(call_share_decode(dec, frag->data, frag->len,
+						 check_visible_edges, &loop));
+		g_assert_true(call_share_decoder_keyframe_needed(dec));
+	}
+	g_assert_cmpuint(loop.count, ==, 1);
 	call_share_decoder_free(dec);
 }
 
@@ -2292,6 +2365,7 @@ int main(int argc, char **argv)
 			intel_decoder_selection);
 	g_test_add_func("/video/screen-share-official-layout",
 			screen_share_official_layout);
+	g_test_add_func("/video/screen-share-portrait", screen_share_portrait);
 	g_test_add_func("/video/screen-capture-conversion",
 			screen_capture_conversion);
 	g_test_add_func("/video/software-yuv-conversion",

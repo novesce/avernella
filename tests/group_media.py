@@ -42,6 +42,7 @@ CASES = {
         "/video/conference-vp8-compact-ved",
         "/video/conference-keyframe-feedback",
         "/video/screen-share-official-layout",
+        "/video/screen-share-portrait",
         "/video/screen-capture-conversion",
     ],
     "test-ui-scroll-scene": ["/ui-scroll/scene-matches-full-repaint"],

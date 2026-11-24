@@ -455,7 +455,7 @@ static struct call_video *open_video(const guint8 tx[30], const guint8 rx[30],
 		   RAND_bytes((guint8 *)&v->ts_base, sizeof(v->ts_base)) != 1))
 		goto failed;
 	if (rx && (!call_srtp_open(&v->rx, rx, ssrc_specific, rx_ssrc) ||
-		   !(v->dec = call_vp8_open(threads))))
+		   !(v->dec = call_vp8_open(threads, FALSE))))
 		goto failed;
 	v->need_key = rx != NULL;
 
@@ -1715,7 +1715,7 @@ struct call_share_decoder *call_share_decoder_new(void)
 {
 	struct call_share_decoder *s = g_new0(struct call_share_decoder, 1);
 
-	s->dec = call_vp8_open(MIN(4, g_get_num_processors()));
+	s->dec = call_vp8_open(MIN(4, g_get_num_processors()), TRUE);
 	if (!s->dec) {
 		g_free(s);
 		return NULL;
@@ -1754,7 +1754,7 @@ static gboolean share_decode_frame(struct call_share_decoder *s,
 		if (vpx_codec_peek_stream_info(vpx_codec_vp8_dx(), vp8, n,
 					       &info) ||
 		    !info.is_kf ||
-		    !line_camera_frame_size_valid(info.w, info.h))
+		    !line_preview_size_valid(info.w, info.h, TRUE))
 			return FALSE;
 	}
 	shown = call_vp8_decode(s->dec, vp8, n, key, s->rotation, display,
