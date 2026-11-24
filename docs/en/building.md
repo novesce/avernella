@@ -103,7 +103,7 @@ Pass them on the command line, as in `make DEBUG=1`.
 
 ### What the release build does
 
-The default flags are `-Oz -flto -fno-plt -fvisibility=hidden` without unwind tables, plus `-std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE`. Linking uses `-fuse-ld=bfd -pie`, `--gc-sections`, `--as-needed`, full RELRO, `-z separate-code`, and, when the toolchain supports them, `--rosegment` and `-z pack-relative-relocs` (glibc 2.36 or newer). The result is stripped.
+The default flags are `-Oz -flto -fno-plt -fvisibility=hidden` without unwind tables, plus `-std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -Werror=format-security -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE`. When the compiler supports them, the Makefile also adds `-fstack-clash-protection` and, for optimizing builds without AddressSanitizer, `-D_FORTIFY_SOURCE=3` (replacing any lower level from the environment). Linking uses `-fuse-ld=bfd -pie`, `--gc-sections`, `--as-needed`, full RELRO, `-z separate-code`, `-z noexecstack`, and, when the toolchain supports them, `--rosegment` and `-z pack-relative-relocs` (glibc 2.36 or newer). The result is stripped.
 
 A few files are built for speed instead of size: `ui_pixels.c`, `camera_pixels.c` and `screencast.c` get `-O3` so GCC can vectorize their per-pixel loops. `screencast.c` also gets `-Wno-pedantic`, because PipeWire's headers use GNU statement expressions.
 

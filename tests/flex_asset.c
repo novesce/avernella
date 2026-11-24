@@ -147,12 +147,36 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
 		"::1",
 		"::ffff:192.168.1.5",
 		"64:ff9b::a00:1",
+		"64:ff9b:1::a00:1",
+		"100::1",
+		/* 2001::/23, IETF protocol assignments, end to end. */
+		"2001::1",
+		"2001:1::1",
+		"2001:2::1",
+		"2001:2:0:ffff::1",
+		"2001:3::1",
+		"2001:4:112::1",
+		"2001:20::1",
+		"2001:30::1",
+		"2001:1ff:ffff::1",
 		"2001:db8::1",
+		"2001:db8:ffff::1",
 		"2002:a01:203::1",
 		"3fff::1",
+		"3fff:fff::1",
+		"5f00::1",
+		"fc00::1",
 		"fd00::1",
 		"fe80::1",
 		"ff02::1",
+	};
+	/* Global unicast, CDNs among it, right up to the special blocks. */
+	static const char *const public6[] = {
+		"2001:200::1",	    "2001:4860:4860::8888",
+		"2001:db7:ffff::1", "2001:db9::1",
+		"2003::1",	    "2606:4700::1111",
+		"2a04:4e42::1",	    "3ffe:ffff::1",
+		"3fff:1000::1",	    "2c0f:fb50::1",
 	};
 
 	if (sockets_checked)
@@ -164,6 +188,19 @@ CURLcode __wrap_curl_easy_perform(CURL *curl)
 	for (guint i = 0; i < G_N_ELEMENTS(private6); i++)
 		g_assert_cmpint(try_address(AF_INET6, private6[i], 443), ==,
 				CURL_SOCKET_BAD);
+	/* A kernel without IPv6 opens no IPv6 socket for anyone. */
+	int v6 = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+	for (guint i = 0; v6 >= 0 && i < G_N_ELEMENTS(public6); i++) {
+		int fd = try_address(AF_INET6, public6[i], 443);
+
+		g_assert_cmpint(fd, >=, 0);
+		close(fd);
+		g_assert_cmpint(try_address(AF_INET6, public6[i], 80), ==,
+				CURL_SOCKET_BAD);
+	}
+	if (v6 >= 0)
+		close(v6);
 	g_assert_cmpint(try_address(AF_INET, "1.2.3.4", 80), ==,
 			CURL_SOCKET_BAD);
 	int fd = try_address(AF_INET, "1.2.3.4", 443);

@@ -65,32 +65,108 @@ gboolean line_liff_line_scheme(const char *url)
 		       !g_ascii_strncasecmp(url, "lineb://", 8));
 }
 
+gboolean line_liff_debug_url(const char *url)
+{
+	static const char prefix[] = "http://127.0.0.1:";
+	gsize n = sizeof(prefix) - 1, digits = 0;
+
+	if (!url || strlen(url) >= LINE_LIFF_PACKET ||
+	    g_ascii_strncasecmp(url, prefix, n))
+		return FALSE;
+	/*
+	 * The authority must be exactly the address and a port, so neither
+	 * user info ("127.0.0.1:80@example.com") nor a backslash, which
+	 * WebKit reads as a slash, can move the real host elsewhere.
+	 */
+	while (g_ascii_isdigit(url[n + digits]))
+		digits++;
+	if (!digits || digits > 5 ||
+	    (url[n + digits] && !strchr("/?#", url[n + digits])))
+		return FALSE;
+	for (const char *p = url; *p; p++)
+		if (!g_ascii_isgraph(*p) || *p == '\\')
+			return FALSE;
+	g_autoptr(GUri) uri = g_uri_parse(url, G_URI_FLAGS_NONE, NULL);
+
+	return uri && !g_uri_get_userinfo(uri) &&
+	       !g_ascii_strcasecmp(g_uri_get_scheme(uri), "http") &&
+	       !g_strcmp0(g_uri_get_host(uri), "127.0.0.1") &&
+	       g_uri_get_port(uri) >= 1024 && g_uri_get_port(uri) <= 65535;
+}
+
+gboolean line_liff_web_url(const char *url, gboolean debug)
+{
+	if (!url)
+		return FALSE;
+	if (!g_ascii_strncasecmp(url, "https://", 8) ||
+	    !g_ascii_strncasecmp(url, "about:", 6) ||
+	    !g_ascii_strncasecmp(url, "data:", 5) ||
+	    !g_ascii_strncasecmp(url, "blob:", 5))
+		return TRUE;
+	return debug && line_liff_debug_url(url);
+}
+
+#define DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
+
+/* A real directory of ours that no other user can write to. */
+static gboolean own_dir(int fd)
+{
+	struct stat st;
+
+	return !fstat(fd, &st) && S_ISDIR(st.st_mode) &&
+	       st.st_uid == geteuid() && !(st.st_mode & 022);
+}
+
 char *line_liff_storage_dir(const char *base)
 {
 	g_autofree char *home = g_build_filename(base, "avernella", NULL);
 	static const char *const legacy[] = { "kitatide", "line-linux" };
-	char *target = g_build_filename(home, "liff", NULL);
+	g_autofree char *target = g_build_filename(home, "liff", NULL);
 	struct stat st;
 
-	if (!lstat(target, &st) || errno != ENOENT)
-		return target;
 	if (g_mkdir_with_parents(home, 0700) < 0)
-		return target;
-	for (gsize i = 0; i < G_N_ELEMENTS(legacy); i++) {
-		g_autofree char *parent =
-			g_build_filename(base, legacy[i], NULL);
-		g_autofree char *source =
-			g_build_filename(parent, "liff", NULL);
+		return NULL;
+	/*
+	 * WebKit opens the path by name, so check the parent first: when it
+	 * is ours alone, no one else can swap the directory inside it.
+	 */
+	int dir = open(home, DIR_FLAGS);
 
-		if (lstat(source, &st) || !S_ISDIR(st.st_mode) ||
-		    st.st_uid != geteuid())
-			continue;
-		if (renameat2(AT_FDCWD, source, AT_FDCWD, target,
-			      RENAME_NOREPLACE) == 0) {
-			/* Drop the old parent only if nothing else is in it. */
-			(void)rmdir(parent);
-			break;
-		}
+	if (dir < 0)
+		return NULL;
+	if (!own_dir(dir)) {
+		close(dir);
+		return NULL;
 	}
-	return target;
+	if (fstatat(dir, "liff", &st, AT_SYMLINK_NOFOLLOW) && errno == ENOENT)
+		for (gsize i = 0; i < G_N_ELEMENTS(legacy); i++) {
+			g_autofree char *parent =
+				g_build_filename(base, legacy[i], NULL);
+			g_autofree char *source =
+				g_build_filename(parent, "liff", NULL);
+
+			if (lstat(source, &st) || !S_ISDIR(st.st_mode) ||
+			    st.st_uid != geteuid())
+				continue;
+			if (renameat2(AT_FDCWD, source, dir, "liff",
+				      RENAME_NOREPLACE) == 0) {
+				/* Drop the old parent only if it is empty. */
+				(void)rmdir(parent);
+				break;
+			}
+		}
+	if (mkdirat(dir, "liff", 0700) && errno != EEXIST) {
+		close(dir);
+		return NULL;
+	}
+	/* Never through a symlink, never someone else's; ours turns 0700. */
+	int fd = openat(dir, "liff", DIR_FLAGS);
+	gboolean ok = fd >= 0 && !fstat(fd, &st) && S_ISDIR(st.st_mode) &&
+		      st.st_uid == geteuid() &&
+		      (!(st.st_mode & 077) || !fchmod(fd, 0700));
+
+	if (fd >= 0)
+		close(fd);
+	close(dir);
+	return ok ? g_steal_pointer(&target) : NULL;
 }

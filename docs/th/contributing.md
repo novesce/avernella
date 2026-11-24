@@ -28,7 +28,7 @@ make checkpatch     # checkpatch.pl ของเคอร์เนล ทีล�
 - ใช้การเก็บกวาดอัตโนมัติของ GLib: `g_autoptr(J)`, `g_autoptr(GError)`, `g_autofree char *` `line.h` นิยาม `G_DEFINE_AUTOPTR_CLEANUP_FUNC(J, json_object_put)` ไว้แล้ว
 - คอมเมนต์ของฟังก์ชันบอกว่าใครเป็นเจ้าของผลลัพธ์ "Caller owns" แปลว่าคุณต้องปล่อยเอง "Borrowed" แปลว่าห้ามปล่อย
 - json-c: `json_object_object_add()` **รับ** ความเป็นเจ้าของของค่าไป ถ้าจะเพิ่มอ็อบเจกต์ที่คุณยังเก็บไว้ ให้ส่ง `json_object_get(value)` `field()` และ `strfield()` คืนพอยน์เตอร์แบบยืม
-- ล้างความลับเมื่อใช้เสร็จ: ใช้ `OPENSSL_cleanse()` หรือ `explicit_bzero()` กับกุญแจ รหัสผ่าน โทเค็น และ payload ที่ถอดรหัสแล้ว ดูวิธีที่ `sealing.c` และ `password_login.c` ทำ
+- ล้างความลับเมื่อใช้เสร็จ: ใช้ `OPENSSL_cleanse()` หรือ `explicit_bzero()` กับกุญแจ รหัสผ่าน โทเค็น และ payload ที่ถอดรหัสแล้ว ดูวิธีที่ `sealing.c` และ `password_login.c` ทำ สำหรับโทเค็นให้ใช้ตัวช่วยใน `line.h`: คืนหน่วยความจำด้วย `line_secret_free()` หรือประกาศเป็น `g_autoptr(LineSecret)` แทนค่าที่เก็บไว้ด้วย `line_secret_set()` และคืนรายการ header ของคำขอด้วย `line_curl_headers_free()`
 
 ### ข้อผิดพลาด
 

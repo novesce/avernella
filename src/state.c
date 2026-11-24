@@ -29,9 +29,9 @@ static gboolean io_failure(const char *action, GError **error)
 
 void line_session_clear(Line *s)
 {
-	g_free(s->access);
-	g_free(s->refresh);
-	g_free(s->obs_token);
+	line_secret_free(s->access);
+	line_secret_free(s->refresh);
+	line_secret_free(s->obs_token);
 	g_clear_pointer(&s->emoji_packs, g_ptr_array_unref);
 	g_free(s->mid);
 	json_object_put(s->keys);
@@ -89,6 +89,9 @@ static gboolean load(int dir, Line *s, GError **error)
 	s->access = g_strdup(token);
 	s->refresh = g_strdup(strfield(session, "refresh"));
 	s->mid = g_strdup(strfield(session, "mid"));
+	/* The parsed copies go with session; the keys stay in use. */
+	line_secret_json_wipe(field(session, "access"));
+	line_secret_json_wipe(field(session, "refresh"));
 	J *refresh_at = field(session, "refreshAt");
 
 	if (json_object_is_type(refresh_at, json_type_int))
@@ -235,14 +238,17 @@ int line_store_open(Line *s, GError **error)
 	return -1;
 }
 
+static gboolean store_record(int dir, Line *s, J *record, GError **error);
+
 gboolean line_store_save(int dir, Line *s, GError **error)
 {
 	g_autoptr(J) record = obj();
-	json_object_object_add(record, "access",
-			       json_object_new_string(s->access));
-	if (s->refresh)
-		json_object_object_add(record, "refresh",
-				       json_object_new_string(s->refresh));
+	J *access = json_object_new_string(s->access);
+	J *refresh = s->refresh ? json_object_new_string(s->refresh) : NULL;
+
+	json_object_object_add(record, "access", access);
+	if (refresh)
+		json_object_object_add(record, "refresh", refresh);
 	if (s->mid)
 		json_object_object_add(record, "mid",
 				       json_object_new_string(s->mid));
@@ -250,11 +256,35 @@ gboolean line_store_save(int dir, Line *s, GError **error)
 		json_object_object_add(record, "refreshAt",
 				       json_object_new_int64(s->refresh_at));
 	json_object_object_add(record, "keys", json_object_get(s->keys));
-	json_object_object_add(record, "seq",
-			       json_object_new_int64(MAX(s->seq, s->seq_reserved)));
+	json_object_object_add(
+		record, "seq",
+		json_object_new_int64(MAX(s->seq, s->seq_reserved)));
+	gboolean saved = store_record(dir, s, record, error);
+
+	/*
+	 * The token copies belong to record alone. Its key objects are shared
+	 * with s->keys, and json-c frees those without wiping them.
+	 */
+	line_secret_json_wipe(access);
+	line_secret_json_wipe(refresh);
+	return saved;
+}
+
+/* Wipes the session text json-c printed into record's own buffer. */
+static void wipe_text(const char *text, size_t size)
+{
+	if (text)
+		explicit_bzero((char *)text, size);
+}
+
+static gboolean store_record(int dir, Line *s, J *record, GError **error)
+{
 	size_t left;
 	const char *p = json_object_to_json_string_length(
 		record, JSON_C_TO_STRING_PLAIN, &left);
+	const char *text = p;
+	size_t size = left;
+
 	if (left > MAX_SESSION_SIZE) {
 		/*
 		 * Peer and group keys can be retrieved again by ID. Keep the device's
@@ -264,7 +294,13 @@ gboolean line_store_save(int dir, Line *s, GError **error)
 		json_object_object_del(s->keys, "groups");
 		p = json_object_to_json_string_length(
 			record, JSON_C_TO_STRING_PLAIN, &left);
+		/* A shorter text reuses the buffer: wipe the longer tail. */
+		if (p == text && size > left)
+			wipe_text(p + left, size - left);
+		text = p;
+		size = left;
 		if (left > MAX_SESSION_SIZE) {
+			wipe_text(text, size);
 			g_set_error_literal(
 				error, LINE_ERROR, 1,
 				"The LINE identity exceeds the local session size limit.");
@@ -272,13 +308,17 @@ gboolean line_store_save(int dir, Line *s, GError **error)
 		}
 	}
 	/* An incomplete update from a killed owner is superseded under flock. */
-	if (unlinkat(dir, TEMP, 0) < 0 && errno != ENOENT)
+	if (unlinkat(dir, TEMP, 0) < 0 && errno != ENOENT) {
+		wipe_text(text, size);
 		return io_failure("prepare", error);
+	}
 	int fd = openat(dir, TEMP,
 			O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC,
 			0600);
-	if (fd < 0)
+	if (fd < 0) {
+		wipe_text(text, size);
 		return io_failure("save", error);
+	}
 	int failure = 0;
 
 	while (left) {
@@ -293,6 +333,7 @@ gboolean line_store_save(int dir, Line *s, GError **error)
 		p += n;
 		left -= n;
 	}
+	wipe_text(text, size);
 	if (!failure && fdatasync(fd))
 		failure = errno;
 	if (close(fd) && !failure)
@@ -312,7 +353,9 @@ gboolean line_store_save(int dir, Line *s, GError **error)
 
 gint32 line_store_sequence(int dir, Line *s, GError **error)
 {
-	enum { SEQUENCE_BATCH = 32 };
+	enum {
+		SEQUENCE_BATCH = 32
+	};
 
 	if (s->seq >= G_MAXINT32) {
 		g_set_error_literal(error, LINE_ERROR, 1,

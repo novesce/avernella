@@ -59,6 +59,8 @@ J\b
 Json\b
 Line\b
 LineAudio\b
+LineSecret\b
+LineSecretBytes\b
 LineStickers\b
 LineVideoPlayback\b
 OpusDecoder\b
@@ -75,6 +77,7 @@ Pb\b
 PbField\b
 QRcode\b
 Rect\b
+RequestPacket\b
 SDL_AudioSpec\b
 SDL_Event\b
 SDL_Renderer\b

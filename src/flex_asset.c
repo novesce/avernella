@@ -96,19 +96,43 @@ static gboolean public_v4(const struct sockaddr_in *addr)
 	       first_three != 0xcb0071 && (ip >> 17) != 0x6309;
 }
 
+/*
+ * The IANA IPv6 special-purpose blocks inside global unicast (2000::/3):
+ * 2001::/23 holds the IETF protocol assignments (Teredo, PCP and TURN
+ * anycast, benchmarking 2001:2::/48, AMT, AS112, ORCHIDv2, drone ID);
+ * 2001:db8::/32 and 3fff::/20 are documentation; 2002::/16 is 6to4, which
+ * embeds any IPv4 address. Everything else special (loopback, IPv4-mapped,
+ * NAT64, unique local, link-local, multicast, SRv6 5f00::/16) lies
+ * outside 2000::/3.
+ */
+static const struct {
+	guint8 prefix[4];
+	guint bits;
+} special_v6[] = {
+	{ { 0x20, 0x01, 0x00, 0x00 }, 23 },
+	{ { 0x20, 0x01, 0x0d, 0xb8 }, 32 },
+	{ { 0x20, 0x02, 0x00, 0x00 }, 16 },
+	{ { 0x3f, 0xff, 0x00, 0x00 }, 20 },
+};
+
 static gboolean public_v6(const struct sockaddr_in6 *addr)
 {
 	const guint8 *ip = addr->sin6_addr.s6_addr;
 
-	/* Accept native global unicast and exclude special/tunnel ranges. */
 	if (addr->sin6_port != htons(443) || (ip[0] & 0xe0) != 0x20 ||
 	    addr->sin6_scope_id)
 		return FALSE;
-	return !(ip[0] == 0x20 &&
-		 (ip[1] == 2 ||
-		  (ip[1] == 1 &&
-		   (ip[2] < 2 || (ip[2] == 0x0d && ip[3] == 0xb8))))) &&
-	       !(ip[0] == 0x3f && ip[1] == 0xff && !(ip[2] & 0xf0));
+	for (gsize i = 0; i < G_N_ELEMENTS(special_v6); i++) {
+		guint bytes = special_v6[i].bits / 8;
+		guint rest = special_v6[i].bits % 8;
+		guint8 mask = 0xff << (8 - rest);
+
+		if (!memcmp(ip, special_v6[i].prefix, bytes) &&
+		    (!rest ||
+		     !((ip[bytes] ^ special_v6[i].prefix[bytes]) & mask)))
+			return FALSE;
+	}
+	return TRUE;
 }
 
 static curl_socket_t asset_socket(void *data, curlsocktype purpose,

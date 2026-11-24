@@ -103,7 +103,7 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 
 ### build แบบ release ทำอะไรบ้าง
 
-แฟล็กเริ่มต้นคือ `-Oz -flto -fno-plt -fvisibility=hidden` โดยไม่มี unwind table บวก `-std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE` ตอนลิงก์ใช้ `-fuse-ld=bfd -pie`, `--gc-sections`, `--as-needed`, RELRO เต็มรูปแบบ, `-z separate-code` และถ้า toolchain รองรับก็ใช้ `--rosegment` กับ `-z pack-relative-relocs` (glibc 2.36 ขึ้นไป) ผลลัพธ์ถูก strip
+แฟล็กเริ่มต้นคือ `-Oz -flto -fno-plt -fvisibility=hidden` โดยไม่มี unwind table บวก `-std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -Werror=format-security -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE` ถ้าคอมไพเลอร์รองรับ Makefile จะเพิ่ม `-fstack-clash-protection` และสำหรับ build ที่เปิด optimization และไม่ใช้ AddressSanitizer จะเพิ่ม `-D_FORTIFY_SOURCE=3` (แทนระดับที่ต่ำกว่าจาก environment) ตอนลิงก์ใช้ `-fuse-ld=bfd -pie`, `--gc-sections`, `--as-needed`, RELRO เต็มรูปแบบ, `-z separate-code`, `-z noexecstack` และถ้า toolchain รองรับก็ใช้ `--rosegment` กับ `-z pack-relative-relocs` (glibc 2.36 ขึ้นไป) ผลลัพธ์ถูก strip
 
 มีบางไฟล์ที่ build เพื่อความเร็วแทนขนาด ได้แก่ `ui_pixels.c`, `camera_pixels.c` และ `screencast.c` ใช้ `-O3` เพื่อให้ GCC ทำ vectorize ลูปที่ประมวลผลทีละพิกเซล `screencast.c` ยังได้ `-Wno-pedantic` เพิ่ม เพราะ header ของ PipeWire ใช้ statement expression ของ GNU
 

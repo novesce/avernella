@@ -65,8 +65,7 @@ char *line_obs_token(Line *s, GError **error)
 			char *fresh = g_strndup(token, end - token);
 
 			if (s) {
-				g_free(s->obs_token);
-				s->obs_token = g_strdup(fresh);
+				line_secret_set(&s->obs_token, g_strdup(fresh));
 				s->obs_until = now + CLAMP(ttl - CLAMP(ttl / 20,
 								       30, 600),
 							   0, 86400) *
@@ -142,9 +141,9 @@ static GBytes *transfer(const char *url, const char *token,
 		if (c)
 			g_private_set(&http_client, c);
 	}
-	struct curl_slist *headers = NULL;
-	g_autofree char *auth =
+	g_autoptr(LineSecret) auth =
 		token ? g_strconcat("x-line-access: ", token, NULL) : NULL;
+	struct curl_slist *headers = NULL;
 	const char *const list[] = {
 		auth, metadata, token ? LINE_APP_HEADER : NULL,
 		upload ? "Content-Type: application/octet-stream" : NULL,
@@ -204,7 +203,7 @@ static GBytes *transfer(const char *url, const char *token,
 done:
 	if (c)
 		curl_easy_reset(c);
-	curl_slist_free_all(headers);
+	line_curl_headers_free(headers);
 	if (rc)
 		g_set_error(error, LINE_ERROR, 1,
 			    "LINE media request failed: %s.",

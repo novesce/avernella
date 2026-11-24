@@ -3,6 +3,8 @@
 #include "liff_url.h"
 #include <glib/gstdio.h>
 #include <string.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #define LIFF_ID "1661444788-rnvmoOo8"
 #define CHAT "u00000000000000000000000000000001"
@@ -251,6 +253,107 @@ static void test_storage_migration(void)
 	g_assert_cmpint(g_rmdir(base), ==, 0);
 }
 
+/* An existing directory is used only when it is a private one of ours. */
+static void test_storage_validation(void)
+{
+	g_autofree char *base = g_dir_make_tmp("liff-store-XXXXXX", NULL);
+	g_autofree char *home = g_build_filename(base, "avernella", NULL);
+	g_autofree char *target = g_build_filename(home, "liff", NULL);
+	g_autofree char *elsewhere = g_build_filename(base, "elsewhere", NULL);
+	struct stat st;
+
+	/* Created fresh, private. */
+	g_autofree char *made = line_liff_storage_dir(base);
+
+	g_assert_cmpstr(made, ==, target);
+	g_assert_cmpint(lstat(target, &st), ==, 0);
+	g_assert_true(S_ISDIR(st.st_mode));
+	g_assert_cmpuint(st.st_mode & 0777, ==, 0700);
+
+	/* An older, looser directory of ours is tightened, not replaced. */
+	g_assert_cmpint(chmod(target, 0755), ==, 0);
+	g_autofree char *loose = line_liff_storage_dir(base);
+
+	g_assert_cmpstr(loose, ==, target);
+	g_assert_cmpint(lstat(target, &st), ==, 0);
+	g_assert_cmpuint(st.st_mode & 0777, ==, 0700);
+
+	/* A symlink, even to a directory of ours, is refused. */
+	g_assert_cmpint(g_rmdir(target), ==, 0);
+	g_assert_cmpint(g_mkdir(elsewhere, 0700), ==, 0);
+	g_assert_cmpint(symlink(elsewhere, target), ==, 0);
+	g_assert_null(line_liff_storage_dir(base));
+	g_assert_cmpint(g_remove(target), ==, 0);
+
+	/* So is a file in its place. */
+	g_assert_true(g_file_set_contents(target, "", 0, NULL));
+	g_assert_null(line_liff_storage_dir(base));
+	g_assert_cmpint(g_remove(target), ==, 0);
+
+	/* And a parent other users could write to, or a symlinked one. */
+	g_assert_cmpint(chmod(home, 0777), ==, 0);
+	g_assert_null(line_liff_storage_dir(base));
+	g_assert_false(g_file_test(target, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(g_rmdir(home), ==, 0);
+	g_assert_cmpint(symlink(elsewhere, home), ==, 0);
+	g_assert_null(line_liff_storage_dir(base));
+	g_assert_cmpint(g_remove(home), ==, 0);
+
+	g_assert_cmpint(g_rmdir(elsewhere), ==, 0);
+	g_assert_cmpint(g_rmdir(base), ==, 0);
+}
+
+static void test_navigation_policy(void)
+{
+	static const char *const debug_ok[] = {
+		"http://127.0.0.1:8080/",
+		"http://127.0.0.1:65535",
+		"HTTP://127.0.0.1:1024/page?x=1#frag",
+	};
+	static const char *const debug_bad[] = {
+		"http://127.0.0.1:80@example.com/",
+		"http://127.0.0.1:8080@example.com/",
+		"http://127.0.0.1:8080\\@example.com/",
+		"http://127.0.0.1:8080.example.com/",
+		"http://127.0.0.1:/",
+		"http://127.0.0.1:80/",
+		"http://127.0.0.1:65536/",
+		"http://127.0.0.1:123456/",
+		"http://127.0.0.1:8080 /",
+		"http://user@127.0.0.1:8080/",
+		"http://127.0.0.10:8080/",
+		"https://127.0.0.1:8080/",
+		"http://localhost:8080/",
+		"http://example.com/",
+		"",
+		NULL,
+	};
+
+	for (gsize i = 0; i < G_N_ELEMENTS(debug_ok); i++) {
+		g_assert_true(line_liff_debug_url(debug_ok[i]));
+		g_assert_true(line_liff_web_url(debug_ok[i], TRUE));
+		g_assert_false(line_liff_web_url(debug_ok[i], FALSE));
+	}
+	for (gsize i = 0; i < G_N_ELEMENTS(debug_bad); i++) {
+		g_assert_false(line_liff_debug_url(debug_bad[i]));
+		if (debug_bad[i] && !g_str_has_prefix(debug_bad[i], "https:"))
+			g_assert_false(line_liff_web_url(debug_bad[i], TRUE));
+	}
+	/* The page stays on https; WebKit's own documents still load. */
+	g_assert_true(line_liff_web_url("https://liff.line.me/1-a", FALSE));
+	g_assert_true(line_liff_web_url("HTTPS://example.com/", FALSE));
+	g_assert_true(line_liff_web_url("about:blank", FALSE));
+	g_assert_true(line_liff_web_url("data:text/html,", FALSE));
+	g_assert_true(line_liff_web_url("blob:https://example.com/1", FALSE));
+	g_assert_false(line_liff_web_url("http://example.com/", FALSE));
+	g_assert_false(line_liff_web_url("http://example.com/", TRUE));
+	g_assert_false(line_liff_web_url("HTTP://example.com/", FALSE));
+	g_assert_false(line_liff_web_url("ftp://example.com/", FALSE));
+	g_assert_false(line_liff_web_url("file:///etc/passwd", TRUE));
+	g_assert_false(line_liff_web_url("javascript:alert(1)", FALSE));
+	g_assert_false(line_liff_web_url(NULL, FALSE));
+}
+
 int main(int argc, char **argv)
 {
 	g_setenv("LANGUAGE", "ja_JP.UTF-8", TRUE);
@@ -261,5 +364,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/liff/issues-view", test_issues_view);
 	g_test_add_func("/liff/opens-consent-page", test_opens_consent_page);
 	g_test_add_func("/liff/storage-migration", test_storage_migration);
+	g_test_add_func("/liff/storage-validation", test_storage_validation);
+	g_test_add_func("/liff/navigation-policy", test_navigation_policy);
 	return g_test_run();
 }

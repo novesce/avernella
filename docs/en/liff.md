@@ -104,6 +104,7 @@ The tokens travel only over this socket, never in arguments or the environment, 
 - **Closing.** Navigating to `liff://close` or calling `window.close()` closes the window.
 - **LINE links** inside the page (`line_liff_url()` or `line_liff_line_scheme()`) are sent back to the UI as `O`, so each gets its own view from LINE.
 - **Permissions.** Camera, microphone, location and notification requests are refused.
+- **HTTPS only.** Every navigation, whether a link, a script or a server redirect, must stay on `https://` or on the `about:`, `data:` and `blob:` documents that pages create (`line_liff_web_url()`). A plain `http://` link the user clicks goes to the desktop browser instead, and any other move to one is dropped, so nothing on the network can replace a page that holds LINE's tokens.
 
 ### Keys in the browser window
 
@@ -116,13 +117,13 @@ The browser protects the chat from heavy pages:
 - It moves itself and every WebKit process into a **systemd transient scope**, its own cgroup v2 leaf, with `MemoryHigh=768M`, `CPUWeight=50` and `IOWeight=50`, via `org.freedesktop.systemd1.Manager`. It waits until `/proc/self/cgroup` shows the move before WebKit forks, so the children land in the scope too.
 - It raises its `oom_score_adj` to 500, so the kernel reclaims it before the client, and sets `PR_SET_PDEATHSIG` so it ends with the client.
 - It sets a 1 ms timer slack (`PR_SET_TIMERSLACK`), which WebKit's processes inherit, so page timers coalesce into fewer wakeups.
-- WebKit's web processes are capped at 512 MB and the network process trims its caches above 128 MB. It keeps a small memory cache and no back-forward page cache. Videos wait for a click.
+- WebKit's web processes are capped at 512 MB and the network process trims its caches above 128 MB. It keeps a small memory cache and no back-forward page cache. Videos wait for a click. When WebKit stops a page for using too much memory, the browser reloads it once after 3 seconds. If it happens again, the window closes instead of reloading the page forever.
 - WebKit's bubblewrap sandbox stays on.
-- HTTP cache and cookies live in `~/.cache/avernella/liff` and `~/.local/share/avernella/liff`. When those don't exist yet, `line_liff_storage_dir()` in `liff_url.c` moves in the same directories of an earlier client (`kitatide`, then `line-linux`), so LINE apps keep their cookies.
+- HTTP cache and cookies live in `~/.cache/avernella/liff` and `~/.local/share/avernella/liff`. When those don't exist yet, `line_liff_storage_dir()` in `liff_url.c` moves in the same directories of an earlier client (`kitatide`, then `line-linux`), so LINE apps keep their cookies. The directory must be a real directory you own, inside a parent no other user can write to, and it is made mode 0700. A symlink, a file or another user's directory is refused, and the browser then keeps nothing on disk.
 
 ## Debugging a LINE app
 
-Run with `LINE_DEBUG_LIFF=1` and open the app again. The terminal reports WebKit load stages and bridge operations as `openWindow`, `closeWindow` or `unsupported`. These fixed labels keep URLs, page console text and tokens out of Avernella's LIFF diagnostics. With the same variable, the browser also loads `http://127.0.0.1:<port>/` pages, so a local test page that loads the real SDK (`https://static.line-scdn.net/liff/edge/2/sdk.js`) can exercise the bridge. See [Building: debugging](building.md#debugging).
+Run with `LINE_DEBUG_LIFF=1` and open the app again. The terminal reports WebKit load stages and bridge operations as `openWindow`, `closeWindow` or `unsupported`. These fixed labels keep URLs, page console text and tokens out of Avernella's LIFF diagnostics. With the same variable, the browser also loads `http://127.0.0.1:<port>/` pages (`line_liff_debug_url()`: port 1024 or higher, and nothing else before the path, such as user info), so a local test page that loads the real SDK (`https://static.line-scdn.net/liff/edge/2/sdk.js`) can exercise the bridge. See [Building: debugging](building.md#debugging).
 
 ## Tests
 

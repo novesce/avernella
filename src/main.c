@@ -1975,8 +1975,8 @@ static void image_free(gpointer data)
 	g_clear_pointer(&job->bytes, g_bytes_unref);
 	g_clear_pointer(&job->ranges, json_object_put);
 	g_free(job->read_chat);
-	g_free(job->access);
-	g_free(job->next_access);
+	line_secret_free(job->access);
+	line_secret_free(job->next_access);
 	g_clear_error(&job->error);
 	g_free(job->path);
 	g_free(job->product);
@@ -2002,7 +2002,7 @@ static gpointer fetch_images(gpointer data)
 			if (session.token_changed)
 				job->next_access =
 					g_steal_pointer(&session.access);
-			g_free(session.access);
+			line_secret_free(session.access);
 		} else if (job->sticker)
 			job->bytes = line_sticker_fetch(job->path, &job->error);
 		else if (job->flex)
@@ -2148,8 +2148,8 @@ static void finish_peer_ranges(struct line_worker *w, struct image_job *job)
 	if (job->generation == w->generation) {
 		if (job->next_access &&
 		    !g_strcmp0(job->access, w->session.access)) {
-			g_free(w->session.access);
-			w->session.access = g_steal_pointer(&job->next_access);
+			line_secret_set(&w->session.access,
+					g_steal_pointer(&job->next_access));
 			w->session.token_changed = TRUE;
 			save_rotated_token(w);
 		}
@@ -2246,7 +2246,7 @@ static void handle(struct line_worker *w, const char *line)
 					    1000));
 	}
 	if (g_error_matches(error, LINE_ERROR, LINE_OBS_UNAUTHORIZED)) {
-		g_clear_pointer(&w->session.obs_token, g_free);
+		line_secret_set(&w->session.obs_token, NULL);
 		w->session.obs_until = 0;
 	}
 	if (w->session.token_changed && w->session.access && w->dir >= 0)
@@ -2619,14 +2619,12 @@ static void live_operations(struct line_worker *w)
 	if (batch.access && s->access &&
 	    !g_strcmp0(batch.access_from, s->access) &&
 	    strcmp(batch.access, s->access)) {
-		memset(s->access, 0, strlen(s->access));
-		g_free(s->access);
-		s->access = g_steal_pointer(&batch.access);
+		line_secret_set(&s->access, g_steal_pointer(&batch.access));
 		s->token_changed = TRUE;
 		save_rotated_token(w);
 	}
-	g_free(batch.access);
-	g_free(batch.access_from);
+	line_secret_free(batch.access);
+	line_secret_free(batch.access_from);
 	if (batch.denied) {
 		/*
 		 * The long poll's token was refused. Confirm once with getProfile,
@@ -2859,8 +2857,8 @@ static int worker(int credentials_fd)
 		if (fds[2].revents & POLLIN)
 			finish_images(&w);
 		if ((fds[5].revents & (POLLIN | POLLERR)) &&
-		    line_route_restored(fds[5].fd, &w.route_lost) &&
-		    w.ready && !w.route_probe) {
+		    line_route_restored(fds[5].fd, &w.route_lost) && w.ready &&
+		    !w.route_probe) {
 			/* A long poll can survive a brief link loss. */
 			w.route_probe = TRUE;
 			wake_after(&w, 1);

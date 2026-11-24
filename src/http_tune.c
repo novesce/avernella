@@ -11,12 +11,20 @@ static gsize curl_initialized;
 gboolean line_curl_global(void)
 {
 	if (g_once_init_enter(&curl_initialized))
-		g_once_init_leave(&curl_initialized,
-				  curl_global_init(CURL_GLOBAL_DEFAULT) ==
-						  CURLE_OK ?
-					  1 :
-					  2);
+		g_once_init_leave(
+			&curl_initialized,
+			curl_global_init(CURL_GLOBAL_DEFAULT) == CURLE_OK ? 1 :
+									    2);
 	return curl_initialized == 1;
+}
+
+/* Header lists are copies: an access token in one outlives the request. */
+void line_curl_headers_free(struct curl_slist *headers)
+{
+	for (struct curl_slist *h = headers; h; h = h->next)
+		if (h->data)
+			explicit_bzero(h->data, strlen(h->data));
+	curl_slist_free_all(headers);
 }
 
 /*

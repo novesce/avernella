@@ -37,6 +37,8 @@
 /* Far above an idle chat client, below a whole desktop browser. */
 #define SCOPE_MEMORY_HIGH (768ULL << 20)
 #define WEB_MEMORY_LIMIT_MB 512
+/* The pause before the one reload after WebKit kills a page for memory. */
+#define CRASH_RETRY_SECONDS 3
 
 static struct {
 	GMainLoop *loop;
@@ -51,6 +53,7 @@ static struct {
 	guint next_dialog;
 	int fd;
 	gboolean liff, debug;
+	guint crashes, retry; /* memory kills of this page, pending reload */
 } b = { .fd = LINE_LIFF_FD };
 
 static void quit(void)
@@ -185,16 +188,15 @@ static void resize(const char *size)
 #endif
 }
 
-/* LINE_DEBUG_LIFF=1 also loads local test pages from 127.0.0.1. */
-static gboolean debug_page(const char *url)
-{
-	return b.debug && g_str_has_prefix(url, "http://127.0.0.1:");
-}
-
 static void open_page(gboolean liff, const char *size, const char *url)
 {
-	if (g_ascii_strncasecmp(url, "https://", 8) && !debug_page(url))
+	/* LINE_DEBUG_LIFF=1 also loads local test pages from 127.0.0.1. */
+	if (g_ascii_strncasecmp(url, "https://", 8) &&
+	    !(b.debug && line_liff_debug_url(url)))
 		return;
+	/* A page the client opens gets its own crash retry. */
+	g_clear_handle_id(&b.retry, g_source_remove);
+	b.crashes = 0;
 	b.liff = liff;
 	webkit_settings_set_user_agent(b.settings, liff ? LINE_LIFF_USER_AGENT :
 							  LINE_WEB_USER_AGENT);
@@ -255,15 +257,6 @@ static gboolean on_packet(int fd, GIOCondition condition, gpointer data)
 	return G_SOURCE_CONTINUE;
 }
 
-static gboolean web_scheme(const char *uri)
-{
-	return !g_ascii_strncasecmp(uri, "https://", 8) ||
-	       !g_ascii_strncasecmp(uri, "http://", 7) ||
-	       !g_ascii_strncasecmp(uri, "about:", 6) ||
-	       !g_ascii_strncasecmp(uri, "data:", 5) ||
-	       !g_ascii_strncasecmp(uri, "blob:", 5);
-}
-
 static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 			  WebKitPolicyDecisionType type, gpointer data)
 {
@@ -292,7 +285,11 @@ static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 		webkit_policy_decision_ignore(decision);
 		return TRUE;
 	}
-	if (web_scheme(uri)) {
+	/*
+	 * Links and redirects alike: the page stays on https, so nothing on
+	 * the network can rewrite what runs beside the user's LINE identity.
+	 */
+	if (line_liff_web_url(uri, b.debug)) {
 		if (type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION)
 			return FALSE;
 		/* One window, like LINE's: new windows replace the page. */
@@ -301,7 +298,9 @@ static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 			webkit_web_view_load_uri(view, uri);
 		return TRUE;
 	}
-	/* tel:, mailto: and app links go to the desktop, on a click only. */
+	/* Plain http, tel:, mailto: and app links go to the desktop, on a
+	 * click only.
+	 */
 	if (gesture)
 		send_packet('X', uri, NULL);
 	webkit_policy_decision_ignore(decision);
@@ -349,19 +348,37 @@ static void on_title(WebKitWebView *view, GParamSpec *spec, gpointer data)
 	WPEToplevel *top = wpe ? wpe_view_get_toplevel(wpe) : NULL;
 
 	if (top)
-		wpe_toplevel_set_title(top, title && *title ? title : "Avernella");
+		wpe_toplevel_set_title(top,
+				       title && *title ? title : "Avernella");
 #endif
+}
+
+static gboolean retry_page(gpointer data)
+{
+	(void)data;
+	b.retry = 0;
+	webkit_web_view_reload(b.view);
+	return G_SOURCE_REMOVE;
 }
 
 static void on_crashed(WebKitWebView *view,
 		       WebKitWebProcessTerminationReason reason, gpointer data)
 {
+	(void)view;
 	(void)data;
-	/* Over the memory limit WebKit kills the page: show it again. */
-	if (reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT)
-		webkit_web_view_reload(view);
-	else
-		quit();
+	/*
+	 * Over the memory limit WebKit kills the page. Show it again once,
+	 * after a pause; a page that outgrows the limit again closes the
+	 * browser rather than loading and crashing forever.
+	 */
+	if (reason == WEBKIT_WEB_PROCESS_EXCEEDED_MEMORY_LIMIT &&
+	    !b.crashes++) {
+		g_clear_handle_id(&b.retry, g_source_remove);
+		b.retry = g_timeout_add_seconds(CRASH_RETRY_SECONDS, retry_page,
+						NULL);
+		return;
+	}
+	quit();
 }
 
 static void on_key(WebKitUserContentManager *manager, JSCValue *value,
@@ -374,6 +391,7 @@ static void on_key(WebKitUserContentManager *manager, JSCValue *value,
 	if (!g_strcmp0(key, "close")) {
 		quit();
 	} else if (!g_strcmp0(key, "reload")) {
+		g_clear_handle_id(&b.retry, g_source_remove);
 		webkit_web_view_reload(b.view);
 	} else if (!g_strcmp0(key, "back")) {
 		webkit_web_view_go_back(b.view);
@@ -572,6 +590,11 @@ static WebKitNetworkSession *network_session(void)
 	webkit_memory_pressure_settings_set_memory_limit(memory, 128);
 	webkit_network_session_set_memory_pressure_settings(memory);
 	webkit_memory_pressure_settings_free(memory);
+	if (!data || !cache) {
+		/* Never store cookies where someone else could read them. */
+		g_printerr("avernella-liff: unsafe storage, nothing kept\n");
+		return webkit_network_session_new_ephemeral();
+	}
 	return webkit_network_session_new(data, cache);
 }
 
@@ -684,7 +707,8 @@ int main(int argc, char **argv)
 	WPEView *wpe = webkit_web_view_get_wpe_view(b.view);
 
 	if (!wpe) {
-		g_printerr("avernella-liff: no display for the in-app browser.\n");
+		g_printerr(
+			"avernella-liff: no display for the in-app browser.\n");
 		return 1;
 	}
 	g_signal_connect(wpe, "closed", G_CALLBACK(quit), NULL);

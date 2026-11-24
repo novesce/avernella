@@ -41,10 +41,29 @@ gboolean line_liff_line_scheme(const char *url);
  * The in-app browser's storage directory under base (the user's data or
  * cache directory): base/avernella/liff. When it doesn't exist yet, an
  * earlier client's directory is moved there, newest first (kitatide, then
- * line-linux), so LINE apps keep their cookies and cache. An existing
- * Avernella directory is never replaced. Returns a newly allocated path.
+ * line-linux), so LINE apps keep their cookies and cache; otherwise it is
+ * created. An existing Avernella directory is never replaced. Returns a
+ * newly allocated path to a real directory that belongs to this user and
+ * is private to them (0700, tightened if needed), inside base/avernella,
+ * which no other user can write to. Returns NULL when that cannot be
+ * guaranteed, such as for a symlink or another user's directory; the
+ * browser then keeps nothing on disk.
  */
 char *line_liff_storage_dir(const char *base);
 
 #define LINE_LIFF_FD 3
 #define LINE_LIFF_PACKET 16384
+
+/*
+ * LINE_DEBUG_LIFF test pages: http://127.0.0.1:<port> with a port from
+ * 1024 to 65535 and nothing else in the authority (no user info).
+ */
+gboolean line_liff_debug_url(const char *url);
+
+/*
+ * Whether the in-app browser may load url itself: https, or the about:,
+ * data: and blob: documents that pages create without the network. Plain
+ * http is never loaded, except debug test pages when debug is set; the
+ * browser offers other links to the desktop instead.
+ */
+gboolean line_liff_web_url(const char *url, gboolean debug);

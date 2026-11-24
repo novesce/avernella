@@ -331,4 +331,5 @@ Avernella leans on the kernel and glibc instead of frameworks. Knowing these hel
 - The browser helper receives LINE app tokens only through its socket, never in arguments or the environment, and they are never logged.
 - Picture downloads from arbitrary hosts (Flex, rich messages) are anonymous, HTTPS-only, and refuse private and local network addresses ([`flex_asset.c`](../../src/flex_asset.c)).
 - Every input from LINE is size-checked and type-checked before use: the Thrift decoder limits nesting to 48 levels and 300,000 values, and field readers check JSON types.
-- The session file is plaintext protected by permissions. Anyone who can read it can act as this linked device.
+- The session file is plaintext protected by permissions. Anyone who can read it can act as this linked device. Avernella doesn't use the desktop keyring (Secret Service) for it: that needs a running keyring, which headless setups often lack, and a key stored beside the file would add nothing.
+- Tokens, header lines that carry them and HTTP reply bodies are wiped before their memory is freed. json-c frees the Letter Sealing key strings in `s->keys` without wiping them, and libcurl and OpenSSL keep their own short-lived copies of what they send and receive.

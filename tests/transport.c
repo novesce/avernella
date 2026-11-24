@@ -45,6 +45,20 @@ CURLcode __wrap_curl_easy_setopt(CURL *easy, CURLoption option, ...)
 	return CURLE_OK;
 }
 
+static guint freed_headers;
+
+void __real_curl_slist_free_all(struct curl_slist *list);
+
+/* Every request header line, the access token's included, is wiped. */
+void __wrap_curl_slist_free_all(struct curl_slist *list)
+{
+	for (struct curl_slist *h = list; h; h = h->next) {
+		g_assert_cmpint(h->data[0], ==, 0);
+		freed_headers++;
+	}
+	__real_curl_slist_free_all(list);
+}
+
 CURLcode __wrap_curl_easy_getinfo(CURL *easy, CURLINFO info, ...)
 {
 	(void)easy;
@@ -319,12 +333,17 @@ static void identity_headers(void)
 
 	http_code = 500;
 	for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+		guint freed = freed_headers;
+
 		g_setenv("LANGUAGE", cases[i][0], TRUE);
 		g_assert_null(line_call(&client, "/S4", "getProfile", NULL,
 					client.access, 0, &error));
 		g_clear_error(&error);
 		g_assert_true(sent(LINE_APP_HEADER));
 		g_assert_true(sent(cases[i][1]));
+		g_assert_true(sent("x-line-access: fixture"));
+		/* The wrapper saw each line, the token's too, already wiped. */
+		g_assert_cmpuint(freed_headers - freed, ==, sent_headers->len);
 	}
 	g_unsetenv("LANGUAGE");
 	http_code = 200;

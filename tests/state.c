@@ -41,6 +41,38 @@ static void persistence(void)
 	line_session_clear(&b);
 }
 
+/* Secrets are wiped where this code holds them, then released. */
+static void secret_helpers(void)
+{
+	g_autoptr(J) value = json_object_new_string("fixture-token");
+	const char *text = json_object_get_string(value);
+	gsize size = json_object_get_string_len(value);
+
+	g_assert_cmpuint(size, ==, 13);
+	line_secret_json_wipe(value);
+	for (gsize i = 0; i < size; i++)
+		g_assert_cmpint(text[i], ==, 0);
+	line_secret_json_wipe(NULL);
+
+	char *slot = g_strdup("one");
+	char *same = slot;
+
+	line_secret_set(&slot, same);
+	g_assert_true(slot == same);
+	g_assert_cmpstr(slot, ==, "one");
+	line_secret_set(&slot, g_strdup("two"));
+	g_assert_cmpstr(slot, ==, "two");
+	line_secret_set(&slot, NULL);
+	g_assert_null(slot);
+	line_secret_free(NULL);
+
+	g_autoptr(LineSecret) scoped = g_strdup("three");
+	g_autoptr(LineSecretBytes) bytes = g_byte_array_new();
+
+	g_byte_array_append(bytes, (const guint8 *)"four", 4);
+	g_assert_cmpstr(scoped, ==, "three");
+}
+
 static void incomplete_session(void)
 {
 	g_autofree char *staged =
@@ -339,6 +371,7 @@ int main(int argc, char **argv)
 	g_assert_nonnull(sandbox);
 	g_setenv("XDG_STATE_HOME", sandbox, TRUE);
 	g_test_add_func("/state/private-atomic-roundtrip", persistence);
+	g_test_add_func("/state/secret-helpers", secret_helpers);
 	g_test_add_func("/state/incomplete-session", incomplete_session);
 	g_test_add_func("/state/legacy-migration", legacy_migration);
 	g_test_add_func("/state/current-directory-wins",

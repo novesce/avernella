@@ -8,6 +8,55 @@ typedef struct json_object J;
 G_DEFINE_AUTOPTR_CLEANUP_FUNC(J, json_object_put)
 
 /*
+ * Secret strings (tokens and header lines that carry them) are wiped
+ * before their memory goes back to the allocator. explicit_bzero() is
+ * never optimized away, unlike a memset() before free(). Declare one with
+ * g_autoptr(LineSecret), or replace a stored one with line_secret_set().
+ */
+typedef char LineSecret;
+
+static inline void line_secret_free(LineSecret *secret)
+{
+	if (!secret)
+		return;
+	explicit_bzero(secret, strlen(secret));
+	g_free(secret);
+}
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(LineSecret, line_secret_free)
+
+/* Stores value (taking it) in *slot and wipes the secret it replaces. */
+static inline void line_secret_set(char **slot, char *value)
+{
+	if (*slot != value)
+		line_secret_free(*slot);
+	*slot = value;
+}
+
+/* Wipes a byte buffer that held secrets, then frees it. */
+static inline void line_secret_bytes_free(GByteArray *bytes)
+{
+	if (!bytes)
+		return;
+	if (bytes->len)
+		explicit_bzero(bytes->data, bytes->len);
+	g_byte_array_unref(bytes);
+}
+typedef GByteArray LineSecretBytes;
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(LineSecretBytes, line_secret_bytes_free)
+
+/*
+ * Wipes a json-c string value in place; json-c frees strings without
+ * wiping them. Only for a string this code holds alone and is about to
+ * release, never for one shared with s->keys or a caller.
+ */
+static inline void line_secret_json_wipe(J *string)
+{
+	if (json_object_is_type(string, json_type_string))
+		explicit_bzero((char *)json_object_get_string(string),
+			       json_object_get_string_len(string));
+}
+
+/*
  * Session state is private to the worker. keys is a JSON object managed by
  * sealing.c. access and refresh are printable tokens, mid is our LINE user ID.
  */
@@ -193,7 +242,7 @@ gboolean line_cooldown_check(const char *url, GError **error);
 
 /* Linux and glibc tuning (tune.c). */
 enum line_thread_role {
-	LINE_THREAD_MEDIA,	/* call audio and video: tight timers */
+	LINE_THREAD_MEDIA, /* call audio and video: tight timers */
 	LINE_THREAD_BACKGROUND, /* image fetch and decode: batch scheduling */
 };
 void line_tune_process(void);
@@ -208,6 +257,9 @@ void line_trim_memory(void);
 gboolean line_curl_tune(CURL *handle, gboolean pooled);
 /* curl_global_init once per process; FALSE if it failed. */
 gboolean line_curl_global(void);
+/* curl_slist_free_all() for request headers, wiping each line first. */
+struct curl_slist;
+void line_curl_headers_free(struct curl_slist *headers);
 /* Frees the calling thread's HTTPS handle. */
 void line_transport_release(void);
 void line_emit(J *packet);

@@ -35,6 +35,8 @@ enum {
 };
 
 #define STREAM_MASK 0x303eu
+/* The largest value a PDTP varint can carry. */
+#define VARINT_MAX G_GUINT64_CONSTANT(0x3fffffffffffffff)
 
 struct rx_segment {
 	guint64 offset, time;
@@ -87,6 +89,7 @@ struct sent_packet {
 	guint64 pn;
 	gint64 sent;
 	guint count;
+	gboolean acked; /* set while an ACK is applied, then dropped */
 	struct sent_item item[4];
 };
 
@@ -188,7 +191,7 @@ gsize call_pdtp_varint(guint8 *out, guint64 v)
 		write32(out, (guint32)v | 0x80000000u);
 		return 4;
 	}
-	v &= G_GUINT64_CONSTANT(0x3fffffffffffffff);
+	v &= VARINT_MAX;
 	write32(out, (guint32)(v >> 32) | 0xc0000000u);
 	write32(out + 4, (guint32)v);
 	return 8;
@@ -564,11 +567,12 @@ static void note_packet(struct call_pdtp *d, guint64 pn, gint64 now)
 	}
 }
 
+/* Callers pass offset <= s->delivered; the end never passes VARINT_MAX. */
 static void consume_segment(struct call_pdtp *d, struct rx_stream *s,
 			    guint64 offset, guint64 time, guint flags,
 			    guint32 source, const guint8 *p, gsize size)
 {
-	if (offset + size <= s->delivered)
+	if (offset > s->delivered || s->delivered - offset >= size)
 		return;
 	gsize skip = s->delivered - offset;
 
@@ -586,7 +590,7 @@ static void consume_segment(struct call_pdtp *d, struct rx_stream *s,
 			   source == d->presentation.source))
 		d->on_data(s->id, s->service, s->delivered, time, flags,
 			   p + skip, size - skip, d->user);
-	s->delivered = offset + size;
+	s->delivered += size - skip;
 }
 
 static void deliver(struct call_pdtp *d, struct rx_stream *s)
@@ -612,8 +616,15 @@ static void stream_data(struct call_pdtp *d, struct rx_stream *s,
 			guint64 offset, guint64 time, guint flags,
 			const guint8 *p, gsize n)
 {
-	if (!n || offset + n <= s->delivered ||
-	    offset + n > s->delivered + RECEIVE_WINDOW + DEFAULT_WINDOW)
+	/*
+	 * Offsets are varints, so a stream can never extend past VARINT_MAX.
+	 * The checks subtract rather than add, so no peer value can wrap.
+	 */
+	if (!n || n > VARINT_MAX || offset > VARINT_MAX - n)
+		return;
+	if (offset <= s->delivered ?
+		    s->delivered - offset >= n :
+		    offset - s->delivered > RECEIVE_WINDOW + DEFAULT_WINDOW - n)
 		return;
 	/* In-order data is borrowed from the authenticated packet. */
 	if (offset <= s->delivered) {
@@ -641,13 +652,23 @@ static void stream_data(struct call_pdtp *d, struct rx_stream *s,
 
 static void acked_range(struct tx_stream *s, guint64 start, guint64 end);
 
-static void peer_acked(struct call_pdtp *d, guint64 pn, gint64 now)
+/*
+ * Applies an ACK range lo..hi to the in-flight packets, newest first, and
+ * marks them for drop_acked(). The in-flight list is sorted by packet
+ * number and the ranges of one ACK descend, so *cursor makes one pass over
+ * the list per ACK, however many packet numbers the ranges claim.
+ */
+static void peer_acked(struct call_pdtp *d, guint64 lo, guint64 hi, gint64 now,
+		       guint *cursor)
 {
-	for (guint i = 0; i < d->inflight->len; i++) {
-		struct sent_packet *sp =
-			&g_array_index(d->inflight, struct sent_packet, i);
+	while (*cursor) {
+		struct sent_packet *sp = &g_array_index(
+			d->inflight, struct sent_packet, *cursor - 1);
 
-		if (sp->pn != pn)
+		if (sp->pn < lo)
+			return;
+		--*cursor;
+		if (sp->pn > hi)
 			continue;
 		gint64 rtt = now - sp->sent;
 
@@ -664,12 +685,30 @@ static void peer_acked(struct call_pdtp *d, guint64 pn, gint64 now)
 			else if (it->kind == PDTP_STREAM_DATA)
 				acked_range(s, it->start, it->end);
 		}
-		g_array_remove_index(d->inflight, i);
+		sp->acked = TRUE;
 		d->acked_packets++;
 		d->last_progress = now;
 		d->probing = FALSE;
-		return;
 	}
+}
+
+/* Removes the packets peer_acked() marked, in one pass, keeping order. */
+static void drop_acked(struct call_pdtp *d)
+{
+	guint kept = 0;
+
+	for (guint i = 0; i < d->inflight->len; i++) {
+		struct sent_packet *sp =
+			&g_array_index(d->inflight, struct sent_packet, i);
+
+		if (sp->acked)
+			continue;
+		if (kept != i)
+			g_array_index(d->inflight, struct sent_packet, kept) =
+				*sp;
+		kept++;
+	}
+	g_array_set_size(d->inflight, kept);
 }
 
 static gboolean setup_ack_range(const struct call_pdtp *d, guint64 lo,
@@ -692,34 +731,55 @@ static gboolean parse_ack(struct call_pdtp *d, const guint8 *p,
 	    !call_pdtp_read_varint(&p, end, &delay) ||
 	    !call_pdtp_read_varint(&p, end, &pairs) || pairs > 256)
 		return FALSE;
+	/*
+	 * Each (gap, count) pair walks down from the largest number. Check
+	 * that every range stays at or above zero before acting on any of
+	 * them, comparing by subtraction so no claimed size can wrap. A
+	 * malformed ACK then changes nothing.
+	 */
+	const guint8 *ranges = p;
 	guint64 pn = largest;
 
-	if (d->group)
-		*setup_acked = setup_ack_range(d, pn, pn);
-	else
-		peer_acked(d, pn, now);
 	for (guint64 i = 0; i < pairs; i++) {
 		guint64 gap, count;
 
 		if (!call_pdtp_read_varint(&p, end, &gap) ||
-		    !call_pdtp_read_varint(&p, end, &count) || gap + count > pn)
+		    !call_pdtp_read_varint(&p, end, &count) || gap > pn ||
+		    count > pn - gap)
 			return FALSE;
-		pn -= gap;
-		if (d->group) {
-			if (count)
-				*setup_acked |=
-					setup_ack_range(d, pn - count, pn - 1);
-			pn -= count;
-		} else
-			for (guint64 j = 0; j < count; j++)
-				peer_acked(d, --pn, now);
+		pn -= gap + count;
 	}
+	if (d->group && p != end)
+		return FALSE;
+	guint cursor = d->inflight->len;
+	guint64 acked = d->acked_packets;
+
+	p = ranges;
+	pn = largest;
+	if (d->group)
+		*setup_acked = setup_ack_range(d, pn, pn);
+	else
+		peer_acked(d, pn, pn, now, &cursor);
+	for (guint64 i = 0; i < pairs; i++) {
+		guint64 gap, count;
+
+		call_pdtp_read_varint(&p, end, &gap);
+		call_pdtp_read_varint(&p, end, &count);
+		pn -= gap;
+		if (count && d->group)
+			*setup_acked |= setup_ack_range(d, pn - count, pn - 1);
+		else if (count)
+			peer_acked(d, pn - count, pn - 1, now, &cursor);
+		pn -= count;
+	}
+	if (d->acked_packets != acked)
+		drop_acked(d);
 	if (d->trace && d->traced < 4000)
 		g_printerr("line-call pdtp ack largest=%" G_GUINT64_FORMAT
 			   " reason=%" G_GUINT64_FORMAT
 			   " ranges=%" G_GUINT64_FORMAT " inflight=%u\n",
 			   largest, reason, pairs, d->inflight->len);
-	return !d->group || p == end;
+	return TRUE;
 }
 
 /* Parses one element; returns FALSE if the packet is malformed. */
@@ -812,7 +872,7 @@ static gboolean element(struct call_pdtp *d, guint type, const char *service,
 			else {
 				d->share_rx.attributed++;
 				if (offset <= s->delivered &&
-				    offset + length > s->delivered)
+				    s->delivered - offset < length)
 					d->share_rx.in_order++;
 			}
 		}

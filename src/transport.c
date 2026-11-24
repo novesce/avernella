@@ -74,7 +74,7 @@ static size_t read_header(char *data, size_t size, size_t count, void *user)
 	static const char header[] = "x-line-next-access:";
 
 	if (n >= 5 && !g_ascii_strncasecmp(data, "HTTP/", 5)) {
-		g_clear_pointer(&r->next_token, g_free);
+		line_secret_set(&r->next_token, NULL);
 		r->invalid_rotation = FALSE;
 	} else if (n >= sizeof(header) - 1 &&
 		   !g_ascii_strncasecmp(data, header, sizeof(header) - 1)) {
@@ -113,6 +113,20 @@ static gboolean service_path(const char *path)
 	return TRUE;
 }
 
+/* An encoded request only exchange() holds: wiped, then released. */
+typedef GBytes RequestPacket;
+
+static void request_packet_free(RequestPacket *packet)
+{
+	gsize n;
+	const void *data = g_bytes_get_data(packet, &n);
+
+	if (data)
+		explicit_bzero((void *)data, n);
+	g_bytes_unref(packet);
+}
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(RequestPacket, request_packet_free)
+
 enum protocol {
 	COMPACT_RPC,
 	BINARY_AUTH,
@@ -145,7 +159,8 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 	}
 	if (line_cooldown_check(origin, error))
 		return NULL;
-	g_autoptr(GBytes) packet = NULL;
+	/* The encoded request can hold a refresh token: wiped when done. */
+	g_autoptr(RequestPacket) packet = NULL;
 
 	if (protocol != JSON_APPROVAL) {
 		packet = protocol == BINARY_AUTH ?
@@ -163,13 +178,14 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 	}
 
 	g_autofree char *url = g_strconcat(origin, path, NULL);
-	g_autofree char *authorization =
+	g_autoptr(LineSecret) authorization =
 		access ? g_strconcat("x-line-access: ", access, NULL) : NULL;
 	g_autofree char *poll =
 		poll_seconds && protocol == COMPACT_RPC ?
 			g_strdup_printf("x-lst: %d", poll_seconds * 1000) :
 			NULL;
-	g_autoptr(GByteArray) data = g_byte_array_new();
+	/* Replies can carry tokens, keys and messages: wiped when done. */
+	g_autoptr(LineSecretBytes) data = g_byte_array_new();
 	struct http_response response = { .body = data };
 	struct curl_slist *headers = NULL;
 	char tag[17];
@@ -241,8 +257,8 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 
 cleanup:
 	curl_easy_reset(client);
-	curl_slist_free_all(headers);
-	g_autofree char *next = response.next_token;
+	line_curl_headers_free(headers);
+	g_autoptr(LineSecret) next = response.next_token;
 
 	if (result != CURLE_OK) {
 		g_set_error(error, LINE_ERROR,
@@ -320,8 +336,7 @@ cleanup:
 	if (strcmp(path, refresh_path) && (reply || s->service_code >= 0) &&
 	    next && !response.invalid_rotation && access &&
 	    !g_strcmp0(access, s->access) && strcmp(access, next)) {
-		g_free(s->access);
-		s->access = g_steal_pointer(&next);
+		line_secret_set(&s->access, g_steal_pointer(&next));
 		s->token_changed = TRUE;
 	}
 	return reply;
@@ -386,11 +401,14 @@ static gboolean refresh_access(Line *s, GError **error)
 	g_autoptr(J) args = obj();
 	J *request = obj();
 
+	J *sent = json_object_new_string(s->refresh);
+
 	json_object_object_add(args, "1:obj", request);
-	json_object_object_add(request, "1:str",
-			       json_object_new_string(s->refresh));
+	json_object_object_add(request, "1:str", sent);
 	g_autoptr(J) reply = line_call(s, refresh_path, "refresh", args,
 				       s->access, 0, error);
+
+	line_secret_json_wipe(sent);
 	if (!reply) {
 		/*
 		 * The refresh endpoint has its own error enum. 1000 is INVALID_REQUEST
@@ -419,11 +437,12 @@ static gboolean refresh_access(Line *s, GError **error)
 			"LINE returned an invalid token refresh response.");
 		return FALSE;
 	}
-	g_free(s->access);
-	s->access = g_strdup(json_object_get_string(access));
+	line_secret_set(&s->access, g_strdup(json_object_get_string(access)));
+	line_secret_json_wipe(access);
 	if (refresh) {
-		g_free(s->refresh);
-		s->refresh = g_strdup(json_object_get_string(refresh));
+		line_secret_set(&s->refresh,
+				g_strdup(json_object_get_string(refresh)));
+		line_secret_json_wipe(refresh);
 	}
 	line_schedule_refresh(s, field(reply, "2"), field(reply, "4"));
 	/* Without LINE's hint, renew daily so the refresh token stays in use. */

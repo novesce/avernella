@@ -57,11 +57,9 @@ static gboolean pause_for(struct line_live_sync *l, gint64 us)
 static void destroy(struct line_live_sync *l)
 {
 	line_transport_release();
-	if (l->access)
-		memset(l->access, 0, strlen(l->access));
-	g_free(l->access);
-	g_free(l->rotated);
-	g_free(l->rotated_from);
+	line_secret_free(l->access);
+	line_secret_free(l->rotated);
+	line_secret_free(l->rotated_from);
 	json_object_put(l->ops);
 	line_talk_sync_clear(&l->sync);
 	close(l->wake);
@@ -88,9 +86,9 @@ static gpointer run(gpointer data)
 		g_autoptr(J) args = line_talk_sync_request(&l->sync);
 		g_autoptr(GError) error = NULL;
 		gint64 started = g_get_monotonic_time();
-		g_autoptr(J) reply =
-			line_call(&session, "/SYNC4", "sync", args,
-				  session.access, LONG_POLL_SECONDS, &error);
+		g_autoptr(J) reply = line_call(&session, "/SYNC4", "sync", args,
+					       session.access,
+					       LONG_POLL_SECONDS, &error);
 		gint64 took = g_get_monotonic_time() - started;
 		gboolean idle_timeout =
 			took >= LONG_POLL_SECONDS * (gint64)G_USEC_PER_SEC &&
@@ -105,10 +103,7 @@ static gpointer run(gpointer data)
 			g_mutex_lock(&l->lock);
 			l->denied = TRUE;
 			g_mutex_unlock(&l->lock);
-			if (session.access)
-				memset(session.access, 0,
-				       strlen(session.access));
-			g_free(session.access);
+			line_secret_free(session.access);
 			notify(l);
 			while (pause_for(l, (gint64)3600 * G_USEC_PER_SEC))
 				;
@@ -121,11 +116,14 @@ static gpointer run(gpointer data)
 			more = line_talk_sync_apply(&l->sync, reply, collect,
 						    ops, &reload);
 		if (!g_strcmp0(g_getenv("LINE_DEBUG_SYNC"), "1"))
-			g_printerr("line-sync %s after %lld ms, %zu operations%s\n",
-				   reply ? "reply" : error ? error->message : "?",
-				   (long long)(took / 1000),
-				   json_object_array_length(ops),
-				   more ? ", more" : "");
+			g_printerr(
+				"line-sync %s after %lld ms, %zu operations%s\n",
+				reply ? "reply" :
+				error ? error->message :
+					"?",
+				(long long)(took / 1000),
+				json_object_array_length(ops),
+				more ? ", more" : "");
 		g_mutex_lock(&l->lock);
 		stopping = l->stop;
 		if (generation == l->access_generation &&
@@ -134,10 +132,9 @@ static gpointer run(gpointer data)
 			if (!l->rotated_from)
 				l->rotated_from = l->access;
 			else
-				g_free(l->access);
+				line_secret_free(l->access);
 			l->access = g_strdup(session.access);
-			g_free(l->rotated);
-			l->rotated = g_strdup(session.access);
+			line_secret_set(&l->rotated, g_strdup(session.access));
 		}
 		gboolean news = json_object_array_length(ops) || reload ||
 				l->rotated;
@@ -149,8 +146,9 @@ static gpointer run(gpointer data)
 			     i++)
 				json_object_array_add(
 					l->ops,
-					json_object_get(json_object_array_get_idx(
-						ops, i)));
+					json_object_get(
+						json_object_array_get_idx(ops,
+									  i)));
 			l->reload |= reload;
 			l->revision = l->sync.revision;
 			if (l->failures) {
@@ -166,9 +164,7 @@ static gpointer run(gpointer data)
 		}
 		guint failures = l->failures;
 		g_mutex_unlock(&l->lock);
-		if (session.access)
-			memset(session.access, 0, strlen(session.access));
-		g_free(session.access);
+		line_secret_free(session.access);
 		if (stopping)
 			break;
 		if (news)
@@ -191,8 +187,7 @@ static gpointer run(gpointer data)
 }
 
 struct line_live_sync *line_live_sync_start(const struct line_talk_sync *from,
-					    const char *access,
-					    GError **error)
+					    const char *access, GError **error)
 {
 	struct line_live_sync *l = g_new0(struct line_live_sync, 1);
 
@@ -210,7 +205,7 @@ struct line_live_sync *line_live_sync_start(const struct line_talk_sync *from,
 	    !(l->thread = g_thread_try_new("line-sync", run, l, error))) {
 		if (l->wake >= 0)
 			close(l->wake);
-		g_free(l->access);
+		line_secret_free(l->access);
 		g_mutex_clear(&l->lock);
 		g_cond_clear(&l->wake_thread);
 		g_free(l);
@@ -247,10 +242,9 @@ void line_live_sync_set_access(struct line_live_sync *l, const char *access)
 	if (g_strcmp0(l->access, access) &&
 	    g_strcmp0(l->rotated_from, access)) {
 		l->access_generation++;
-		g_free(l->access);
-		l->access = g_strdup(access);
-		g_clear_pointer(&l->rotated, g_free);
-		g_clear_pointer(&l->rotated_from, g_free);
+		line_secret_set(&l->access, g_strdup(access));
+		line_secret_set(&l->rotated, NULL);
+		line_secret_set(&l->rotated_from, NULL);
 	}
 	g_mutex_unlock(&l->lock);
 }

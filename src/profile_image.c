@@ -255,7 +255,7 @@ J *line_own_picture_update(Line *s, const char *path, GError **error)
 	g_autoptr(GBytes) jpeg = line_profile_jpeg(original, error);
 	if (!jpeg)
 		return NULL;
-	g_autofree char *token = line_obs_token(s, error);
+	g_autoptr(LineSecret) token = line_obs_token(s, error);
 
 	if (!token || !line_obs_upload_profile(token, s->mid, jpeg, error))
 		return NULL;

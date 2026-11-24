@@ -23,7 +23,7 @@ CFLAGS ?= -Oz -flto -fno-plt -fvisibility=hidden \
 	-fno-unwind-tables -fno-asynchronous-unwind-tables
 STRIP_RELEASE = -s
 endif
-CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE
+CFLAGS += -std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -Werror=format-security -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE
 LDLIBS += $(shell pkg-config --libs $(PKGS)) -pthread -ldl
 
 # Check the driver itself so GCC aliases and wrappers also work.
@@ -42,8 +42,20 @@ PACKED_RELOCS := $(shell printf '\043include <features.h>\n\043if __GLIBC_PREREQ
 	$(CC) $(CPPFLAGS) $(LDFLAGS) -x c - -fuse-ld=bfd -pie \
 	-Wl,--fatal-warnings,-z,pack-relative-relocs -o /dev/null \
 	>/dev/null 2>&1 && printf '%s' '-Wl,-z,pack-relative-relocs')
+# _FORTIFY_SOURCE=3 needs an optimizing build and is left out under
+# AddressSanitizer, which checks the same calls itself. It replaces any
+# lower level a distribution's flags set.
+FORTIFY := $(if $(findstring -fsanitize=address,$(CFLAGS) $(CPPFLAGS)),,$(shell \
+	printf '\043ifndef __OPTIMIZE__\n\043error no optimization\n\043endif\n' | \
+	$(CC) $(CFLAGS) -E -x c - >/dev/null 2>&1 && \
+	printf '%s' '-U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=3'))
+# Stack clash probes exist on x86-64, AArch64 and most other Linux targets.
+STACK_CLASH := $(shell printf 'int main(void) { return 0; }\n' | \
+	$(CC) -Werror -fstack-clash-protection -x c - -o /dev/null \
+	>/dev/null 2>&1 && printf '%s' '-fstack-clash-protection')
+CFLAGS += $(FORTIFY) $(STACK_CLASH)
 endif
-LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-O1
+LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode
@@ -306,7 +318,7 @@ build/test-stickers: tests/stickers.c build/stickers.o build/thrift.o
 build/test-sealing: tests/sealing.c build/sealing.o build/thrift.o
 build/test-pair: tests/pair.c build/pair.o
 build/test-password-login: tests/password_login.c build/password_login.o
-build/test-transport: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
+build/test-transport: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo,--wrap=curl_slist_free_all
 build/test-transport: tests/transport.c build/transport.o build/thrift.o build/http_tune.o
 build/test-talk-sync: tests/talk_sync.c build/talk_sync.o build/thrift.o
 build/test-live-sync: tests/live_sync.c build/live_sync.o build/talk_sync.o
@@ -394,7 +406,7 @@ build/vulkan-preview: tests/vulkan_preview.c src/render/vk_present.c $(VK_PREREQ
 
 avernella-vulkan.so: src/render/vk_backend.c src/render/vk_backend.map src/render/vk_canvas.c src/render/vk_tex.c src/render/vk_present.c $(VK_PREREQS)
 	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2) \
-		$(LDFLAGS) -shared -Wl,--exclude-libs,ALL,--gc-sections,-z,defs,-z,relro,-z,now $(STRIP_RELEASE) \
+		$(LDFLAGS) -shared -Wl,--exclude-libs,ALL,--gc-sections,-z,defs,-z,relro,-z,now,-z,noexecstack $(STRIP_RELEASE) \
 		-Wl,--version-script=src/render/vk_backend.map \
 		-o build/$@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2) -ldl
 	cp build/$@ $@.tmp

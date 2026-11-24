@@ -179,7 +179,7 @@ where an area's `kind` is `link` (an HTTPS URL), `message` (text to send as you)
 Flex and rich-message artwork can come from **any HTTPS host** the sender chooses, as on the phone. That means the sender's server sees your IP address. `line_flex_image_download()` in [`flex_asset.c`](../../src/flex_asset.c) keeps the risk small:
 
 - HTTPS only. Requests carry no cookies or credentials.
-- A custom socket callback (`asset_socket()`) checks the resolved address and refuses private, loopback, link-local and other non-public IPv4 and IPv6 addresses, so a message can't make the client probe your local network.
+- A custom socket callback (`asset_socket()`) checks the resolved address and refuses private, loopback, link-local and other non-public IPv4 and IPv6 addresses, so a message can't make the client probe your local network. For IPv6 only global unicast (2000::/3) passes, minus the IANA special-purpose blocks inside it: 2001::/23 (Teredo, benchmarking and other protocol assignments), 2001:db8::/32 and 3fff::/20 (documentation) and 2002::/16 (6to4).
 - Redirects are followed only to other allowed HTTPS URLs.
 - Only JPEG, PNG or WebP is accepted, up to 64 MiB, a limit that only guards against a server that never stops sending.
 - A host that answers 429 or 503 gets no further request until its `Retry-After` passes, and the imagemap plain-URL fallback is skipped.

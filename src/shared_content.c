@@ -76,8 +76,8 @@ void line_shared_clear(Line *s)
 
 	if (!c)
 		return;
-	g_free(c->tokens[NOTE]);
-	g_free(c->tokens[ALBUM]);
+	line_secret_free(c->tokens[NOTE]);
+	line_secret_free(c->tokens[ALBUM]);
 	g_free(c->chat);
 	g_free(c->album);
 	g_hash_table_unref(c->albums);
@@ -155,8 +155,10 @@ static GBytes *transfer(Line *s, enum channel channel, const char *path,
 	/* Albums and notes share legy's cooldown with every RPC. */
 	if (line_cooldown_check(url, e))
 		return NULL;
-	g_autofree char *auth = g_strconcat("x-line-access: ", s->access, NULL);
-	g_autofree char *ch = g_strconcat("x-line-channeltoken: ", token, NULL);
+	g_autoptr(LineSecret) auth =
+		g_strconcat("x-line-access: ", s->access, NULL);
+	g_autoptr(LineSecret) ch =
+		g_strconcat("x-line-channeltoken: ", token, NULL);
 	g_autofree char *mid =
 		g_strconcat("x-line-mid: ", album ? chat_header : s->mid, NULL);
 	g_autofree char *room =
@@ -233,12 +235,12 @@ static GBytes *transfer(Line *s, enum channel channel, const char *path,
 		line_cooldown_note(url, curl, status);
 out:
 	curl_easy_cleanup(curl);
-	curl_slist_free_all(list);
+	line_curl_headers_free(list);
 	if (!rc && status >= 200 && status < 300)
 		return g_byte_array_free_to_bytes(r.data);
 	g_byte_array_unref(r.data);
 	if (status == 401 || status == 403)
-		g_clear_pointer(&s->shared->tokens[channel], g_free);
+		line_secret_set(&s->shared->tokens[channel], NULL);
 	if (rc)
 		g_set_error(e, LINE_ERROR, 1,
 			    "Shared-content transfer failed: %s.",

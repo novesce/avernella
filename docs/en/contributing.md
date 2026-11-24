@@ -28,7 +28,7 @@ make checkpatch     # the kernel's checkpatch.pl, one file per run
 - Use GLib's automatic cleanup: `g_autoptr(J)`, `g_autoptr(GError)`, `g_autofree char *`. `line.h` defines `G_DEFINE_AUTOPTR_CLEANUP_FUNC(J, json_object_put)`.
 - Function comments say who owns a result. "Caller owns" means you must free it. "Borrowed" means you must not.
 - json-c: `json_object_object_add()` **takes** ownership of the value. To add an object you keep, pass `json_object_get(value)`. `field()` and `strfield()` return borrowed pointers.
-- Wipe secrets when done: `OPENSSL_cleanse()` or `explicit_bzero()` for keys, passwords, tokens and decrypted payloads. Look at how `sealing.c` and `password_login.c` do it.
+- Wipe secrets when done: `OPENSSL_cleanse()` or `explicit_bzero()` for keys, passwords, tokens and decrypted payloads. Look at how `sealing.c` and `password_login.c` do it. For tokens use the helpers in `line.h`: free them with `line_secret_free()` or declare them `g_autoptr(LineSecret)`, replace a stored one with `line_secret_set()`, and free request header lists with `line_curl_headers_free()`.
 
 ### Errors
 

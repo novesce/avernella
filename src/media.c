@@ -291,7 +291,7 @@ static J *send_attachment_bytes(Line *s, const char *chat, GBytes *bytes,
 	OPENSSL_cleanse(material, 32);
 	if (!encrypted)
 		return NULL;
-	g_autofree char *token = line_obs_token(s, error);
+	g_autoptr(LineSecret) token = line_obs_token(s, error);
 
 	if (!token)
 		return NULL;
@@ -442,7 +442,7 @@ static GBytes *download_object(Line *s, const char *sid, const char *oid,
 	g_autoptr(GError) failure = NULL;
 
 	for (int i = 0; i < 2; i++) {
-		g_autofree char *token = line_obs_token(s, &failure);
+		g_autoptr(LineSecret) token = line_obs_token(s, &failure);
 
 		if (!token)
 			break;
@@ -459,7 +459,7 @@ static GBytes *download_object(Line *s, const char *sid, const char *oid,
 			break;
 		/* The OBS token may have been invalidated ahead of its local TTL. */
 		g_clear_error(&failure);
-		g_clear_pointer(&s->obs_token, g_free);
+		line_secret_set(&s->obs_token, NULL);
 		s->obs_until = 0;
 	}
 	if (failure)
