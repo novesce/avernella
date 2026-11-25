@@ -85,6 +85,7 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 | `format` | จัดรูปแบบซอร์สทั้งหมดด้วย `clang-format` ทับไฟล์เดิม |
 | `format-check` | ล้มเหลวถ้ามีซอร์สที่ยังไม่ได้จัดรูปแบบ |
 | `checkpatch` | รัน `checkpatch.pl` ของเคอร์เนล Linux กับทุกซอร์ส ทีละไฟล์ |
+| `analyze` | รันตัววิเคราะห์โค้ดแบบสถิตของ GCC (`-fanalyzer`) กับซอร์สของโปรแกรมทุกไฟล์แบบขนาน ทำแค่รายงาน และใช้เวลาราว 15 วินาที |
 | `install`, `uninstall` | ดูหัวข้อ "การติดตั้ง" ด้านล่าง |
 | `clean` | ลบผลลัพธ์จากการ build แต่เก็บ corpus ของการฟัซไว้ `fuzz-clean` ลบ `build-fuzz/` ทั้งหมด |
 
@@ -101,12 +102,20 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 | `GLSLANG=…`, `SPIRV_VAL=…` | ตัวคอมไพล์และตัวตรวจ shader ที่จะใช้ |
 | `CC=…` | ไดรเวอร์ GCC ตัวอื่น เช่น `gcc-14` หรือ wrapper คอมไพเลอร์ที่ไม่ใช่ GCC จะถูกปฏิเสธ |
 | `CFLAGS=…` | แทนแฟล็กการปรับแต่ง (optimization) แฟล็กคำเตือนและแฟล็กความปลอดภัยยังถูกเติมให้เสมอ |
+| `HARDEN=…` | แทนแฟล็กคอมไพเลอร์สำหรับป้องกันหน่วยความจำที่อธิบายด้านล่าง `HARDEN=` จะ build โดยไม่มีแฟล็กเหล่านี้ ออบเจกต์ไม่ถูก build ใหม่เมื่อเปลี่ยนแฟล็ก จึงต้องรัน `make clean` ก่อน |
 | `PREFIX=…`, `DESTDIR=…` | ตำแหน่งติดตั้ง ดูด้านล่าง |
 | `CHECKPATCH=…`, `CLANG_FORMAT=…` | พาธของเครื่องมือตรวจสไตล์ |
 
 ### build แบบ release ทำอะไรบ้าง
 
 แฟล็กเริ่มต้นคือ `-Oz -flto -fno-plt -fvisibility=hidden` โดยไม่มี unwind table บวก `-std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -Werror=format-security -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE` ถ้าคอมไพเลอร์รองรับ Makefile จะเพิ่ม `-fstack-clash-protection` และสำหรับ build ที่เปิด optimization และไม่ใช้ AddressSanitizer จะเพิ่ม `-D_FORTIFY_SOURCE=3` (แทนระดับที่ต่ำกว่าจาก environment) ตอนลิงก์ใช้ `-fuse-ld=bfd -pie`, `--gc-sections`, `--as-needed`, RELRO เต็มรูปแบบ, `-z separate-code`, `-z noexecstack` และถ้า toolchain รองรับก็ใช้ `--rosegment` กับ `-z pack-relative-relocs` (glibc 2.36 ขึ้นไป) ผลลัพธ์ถูก strip
+
+Makefile ยังตรวจหาแฟล็กป้องกันหน่วยความจำเหล่านี้ (`HARDEN`) และเติมตัวที่คอมไพเลอร์รับได้ให้กับโปรแกรม โมดูล Vulkan, volk และโปรแกรมเบราว์เซอร์:
+
+- `-fcf-protection=full` บน x86-64: ติดเครื่องหมาย shadow stack และ IBT ซึ่งทำให้ worker รันพร้อม shadow stack ได้ ([การป้องกันหน่วยความจำ](architecture.md#การป้องกันหน่วยความจำ)) บน arm64 ใช้ `-mbranch-protection=standard` (การเซ็นที่อยู่ส่งกลับและ BTI) ซึ่งคอร์รุ่นเก่ารันเป็นคำสั่งว่าง
+- `-ftrivial-auto-var-init=zero` (GCC 12): ตัวแปรบนสแตกที่บางเส้นทางลืมตั้งค่าจะเริ่มเป็นศูนย์ แทนที่จะเป็นข้อมูลเก่าที่ค้างอยู่
+- `-fstrict-flex-arrays=3` (GCC 13): นับเฉพาะ `[]` เป็น flexible array ทำให้ `_FORTIFY_SOURCE` และ `-Warray-bounds` รู้ขนาดของอาร์เรย์ขนาดตายตัวทุกตัวที่ท้ายโครงสร้าง
+- `-fsanitize=bounds-strict -fsanitize-trap=bounds-strict`: ตรวจทุกดัชนีที่ใช้กับอาร์เรย์ที่รู้ขนาด และดัชนีที่เกินขอบเขตจะหยุดโปรเซสด้วย `SIGILL` แบบ trap นี้ไม่ต้องใช้ไลบรารี runtime ของ UBSan และจะถูกเว้นไว้เมื่อ `CFLAGS` หรือ `CPPFLAGS` ขอ sanitizer อยู่แล้ว เพื่อให้ sanitizer นั้นรายงานได้ตามปกติ
 
 มีบางไฟล์ที่ build เพื่อความเร็วแทนขนาด ได้แก่ `ui_pixels.c`, `camera_pixels.c` และ `screencast.c` ใช้ `-O3` เพื่อให้ GCC ทำ vectorize ลูปที่ประมวลผลทีละพิกเซล `screencast.c` ยังได้ `-Wno-pedantic` เพิ่ม เพราะ header ของ PipeWire ใช้ statement expression ของ GNU
 
@@ -176,14 +185,14 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `LINE_CALL_DEBUG=1` | รายงานการต่อรองการโทร ข้อความควบคุม จำนวนแพ็กเก็ตทุกห้าวินาที และจังหวะที่ได้เฟรมแรก | `call.c`, `camera.c`, `ui_media.c` |
 | `LINE_CALL_PDTP_DUMP=<dir>` | เมื่อเปิด `LINE_CALL_DEBUG=1` จะเก็บข้อมูลดิบของสตรีม LINE และ PLANET ในไดเรกทอรีที่สร้างไว้และให้สิทธิ์เฉพาะเจ้าของ (0700) | `call.c` |
 | `LINE_RENDER_LOG=1` | บอกว่าเลือกตัววาดตัวไหนและทำไมต้องถอยไปตัวสำรอง | `ui_gpu.c`, `ui_draw.c` |
-| `LINE_DEBUG_SANDBOX=1` | พิมพ์ว่าแซนด์บ็อกซ์ของ worker ชั้นใดทำงานอยู่: `line-sandbox no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1` | `sandbox.c` |
+| `LINE_DEBUG_SANDBOX=1` | พิมพ์ว่าชั้นแซนด์บ็อกซ์และการป้องกันหน่วยความจำชั้นใดทำงานอยู่ ครั้งหนึ่งสำหรับ UI และอีกครั้งสำหรับ worker: `line-sandbox worker no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1 mdwe=1 seal=1(513) shadow-stack=1 memory-tagging=0 heap-wipe=1 guard-pages=1` | `sandbox.c` |
 
 ### พฤติกรรม
 
 | ตัวแปร | ผล |
 | ------ | -- |
 | `LINE_EXPERIMENTAL_VIDEO=0` | ปิดวิดีโอคอล (โทรเสียงยังใช้ได้) |
-| `LINE_DISABLE_SANDBOX=1` | เริ่ม worker โดยไม่มีแซนด์บ็อกซ์ เช่นเพื่อต่อ `gdb` หรือ `strace` เข้ากับ worker |
+| `LINE_DISABLE_SANDBOX=1` | เริ่ม worker โดยไม่มีแซนด์บ็อกซ์และการป้องกันหน่วยความจำ และ UI ก็ไม่ใช้การป้องกันของตัวเอง เช่นเพื่อต่อ `gdb` หรือ `strace` เข้ากับ worker ถ้าใส่รายชื่อคั่นด้วยจุลภาคจะเว้นเฉพาะชั้นที่ระบุ: `seccomp`, `landlock`, `mdwe`, `seal`, `shstk`, `mte`, `wipe`, `guard` |
 | `LINE_DISABLE_UDP_BATCH=1` | ส่งและรับมีเดียของการโทรครั้งละหนึ่งดาตาแกรมต่อ system call แทนการใช้ `sendmmsg`, `recvmmsg` และ `UDP_SEGMENT` |
 | `LINE_NOISE_SUPPRESSION=0` | ส่งเสียงไมค์ดิบ ไม่ผ่าน RNNoise |
 | `LINE_CALL_FEEDBACK=0` | หยุดส่งคำขอส่งวิดีโอซ้ำ receiver report และ REMB ในการโทรแบบตัวต่อตัว เพื่อใช้แก้ปัญหา ([เครือข่ายที่ไม่ดี](calls.md#8-เครือข่ายที่ไม่ดี)) |
@@ -219,6 +228,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 - **คำขอล้มเหลว** ข้อความผิดพลาดจาก worker จะขึ้นที่บรรทัดสถานะด้านบนของแชต รันด้วย `LINE_DEBUG_TIMING=1` เพื่อดูว่าคำขอไหนล้มเหลวหรือช้า ข้อความอย่าง "LINE declined sendMessage (service code 10)" มีหมายเลขข้อผิดพลาดของ LINE เองติดมาด้วย หน้า [พื้นฐานโปรโตคอล](protocol-basics.md) อธิบายรหัสที่พบบ่อย
 - **ข้อความมาช้า** รันด้วย `LINE_DEBUG_SYNC=1` ตอนว่าง long poll แต่ละรอบควรใช้เวลาราว 50 วินาที และตอบกลับทันทีเมื่อมีอะไรเกิดขึ้น
 - **รูปในการ์ดว่างเปล่า** รันด้วย `LINE_DEBUG_MEDIA=1`
+- **UI หรือ worker ตายด้วย `SIGILL` หรือ `SIGSEGV` โดยไม่มีข้อความอื่น** `SIGILL` ในโค้ดของ Avernella เองคือการตรวจขอบเขต: มีดัชนีอาร์เรย์ที่เกินขอบเขต `SIGSEGV` ที่มี `si_code` เป็น `SEGV_CPERR` (`gdb` และ `coredumpctl info` แสดงให้เห็น แม้ worker จะไม่เขียน core dump) คือ shadow stack จับที่อยู่ส่งกลับที่ถูกเขียนทับได้ fault ที่อยู่ถัดจากไบต์สุดท้ายของคำตอบจาก LINE พอดีคือหน้าเฝ้าระวัง ทั้งสามกรณีเป็นบั๊กที่ควรรายงาน `LINE_DISABLE_SANDBOX=shstk,guard` และ build ด้วย `HARDEN=` เอาการตรวจออกเพื่อเปรียบเทียบเท่านั้น ไม่ใช่เพื่อเลี่ยงการล่ม
 - **แอป LINE โหลดไม่เสร็จ** รันด้วย `LINE_DEBUG_LIFF=1` แล้วเปิดใหม่ ตรวจสอบว่าการโหลดถึง `committed` และ `finished` หรือยัง และมีคำสั่ง bridge ที่ขึ้นว่า `unsupported` หรือไม่
 - **โทรแล้วไม่มีภาพ** รันด้วย `LINE_CALL_DEBUG=1`
 - **ไล่โค้ดทีละขั้น** build ด้วย `make clean && make DEBUG=1` หน้าต่างคือโปรเซส `avernella` ส่วน worker เป็นโปรเซสลูกชื่อ `avernella --worker` ให้ attach แยกด้วย `gdb -p $(pgrep -f 'avernella --worker')` เนื่องจาก worker จะจบตามเมื่อโปรเซสแม่ตาย (`PR_SET_PDEATHSIG`) การปิดหน้าต่างจึงทำให้ worker จบด้วย

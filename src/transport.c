@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "line.h"
+#include "sandbox.h"
 #include <curl/curl.h>
 #include <string.h>
 
@@ -316,11 +317,18 @@ cleanup:
 			"LINE returned an invalid approval response.");
 		return NULL;
 	}
+	/* An over-read in the decoder faults instead of reading the heap. */
+	struct line_guarded window;
+	const guint8 *input = line_guard_copy(&window, data->data, data->len) ?
+				      window.data :
+				      data->data;
 	J *reply = protocol == BINARY_AUTH ?
-			   line_decode_auth(method, data->data, data->len,
+			   line_decode_auth(method, input, data->len,
 					    &s->service_code, error) :
-			   line_decode_reply(method, data->data, data->len,
+			   line_decode_reply(method, input, data->len,
 					     &s->service_code, error);
+
+	line_guard_free(&window);
 	gboolean own = access && s->access && !g_strcmp0(access, s->access);
 
 	if (!reply && talk_path(path) && line_busy_code(s->service_code))

@@ -9,6 +9,7 @@
 #include "state.h"
 #include "gpu_health.h"
 #include "media_io.h"
+#include "sandbox.h"
 #include "line_build_commit.h"
 #include "flex_asset.h"
 #include "ui_chat_lists.h"
@@ -747,6 +748,13 @@ static char **worker_environment(void)
 		env = g_environ_setenv(env, "AVERNELLA_MEDIA_GPU_VENDOR", id,
 				       TRUE);
 	}
+	/* glibc turns on the shadow stack and MTE only at start-up. */
+	g_autofree char *tunables =
+		line_sandbox_tunables(g_environ_getenv(env, "GLIBC_TUNABLES"),
+				      line_sandbox_worker_spawn_layers());
+
+	if (tunables)
+		env = g_environ_setenv(env, "GLIBC_TUNABLES", tunables, TRUE);
 	return env;
 }
 
@@ -2834,8 +2842,13 @@ void ui_restore_input(void)
 		focus_on(ui.focus);
 }
 
+/* VK_VENDOR_ID_MESA: Mesa's CPU drivers (lavapipe) report it. */
+#define UI_VK_VENDOR_MESA 0x10005u
+
 int line_ui(int argc, char **argv)
 {
+	/* Before anything is loaded that might be unloaded again. */
+	line_sandbox_ui_start();
 	g_autoptr(GError) error = NULL;
 	int primary = ui_instance_open(&error);
 	int status = 1;
@@ -2902,6 +2915,14 @@ int line_ui(int argc, char **argv)
 		g_printerr("Window: %s\n", SDL_GetError());
 		goto quit_sdl;
 	}
+	/*
+	 * Hardware Vulkan, GL, VA-API, CUDA and PipeWire need no memory that
+	 * turns executable; Mesa's llvmpipe and lavapipe do (LLVM). The native
+	 * renderer skips CPU devices, so its device decides. SDL's renderers
+	 * may pick a software device, so they keep the UI without MDWE.
+	 */
+	line_sandbox_ui_renderer(ui_gpu_active() &&
+				 ui_gpu_device_vendor() != UI_VK_VENDOR_MESA);
 	SDL_SetWindowMinimumSize(ui.window, 360, 480);
 	wire.requests = g_hash_table_new_full(g_direct_hash, g_direct_equal,
 					      NULL, free_request);

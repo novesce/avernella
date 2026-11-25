@@ -53,7 +53,26 @@ FORTIFY := $(if $(findstring -fsanitize=address,$(CFLAGS) $(CPPFLAGS)),,$(shell 
 STACK_CLASH := $(shell printf 'int main(void) { return 0; }\n' | \
 	$(CC) -Werror -fstack-clash-protection -x c - -o /dev/null \
 	>/dev/null 2>&1 && printf '%s' '-fstack-clash-protection')
-CFLAGS += $(FORTIFY) $(STACK_CLASH)
+# Control-flow protection: x86 CET marks every object for shadow stacks
+# (the worker runs with one, see sandbox.c) and adds IBT landing pads;
+# arm64 gets return-address signing (PAC) and BTI landing pads, which
+# older cores execute as no-ops. -ftrivial-auto-var-init=zero (GCC 12)
+# zeroes stack variables a path forgot to set, so they never carry stale
+# data; -fstrict-flex-arrays=3 (GCC 13) lets _FORTIFY_SOURCE and
+# -Warray-bounds treat only [] as unbounded. The bounds sanitizer checks
+# every index into an array of known size and stops the process with an
+# illegal instruction, without UBSan's runtime library; it is left out
+# when CFLAGS already ask for a sanitizer, to keep its reports.
+# HARDEN= turns all of these off.
+HARDEN_PROBE = $(shell printf 'int main(void) { return 0; }\n' | \
+	$(CC) -Werror $(1) -x c - -o /dev/null >/dev/null 2>&1 && printf '%s' '$(1)')
+ifeq ($(origin HARDEN),undefined)
+HARDEN := $(or $(call HARDEN_PROBE,-fcf-protection=full),$(call HARDEN_PROBE,-mbranch-protection=standard)) \
+	$(call HARDEN_PROBE,-ftrivial-auto-var-init=zero) \
+	$(call HARDEN_PROBE,-fstrict-flex-arrays=3) \
+	$(if $(findstring -fsanitize=,$(CFLAGS) $(CPPFLAGS)),,$(call HARDEN_PROBE,-fsanitize=bounds-strict -fsanitize-trap=bounds-strict))
+endif
+CFLAGS += $(FORTIFY) $(STACK_CLASH) $(HARDEN)
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
@@ -126,7 +145,7 @@ LIFF_GTK ?= $(shell pkg-config --exists $(LIFF_GTK_PKGS) && echo 1)
 endif
 endif
 
-.PHONY: all check bench clean format format-check checkpatch install uninstall
+.PHONY: all check bench clean format format-check checkpatch analyze install uninstall
 all: avernella
 ifeq ($(LIFF_WPE),1)
 all: avernella-liff
@@ -155,6 +174,15 @@ checkpatch:
 		perl "$(CHECKPATCH)" $(CHECKPATCH_TEST_FLAGS) "$$f" || status=1; \
 	done; \
 	rm -f .checkpatch-camelcase.git.; exit $$status
+
+# GCC's static analyzer follows each path through a function and reports
+# leaks, double frees, uses after free, NULL dereferences and out-of-bounds
+# accesses. It is slow and only reports, so it is not part of `make check`.
+ANALYZE_SOURCES ?= $(SOURCES:%=src/%.c)
+analyze: avernella
+	@printf '%s\n' $(ANALYZE_SOURCES) | xargs -P "$$(nproc)" -I{} \
+		$(CC) $(CPPFLAGS) -Ibuild -std=c17 -O1 -fanalyzer \
+		-Wno-analyzer-too-complex -c {} -o /dev/null
 
 avernella: $(OBJECTS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $(RO_SEGMENT) $(PACKED_RELOCS) $(STRIP_RELEASE) -o build/$@ $^ $(LDLIBS)
@@ -331,7 +359,7 @@ build/test-sealing: tests/sealing.c build/sealing.o build/thrift.o
 build/test-pair: tests/pair.c build/pair.o
 build/test-password-login: tests/password_login.c build/password_login.o
 build/test-transport: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo,--wrap=curl_slist_free_all
-build/test-transport: tests/transport.c build/transport.o build/thrift.o build/http_tune.o
+build/test-transport: tests/transport.c build/transport.o build/thrift.o build/http_tune.o build/sandbox.o
 build/test-talk-sync: tests/talk_sync.c build/talk_sync.o build/thrift.o
 build/test-live-sync: tests/live_sync.c build/live_sync.o build/talk_sync.o
 build/test-flex-asset: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
@@ -362,7 +390,7 @@ UI_FIXTURE_TARGETS += build/test-ui-worker-stop
 $(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
 $(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 $(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-$(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o $(UI_LANG_OBJECTS)
+$(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o build/sandbox.o $(UI_LANG_OBJECTS)
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 
@@ -377,8 +405,8 @@ VK_HEADERS ?=
 VOLK_FLAGS = $(addprefix -I,$(VK_HEADERS) $(VOLK_DIR))
 ifneq ($(VOLK_DIR),)
 VOLK_LINK = build/volk.o
-build/volk.o: $(VOLK_DIR)/volk.c $(VOLK_DIR)/volk.h | build
-	$(CC) -Os -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections $(VOLK_FLAGS) -c $< -o $@
+build/volk.o: $(VOLK_DIR)/volk.c $(VOLK_DIR)/volk.h Makefile | build
+	$(CC) -Os -fPIC -fvisibility=hidden -ffunction-sections -fdata-sections $(HARDEN) $(VOLK_FLAGS) -c $< -o $@
 else
 VOLK_LINK = -lvolk
 endif

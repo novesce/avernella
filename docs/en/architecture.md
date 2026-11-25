@@ -227,7 +227,7 @@ Avernella was called *kitatide* before, and started from *line-linux*. Their fil
 | HTTPS transport, token renewal, `Retry-After` | `transport.c` |
 | libcurl tuning, shared DNS and TLS caches | `http_tune.c` |
 | glibc and scheduler tuning | `tune.c` |
-| Worker sandbox: no-dump, seccomp, Landlock | `sandbox.c` |
+| Worker sandbox and memory hardening: no-dump, seccomp, Landlock, MDWE, `mseal`, shadow stack, guard pages | `sandbox.c` |
 | Thrift Compact and Binary encoder and decoder | `thrift.c` |
 | QR pairing | `pair.c` |
 | Email and password sign-in | `password_login.c` |
@@ -303,7 +303,7 @@ Avernella leans on the kernel and glibc instead of frameworks. Knowing these hel
 **Processes**
 - `posix_spawn` of `/proc/self/exe` for the worker, `pidfd_spawn` (clone3 with a pidfd) for the browser helper, `PR_SET_PDEATHSIG` in both children.
 - The UI waits for the worker through `pidfd_open` and signals it only while it is still unreaped, so the PID can't have been reused.
-- The worker confines itself at start-up with `PR_SET_DUMPABLE`, `PR_SET_NO_NEW_PRIVS`, seccomp and Landlock ([the worker sandbox](#the-worker-sandbox)).
+- The worker confines itself at start-up with `PR_SET_DUMPABLE`, `PR_SET_NO_NEW_PRIVS`, seccomp and Landlock, and hardens its memory with MDWE, `mseal()`, a shadow stack, `M_PERTURB` and guard pages ([the worker sandbox](#the-worker-sandbox), [memory hardening](#memory-hardening)).
 - `posix_spawn_file_actions_addclosefrom_np` so children inherit only the descriptors they need.
 
 **Waiting without timers**
@@ -347,9 +347,39 @@ The worker holds every secret and parses everything LINE sends: Thrift replies, 
 
 The filter answers with an errno instead of killing the worker: `EPERM` for refused calls, and `ENOSYS` for `io_uring` and `clone3`, so a library falls back as it would on an older kernel. `clone3` passes its flags in memory, where seccomp can't inspect them. glibc then uses `clone`, whose namespace flags the filter checks.
 
-Each layer is optional. A kernel that lacks one, or an outer sandbox (Flatpak, a container) that refuses one, leaves the rest in force. Files are not restricted, because the worker saves attachments wherever the user chooses. `LINE_DEBUG_SANDBOX=1` prints which layers are active. `LINE_DISABLE_SANDBOX=1` applies none, for attaching a debugger.
+Each layer is optional. A kernel that lacks one, or an outer sandbox (Flatpak, a container) that refuses one, leaves the rest in force. Files are not restricted, because the worker saves attachments wherever the user chooses. `LINE_DEBUG_SANDBOX=1` prints which layers are active in each process, for example `line-sandbox worker no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1 mdwe=1 seal=1(513) shadow-stack=1 memory-tagging=0 heap-wipe=1 guard-pages=1` (513 is the number of sealed ranges). `LINE_DISABLE_SANDBOX=1` applies none, for attaching a debugger. A comma-separated list of names (`seccomp`, `landlock`, `mdwe`, `seal`, `shstk`, `mte`, `wipe`, `guard`) leaves out only those layers, as in `LINE_DISABLE_SANDBOX=mdwe,shstk`.
 
-The UI is not confined the same way: it starts the WebKit browser helper, whose own sandbox (bubblewrap) needs namespaces, and seccomp filters pass to child processes.
+### Memory hardening
+
+Avernella is written in C, and no kernel feature makes C memory-safe: a buffer overflow or a use after free in a parser is still a bug. What the kernel and glibc can do is make such a bug much harder to turn into running code, and keep an exploited process from reaching much. [`sandbox.c`](../../src/sandbox.c) adds these layers to the confinement above:
+
+| Layer | Needs | Process | What it does |
+| ----- | ----- | ------- | ------------ |
+| MDWE (`PR_SET_MDWE`) | Linux 6.3 | Worker; UI on a hardware GPU (Linux 6.7) | Refuses memory that is writable and executable, or that becomes executable later, so injected bytes never run as code |
+| `mseal()` | Linux 6.10, 64-bit | Worker and UI | Seals the code, read-only data and RELRO (which holds the GOT, because the program links with `-z now`) of the program and of every library loaded at start-up. `mprotect()` can't make them writable, and `munmap()` or `mremap()` can't replace them |
+| x86 shadow stack | Linux 6.6, glibc 2.39, a CPU with CET (Intel 11th generation, AMD Zen 3 and newer) | Worker | The CPU keeps a second copy of every return address where ordinary stores can't reach it. An overwritten return address stops the process (`SIGSEGV`) instead of jumping where an attacker wants |
+| arm64 MTE heap tagging | Linux 5.10, glibc 2.33, a CPU with MTE | Worker | glibc tags every malloc chunk, and a pointer used outside its chunk or after `free()` faults (asynchronously) |
+| Heap wipe (`M_PERTURB`) | glibc | Worker | glibc fills chunks it takes back with `0xff` and zeroes chunks it hands out. Freed replies and messages don't linger, and a pointer read from freed memory is non-canonical and faults. glibc's per-thread cache (chunks up to 1032 bytes) skips this |
+| Guard pages | Linux 6.13 (`MADV_GUARD_INSTALL`), else `PROT_NONE` pages | Worker | Each Thrift reply is decoded from a read-only copy whose last byte touches a guard page (`line_guard_copy()` in `transport.c`), so reading one byte past the reply, or writing into it, faults instead of touching the heap. Freeing the copy unmaps it |
+
+The compiler adds its share in every process: control-flow protection (`-fcf-protection=full`, or `-mbranch-protection=standard` on arm64), `-ftrivial-auto-var-init=zero`, `-fstrict-flex-arrays=3` and the bounds sanitizer in trap mode, besides `_FORTIFY_SOURCE=3`, the stack protector, stack-clash probes and full RELRO. See [What the release build does](building.md#what-the-release-build-does). `make analyze` runs GCC's static analyzer over the sources.
+
+**How the worker gets its shadow stack.** glibc can turn the shadow stack on only while a program starts, so the UI asks for it in the worker's `GLIBC_TUNABLES` (`line_sandbox_tunables()`, called from `worker_environment()` in `ui.c`): `glibc.cpu.hwcaps=SHSTK:glibc.cpu.x86_shstk=on`. glibc 2.39 to 2.44 drop SHSTK from the CPU features because the kernel hasn't enabled it at exec, and then ignore `x86_shstk=on` unless `hwcaps` names SHSTK again. The value is `on` rather than `permissive`. Several codec libraries pulled in by libavcodec (libvpx, libzstd, libaom and others) and NVIDIA's CUDA and VA-API libraries aren't CET-marked, and `permissive` would leave the shadow stack off because of them. They work correctly with it, because they never switch stacks themselves. The UI asks only when `/proc/cpuinfo` lists `user_shstk` and glibc is 2.39 or newer. It keeps every tunable already in the environment, and one that sets `x86_shstk` itself wins. On arm64 with MTE it adds `glibc.mem.tagging=1` the same way.
+
+**The UI.** The UI decodes pictures and draws untrusted text, but it also runs GPU drivers. `line_sandbox_ui_start()` seals the program and its start-up libraries first thing in `line_ui()`, before anything is loaded that might be unloaded again, because a sealed mapping can't be unmapped. `line_sandbox_ui_renderer()` turns on MDWE once the native Vulkan renderer runs on a hardware device. Mesa's software drivers (llvmpipe, lavapipe) compile code with LLVM and crash under MDWE, so the UI goes without it when SDL's renderer or a software device draws. The UI sets the flag with `PR_MDWE_NO_INHERIT` (Linux 6.7), so the worker and the WebKit browser helper, whose JavaScript JIT needs writable code, start without it. On Linux 6.3 to 6.6 the UI goes without MDWE. One case remains: if the hardware GPU fails later and the replacement window's OpenGL falls back to llvmpipe, the UI can crash. `LINE_DISABLE_SANDBOX=mdwe` avoids that.
+
+The UI is not confined like the worker: it starts the WebKit browser helper, whose own sandbox (bubblewrap) needs namespaces, and seccomp filters pass to child processes.
+
+**Tested drivers.** On Linux 7.3 with glibc 2.44, NVIDIA 620.73 (RTX 5050) and Mesa 26.3 (Radeon 780M), all of these work under MDWE: Vulkan rendering and presentation on both GPUs (`vulkan-smoke`, `vulkan-preview --test`), hardware OpenGL on both, VP8 decoding through NVDEC (CUDA) and through VA-API on both, and PipeWire. The CUDA and VA-API paths also work with the shadow stack. llvmpipe crashes under MDWE, as expected. Every test in `make check` also passes with the shadow stack, MDWE and the heap wipe together.
+
+**Costs**, measured on the same machine. Applying every worker layer takes about 0.25 ms, once; the worker's start-up time doesn't change measurably. A guarded copy costs about 17 µs for a 4 KiB reply and 55 µs for 64 KiB, against network round trips of tens of milliseconds. The heap wipe made parsing and printing a 176 KiB JSON document with json-c about 4% slower. The shadow stack made no measurable difference. The compiler flags grew the program by 1.3% (1,238,136 to 1,254,520 bytes) and changed neither `render-bench` nor the pixel, audio and Thrift tests measurably.
+
+**Left out, and why.**
+- Turning off glibc's per-thread malloc cache (`glibc.malloc.tcache_count=0`) would let the heap wipe cover small chunks too, but it made json-c parsing 80% slower. The cache already has pointer mangling (safe-linking) and double-free checks.
+- `-fzero-call-used-regs=used-gpr` removes some return-oriented programming gadgets but grew the program by 1%, and the worker's shadow stack already stops return-oriented code there.
+- Indirect branch tracking (IBT): the objects carry the landing pads, but Linux doesn't enable IBT for user programs.
+- MTE is implemented but untested, because this machine is x86-64. Most Jetson boards don't have it (Orin's Cortex-A78AE lacks MTE).
+- Pictures, stickers and APNG frames are still decoded in the UI, with libpng, libjpeg-turbo and libwebp. Moving decoding into the worker, or into a helper with its own seccomp filter and nothing else, would protect the UI best of all, and is the largest change left.
 
 Avernella doesn't use io_uring. The worker's I/O is a few sockets and small files, where `poll()` and plain reads already cost little, and many systems turn io_uring off (`kernel.io_uring_disabled`, container and Flatpak profiles). The sandbox refuses it, which removes that kernel interface from an attacker's reach.
 
@@ -357,6 +387,7 @@ Avernella doesn't use io_uring. The worker's I/O is a few sockets and small file
 
 - Tokens and keys live only in the worker. The UI never sees the access token, the refresh token or a private key.
 - The worker is non-dumpable and runs under seccomp and Landlock ([the worker sandbox](#the-worker-sandbox)). Media reach the UI as passed descriptors, never as paths into the worker's `/proc`.
+- Memory bugs are harder to exploit: no writable and executable memory, sealed code and GOT, a shadow stack in the worker, wiped heap chunks and guard pages after LINE replies ([memory hardening](#memory-hardening)). None of this makes the C code memory-safe.
 - The call thread receives only call-local data, never the account token.
 - The browser helper receives LINE app tokens only through its socket, never in arguments or the environment, and they are never logged.
 - Picture downloads from arbitrary hosts (Flex, rich messages) are anonymous, HTTPS-only, and refuse private and local network addresses ([`flex_asset.c`](../../src/flex_asset.c)).

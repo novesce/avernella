@@ -85,6 +85,7 @@ GNU Make 4.3 and newer runs one job per CPU (`nproc`) by default, because the Ma
 | `format` | Rewrites all sources in place with `clang-format` |
 | `format-check` | Fails if any source isn't formatted |
 | `checkpatch` | Runs the Linux kernel's `checkpatch.pl` on every source, one file per run |
+| `analyze` | Runs GCC's static analyzer (`-fanalyzer`) on every program source, in parallel. It only reports, and takes about 15 seconds |
 | `install`, `uninstall` | See [Installing](#installing) |
 | `clean` | Removes build products. It keeps the fuzzing corpus; `fuzz-clean` removes all of `build-fuzz/`. |
 
@@ -101,12 +102,20 @@ Pass them on the command line, as in `make DEBUG=1`.
 | `GLSLANG=…`, `SPIRV_VAL=…` | Shader compiler and validator to use |
 | `CC=…` | Another GCC driver, such as `gcc-14` or a wrapper. Non-GCC compilers are refused. |
 | `CFLAGS=…` | Replaces the optimization flags. The warning and hardening flags are always added. |
+| `HARDEN=…` | Replaces the memory-hardening compiler flags described below; `HARDEN=` builds without them. Objects aren't rebuilt for a flag change, so run `make clean` first. |
 | `PREFIX=…`, `DESTDIR=…` | Install location, see below |
 | `CHECKPATCH=…`, `CLANG_FORMAT=…` | Paths to the style tools |
 
 ### What the release build does
 
 The default flags are `-Oz -flto -fno-plt -fvisibility=hidden` without unwind tables, plus `-std=c17 -Wall -Wextra -Wpedantic -Wformat=2 -Werror=format-security -fstack-protector-strong -ffunction-sections -fdata-sections -fPIE`. When the compiler supports them, the Makefile also adds `-fstack-clash-protection` and, for optimizing builds without AddressSanitizer, `-D_FORTIFY_SOURCE=3` (replacing any lower level from the environment). Linking uses `-fuse-ld=bfd -pie`, `--gc-sections`, `--as-needed`, full RELRO, `-z separate-code`, `-z noexecstack`, and, when the toolchain supports them, `--rosegment` and `-z pack-relative-relocs` (glibc 2.36 or newer). The result is stripped.
+
+The Makefile also probes for these memory-hardening flags (`HARDEN`) and adds the ones the compiler accepts, to the program, the Vulkan module, volk and the browser helpers:
+
+- `-fcf-protection=full` on x86-64: shadow-stack and IBT marking, which lets the worker run with a shadow stack ([memory hardening](architecture.md#memory-hardening)). On arm64, `-mbranch-protection=standard` (return-address signing and BTI), which older cores execute as no-ops.
+- `-ftrivial-auto-var-init=zero` (GCC 12): stack variables that a path forgets to set start as zero instead of stale data.
+- `-fstrict-flex-arrays=3` (GCC 13): only `[]` counts as a flexible array, so `_FORTIFY_SOURCE` and `-Warray-bounds` know the size of every fixed array at the end of a structure.
+- `-fsanitize=bounds-strict -fsanitize-trap=bounds-strict`: every index into an array of known size is checked, and an index out of range stops the process with `SIGILL`. The trap needs no UBSan runtime library. It is left out when `CFLAGS` or `CPPFLAGS` already ask for a sanitizer, so that sanitizer keeps its reports.
 
 A few files are built for speed instead of size: `ui_pixels.c`, `camera_pixels.c` and `screencast.c` get `-O3` so GCC can vectorize their per-pixel loops. `screencast.c` also gets `-Wno-pedantic`, because PipeWire's headers use GNU statement expressions.
 
@@ -176,14 +185,14 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `LINE_CALL_DEBUG=1` | Reports call negotiation, control messages, packet counts every five seconds and first-frame milestones | `call.c`, `camera.c`, `ui_media.c` |
 | `LINE_CALL_PDTP_DUMP=<dir>` | With `LINE_CALL_DEBUG=1`, stores raw LINE and PLANET stream data in an existing owner-only directory (mode 0700) | `call.c` |
 | `LINE_RENDER_LOG=1` | Says which renderer was chosen and why fallbacks happened | `ui_gpu.c`, `ui_draw.c` |
-| `LINE_DEBUG_SANDBOX=1` | Prints which worker sandbox layers are active: `line-sandbox no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1` | `sandbox.c` |
+| `LINE_DEBUG_SANDBOX=1` | Prints which sandbox and memory-hardening layers are active, once for the UI and once for the worker: `line-sandbox worker no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1 mdwe=1 seal=1(513) shadow-stack=1 memory-tagging=0 heap-wipe=1 guard-pages=1` | `sandbox.c` |
 
 ### Behavior
 
 | Variable | Effect |
 | -------- | ------ |
 | `LINE_EXPERIMENTAL_VIDEO=0` | Turns off video calls (voice still works) |
-| `LINE_DISABLE_SANDBOX=1` | Starts the worker without its sandbox, for example to attach `gdb` or `strace` to it |
+| `LINE_DISABLE_SANDBOX=1` | Starts the worker without its sandbox and memory hardening, and the UI without its own, for example to attach `gdb` or `strace` to the worker. A comma-separated list leaves out only the named layers: `seccomp`, `landlock`, `mdwe`, `seal`, `shstk`, `mte`, `wipe`, `guard` |
 | `LINE_DISABLE_UDP_BATCH=1` | Sends and receives call media one datagram per system call instead of with `sendmmsg`, `recvmmsg` and `UDP_SEGMENT` |
 | `LINE_NOISE_SUPPRESSION=0` | Sends the raw microphone, without RNNoise |
 | `LINE_CALL_FEEDBACK=0` | Stops sending video retransmission requests, receiver reports and REMB in one-to-one calls, for troubleshooting ([Bad networks](calls.md#8-bad-networks)) |
@@ -219,6 +228,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 - **A request fails.** The error text from the worker appears in the status line at the top of the chat. Run with `LINE_DEBUG_TIMING=1` to see which request failed or was slow. A message such as "LINE declined sendMessage (service code 10)" carries LINE's own error number. [Protocol basics](protocol-basics.md#errors) explains the common codes.
 - **Messages arrive late.** Run with `LINE_DEBUG_SYNC=1`. Each long-poll round should take about 50 seconds when idle and return immediately when something happens.
 - **A card picture stays blank.** Run with `LINE_DEBUG_MEDIA=1`.
+- **The UI or the worker dies with `SIGILL` or `SIGSEGV` and nothing else.** `SIGILL` in Avernella's own code is the bounds check: an array index was out of range. `SIGSEGV` with `si_code` `SEGV_CPERR` (shown by `gdb` and `coredumpctl info`, though the worker writes no core dump) is the shadow stack catching an overwritten return address. A fault right after a LINE reply's last byte is the guard page. All three are bugs to report. `LINE_DISABLE_SANDBOX=shstk,guard` and a `HARDEN=` build take the checks away to compare, never to work around a crash.
 - **A LINE app never finishes loading.** Run with `LINE_DEBUG_LIFF=1` and open it again. Check whether the load reached `committed` and `finished`, and whether the bridge reported an unsupported operation.
 - **A call has no video.** Run with `LINE_CALL_DEBUG=1`.
 - **Stepping through code.** Build with `make clean && make DEBUG=1`. The window is the `avernella` process. The worker is a child process named `avernella --worker`; attach to it separately with `gdb -p $(pgrep -f 'avernella --worker')`. Because the worker exits when its parent dies (`PR_SET_PDEATHSIG`), killing the window also ends the worker.
