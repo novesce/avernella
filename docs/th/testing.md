@@ -58,6 +58,7 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-media` | `media.c` | ซองของไฟล์แนบ ภาพตัวอย่าง object hash ของวิดีโอ ชื่อไฟล์ การอัปโหลดที่ถูกปฏิเสธ ข้อมูลเสีย การเปลี่ยนป้าย metadata |
 | `test-obs` | `obs_http.c` | คำขอและเฮดเดอร์ของ OBS (ห่อ libcurl) |
 | `test-media-io` | `media_io.c` | lease การปิดผนึก การส่งเฟรม descriptor ของ lease ที่ส่งไปพร้อมบรรทัด JSON (รวมถึงเมื่ออ่านทีละ 1 ไบต์) worker ที่เป็น non-dumpable |
+| `test-gpu-health` | `gpu_health.c` | สถานะของ GPU NVIDIA บนโครงสร้าง sysfs จำลอง (ปกติ ไม่มีไดรเวอร์ ไม่มีอุปกรณ์แสดงผล ส่งต่อให้ VM GPU หายไป ไม่มีไดรเวอร์ NVIDIA) การสลับตอนเริ่มแอป และค่าไดรเวอร์ Vulkan ที่ผู้ใช้ตั้งเอง |
 | `test-udp-batch` | `udp_batch.c` | `sendto`, `sendmmsg`, `UDP_SEGMENT`, `recvfrom` และ `recvmmsg` ผ่าน loopback ส่งดาตาแกรมเดียวกันตามลำดับเดิม การถอยกลับเมื่อเคอร์เนลปฏิเสธ `UDP_SEGMENT` และภายใต้ตัวกรอง seccomp ที่ปฏิเสธ `sendmmsg` กับ `recvmmsg` และเวลา CPU ต่อดาตาแกรมด้วย `-m perf` |
 | `test-sandbox` | `sandbox.c` | ในโปรเซสลูก: สิ่งที่แซนด์บ็อกซ์ของ worker ปฏิเสธ (exec, namespace, ptrace, io_uring, clone3, BPF, ioctl ที่พิมพ์ใส่เทอร์มินัล รวมถึงเมื่อตั้งบิตสูงไว้, การรอรับ TCP, สัญญาณไปข้างนอก) การครอบคลุมเธรดที่เริ่มไว้ก่อน การที่เธรด fork, memfd, UDP แบบรวมชุด และ TCP ขาออกยังใช้ได้ `LINE_DISABLE_SANDBOX=1` และการใช้ซ้ำสองครั้ง |
 | `test-friends` | `friends.c` | การค้นหา การเพิ่ม รายชื่อและการแบ่งหน้า รายการโปรด ชื่อ การซ่อนและบล็อก คำขอ การ์ด |

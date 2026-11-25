@@ -255,6 +255,7 @@ Avernella เคยชื่อ *kitatide* และเริ่มต้นม�
 | การเข้ารหัสแพ็กเก็ต PLANET ตัวช่วย protobuf การสร้างกุญแจมีเดีย | `call_wire.c` |
 | context ของ SRTP | `call_srtp.c` |
 | UDP ของการโทรแบบรวมชุด: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` | `udp_batch.c` |
+| สถานะ GPU NVIDIA; ข้ามไดรเวอร์ Vulkan ของ GPU ที่เสีย | `gpu_health.c` |
 | PDTP (การขนส่งสำหรับแชร์หน้าจอ) | `call_pdtp.c` |
 | เสียงในการโทร (SDL, Opus, EAS2) | `call_audio.c` |
 | การตัดเสียงรบกวน | `call_denoise.c` |

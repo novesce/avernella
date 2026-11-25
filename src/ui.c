@@ -7,6 +7,7 @@
 #include "line.h"
 #include "login_retry.h"
 #include "state.h"
+#include "gpu_health.h"
 #include "media_io.h"
 #include "line_build_commit.h"
 #include "flex_asset.h"
@@ -2847,6 +2848,8 @@ int line_ui(int argc, char **argv)
 	}
 	if (!primary)
 		return 0;
+	/* Before any thread starts, and before the Vulkan loader. */
+	line_gpu_avoid_broken_nvidia(NULL);
 	if ((g_getenv("WAYLAND_DISPLAY") || g_getenv("WAYLAND_SOCKET") ||
 	     !g_strcmp0(g_getenv("XDG_SESSION_TYPE"), "wayland")) &&
 	    !g_getenv("SDL_VIDEODRIVER") && !g_getenv("SDL_VIDEO_DRIVER"))

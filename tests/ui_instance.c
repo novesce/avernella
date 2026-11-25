@@ -123,27 +123,57 @@ static void zombie_owner(void)
 	ui_instance_close();
 }
 
-/* An older binary binds the well-known datagram address directly. */
-static void legacy_owner(void)
+static int bind_untracked(int *dir)
 {
 	g_autofree char *path =
 		g_build_filename(g_get_user_state_dir(), "avernella-ui", NULL);
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
-	char show;
-	int fd, dir;
+	int fd;
 
 	g_assert_cmpint(g_mkdir_with_parents(path, 0700), ==, 0);
-	dir = open(path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
-	g_assert_cmpint(dir, >=, 0);
+	*dir = open(path, O_DIRECTORY | O_RDONLY | O_CLOEXEC);
+	g_assert_cmpint(*dir, >=, 0);
 	g_snprintf(addr.sun_path, sizeof(addr.sun_path),
-		   "/proc/self/fd/%d/activate", dir);
-	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
+		   "/proc/self/fd/%d/activate", *dir);
+	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	g_assert_cmpint(fd, >=, 0);
 	g_assert_cmpint(bind(fd, (struct sockaddr *)&addr, sizeof(addr)), ==,
 			0);
+	return fd;
+}
+
+static gpointer read_show(gpointer data)
+{
+	char show = 0;
+
+	if (recv(GPOINTER_TO_INT(data), &show, sizeof(show), 0) != 1)
+		show = 0;
+	return GINT_TO_POINTER(show);
+}
+
+/* An older binary binds the address without a lock and keeps reading. */
+static void legacy_owner(void)
+{
+	int dir, fd = bind_untracked(&dir);
+	GThread *reader =
+		g_thread_new("legacy", read_show, GINT_TO_POINTER(fd));
+
 	launch("--activate");
-	g_assert_cmpint(recv(fd, &show, sizeof(show), 0), ==, 1);
-	g_assert_cmpint(show, ==, 1);
+	g_assert_cmpint(GPOINTER_TO_INT(g_thread_join(reader)), ==, 1);
+	close(fd);
+	close(dir);
+}
+
+/*
+ * An owner that has dropped its lock while exiting, but whose socket a
+ * blocked device close keeps open: it never reads again. The next launch
+ * must start a window instead of asking the dead one to show itself.
+ */
+static void unresponsive_owner(void)
+{
+	int dir, fd = bind_untracked(&dir);
+
+	launch("--claim");
 	close(fd);
 	close(dir);
 }
@@ -152,6 +182,8 @@ int main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "--activate"))
 		return ui_instance_open(NULL) == 0 ? 0 : 1;
+	if (argc == 2 && !strcmp(argv[1], "--claim"))
+		return ui_instance_open(NULL) == 1 ? 0 : 1;
 	if (argc == 2 && !strcmp(argv[1], "--abandon"))
 		_exit(ui_instance_open(NULL) == 1 ? 0 : 1);
 
@@ -168,5 +200,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/instance/restart", restart);
 	g_test_add_func("/instance/zombie-owner", zombie_owner);
 	g_test_add_func("/instance/legacy-owner", legacy_owner);
+	g_test_add_func("/instance/unresponsive-owner", unresponsive_owner);
 	return g_test_run();
 }

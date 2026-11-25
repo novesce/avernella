@@ -255,6 +255,7 @@ Avernella was called *kitatide* before, and started from *line-linux*. Their fil
 | PLANET packet encryption, protobuf helpers, media key derivation | `call_wire.c` |
 | SRTP contexts | `call_srtp.c` |
 | Batched call UDP: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` | `udp_batch.c` |
+| NVIDIA GPU health; skips a broken GPU's Vulkan driver | `gpu_health.c` |
 | PDTP (screen sharing transport) | `call_pdtp.c` |
 | Call audio (SDL, Opus, EAS2) | `call_audio.c` |
 | Noise suppression | `call_denoise.c` |

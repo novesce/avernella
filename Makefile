@@ -58,7 +58,7 @@ endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
-SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox
+SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
 # Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
 JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
@@ -111,7 +111,7 @@ TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
-TESTS += build/test-udp-batch build/test-sandbox
+TESTS += build/test-udp-batch build/test-sandbox build/test-gpu-health
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -236,6 +236,7 @@ build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/udp_batch.o
+build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o
 build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/camera_pixels.o
 ifeq ($(CALL_VP8_JETSON),1)
@@ -295,7 +296,7 @@ build/test-ui-lang: tests/ui_lang.c $(UI_LANG_OBJECTS)
 build/test-audio: LDFLAGS += -Wl,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
 build/test-audio: tests/call_audio.c build/call_audio.o build/call_srtp.o build/call_denoise.o
 build/test-video-record: CPPFLAGS += -DLINE_RECORD_TEST
-build/test-video-record: tests/video_record.c src/video_record.c
+build/test-video-record: tests/video_record.c src/video_record.c src/gpu_health.c
 build/test-video-play: tests/video_play.c build/video_play.o
 build/test-media-io: tests/media_io.c build/media_io.o
 build/test-obs: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
@@ -354,7 +355,7 @@ build/render-bench: tests/render_bench.c build/ui_gpu.o
 UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene build/test-ui-refresh
 UI_FIXTURE_TARGETS += build/test-ui-chat-refresh
 UI_FIXTURE_TARGETS += build/test-ui-worker-stop
-$(UI_FIXTURE_TARGETS): build/ui.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
+$(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
 $(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 $(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
 $(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o $(UI_LANG_OBJECTS)

@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_instance.h"
 #include <errno.h>
+#include <linux/sockios.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <stddef.h>
 #include <sys/eventfd.h>
 #include <sys/file.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -29,15 +31,21 @@ static void instance_error(GError **error)
 		    g_strerror(reason));
 }
 
+enum owner {
+	OWNER_LIVE, /* holds the record lock */
+	OWNER_UNTRACKED, /* no lock: an older binary, or one already exiting */
+	OWNER_DEAD, /* its process is a zombie */
+};
+
 /*
  * While owning the bound socket, hold a shared POSIX record lock on its
  * inode's byte in the private directory. F_GETLK identifies the owning
  * process in the caller's PID namespace, even if a driver thread outlives
  * the main thread and keeps the socket open. This module owns the only FD
  * for this directory in the UI process: closing another FD for the same
- * inode would release the POSIX lock. Leave untracked owners alone.
+ * inode would release the POSIX lock.
  */
-static gboolean dead_owner(int dir, ino_t inode)
+static enum owner owner_state(int dir, ino_t inode)
 {
 	struct flock lock = { .l_type = F_WRLCK,
 			      .l_whence = SEEK_SET,
@@ -47,15 +55,36 @@ static gboolean dead_owner(int dir, ino_t inode)
 	char path[64];
 	const char *end;
 
-	if (fcntl(dir, F_GETLK, &lock) || lock.l_type != F_RDLCK ||
-	    lock.l_pid <= 0)
-		return FALSE;
+	if (fcntl(dir, F_GETLK, &lock) || lock.l_type == F_UNLCK)
+		return OWNER_UNTRACKED;
+	if (lock.l_type != F_RDLCK || lock.l_pid <= 0)
+		return OWNER_LIVE;
 	g_snprintf(path, sizeof(path), "/proc/%d/stat", lock.l_pid);
 	if (!g_file_get_contents(path, &stat, NULL, NULL))
-		return FALSE;
+		return OWNER_LIVE;
 	end = strrchr(stat, ')');
-	return end &&
-	       (g_str_has_prefix(end, ") Z ") || g_str_has_prefix(end, ") X "));
+	return end && (g_str_has_prefix(end, ") Z ") ||
+		       g_str_has_prefix(end, ") X ")) ?
+		       OWNER_DEAD :
+		       OWNER_LIVE;
+}
+
+/*
+ * Whether an owner without a lock read our request. A Unix datagram stays
+ * charged to its sender (SIOCOUTQ) until the receiver takes it. A process
+ * that is exiting has dropped its lock but may keep the socket open for
+ * as long as a device driver blocks its exit, and never reads again.
+ */
+static gboolean answered(int fd)
+{
+	for (int waited = 0; waited <= 500; waited += 5) {
+		int queued;
+
+		if (ioctl(fd, SIOCOUTQ, &queued) || !queued)
+			return TRUE;
+		g_usleep(5000);
+	}
+	return FALSE;
 }
 
 /* The directory lock serializes binding, probing and unlinking a dead
@@ -80,16 +109,29 @@ static int claim_socket(int dir, int fd)
 		errno = EEXIST;
 		return -1;
 	}
-	if (!dead_owner(dir, st.st_ino)) {
+	enum owner owner = owner_state(dir, st.st_ino);
+
+	if (owner != OWNER_DEAD) {
 		char show = 1;
 		ssize_t sent = TEMP_FAILURE_RETRY(
 			sendto(fd, &show, sizeof(show), MSG_NOSIGNAL,
 			       (struct sockaddr *)&addr, len));
 
-		if (sent >= 0 || errno == EAGAIN)
-			return 0;
-		if (errno != ECONNREFUSED)
+		if (sent < 0 && errno != EAGAIN && errno != ECONNREFUSED)
 			return -1;
+		/* A full queue means an untracked owner stopped reading. */
+		if ((sent >= 0 || errno == EAGAIN) &&
+		    (owner == OWNER_LIVE || (sent >= 0 && answered(fd)))) {
+			g_printerr(
+				"avernella: already running; showing its window\n");
+			return 0;
+		}
+		if (sent >= 0 || errno == EAGAIN)
+			g_printerr(
+				"avernella: the running window does not respond; starting a new one\n");
+	} else {
+		g_printerr(
+			"avernella: the previous window is still exiting; starting a new one\n");
 	}
 	if (unlinkat(dir, ENDPOINT, 0))
 		return -1;

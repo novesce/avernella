@@ -4,7 +4,7 @@
 
 Everything on this page runs in the **UI process**. It never talks to LINE directly: it asks the worker (see [Architecture](architecture.md#how-the-ui-and-the-worker-talk)) and draws what comes back.
 
-Opening Avernella again raises the existing window. If the primary UI thread has exited and a driver thread still holds the activation socket, a new launch can reclaim it. A busy, living UI keeps its window.
+Opening Avernella again raises the existing window. If the primary UI thread has exited and a driver thread still holds the activation socket, a new launch can reclaim it. A busy, living UI keeps its window. A window that has dropped its instance lock while exiting, but whose socket a blocked device driver keeps open, never reads requests again. A new launch therefore sends "show" and waits up to half a second for it to be read (`SIOCOUTQ` drops to zero). If the request stays unread, or the old window's queue is full, the new launch starts its own window. Each launch prints on standard error whether it handed off or started a new window.
 
 ## The main loop
 

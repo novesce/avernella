@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "video_record.h"
+#include "gpu_health.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <glib/gstdio.h>
@@ -256,7 +257,8 @@ static gboolean select_nvenc(guint vendor, int render_minor, char ***gpu_env)
 	const char *node = g_getenv("AVERNELLA_RENDER_NODE");
 	struct stat st;
 
-	if (!g_strcmp0(g_getenv("LINE_DISABLE_GPU"), "1"))
+	if (!g_strcmp0(g_getenv("LINE_DISABLE_GPU"), "1") ||
+	    line_nvidia_unusable(NULL, NULL, 0))
 		return FALSE;
 	if (node && *node) {
 		if (stat(node, &st) || !S_ISCHR(st.st_mode) ||
