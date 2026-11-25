@@ -202,6 +202,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `AVERNELLA_VULKAN=sdl` | Skips the native module but still tries SDL's Vulkan renderer |
 | `AVERNELLA_VK_DESCRIPTORS=buffer` | Makes the native module use descriptor buffers instead of descriptor heaps |
 | `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` | Picks the GPU by DRM render node, on drivers that expose DRM properties |
+| `AVERNELLA_PRESENT_MODE=fifo` | Makes the native module present with plain FIFO on NVIDIA too. `latest` uses FIFO latest ready on any driver that offers it |
 | `SDL_VIDEODRIVER=x11` | Forces X11 |
 
 ### Benchmarks

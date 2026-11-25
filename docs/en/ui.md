@@ -74,6 +74,7 @@ The module ([`vk_ctx.c`](../../src/render/vk_ctx.c), [`vk_frame.c`](../../src/re
 - Call video is converted from I420 to RGB in the shader, so the CPU never converts video frames.
 - During a call, a camera texture can change size while the GPU is reading it. The renderer checks for completion and retries on a later frame, so the window can process input in between.
 - On drivers with `VK_KHR_incremental_present`, it tells the compositor which window region changed.
+- On NVIDIA it presents with **FIFO latest ready** (`VK_KHR_present_mode_fifo_latest_ready`, or the EXT name on older drivers) when the window surface offers it. The display still updates once per refresh without tearing, but a newer ready frame replaces an older queued one. With plain FIFO, NVIDIA's Wayland driver blocks `vkQueuePresentKHR` on the UI thread for about one refresh interval. The UI paces its own frames to the display rate (`ui_frame_wait_ms()`), so the faster mode does not spin. A replaced frame never reaches the screen, so in this mode the presenter sends no incremental-present region. Other drivers keep FIFO, and `LINE_RENDER_LOG=1` names the mode. `AVERNELLA_PRESENT_MODE=fifo` turns it off, and `AVERNELLA_PRESENT_MODE=latest` also allows it on other drivers that offer it.
 
 ### Damage: drawing only what changed
 

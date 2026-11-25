@@ -202,6 +202,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `AVERNELLA_VULKAN=sdl` | ข้ามโมดูลเนทีฟ แต่ยังลองตัววาด Vulkan ของ SDL |
 | `AVERNELLA_VK_DESCRIPTORS=buffer` | ให้โมดูลเนทีฟใช้ descriptor buffer แทน descriptor heap |
 | `AVERNELLA_RENDER_NODE=/dev/dri/renderD128` | เลือก GPU ด้วย DRM render node บนไดรเวอร์ที่เปิดเผยคุณสมบัติ DRM |
+| `AVERNELLA_PRESENT_MODE=fifo` | ให้โมดูลเนทีฟนำเสนอแบบ FIFO ธรรมดาบน NVIDIA ด้วย ส่วน `latest` ใช้ FIFO latest ready บนทุกไดรเวอร์ที่รองรับ |
 | `SDL_VIDEODRIVER=x11` | บังคับใช้ X11 |
 
 ### เบนช์มาร์ก

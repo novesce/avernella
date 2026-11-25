@@ -45,7 +45,7 @@ struct vk_present {
 	SDL_Window *window;
 	VkExtent2D drawable;
 	bool log, opaque, rebuild, previous_present, retain_images;
-	bool acquired, suboptimal;
+	bool acquired, suboptimal, latest_ready;
 	uint32_t acquired_index;
 	VkRect2D damage;
 	struct frame_slot slots[VK_PRESENT_SLOTS];
@@ -259,6 +259,33 @@ static VkResult init_images(struct vk_present *p, VkFormat format)
 	return result;
 }
 
+/* FIFO_LATEST_READY keeps FIFO's vblank and no tearing, but a ready image
+ * replaces an older queued one. On NVIDIA's Wayland driver, FIFO instead
+ * blocks vkQueuePresentKHR on the UI thread for about one refresh interval.
+ * The UI paces its own frames to the display rate, so nothing spins.
+ */
+static bool surface_latest_ready(const struct vk_ctx *ctx)
+{
+	uint32_t count = 0;
+	bool found = false;
+
+	if (!ctx->fifo_latest_ready ||
+	    vkGetPhysicalDeviceSurfacePresentModesKHR(
+		    ctx->gpu, ctx->surface, &count, NULL) != VK_SUCCESS ||
+	    !count)
+		return false;
+	VkPresentModeKHR *modes = calloc(count, sizeof(*modes));
+
+	if (modes &&
+	    vkGetPhysicalDeviceSurfacePresentModesKHR(
+		    ctx->gpu, ctx->surface, &count, modes) == VK_SUCCESS)
+		for (uint32_t i = 0; i < count; i++)
+			found |= modes[i] ==
+				 VK_PRESENT_MODE_FIFO_LATEST_READY_KHR;
+	free(modes);
+	return found;
+}
+
 static uint32_t clamp_extent(uint32_t size, uint32_t min, uint32_t max)
 {
 	return size < min ? min : size > max ? max : size;
@@ -320,6 +347,7 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	bool retain = ctx->incremental_present &&
 		      caps.currentTransform ==
 			      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
+	bool latest = surface_latest_ready(ctx);
 	VkSwapchainCreateInfoKHR info = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.surface = ctx->surface,
@@ -332,7 +360,8 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 		.preTransform = caps.currentTransform,
 		.compositeAlpha = alpha & (0u - alpha),
-		.presentMode = VK_PRESENT_MODE_FIFO_KHR,
+		.presentMode = latest ? VK_PRESENT_MODE_FIFO_LATEST_READY_KHR :
+					VK_PRESENT_MODE_FIFO_KHR,
 		/* Reacquired images must also retain previously obscured pixels. */
 		.clipped = !retain,
 	};
@@ -357,10 +386,12 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	p->extent = extent;
 	p->drawable = (VkExtent2D){ w, h };
 	p->retain_images = retain;
+	p->latest_ready = latest;
 	p->rebuild = false;
 	if (p->log)
-		fprintf(stderr, "Vulkan swapchain: %ux%u, %u images, FIFO\n",
-			extent.width, extent.height, p->chain->count);
+		fprintf(stderr, "Vulkan swapchain: %ux%u, %u images, %s\n",
+			extent.width, extent.height, p->chain->count,
+			latest ? "FIFO latest ready" : "FIFO");
 	return VK_SUCCESS;
 }
 
@@ -658,7 +689,9 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	slot->done = ++p->submitted;
 	p->acquired = false;
 	/* Damage is relative to the previous present on the swapchain, even
-	 * when a different swapchain image was just acquired and redrawn.
+	 * when a different swapchain image was just acquired and redrawn. A
+	 * superseded FIFO_LATEST_READY present never reaches the screen, so
+	 * its damage would be lost: send no region hint in that mode.
 	 */
 	VkRectLayerKHR rect = { .offset = damage.offset,
 				.extent = damage.extent };
@@ -671,7 +704,7 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	};
 	VkSwapchainPresentFenceInfoKHR fence = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_PRESENT_FENCE_INFO_KHR,
-		.pNext = incremental ? &regions : NULL,
+		.pNext = incremental && !p->latest_ready ? &regions : NULL,
 		.swapchainCount = 1,
 		.pFences = &image->presented,
 	};

@@ -40,6 +40,7 @@ struct vk_ctx {
 	VkPhysicalDeviceMemoryProperties memory;
 	VkImageLayout texture_layout;
 	bool descriptor_heap, host_image_copy, incremental_present;
+	bool fifo_latest_ready; /* enabled; the surface may still lack it */
 	struct vk_desc_buffer *descriptors;
 	struct vk_heap resources, samplers;
 	uint32_t free_head, free_next[UI_TEXTURE_SLOTS];

@@ -52,7 +52,7 @@ static void feature_chain(struct vk_features *f, bool v14, bool heap,
 
 struct device_caps {
 	bool heap, buffer, drm, swapchain, incremental;
-	unsigned maintenance;
+	unsigned maintenance, latest_ready;
 };
 
 enum maintenance {
@@ -156,6 +156,12 @@ static bool read_extensions(VkPhysicalDevice gpu, struct device_caps *caps)
 			else if (!strcmp(name,
 					 VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME))
 				caps->maintenance |= MAINTENANCE_EXT;
+			else if (!strcmp(name,
+					 VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+				caps->latest_ready |= MAINTENANCE_KHR;
+			else if (!strcmp(name,
+					 VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME))
+				caps->latest_ready |= MAINTENANCE_EXT;
 		}
 	}
 	free(extensions);
@@ -228,6 +234,19 @@ VkResult vk_surface_format(VkPhysicalDevice gpu, VkSurfaceKHR surface,
 	return result;
 }
 
+/* FIFO_LATEST_READY is measured on NVIDIA's Wayland driver, where FIFO blocks
+ * vkQueuePresentKHR for a refresh interval. AVERNELLA_PRESENT_MODE=fifo turns
+ * it off, and =latest allows it on other drivers that offer it.
+ */
+static bool want_latest_ready(uint32_t vendor)
+{
+	const char *mode = getenv("AVERNELLA_PRESENT_MODE");
+
+	if (mode && !strcmp(mode, "fifo"))
+		return false;
+	return vendor == 0x10de || (mode && !strcmp(mode, "latest"));
+}
+
 static void inspect_adapter(struct vk_adapter *adapter, VkPhysicalDevice gpu,
 			    VkSurfaceKHR surface, uint32_t vendor,
 			    unsigned maintenance, const char *render_node,
@@ -250,9 +269,14 @@ static void inspect_adapter(struct vk_adapter *adapter, VkPhysicalDevice gpu,
 	    !vk_drm_matches(gpu, render_node, caps.drm, &render_minor) ||
 	    (surface && (!caps.swapchain || !(caps.maintenance & maintenance))))
 		return;
+	VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latest = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+	};
 	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR present = {
 		.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+		.pNext = caps.latest_ready ? &latest : NULL,
 	};
 	feature_chain(&f, v14, caps.heap, caps.buffer,
 		      surface ? &present : NULL);
@@ -298,6 +322,11 @@ static void inspect_adapter(struct vk_adapter *adapter, VkPhysicalDevice gpu,
 				   MAINTENANCE_KHR,
 		.incremental = surface && caps.incremental,
 		.host_copy = v14 && f.v14.hostImageCopy,
+		.latest_ready =
+			surface && latest.presentModeFifoLatestReady &&
+					want_latest_ready(properties.vendorID) ?
+				caps.latest_ready :
+				0,
 	};
 }
 
@@ -628,11 +657,18 @@ static VkResult open_device(struct vk_ctx *ctx,
 	ctx->descriptor_heap = adapter->heap;
 	ctx->incremental_present = adapter->incremental;
 	ctx->host_image_copy = adapter->host_copy;
+	ctx->fifo_latest_ready = adapter->latest_ready;
 	struct vk_features features;
 
+	VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latest = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+		.presentModeFifoLatestReady = VK_TRUE,
+	};
 	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance = {
 		.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
+		.pNext = ctx->fifo_latest_ready ? &latest : NULL,
 		.swapchainMaintenance1 = VK_TRUE,
 	};
 	feature_chain(&features, ctx->host_image_copy || ctx->descriptor_heap,
@@ -655,23 +691,32 @@ static VkResult open_device(struct vk_ctx *ctx,
 		.queueCount = 1,
 		.pQueuePriorities = &priority,
 	};
-	const char *extensions[] = {
+	const char *extensions[5] = {
 		ctx->descriptor_heap ? VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME :
 				       VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
-		VK_KHR_SWAPCHAIN_EXTENSION_NAME,
-		adapter->maintenance_khr ?
-			VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME :
-			VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME,
-		VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME,
 	};
+	uint32_t count = 1;
+
+	if (ctx->surface) {
+		extensions[count++] = VK_KHR_SWAPCHAIN_EXTENSION_NAME;
+		extensions[count++] =
+			adapter->maintenance_khr ?
+				VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME :
+				VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+	}
+	if (ctx->incremental_present)
+		extensions[count++] = VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME;
+	if (ctx->fifo_latest_ready)
+		extensions[count++] =
+			adapter->latest_ready & MAINTENANCE_KHR ?
+				VK_KHR_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME :
+				VK_EXT_PRESENT_MODE_FIFO_LATEST_READY_EXTENSION_NAME;
 	VkDeviceCreateInfo device = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.pNext = &features.core,
 		.queueCreateInfoCount = 1,
 		.pQueueCreateInfos = &queue,
-		.enabledExtensionCount = ctx->incremental_present ? 4 :
-					 ctx->surface		  ? 3 :
-								    1,
+		.enabledExtensionCount = count,
 		.ppEnabledExtensionNames = extensions,
 	};
 

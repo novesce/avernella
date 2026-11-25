@@ -200,6 +200,8 @@ MID ทุกตัวในเทสต์เห็นได้ชัดว่�
 xvfb-run -a env LINE_REDUCE_MOTION=1 LINE_BENCH_VIDEODRIVER=x11 LINE_BENCH_DAMAGE=1 ./build/render-bench
 ```
 
+เบนช์มาร์กวาดเฟรมติดกันไปเรื่อย ๆ เมื่อใช้ `LINE_BENCH_VIDEODRIVER=wayland` กับโหมดนำเสนอที่รอจอ เช่น FIFO ธรรมดา แต่ละเฟรมจะใช้เวลาหนึ่งรอบรีเฟรช (8.3 ms ที่ 120 Hz) ผลที่ได้จึงวัดจอ ไม่ใช่ตัววาด บน NVIDIA โมดูลใช้ FIFO latest ready ตัวเลขจึงเป็นต้นทุนของตัววาดเอง เทียบสองแบบได้ด้วย `AVERNELLA_PRESENT_MODE=fifo`
+
 **Vulkan** ต้องมี GPU และ Vulkan SDK
 
 ```sh

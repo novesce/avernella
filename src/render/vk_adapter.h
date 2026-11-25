@@ -9,6 +9,7 @@ struct vk_adapter {
 	uint32_t family, vendor;
 	int render_minor;
 	bool heap, maintenance_khr, incremental, host_copy;
+	unsigned int latest_ready; /* 1: KHR extension name, 2: EXT */
 };
 
 /* Null handles represent incompatible adapters or failed device opens.

@@ -214,6 +214,8 @@ All MIDs in tests are obviously fake (`u00000000000000000000000000000001`), and 
 xvfb-run -a env LINE_REDUCE_MOTION=1 LINE_BENCH_VIDEODRIVER=x11 LINE_BENCH_DAMAGE=1 ./build/render-bench
 ```
 
+The benchmark draws frames back to back. With `LINE_BENCH_VIDEODRIVER=wayland` and a present mode that waits for the display, such as plain FIFO, each frame takes one refresh interval (8.3 ms at 120 Hz), and the result measures the display, not the renderer. On NVIDIA the module uses FIFO latest ready, so the numbers are the renderer's own cost. Compare the two with `AVERNELLA_PRESENT_MODE=fifo`.
+
 **Vulkan.** These need a GPU and the Vulkan SDK:
 
 ```sh
