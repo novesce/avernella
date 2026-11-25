@@ -284,6 +284,61 @@ static void default_mode(void)
 	g_assert_cmpint(line_udp_default_mode(), ==, LINE_UDP_GSO);
 }
 
+/* The TOS byte a datagram arrived with, from IP_RECVTOS. */
+static int received_tos(int fd)
+{
+	guint8 data[64];
+	union {
+		struct cmsghdr header;
+		guint8 space[CMSG_SPACE(sizeof(int))];
+	} control;
+	struct iovec iov = { data, sizeof(data) };
+	struct msghdr msg = { .msg_iov = &iov,
+			      .msg_iovlen = 1,
+			      .msg_control = control.space,
+			      .msg_controllen = sizeof(control.space) };
+
+	g_assert_cmpint(recvmsg(fd, &msg, 0), >, 0);
+	for (struct cmsghdr *c = CMSG_FIRSTHDR(&msg); c;
+	     c = CMSG_NXTHDR(&msg, c))
+		if (c->cmsg_level == IPPROTO_IP && c->cmsg_type == IP_TOS)
+			return *CMSG_DATA(c);
+	return -1;
+}
+
+/* Voice is marked EF per datagram, everything else AF41 by default. */
+static void traffic_class(void)
+{
+	struct sockaddr_in to, from;
+	int rx = bound_socket(&to), tx = bound_socket(&from), on = 1;
+	guint8 data[32] = { 1 };
+
+	g_assert_cmpint(setsockopt(rx, IPPROTO_IP, IP_RECVTOS, &on, sizeof(on)),
+			==, 0);
+	g_unsetenv("LINE_CALL_DSCP");
+	g_assert_cmpuint(line_udp_tune(tx, AF_INET), ==, LINE_DSCP_VIDEO);
+	g_assert_cmpint(sendto(tx, data, sizeof(data), 0, (void *)&to,
+			       sizeof(to)),
+			==, sizeof(data));
+	g_assert_cmpint(received_tos(rx), ==, LINE_DSCP_VIDEO << 2);
+	g_assert_cmpint(line_udp_send_class(tx, AF_INET, &to, sizeof(to), data,
+					    sizeof(data), LINE_DSCP_VOICE),
+			==, sizeof(data));
+	g_assert_cmpint(received_tos(rx), ==, LINE_DSCP_VOICE << 2);
+	close(tx);
+	/* LINE_CALL_DSCP=0 leaves call packets unmarked. */
+	tx = bound_socket(&from);
+	g_setenv("LINE_CALL_DSCP", "0", TRUE);
+	g_assert_cmpuint(line_udp_tune(tx, AF_INET), ==, 0);
+	g_assert_cmpint(line_udp_send_class(tx, AF_INET, &to, sizeof(to), data,
+					    sizeof(data), LINE_DSCP_VOICE),
+			==, sizeof(data));
+	g_assert_cmpint(received_tos(rx), ==, 0);
+	g_unsetenv("LINE_CALL_DSCP");
+	close(tx);
+	close(rx);
+}
+
 static gdouble cpu_seconds(void)
 {
 	struct timespec ts;
@@ -396,6 +451,7 @@ int main(int argc, char **argv)
 			     GINT_TO_POINTER(LINE_UDP_MMSG), receive_modes);
 	g_test_add_func("/udp-batch/sandbox-fallback", sandbox_fallback);
 	g_test_add_func("/udp-batch/default-mode", default_mode);
+	g_test_add_func("/udp-batch/traffic-class", traffic_class);
 	for (int mode = LINE_UDP_PLAIN; mode <= LINE_UDP_GSO; mode++) {
 		g_autofree char *send = g_strdup_printf(
 			"/udp-batch/perf/send/%s", mode_names[mode]);

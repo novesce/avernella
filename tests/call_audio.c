@@ -200,6 +200,7 @@ static void incoming_stream(void)
 static void reorder_and_loss(void)
 {
 	guint8 tx[30] = { 1 }, rx[30] = { 2 }, packet[2048];
+	struct line_audio_stats stats;
 
 	g_autoptr(GError) error = NULL;
 	LineAudio *audio = line_audio_open(tx, rx, 96, 202, 102, &error);
@@ -211,20 +212,28 @@ static void reorder_and_loss(void)
 	g_assert_true(line_audio_receive(audio, packet, n));
 	n = protect(packet, rx, 96, 102, 12);
 	g_assert_true(line_audio_receive(audio, packet, n));
-	g_assert_cmpint(line_audio_playout(audio, 0), <, G_MAXINT64);
 	n = protect(packet, rx, 96, 102, 11);
 	g_assert_true(line_audio_receive(audio, packet, n));
-	g_assert_cmpint(line_audio_playout(audio, 0), ==, G_MAXINT64);
+	g_assert_false(line_audio_receive(audio, packet, n));
+	g_assert_cmpint(line_audio_playout(audio, G_MAXINT64), ==, G_MAXINT64);
+	line_audio_stats(audio, &stats);
+	/* The reordered packet played in its place, with nothing concealed. */
+	g_assert_cmpuint(stats.played, ==, 3 * 960);
+	g_assert_cmpuint(stats.concealed, ==, 0);
+	g_assert_cmpuint(stats.lost, ==, 0);
 
 	n = protect(packet, rx, 96, 102, 14);
 	g_assert_true(line_audio_receive(audio, packet, n));
-	gint64 due = line_audio_playout(audio, 0);
-
-	g_assert_cmpint(due, <, G_MAXINT64);
-	g_assert_cmpint(line_audio_playout(audio, due - 1), ==, due);
-	g_assert_cmpint(line_audio_playout(audio, due), ==, G_MAXINT64);
+	g_assert_cmpint(line_audio_playout(audio, G_MAXINT64), ==, G_MAXINT64);
+	line_audio_stats(audio, &stats);
+	/* The missing packet was concealed, from 14's FEC where present. */
+	g_assert_cmpuint(stats.lost, ==, 1);
+	g_assert_cmpuint(stats.concealed, ==, 960);
+	g_assert_cmpuint(stats.played, ==, 4 * 960);
 	n = protect(packet, rx, 96, 102, 13);
 	g_assert_false(line_audio_receive(audio, packet, n));
+	line_audio_stats(audio, &stats);
+	g_assert_cmpuint(stats.late, ==, 1);
 	line_audio_close(audio);
 }
 
@@ -252,6 +261,7 @@ static void rtp_audio_timeline(void)
 	g_assert_cmpint(line_audio_playout(audio, 0), <, G_MAXINT64);
 	n = protect_at(packet, rx, 96, 102, 16, 2880);
 	g_assert_true(line_audio_receive(audio, packet, n));
+	g_assert_cmpint(line_audio_playout(audio, G_MAXINT64), ==, G_MAXINT64);
 	/* The newer packet must not discard the earlier waiting speech. */
 	g_assert_cmpuint(frames_20ms - before, ==, 4);
 
@@ -346,6 +356,8 @@ static void eas2(void)
 	memcpy(payload + 6, frame + 1, n - 1);
 	memcpy(payload + 6 + n - 1, second + 1, n2 - 1);
 	wire = protect_payload(packet, rx, 96, 102, 6, payload, 4 + n + n2);
+	/* Play what is buffered so only this packet counts below. */
+	g_assert_cmpint(line_audio_playout(audio, G_MAXINT64), ==, G_MAXINT64);
 	guint before = frames_40ms;
 
 	g_assert_true(line_audio_receive(audio, packet, wire));

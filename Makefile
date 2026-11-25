@@ -112,6 +112,7 @@ TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-p
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
 TESTS += build/test-udp-batch build/test-sandbox build/test-gpu-health
+TESTS += build/test-call-net
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -238,14 +239,17 @@ build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/udp_batch.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o
+# Bad-network harness: a virtual clock and simulated audio devices.
+build/test-call-net: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time,--wrap=SDL_InitSubSystem,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice,--wrap=SDL_ClearQueuedAudio,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
+build/test-call-net: tests/call_net.c build/call_video.o build/call_srtp.o build/call_audio.o build/call_denoise.o build/camera_pixels.o
 build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/camera_pixels.o
 ifeq ($(CALL_VP8_JETSON),1)
 build/call_vp8_jetson.o: private CPPFLAGS += $(shell pkg-config --cflags $(JETSON_PKGS))
-avernella build/test-call build/test-call-video: private LDLIBS += $(shell pkg-config --libs $(JETSON_PKGS))
-build/test-call build/test-call-video: build/call_vp8_jetson.o
+avernella build/test-call build/test-call-video build/test-call-net: private LDLIBS += $(shell pkg-config --libs $(JETSON_PKGS))
+build/test-call build/test-call-video build/test-call-net: build/call_vp8_jetson.o
 endif
-build/test-call build/test-call-video: build/call_vp8.o build/call_vp8_device.o
-build/test-call: build/call_vp8_encode.o
+build/test-call build/test-call-video build/test-call-net: build/call_vp8.o build/call_vp8_device.o
+build/test-call build/test-call-net: build/call_vp8_encode.o
 build/test-call-video: build/test-call_vp8_encode.o
 build/test-call-video: private LDFLAGS += -Wl,--wrap=call_vp8_encoder_open,--wrap=call_vp8_encoder_frame,--wrap=call_vp8_encoder_close,--wrap=call_vp8_encoder_name
 build/test-call-video: private CPPFLAGS += -Ibuild
@@ -257,7 +261,7 @@ ifeq ($(CALL_HWCODECS),1)
 build/call_vp8.o build/call_vp8_encode.o build/test-call_vp8_encode.o build/test-call-video: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
 build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwframe_transfer_data
 build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwdevice_ctx_create,--wrap=g_file_read_link,--wrap=g_file_get_contents
-avernella build/test-call build/test-call-video: private LDLIBS += $(shell pkg-config --libs $(CALL_HWDECODE_PKGS))
+avernella build/test-call build/test-call-video build/test-call-net: private LDLIBS += $(shell pkg-config --libs $(CALL_HWDECODE_PKGS))
 endif
 CALL_HWDECODE_DEFINE := \#define CALL_HWDECODE $(CALL_HWCODECS)
 ifneq ($(file <build/call_hwdecode_config.h),$(CALL_HWDECODE_DEFINE))

@@ -311,3 +311,69 @@ gboolean line_udp_tx_queue(struct line_udp_tx *t, const void *to,
 	t->sizes[t->count++] = size;
 	return ok;
 }
+
+static gboolean dscp_enabled(void)
+{
+	const char *mark = getenv("LINE_CALL_DSCP");
+
+	return !mark || strcmp(mark, "0");
+}
+
+guint line_udp_tune(int fd, int family)
+{
+	int buffer = 1 << 20;
+	int tos = LINE_DSCP_VIDEO << 2;
+
+	/* Room for a keyframe burst and a Wi-Fi stall's backlog. */
+	(void)setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buffer, sizeof(buffer));
+	(void)setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer));
+	if (!dscp_enabled())
+		return 0;
+	if (family == AF_INET6 ?
+		    setsockopt(fd, IPPROTO_IPV6, IPV6_TCLASS, &tos,
+			       sizeof(tos)) :
+		    setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, sizeof(tos)))
+		return 0;
+	return LINE_DSCP_VIDEO;
+}
+
+ssize_t line_udp_send_class(int fd, int family, const void *to,
+			    socklen_t to_len, const guint8 *data, gsize size,
+			    guint dscp)
+{
+	union {
+		struct cmsghdr header;
+		guint8 space[CMSG_SPACE(sizeof(int))];
+	} control = { 0 };
+	struct iovec iov = { (void *)data, size };
+	struct msghdr msg = { .msg_name = (void *)to,
+			      .msg_namelen = to_len,
+			      .msg_iov = &iov,
+			      .msg_iovlen = 1 };
+	ssize_t n;
+
+	if (dscp && dscp_enabled()) {
+		struct cmsghdr *c;
+		int tos = dscp << 2;
+
+		msg.msg_control = control.space;
+		msg.msg_controllen = sizeof(control.space);
+		c = CMSG_FIRSTHDR(&msg);
+		c->cmsg_level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+		c->cmsg_type = family == AF_INET6 ? IPV6_TCLASS : IP_TOS;
+		c->cmsg_len = CMSG_LEN(sizeof(int));
+		memcpy(CMSG_DATA(c), &tos, sizeof(tos));
+	}
+	do {
+		n = sendmsg(fd, &msg, MSG_NOSIGNAL);
+	} while (n < 0 && errno == EINTR);
+	if (n < 0 && msg.msg_control &&
+	    (errno == EINVAL || unsupported(errno))) {
+		msg.msg_control = NULL;
+		msg.msg_controllen = 0;
+		do {
+			n = sendmsg(fd, &msg, MSG_NOSIGNAL);
+		} while (n < 0 && errno == EINTR);
+	}
+	return n;
+}

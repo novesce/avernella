@@ -69,6 +69,18 @@ The serializer at `0x614b68` writes a big-endian header with 16-bit values 1, 0 
 
 The shipped `vns_fci_fmt_name` at `0x8a2de0`, executed offline with all packet type/format combinations, identifies payload-specific feedback format 16 as PEI and 17 as FIR for RTCP packet type 206. The FIR writer at `0x8a0aac` creates a 28-byte control packet beginning `91 ce 00 06`, followed by the local and media SSRCs and a 16-byte control block. The engine calls the FIR parser at `0x7c1acc`. An official-peer exchange is still needed to establish feedback timing and how this control travels on the selected route.
 
+### Loss recovery and congestion feedback sent by Avernella
+
+For one-to-one calls Avernella also sends these SRTCP packets on the video stream. Each uses the local transmit SSRC as packet sender and the peer's transmit SSRC as media source:
+
+- **RRR, RTPFB format 5.** Bytes 12–13 hold a count, followed by that many 16-bit sequence numbers. The block is word-aligned with standard RTCP padding (the P bit, and a final byte of 2). This is the layout `call_group_retransmit_request()` accepts from the conference relay. Requests stop after three tries, or when the reorder hold expires.
+- **Receiver report, PT 201, one block.** The fraction lost counts packets that were neither received nor repaired by a resend. The extended highest sequence number is filled in. Jitter, LSR and DLSR are zero.
+- **REMB, PSFB format 15.** `REMB`, one SSRC, then a 6-bit exponent and 18-bit mantissa in bit/s, as in draft-alvestrand-rmcat-remb.
+
+A received RRR or RFC 4585 NACK for the local transmit SSRC is answered by resending the stored SRTP bytes unchanged. For a lost original, the receiver's replay window accepts the copy. In a group call, the relay's clear RRR for the camera source is answered the same way. Relay CCFS blocks for the camera source feed the sender's loss estimate.
+
+Not yet observed with an official peer: whether LINE for Android sends RRR, receiver reports or REMB in a one-to-one call, and whether it acts on the ones Avernella sends. Offline coverage is `build/test-call-net` and `build/test-call-video`.
+
 ## Local checks
 
 `build/test-call-video` encodes a synthetic I420 image with libvpx, authenticates fragmented EVS3 video with libsrtp2, reverses packet arrival order, and checks the decoded I420 output. It independently decrypts the wire packets to check Android descriptor bytes and declared sizes. Cases also check altered and replayed packets, loss, keyframe recovery, frame pacing and RTP negotiation. The relay fixture in `build/test-call` checks authenticated media address changes, including rejection of tampered and wrong-stream packets, and continuing an audio call when video negotiation fails. A live official-peer call is still needed to validate relay acceptance, peer updates, feedback timing and observed video quality.

@@ -35,6 +35,16 @@ enum {
 	GROUP_PLAYBACK_TARGET = FRAME * 9,
 	GROUP_PLAYBACK_LIMIT = FRAME * 18,
 	GROUP_CONCEAL_LIMIT = 2 * GROUP_FRAME,
+	/* One-to-one playout: an adaptive jitter buffer (see jb_playout()). */
+	JB_PACKETS = 50,
+	JB_BUCKETS = 50, /* 10 ms each */
+	/* PipeWire can drain SDL's queue 1024 samples at a time. */
+	JB_DEVICE_LOW = FRAME * 2, /* 40 ms waiting at the speaker */
+	JB_DECIDE = 1024, /* 21 ms: a missing packet waits until then */
+	JB_MIN_MS = 40,
+	JB_MAX_MS = 500,
+	JB_EXPAND_LIMIT = 10, /* frames of concealment with nothing buffered */
+	JB_JUMP = 5, /* a longer gap is skipped rather than concealed */
 };
 
 struct mixed_group {
@@ -61,10 +71,26 @@ struct audio_packet {
 	guint32 stamp;
 	guint16 seq;
 	int len, samples, frame_samples;
-	gint64 reorder_until;
+	gint64 reorder_until, arrival;
 	gboolean marker;
 	struct mixed_group group;
 	struct xrtp_layout xrtp;
+};
+
+/*
+ * Packets wait sorted by sequence. The target delay is the 97th
+ * percentile of arrival delay relative to the fastest packet of the last
+ * 10-20 s, from a histogram that forgets with a 5 s time constant, plus
+ * one packet. The speaker's demand drives decoding.
+ */
+struct jitter_buffer {
+	struct audio_packet packet[JB_PACKETS];
+	guint count, expanded;
+	double histogram[JB_BUCKETS];
+	gint64 base_arrival, min_delay, min_next, min_reset, excess_since;
+	guint32 base_stamp, next_stamp;
+	guint16 next_seq;
+	gboolean have_base, have_seq, playing, restart;
 };
 
 struct audio_interval {
@@ -111,6 +137,8 @@ struct LineAudio {
 	gboolean group_active, last_xrtp;
 	struct line_denoise *denoise;
 	struct audio_diagnostics *diagnostics;
+	struct line_audio_stats totals;
+	struct jitter_buffer *jb;
 	struct xrtp_track *tracks;
 	guint64 xrtp_packet;
 };
@@ -118,6 +146,11 @@ struct LineAudio {
 enum line_media_reception line_audio_reception(const LineAudio *a)
 {
 	return a->reception;
+}
+
+void line_audio_stats(const LineAudio *a, struct line_audio_stats *out)
+{
+	*out = a ? a->totals : (struct line_audio_stats){ 0 };
 }
 
 void line_audio_enable_diagnostics(LineAudio *a)
@@ -179,6 +212,13 @@ void line_audio_report(LineAudio *a)
 	d->report_at = now;
 }
 
+static void jb_free(struct jitter_buffer *jb)
+{
+	for (guint i = 0; jb && i < jb->count; i++)
+		g_free(jb->packet[i].data);
+	g_free(jb);
+}
+
 static void clear_pending(LineAudio *a)
 {
 	for (guint i = 0; i < a->pending_count; i++)
@@ -191,6 +231,7 @@ void line_audio_close(LineAudio *a)
 	if (!a)
 		return;
 	clear_pending(a);
+	g_clear_pointer(&a->jb, jb_free);
 	if (a->capture)
 		SDL_CloseAudioDevice(a->capture);
 	line_denoise_free(a->denoise);
@@ -296,6 +337,8 @@ static LineAudio *open_audio(const guint8 tx[30], const guint8 rx[30],
 	}
 	a->capture_channels = wanted.channels;
 	a->denoise = line_denoise_new();
+	if (!group)
+		a->jb = g_new0(struct jitter_buffer, 1);
 	SDL_PauseAudioDevice(a->playback, 0);
 	SDL_PauseAudioDevice(a->capture, 0);
 	return a;
@@ -889,10 +932,12 @@ static gboolean queue_pcm(LineAudio *a, opus_int16 *pcm, int samples)
 				   preroll * sizeof(*pcm)) < 0)
 			return FALSE;
 		depth += preroll;
+		a->totals.silence += preroll;
 		if (stats)
 			stats->queue_prerolls++;
 	}
 	if (queued >= limit) {
+		a->totals.dropped += samples;
 		if (stats)
 			stats->queue_drops++;
 		return TRUE;
@@ -962,6 +1007,9 @@ static void conceal_loss(LineAudio *a, const struct audio_packet *next)
 
 		if (count <= 0)
 			break;
+		a->totals.concealed += count;
+		a->totals.fec += fec;
+		a->totals.lost++;
 		if (stats)
 			stats->conceal_samples += count;
 		queue_pcm(a, pcm, count);
@@ -1006,6 +1054,10 @@ static gboolean play_packet(LineAudio *a, const struct audio_packet *packet)
 			stats->decoded_errors++;
 		return FALSE;
 	}
+	a->totals.played += count - skip;
+	a->totals.delay_ms_sum +=
+		SDL_GetQueuedAudioSize(a->playback) / sizeof(*pcm) / 48;
+	a->totals.delay_count++;
 	if (stats) {
 		stats->decoded_packets++;
 		stats->decoded_samples += count - skip;
@@ -1021,8 +1073,272 @@ static gboolean play_packet(LineAudio *a, const struct audio_packet *packet)
 	return queue_pcm(a, pcm + skip, count - skip);
 }
 
+/* Delay of this arrival above the fastest recent one, into the histogram. */
+static void jb_arrival(struct jitter_buffer *jb, guint32 stamp, gint64 now)
+{
+	if (!jb->have_base) {
+		jb->have_base = TRUE;
+		jb->base_arrival = now;
+		jb->base_stamp = stamp;
+		jb->min_delay = jb->min_next = G_MAXINT64;
+		jb->min_reset = now + 10 * G_USEC_PER_SEC;
+		jb->histogram[0] = 1;
+	}
+	gint64 delay = now - jb->base_arrival -
+		       (gint64)(gint32)(stamp - jb->base_stamp) *
+			       G_USEC_PER_SEC / RATE;
+
+	jb->min_delay = MIN(jb->min_delay, delay);
+	jb->min_next = MIN(jb->min_next, delay);
+	if (now >= jb->min_reset) {
+		jb->min_delay = jb->min_next;
+		jb->min_next = delay;
+		jb->min_reset = now + 10 * G_USEC_PER_SEC;
+	}
+	guint bucket = MIN((delay - jb->min_delay) / 10000, JB_BUCKETS - 1);
+
+	for (guint i = 0; i < JB_BUCKETS; i++)
+		jb->histogram[i] *= 0.996;
+	jb->histogram[bucket] += 0.004;
+}
+
+static guint jb_target_ms(const struct jitter_buffer *jb)
+{
+	double total = 0, sum = 0;
+
+	for (guint i = 0; i < JB_BUCKETS; i++)
+		total += jb->histogram[i];
+	for (guint i = 0; i < JB_BUCKETS; i++) {
+		sum += jb->histogram[i];
+		if (sum >= 0.97 * total)
+			return CLAMP((i + 1) * 10 + FRAME / 48, JB_MIN_MS,
+				     JB_MAX_MS);
+	}
+	return JB_MAX_MS;
+}
+
+/* Audio waiting after the next one to play, in milliseconds. */
+static guint jb_span_ms(const struct jitter_buffer *jb)
+{
+	if (!jb->count)
+		return 0;
+	const struct audio_packet *last = &jb->packet[jb->count - 1];
+	gint32 span = last->stamp + last->samples -
+		      (jb->playing ? jb->next_stamp : jb->packet[0].stamp);
+
+	return span > 0 ? span / 48 : 0;
+}
+
+static gboolean jb_insert(LineAudio *a, struct audio_packet *frame)
+{
+	struct jitter_buffer *jb = a->jb;
+
+	/* Far behind is a restarted stream: start over from this packet. */
+	if (jb->have_seq &&
+	    (gint16)(frame->seq - jb->next_seq) < -4 * JB_PACKETS) {
+		for (guint i = 0; i < jb->count; i++)
+			g_free(jb->packet[i].data);
+		jb->count = 0;
+		jb->have_seq = jb->playing = FALSE;
+		jb->restart = TRUE;
+	}
+	/* Late: its audio has been played or concealed already. */
+	if (jb->have_seq &&
+	    ((gint16)(frame->seq - jb->next_seq) < 0 ||
+	     (gint32)(frame->stamp + frame->samples - jb->next_stamp) <= 0)) {
+		a->totals.late++;
+		return FALSE;
+	}
+	guint pos = jb->count;
+
+	while (pos && (gint16)(frame->seq - jb->packet[pos - 1].seq) < 0)
+		pos--;
+	if (pos && jb->packet[pos - 1].seq == frame->seq)
+		return FALSE;
+	jb_arrival(jb, frame->stamp, frame->arrival);
+	if (jb->count == JB_PACKETS) {
+		/* Full: the oldest gives way. */
+		a->totals.dropped += jb->packet[0].samples;
+		g_free(jb->packet[0].data);
+		memmove(jb->packet, jb->packet + 1,
+			--jb->count * sizeof(*jb->packet));
+		if (jb->playing)
+			jb->next_seq = jb->packet[0].seq;
+		if (!pos)
+			return FALSE;
+		pos--;
+	}
+	memmove(jb->packet + pos + 1, jb->packet + pos,
+		(jb->count - pos) * sizeof(*jb->packet));
+	frame->data = g_memdup2(frame->data, frame->len);
+	jb->packet[pos] = *frame;
+	jb->count++;
+	return TRUE;
+}
+
+static void jb_pop(struct jitter_buffer *jb)
+{
+	g_free(jb->packet[0].data);
+	memmove(jb->packet, jb->packet + 1, --jb->count * sizeof(*jb->packet));
+}
+
+/* Plays a frame 10% faster by linear resampling, to shed delay. */
+static int jb_compress(opus_int16 *pcm, int samples)
+{
+	int count = samples - samples / 10;
+
+	if (count < 2)
+		return samples;
+	for (int i = 1; i < count; i++) {
+		int position =
+			(int)((gint64)i * (samples - 1) * 4096 / (count - 1));
+		int source = position / 4096, fraction = position % 4096;
+		int next = MIN(source + 1, samples - 1);
+
+		pcm[i] = pcm[source] +
+			 (pcm[next] - pcm[source]) * fraction / 4096;
+	}
+	return count;
+}
+
+/*
+ * One-to-one playout, after WebRTC's NetEq: when the speaker runs low,
+ * decode the next packet. The RTP clock decides what is missing. A gap
+ * waits with concealment while less than the target is buffered behind
+ * it; after that it is concealed from the following packet's in-band FEC
+ * or with Opus PLC. An empty buffer is stretched with PLC for up to
+ * 200 ms, then playout stops and buffers to the target again. Delay above
+ * the target is shed by playing frames faster or skipping them. A now of
+ * G_MAXINT64 drains the buffer at once.
+ */
+static gint64 jb_playout(LineAudio *a, gint64 now)
+{
+	struct jitter_buffer *jb = a->jb;
+	gboolean drain = now == G_MAXINT64;
+	guint queued = SDL_GetQueuedAudioSize(a->playback) / sizeof(opus_int16);
+	guint target = jb_target_ms(jb);
+
+	if (!jb->playing) {
+		if (!jb->count)
+			return G_MAXINT64;
+		gint64 waited = now - jb->packet[0].arrival;
+
+		if (!drain && queued / 48 + jb_span_ms(jb) < target &&
+		    waited < (gint64)target * 1000)
+			return now + 5000;
+		jb->playing = TRUE;
+		jb->have_seq = TRUE;
+		jb->next_seq = jb->packet[0].seq;
+		jb->next_stamp = jb->packet[0].stamp;
+		jb->expanded = 0;
+		if (jb->restart)
+			opus_decoder_ctl(a->decoder, OPUS_RESET_STATE);
+		jb->restart = FALSE;
+	}
+	while (drain ? jb->count > 0 : queued < JB_DEVICE_LOW) {
+		opus_int16 pcm[MAX_PCM];
+		int n, skip = 0,
+		       length = a->last_samples ? a->last_samples : FRAME;
+		struct audio_packet *head = jb->count ? &jb->packet[0] : NULL;
+		gint32 ticks = head ? (gint32)(head->stamp - jb->next_stamp) :
+				      0;
+		guint level = queued / 48 + jb_span_ms(jb);
+
+		if (head && ticks > JB_JUMP * FRAME) {
+			/* A long loss or pause: resume at the next packet. */
+			a->totals.lost += ticks / FRAME;
+			jb->next_stamp = head->stamp;
+			opus_decoder_ctl(a->decoder, OPUS_RESET_STATE);
+			continue;
+		}
+		if (head && ticks <= 0) {
+			/* Skip audio already concealed in its place. */
+			skip = MIN(-ticks, head->samples);
+			if (skip == head->samples) {
+				jb_pop(jb);
+				a->totals.late++;
+				continue;
+			}
+			n = decode_packet(a->decoder, head, &skip, pcm) - skip;
+			if (n > 0)
+				memmove(pcm, pcm + skip, n * sizeof(*pcm));
+			jb->next_seq = head->seq + 1;
+			jb->next_stamp = head->stamp + head->samples;
+			jb->expanded = 0;
+			a->last_samples = MIN(head->samples, MAX_PCM);
+			jb_pop(jb);
+			if (n <= 0)
+				continue;
+			a->totals.played += n;
+			level = (queued + n) / 48 + jb_span_ms(jb);
+			a->totals.delay_ms_sum += level;
+			a->totals.delay_count++;
+			if (level <= target + 60)
+				jb->excess_since = 0;
+			else if (!jb->excess_since)
+				jb->excess_since = now;
+			if (!drain && level > target + 200) {
+				a->totals.dropped += n;
+				continue;
+			}
+			if (!drain && jb->excess_since &&
+			    now - jb->excess_since >= G_USEC_PER_SEC / 2) {
+				int shorter = jb_compress(pcm, n);
+
+				a->totals.dropped += n - shorter;
+				n = shorter;
+			}
+		} else if (head && !drain && queued >= JB_DECIDE) {
+			/* The speaker still has audio: decide as late as can be. */
+			break;
+		} else if (head && (drain || level >= target ||
+				    jb->expanded >= JB_EXPAND_LIMIT)) {
+			/* Lost: the following packet may carry it as FEC. */
+			int missing = MIN(ticks, length);
+			gboolean fec = missing == ticks && !head->group.count &&
+				       head->samples == missing &&
+				       head->frame_samples == missing;
+
+			n = opus_decode(a->decoder, fec ? head->data : NULL,
+					fec ? head->len : 0, pcm, missing, fec);
+			jb->next_stamp += missing;
+			a->totals.lost++;
+			a->totals.fec += fec && n > 0;
+			if (n <= 0)
+				continue;
+			a->totals.concealed += n;
+		} else {
+			/* Wait for a late or reordered packet with concealment. */
+			if (!head && jb->expanded >= JB_EXPAND_LIMIT) {
+				jb->playing = FALSE;
+				jb->restart = TRUE;
+				break;
+			}
+			n = opus_decode(a->decoder, NULL, 0, pcm, length, 0);
+			jb->expanded++;
+			if (n <= 0)
+				break;
+			a->totals.concealed += n;
+		}
+		if (SDL_QueueAudio(a->playback, pcm, n * sizeof(*pcm)) < 0)
+			break;
+		a->reception = LINE_MEDIA_PLAYABLE;
+		queued += n;
+	}
+	if (drain || !jb->playing)
+		return drain || !jb->count ? G_MAXINT64 : now + 5000;
+	guint low = jb->count && jb->packet[0].stamp != jb->next_stamp ?
+			    JB_DECIDE :
+			    JB_DEVICE_LOW;
+
+	return now + MAX(1000, (gint64)(queued - MIN(queued, low)) *
+				       G_USEC_PER_SEC / RATE);
+}
+
 gint64 line_audio_playout(LineAudio *a, gint64 now)
 {
+	if (a->jb)
+		return jb_playout(a, now);
 	while (a->pending_count) {
 		struct audio_packet first = a->pending[0];
 		gint64 until = a->group ? first.reorder_until :
@@ -1397,7 +1713,8 @@ gboolean line_audio_receive(LineAudio *a, const guint8 *packet, gsize size)
 	guint16 seq = ((guint16)plain[2] << 8) | plain[3];
 	gint16 delta = (gint16)(seq - a->received);
 
-	if (!a->first_rx && delta <= 0) {
+	if (!a->jb && !a->first_rx && delta <= 0) {
+		a->totals.late++;
 		if (d)
 			d->interval.late++;
 		return FALSE;
@@ -1441,6 +1758,10 @@ gboolean line_audio_receive(LineAudio *a, const guint8 *packet, gsize size)
 		diagnose_received_audio(d, &frame, n - off - !frame.xrtp.count,
 					plain[0] & 15);
 
+	if (a->jb) {
+		frame.arrival = g_get_monotonic_time();
+		return jb_insert(a, &frame);
+	}
 	if (a->first_rx || delta == 1 || delta > REORDER_PACKETS + 1) {
 		if (!a->first_rx && delta > REORDER_PACKETS + 1)
 			line_audio_playout(a, G_MAXINT64);

@@ -179,7 +179,7 @@ struct voice_call {
 	guint data_traced;
 	guint32 audio_rx, audio_tx, video_rx, video_tx;
 	char *video_notice;
-	gint64 next_video, next_video_feedback, video_start_retry;
+	gint64 next_video, video_start_retry;
 	/* -1 until the connected call has reported its outgoing video once. */
 	int reported_video;
 	/* Sending limits chosen from the peer's advertised receive limits. */
@@ -303,6 +303,18 @@ static gboolean send_to(struct voice_call *c, const struct call_endpoint *to,
 			   (const void *)&to->addr, to->len);
 	} while (n < 0 && errno == EINTR);
 	return n == (ssize_t)pkt.n;
+}
+
+/* Microphone packets carry the voice class; the socket default is video. */
+static gboolean send_voice(struct voice_call *c, Slice pkt)
+{
+	const struct call_endpoint *to = &c->audio_route.current;
+
+	if (line_udp_tx_pending(c->udp_tx))
+		line_udp_tx_flush(c->udp_tx);
+	return line_udp_send_class(c->fd, to->addr.ss_family,
+				   (const void *)&to->addr, to->len, pkt.p,
+				   pkt.n, LINE_DSCP_VOICE) == (ssize_t)pkt.n;
 }
 
 static void media_received(struct voice_call *c, struct media_route *route,
@@ -2042,7 +2054,6 @@ static void group_select_video(struct voice_call *c)
 	g_clear_pointer(&v->receiver, call_video_close);
 	v->retry_at = 0;
 	v->last_rtp = 0;
-	c->next_video_feedback = 0;
 	v->peer = (struct call_group_member){ 0 };
 	if (selected) {
 		v->receiver = call_video_open_group_rx(v->rx_key, c->video_pt,
@@ -2919,6 +2930,10 @@ static void group_feedback_blocks(struct voice_call *c, const guint8 *p,
 		if (id && id == c->video_tx) {
 			c->stats.ccfs_camera += count;
 			c->stats.camera_acknowledged += received;
+			/* Relay arrivals drive the camera's rate. A shared
+			 * screen keeps its rate (see configure_encoder()).
+			 */
+			call_video_uplink_loss(c->video, count, received);
 		}
 		if (id != c->audio_tx && id != c->video_tx)
 			c->stats.feedback_other_slots += count;
@@ -2958,6 +2973,29 @@ static void group_rtcp(struct voice_call *c, Slice packet, gint64 arrival)
 			if (n)
 				send_to(c, &c->relay, (Slice){ reply, n });
 		}
+		/* The relay asks for lost camera packets with LINE's RRR. */
+		if (p[1] == 205 && blocks == 5 && c->video &&
+		    !c->self_sharing) {
+			guint32 target = 0;
+			guint count = call_group_retransmit_request(
+				(Slice){ p, len }, &target);
+			guint16 list[64];
+
+			for (guint i = 0; target == c->video_tx &&
+					  i < MIN(count, G_N_ELEMENTS(list));
+			     i++)
+				list[i] = ((guint)p[14 + 2 * i] << 8) |
+					  p[15 + 2 * i];
+			if (target == c->video_tx && count)
+				call_video_retransmit(c->video, list,
+						      MIN(count,
+							  G_N_ELEMENTS(list)),
+						      g_get_monotonic_time(),
+						      send_video_packet, c);
+		}
+		if (c->feedback && p[1] == 205 &&
+		    (blocks == 9 || blocks == 11) && len >= 20)
+			group_feedback_blocks(c, p, len, blocks);
 		if (c->stats.next && p[1] == 205) {
 			c->stats.feedback_formats |= 1u << blocks;
 			if (blocks == 5) {
@@ -2972,7 +3010,8 @@ static void group_rtcp(struct voice_call *c, Slice packet, gint64 arrival)
 					c->stats.mic_retransmits_requested +=
 						count;
 			}
-			if ((blocks == 9 || blocks == 11) && len >= 20)
+			if (!c->feedback && (blocks == 9 || blocks == 11) &&
+			    len >= 20)
 				group_feedback_blocks(c, p, len, blocks);
 		}
 		if (c->stats.next && (p[1] == 200 || p[1] == 201) &&
@@ -3112,8 +3151,8 @@ static gboolean run_call(struct voice_call *c, GError **e)
 							      sizeof(data), e);
 				if (size < 0 ||
 				    (size > 0 &&
-				     !send_to(c, &c->audio_route.current,
-					      (Slice){ data, (gsize)size })))
+				     !send_voice(c,
+						 (Slice){ data, (gsize)size })))
 					return FALSE;
 				if (c->stats.next && size > 0) {
 					c->stats.audio_sent++;
@@ -3234,16 +3273,15 @@ static gboolean run_call(struct voice_call *c, GError **e)
 					      call_video_authenticated_packets(
 						      rx_video);
 
-		if (receiving && call_video_needs_keyframe(rx_video)) {
-			if (now >= c->next_video_feedback) {
-				call_video_send_peer_feedback(c->video,
-							      rx_video,
-							      send_video_packet,
-							      c);
-				c->next_video_feedback = now + G_USEC_PER_SEC;
-			}
-			next = MIN(next, c->next_video_feedback);
-		}
+		/*
+		 * Held packets, retransmission and keyframe requests and
+		 * REMB for the incoming video (see call_video_poll()).
+		 */
+		if (rx_video)
+			next = MIN(next,
+				   call_video_poll(rx_video, c->video, now,
+						   receiving, send_video_packet,
+						   c, display_video, c));
 		if (c->video_start_retry) {
 			if (now >= c->video_start_retry) {
 				start_video_streams(c, &c->media);
@@ -3329,14 +3367,14 @@ static gboolean run_call(struct voice_call *c, GError **e)
 					c->stats.rtcp_other_port++;
 				if (c->group &&
 				    equal_address(&source, &c->relay)) {
-					if (c->feedback || c->stats.next)
-						group_rtcp(
-							c, pkt,
-							g_get_monotonic_time());
+					group_rtcp(c, pkt,
+						   g_get_monotonic_time());
 					group_camera_feedback(c, pkt);
 				} else if (!c->group && c->video &&
-					   call_video_receive_feedback(c->video,
-								       data, n))
+					   call_video_receive_rtcp(
+						   c->video, data, n,
+						   g_get_monotonic_time(),
+						   send_video_packet, c))
 					media_received(c, &c->video_route,
 						       &source);
 				continue;
@@ -3836,6 +3874,7 @@ static gboolean setup_relay(struct voice_call *c, const char *host,
 		set_error(e, "Could not open the UDP call socket.");
 		return FALSE;
 	}
+	line_udp_tune(c->fd, c->relay.addr.ss_family);
 	c->udp_rx = line_udp_rx_new(c->fd, line_udp_default_mode());
 	c->udp_tx = line_udp_tx_new(c->fd, line_udp_default_mode());
 	CallInfo *s = &c->info;

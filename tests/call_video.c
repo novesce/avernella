@@ -708,6 +708,14 @@ static void standard_vp8(void)
 	done(&loop);
 }
 
+static gboolean ignore_feedback(const guint8 *packet, gsize size, gpointer data)
+{
+	(void)packet;
+	(void)size;
+	(void)data;
+	return TRUE;
+}
+
 static void single_packet(gconstpointer mode)
 {
 	gboolean rfc = GPOINTER_TO_INT(mode);
@@ -728,6 +736,12 @@ static void single_packet(gconstpointer mode)
 		if (i == 2)
 			continue; /* Losing a whole frame requires a keyframe. */
 		g_assert_true(deliver(&loop, 0));
+		/* The next frame waits for reordering or a resend first. */
+		if (i == 3)
+			call_video_poll(loop.rx, loop.rx,
+					g_get_monotonic_time() + G_USEC_PER_SEC,
+					FALSE, ignore_feedback, NULL, display,
+					&loop);
 		g_assert_cmpuint(loop.count, ==, i == 4 ? 3 : MIN(i + 1, 2));
 		g_assert_cmpint(call_video_needs_keyframe(loop.rx), ==, i == 3);
 	}

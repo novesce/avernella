@@ -57,6 +57,40 @@ gboolean call_video_send_peer_feedback(struct call_video *tx,
 				       call_video_send_fn send, gpointer data);
 gboolean call_video_receive_feedback(struct call_video *video,
 				     const guint8 *packet, gsize size);
+/*
+ * Handles one-to-one SRTCP from the peer: keyframe requests (spaced
+ * 300 ms apart), retransmission requests (LINE's RTPFB format 5 and
+ * RFC 4585 NACK), REMB and receiver-report loss for rate control.
+ */
+gboolean call_video_receive_rtcp(struct call_video *video, const guint8 *packet,
+				 gsize size, gint64 now_us,
+				 call_video_send_fn send, gpointer data);
+/*
+ * Receiver loss recovery. Releases packets the reorder buffer held,
+ * requests missing ones (one-to-one only), asks for a keyframe when
+ * keyframes is TRUE and decoding needs one, and sends REMB. feedback is
+ * the stream whose SRTCP state signs the requests. Returns the next time
+ * to call it.
+ */
+gint64 call_video_poll(struct call_video *rx, struct call_video *feedback,
+		       gint64 now_us, gboolean keyframes,
+		       call_video_send_fn send, gpointer data,
+		       call_video_display_fn display, gpointer display_data);
+/* Resends kept packets by RTP sequence number. Returns how many it sent. */
+guint call_video_retransmit(struct call_video *video, const guint16 *seqs,
+			    guint count, gint64 now_us, call_video_send_fn send,
+			    gpointer data);
+struct call_video_recovery {
+	guint requests, requested, retransmitted, gave_up, late;
+	guint keyframe_requests, rembs, rate_changes, rescales;
+	guint target_kbps, encoder_kbps, rtt_ms, hold_ms;
+	guint width, height;
+};
+void call_video_recovery(const struct call_video *video,
+			 struct call_video_recovery *out);
+/* Conference transport feedback: packets the relay saw for this stream. */
+void call_video_uplink_loss(struct call_video *video, guint packets,
+			    guint received);
 /* The conference transport must validate the relay and sender first. */
 gboolean call_video_receive_group_feedback(struct call_video *video,
 					   const guint8 *packet, gsize size,

@@ -161,7 +161,7 @@ Media packets go to the media address the peer's connection signalling gives, wh
 - **Capture.** The encoder takes 48 kHz mono in 20 ms frames (960 samples). Group calls can capture in stereo and select a microphone channel before encoding. Each 10 ms half goes through RNNoise first ([`call_denoise.c`](../../src/call_denoise.c)), unless `LINE_NOISE_SUPPRESSION=0`. RNNoise is a small neural network that removes fan noise, wind and the hiss some laptop microphones pick up when the webcam turns on. It costs about 0.5% of one CPU core.
 - **Encoding.** Opus, `OPUS_APPLICATION_VOIP`, 32 kbps, voice signal, in-band FEC, 5% expected loss.
 - **The EAS2 format.** LINE calls its normal-audio codec EAS2. On the wire, Opus frames are wrapped with LINE's own frame headers: a single frame with an activity bit, or grouped frames with an activity bitmap, and mixed groups where each table-of-contents byte's low bit marks the last. The receiver normalizes these back to plain Opus before decoding.
-- **Playback.** Received packets are authenticated against the negotiated payload type and SSRC, briefly held to absorb reordering, and played out on schedule (`line_audio_playout()`). Decoder state resets on a gap.
+- **Playback.** Received packets are authenticated against the negotiated payload type and SSRC. In a one-to-one call they wait in an adaptive jitter buffer, and the speaker's demand drives decoding (`line_audio_playout()`, see [Bad networks](#8-bad-networks)). Group calls keep the mixer playout: a short reorder hold, then playback on schedule. Decoder state resets on a long gap.
 - **Mute** stops sending microphone audio (`line_audio_mute()`).
 
 For a stereo group-call microphone, Avernella measures the changing part of each channel so a stuck input or a DC offset cannot win the selection. If one channel clips repeatedly and the other has a usable signal, it favors the cleaner channel. If both channels clip, reduce the input gain in the system sound settings.
@@ -180,7 +180,7 @@ For group screen sharing, the `group-stats share` line appears every three secon
 - **Software encoding.** Camera and RTP screen video use real-time libvpx settings and a keyframe at least every three seconds. The speed starts at `-6` for 720p and adapts once a second like WebRTC's CPU-overuse detector (`call_video_pace()`). If encoding averaged more than 60% of the frame interval, the encoder moves one step faster, down to `-12`. Below 25% it steps back toward the starting speed. The screen-share encoder adapts the same way. The libvpx software decoder uses up to four threads. `./build/test-call-video -m perf -p /video/encode-720p` reports the cost of a 720p frame through the full send path.
 - **EVS3 packets.** LINE doesn't use the standard RTP VP8 payload format in PLANET calls. Each frame is split into fragments, each with an **EVS3 picture descriptor**: a flags byte (bit 3 start, bit 2 end, bit 5 "layer and reference byte follows", bit 1 "orientation byte follows"), a 16-bit big-endian picture ID, and, on the first fragment, a resolution and key byte and a three-byte length that carries *N* + 3 in groups of 2, 8 and 8 bits, least significant first. Examples are in [analysis/video-call-wire.md](../../analysis/video-call-wire.md#media-packets).
 - **Rotation.** The orientation byte's two high bits give 0°, 90°, 180° or 270°. The UI rotates the whole picture.
-- **Feedback.** RTCP payload-specific feedback with format 17 (**FIR**, a full intra request) asks the sender for a keyframe after loss (`call_video_send_feedback()`, `call_video_receive_feedback()`).
+- **Feedback.** RTCP payload-specific feedback with format 17 (**FIR**, a full intra request) asks the sender for a keyframe after loss. Retransmission requests, receiver reports and REMB adapt the stream to the network (`call_video_poll()`, `call_video_receive_rtcp()`, see [Bad networks](#8-bad-networks)).
 - **Turning the camera on mid-call.** Before each camera change, the client sends a media-control **stream report** (`call_stream_spec()`) listing its transmit SSRC as running, because peers otherwise keep the earlier paused state. Media-control stream actions are 1 START, 2 STOP, 3 PAUSE and 4 RESUME.
 - **To the window.** Decoded frames go to the UI as sealed memfds over the frame socket (see [Architecture](architecture.md#call-video-frames)), along with your own camera preview.
 
@@ -214,6 +214,62 @@ LINE calls a screen share a *presentation*: media kind 4 (DATA) with data servic
 
 [analysis/video-call-wire.md](../../analysis/video-call-wire.md#screen-sharing-presentation) records exactly what has and hasn't been verified against LINE's apps. The direct-call receive path has been exercised with the official app. Sending a separate native presentation remains experimental.
 
+## 8. Bad networks
+
+The wire format is fixed by LINE, so Avernella improves calls on lossy, jittery or slow links by how it uses that format. Everything below works with any peer. What depends on the peer's feedback is marked.
+
+**Video receive** ([`call_video.c`](../../src/call_video.c)):
+
+- **A reorder buffer before picture assembly.** Packets in sequence go straight to the EVS3 assembler, with no added delay. After a gap, later packets wait until the missing one arrives, or until the hold expires. The hold is about the usual reordering delay. Once the peer has answered a retransmission request, it also covers a request and one repeat (grace + 2.5 × RTT + 30 ms, at most 500 ms). A complete keyframe never waits behind a gap, because nothing before a keyframe matters to the decoder. A late fragment of the picture still assembling is still accepted.
+- **Retransmission requests.** A packet missing for longer than about three-quarters of the observed reordering is requested with LINE's own RTPFB format 5 (RRR, the list of 16-bit sequence numbers the group relay also sends). It is requested again after 1.25 × RTT, three times at most. RTT is measured from request to arrival. One-to-one calls only.
+- **Keyframe requests.** FIR goes out as soon as decoding needs a keyframe, then again after 300 ms, 600 ms and every second. The pace resets after each decoded picture. Group calls keep one request a second, because the relay rate-limits keyframes itself.
+- **Receiver reports.** Once a second the receiver sends a standard RTCP receiver report. Its loss fraction counts only packets that were neither received nor repaired, so reordering does not look like loss.
+- **REMB.** The receiver times each picture's last packet against its RTP timestamp. Delay above the lowest of the last 15–30 s is queueing. If the queue passes 50 ms and keeps growing, or passes 120 ms, the estimate becomes 85% of the measured arrival rate, cut deeper for longer queues (down to half). It grows 10% a second while the queue stays short, or 25% after three calm seconds, and is dropped once it no longer limits the sender. The estimate is sent as a standard REMB packet (PSFB format 15).
+
+**Video send:**
+
+- **Retransmission.** The sender keeps the last 512 protected packets and resends the identical bytes on request (RRR or RFC 4585 NACK), up to three times each within a second. The SRTP replay check makes a duplicate of a packet that did arrive harmless. Resends may add about a third to the rate. The conference relay's RRR requests are answered for the camera, but not while you share your screen.
+- **Rate control, after Google Congestion Control.** Above 10% loss the rate falls by half the loss rate, at most once a second and never below 70% of a fresh REMB. Below 2% it grows 10% a second, or 25% after three calm seconds. In between it holds. REMB caps the rate at once. Loss comes from receiver reports when the peer sends them, and otherwise from retransmission requests. A peer that sends only keyframe requests still lowers the rate when it asks more than once in half a second. Without any feedback, the rate stays at the negotiated ceiling, as before. libvpx changes its rate between frames without a keyframe. A hardware encoder restarts, so it follows only changes of 25% or more.
+- **Resolution and frame rate.** In a one-to-one call the camera picture steps down to 3/4, 1/2, 3/8 or 1/4 of its size when each pixel would get fewer than 0.05 bits. It steps back up when the larger size would get more than 0.09, after at least 4 s. Below 250 kbit/s the camera sends 15 fps, and below 120 kbit/s 10 fps. Screen shares and group calls keep their size. A group screen share also keeps the HD layer's rate, so shared text stays readable.
+- **Keyframe spacing.** Forced keyframes stay at least 300 ms apart. A request that arrives sooner is honoured when the spacing allows.
+
+**Audio playout** ([`call_audio.c`](../../src/call_audio.c)), one-to-one calls, after WebRTC's NetEq:
+
+- The target delay is the 97th percentile of arrival delay, relative to the fastest packet of the last 10–20 s, plus one packet, between 40 and 500 ms. It comes from a histogram that forgets with a time constant of about 5 s.
+- When less than 40 ms waits at the speaker, the next packet is decoded. The RTP clock decides what is missing. A missing packet waits while the speaker still holds more than 21 ms of audio (PipeWire can drain 1024 samples at once), and longer while less than the target is buffered behind it. It is then rebuilt from the following packet's in-band Opus FEC, or with Opus loss concealment. A gap of more than 100 ms is skipped.
+- With nothing buffered, playout continues with concealment for up to 200 ms. It then stops and buffers to the target again.
+- Delay more than 60 ms above the target for half a second is shed by playing frames 10% faster. More than 200 ms above the target skips frames.
+
+**Socket.** The call socket asks for 1 MiB send and receive buffers (the kernel caps them at `net.core.wmem_max` and `rmem_max`). Video, data and signalling are marked DSCP AF41. Each microphone packet is marked EF through `IP_TOS` or `IPV6_TCLASS` control data on `sendmsg()`. On Wi-Fi, current kernels map EF to the WMM voice and AF41 to the video access category, which wins channel access ahead of bulk traffic. Networks may ignore or clear the marks. `LINE_CALL_DSCP=0` sends unmarked packets. `SO_PRIORITY` is not used: values above 6 need `CAP_NET_ADMIN`, and Wi-Fi drivers ignore lower ones. The call and audio threads already use the short scheduler slice and utilization clamp set in `tune.c`.
+
+**Received video on the GPU.** The native Vulkan renderer draws call video from its I420 planes. When the picture is magnified, it samples luma with a Catmull–Rom bicubic filter, nine bilinear fetches for the exact 16-tap result, and keeps bilinear chroma. On decoded VP8 scaled up to 640 × 360 from 480 × 270 or 320 × 180 at 100–300 kbit/s, Catmull–Rom measured 0.7–1.0 dB PSNR above bilinear. Lanczos-3 did no better, and an unsharp mask added at most 0.2 dB, so neither is used. SDL's renderers and the software path keep bilinear scaling. The filter runs on any Vulkan GPU, NVIDIA, AMD or Intel, in the UI process. The worker and its sandbox are unchanged.
+
+**What was left out, and why.** Desktop NVENC has no VP8 encoder, so CUDA cannot take over encoding. NVIDIA's Tensor-core video and audio effects (Video Effects SDK, Audio Effects SDK, RTX Video Super Resolution) need proprietary SDKs, models and TensorRT. None of them was installed on the development machine (an RTX 5050 laptop with only the driver), so no benefit could be measured, and they are not used. GPU colour conversion would not pay for itself: converting a 720p camera frame on the CPU takes about 0.5 ms, less than the upload and readback would. RNNoise costs about 0.5% of one core, so a GPU denoiser would add latency without a measurable gain. Encoder frame dropping (`rc_dropframe_thresh`) made no difference in the harness and stays off. Kernel pacing (`SO_MAX_PACING_RATE`, `SO_TXTIME`) only works under the `fq` qdisc, which typical desktops do not use for Wi-Fi, so pictures still leave as one burst. Opus DTX stays off. Adapting Opus's expected-loss setting would need audio feedback that LINE's one-to-one calls do not carry.
+
+**Interoperability.** Packet formats and descriptors are unchanged, and the Android packet comparisons still pass. The receiver now also sends RRR, receiver reports and REMB to the peer. How LINE for Android treats them in a one-to-one call, and whether it answers RRR or honours REMB, still needs a live test. Between two Avernella clients both work. Set `LINE_CALL_FEEDBACK=0` to stop sending RRR, receiver reports and REMB, for troubleshooting.
+
+**Measurements.** `build/test-call-net` (`tests/call_net.c`) runs these paths over a simulated network on a virtual clock. It uses 640 × 360 VP8 at 15 fps with an 800 kbit/s ceiling and 30 s of synthetic voice. The table compares the code before this work with the current code. *Screen PSNR* compares what the viewer sees with the newest four pictures the path could have delivered, so a frozen picture scores low.
+
+| Scenario | fps before → after | Freeze per 19 s, before → after | Screen PSNR before → after |
+| -------- | ------------------ | ------------------------------- | -------------------------- |
+| Clean, 30 ms | 15.0 → 15.0 | 0 → 0 ms | 45.1 → 45.1 dB |
+| 5% burst loss | 3.7 → 15.0 | 15.3 → 1.4 s | 28.0 → 44.7 dB |
+| Wi-Fi jitter (40 ms, reordering, 120 ms stalls every 2 s) | 7.6 → 14.8 | 10.2 → 1.0 s | 34.2 → 44.7 dB |
+| 400 kbit/s bottleneck, 250 ms queue | 0.2 → 14.7 | 18.8 → 0.4 s | 13.6 → 42.6 dB |
+| 1.2 Mbit/s dropping to 300 kbit/s for 7 s | 9.2 → 13.4 | 7.3 → 2.1 s | 32.7 → 36.0 dB |
+| 600 ms outage | 14.4 → 14.4 | 0.8 → 0.8 s, recovery 178 ms | 44.3 → 44.2 dB |
+| Mobile hotspot (70 ms, 50 ms jitter, 1 Mbit/s falling to 450 kbit/s) | 2.0 → 14.7 | 17.1 → 3.4 s | 19.9 → 41.7 dB |
+
+| Audio scenario | Dead air per minute, before → after | Mean playout delay, before → after |
+| -------------- | ----------------------------------- | ---------------------------------- |
+| Clean | 0 → 0 ms | 66 → 63 ms |
+| 5% burst loss | 235 → 0 ms | 189 → 110 ms |
+| 15% burst loss | 822 → 0 ms | 171 → 109 ms |
+| Wi-Fi jitter | 130 → 0 ms | 174 → 145 ms |
+| Mobile hotspot | 174 → 0 ms | 145 → 117 ms |
+
+Before, a missing packet let the speaker run dry, and each restart added 60 ms of silence that stayed as extra delay. On the Wi-Fi profile the new buffer conceals more audio than before (1.4 s against 0.7 s a minute), because it does not keep 170 ms of delay for the periodic stalls. The tests fail if these results fall back toward the earlier numbers.
+
 ## Incoming calls
 
 An incoming call is a sync operation. `line_voice_operation()` (called for every operation, see [Sync](sync.md)) looks for OpType **50** (invitation) and **51** (canceled):
@@ -243,4 +299,4 @@ Set `LINE_CALL_DEBUG=1`. The terminal shows negotiation (payload types, SSRCs, l
 
 ## Tests
 
-`tests/call.c` runs complete calls against a **local relay fixture**: incoming and outgoing signalling, bidirectional SRTP audio and video, media address changes, rejection of tampered and wrong-stream packets, continuing as voice when video fails, and screen sharing with and without the camera. SDL audio is replaced with `-Wl,--wrap`. `tests/call_video.c` checks VP8 encoding and decoding through EVS3 fragments and SRTP, including reordering, loss, replays and keyframe recovery, against the Android descriptor bytes. `tests/call_audio.c` covers the EAS2 framing and playout, and `tests/call_denoise.c` the noise suppressor.
+`tests/call.c` runs complete calls against a **local relay fixture**: incoming and outgoing signalling, bidirectional SRTP audio and video, media address changes, rejection of tampered and wrong-stream packets, continuing as voice when video fails, and screen sharing with and without the camera. SDL audio is replaced with `-Wl,--wrap`. `tests/call_video.c` checks VP8 encoding and decoding through EVS3 fragments and SRTP, including reordering, loss, replays and keyframe recovery, against the Android descriptor bytes. `tests/call_audio.c` covers the EAS2 framing and playout, and `tests/call_denoise.c` the noise suppressor. `tests/call_net.c` measures video and audio over the simulated bad networks in [Bad networks](#8-bad-networks).

@@ -39,6 +39,61 @@ enum {
 	EVS3_RTP_VFD_SIZE = 12,
 	EVS3_RTP_VED_SIZE = 20,
 	EVS3_VED_TARGET_BR_SIZE = 4,
+	RTCP_SR = 200,
+	RTCP_RR = 201,
+	RTCP_RTPFB = 205,
+	RTCP_NACK = 1,
+	LINE_RRR = 5,
+	RTCP_REMB = 15,
+	/* Packets held to put a picture back in order or wait for a resend. */
+	RX_SLOTS = 256,
+	/* Sent packets kept for retransmission, about a second at 4 Mbit/s. */
+	TX_HISTORY = 512,
+	RRR_MAX = 64,
+	RTX_AGE_US = 1000000,
+	MIN_KBPS = 60,
+	KEY_SPACING_US = 300000,
+};
+
+/* One RTP sequence slot of the receive reorder buffer. */
+struct rx_packet {
+	GBytes *payload;
+	gint64 missing_since, requested_at;
+	guint32 ts;
+	guint16 seq;
+	guint8 requests;
+	gboolean marker;
+};
+
+struct tx_packet {
+	gint64 sent, resent;
+	guint16 seq, size;
+	guint8 resends;
+	guint8 data[VIDEO_MTU + SRTP_MAX_TRAILER_LEN];
+};
+
+/*
+ * Sending rate from receiver feedback: loss from retransmission requests,
+ * receiver reports and keyframe requests, and a delay-based cap from REMB.
+ * Without any feedback the rate stays at the negotiated ceiling.
+ */
+struct rate_control {
+	guint target, remb;
+	gint64 window_start, remb_at, scaled_at, last_fir, decreased_at;
+	guint sent, lost, firs;
+	double report_loss;
+	gboolean feedback; /* the peer sends more than keyframe requests */
+	guint scale; /* 0 full size, then 3/4, 1/2, 3/8, 1/4 */
+};
+
+/* Receive-side delay-based estimate, sent to the sender as REMB. */
+struct remb_estimate {
+	gint64 base_us, min_delay, min_next, min_reset, sent_at, decreased_at;
+	gint64 window_start, updated;
+	guint32 base_ts, last_ts;
+	guint64 window_bytes, picture_bytes;
+	double queue_ms, calm_ms, rate_kbps, estimate;
+	gboolean started, send_now, have_ts;
 };
 
 enum video_format {
@@ -180,6 +235,7 @@ static gboolean sender_open_software(struct vp8_sender *s)
 	cfg.rc_buf_initial_sz = 500;
 	cfg.rc_buf_optimal_sz = 600;
 	cfg.rc_buf_sz = 1000;
+	/* Skip a camera frame rather than overshoot a reduced rate. */
 	cfg.rc_dropframe_thresh = 0;
 	cfg.rc_resize_allowed = 0;
 	cfg.kf_mode = VPX_KF_AUTO;
@@ -243,6 +299,21 @@ static gboolean sender_open(struct vp8_sender *s, guint w, guint h, guint kbps,
 		return TRUE;
 	}
 	return sender_open_software(s);
+}
+
+/* libvpx changes its target rate between frames without a keyframe. */
+static gboolean sender_set_rate(struct vp8_sender *s, guint kbps)
+{
+	vpx_codec_enc_cfg_t cfg;
+
+	if (!s->ready || s->hw || !s->sw.config.enc)
+		return FALSE;
+	cfg = *s->sw.config.enc;
+	cfg.rc_target_bitrate = kbps;
+	if (vpx_codec_enc_config_set(&s->sw, &cfg))
+		return FALSE;
+	s->kbps = kbps;
+	return TRUE;
 }
 
 static gboolean sender_image(vpx_image_t *img,
@@ -367,6 +438,31 @@ struct call_video {
 	guint32 extended_size;
 	unsigned int fragments, authenticated;
 
+	/* Loss recovery and congestion control. */
+	struct rx_packet *rx_ring;
+	guint16 rx_next, rx_high;
+	guint rx_held;
+	gboolean rx_started, rtx_answered;
+	gint64 reorder_us, rtx_rtt_us, next_fir, fir_interval, now;
+	gint64 last_key_at, key_due, rtx_window;
+	guint source_w, source_h;
+	guint rtx_bytes;
+	struct tx_packet *history;
+	struct rate_control rc;
+	gboolean rr_seen;
+	struct remb_estimate remb;
+	/* Receiver report: losses after repair, from this receiver's view. */
+	struct {
+		gint64 sent_at;
+		guint32 cycles, lost_total, expected_prior, lost_prior;
+		guint16 first, last_high;
+		guint lost;
+	} rr;
+	struct {
+		guint requests, requested, retransmitted, gave_up, late;
+		guint firs, rembs, rate_changes, scaled;
+	} recovery;
+
 	struct {
 		guint evs_starts, rfc_starts, markers, unknown, incomplete;
 		guint evs_metadata;
@@ -429,6 +525,10 @@ void call_video_close(struct call_video *v)
 	if (!v)
 		return;
 	clear_picture(v);
+	for (guint i = 0; v->rx_ring && i < RX_SLOTS; i++)
+		g_clear_pointer(&v->rx_ring[i].payload, g_bytes_unref);
+	g_free(v->rx_ring);
+	g_free(v->history);
 	sender_close(&v->sender);
 	call_vp8_close(v->dec);
 	if (v->tx)
@@ -460,6 +560,12 @@ static struct call_video *open_video(const guint8 tx[30], const guint8 rx[30],
 		   !(v->dec = call_vp8_open(threads, FALSE))))
 		goto failed;
 	v->need_key = rx != NULL;
+	if (rx)
+		v->rx_ring = g_new0(struct rx_packet, RX_SLOTS);
+	if (tx)
+		v->history = g_new0(struct tx_packet, TX_HISTORY);
+	v->reorder_us = 30000;
+	v->fir_interval = KEY_SPACING_US;
 
 	v->pt = pt;
 	v->tx_ssrc = tx_ssrc;
@@ -571,9 +677,29 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 				       kbps < 2400 ? 20u :
 						     30u);
 	}
+	/*
+	 * Feedback can lower the rate below the negotiated ceiling. A group
+	 * screen share keeps the HD layer's rate so shared text stays sharp.
+	 */
+	if (v->rc.target && !(v->group_tx && screen))
+		kbps = MAX(MIN(kbps, v->rc.target), (guint)MIN_KBPS);
+	if (!screen && !v->group_tx)
+		fps = MIN(fps, kbps < 120 ? 10u : kbps < 250 ? 15u : fps);
 	if (s->ready && w == s->width && h == s->height && kbps == s->kbps &&
 	    fps == s->fps)
 		return TRUE;
+	if (s->ready && w == s->width && h == s->height && fps == s->fps &&
+	    kbps != s->kbps) {
+		/* Hardware encoders restart with a keyframe, so they follow
+		 * only larger changes.
+		 */
+		if (s->hw && (guint)ABS((int)kbps - (int)s->kbps) * 4 < s->kbps)
+			return TRUE;
+		if (sender_set_rate(s, kbps)) {
+			v->recovery.rate_changes++;
+			return TRUE;
+		}
+	}
 	if (!sender_open(s, w, h, kbps, fps,
 			 screen ? VP8_SCREEN_RTP : VP8_CAMERA))
 		return FALSE;
@@ -623,11 +749,23 @@ static void scale_plane(const guint8 *src, int pitch, guint sw, guint sh,
 	}
 }
 
-static gboolean group_encoder_image(struct call_video *v, vpx_image_t *img)
+/* Picture sizes for rate adaptation, in eighths of the camera's size. */
+static const guint scale_eighths[] = { 8, 6, 4, 3, 2 };
+
+static gboolean encoder_image(struct call_video *v, vpx_image_t *img)
 {
 	guint w = img->w, h = img->h;
 
-	if (v->requested_resolution >= 0) {
+	v->source_w = w;
+	v->source_h = h;
+	if (!v->group_tx) {
+		guint e = scale_eighths[v->rc.scale];
+
+		if (e == 8 || v->screen_kbps)
+			return TRUE;
+		w = MAX(16u, w * e / 8) & ~1u;
+		h = MAX(16u, h * e / 8) & ~1u;
+	} else if (v->requested_resolution >= 0) {
 		guint source = resolution_class(w * h);
 		guint target = v->requested_resolution;
 
@@ -890,12 +1028,144 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 					   key, size, delay_ms);
 		memcpy(packet + header, picture + pos, len);
 		n = header + len;
-		if (srtp_protect(v->tx, packet, &n) != srtp_err_status_ok ||
-		    !send(packet, n, data))
+		if (srtp_protect(v->tx, packet, &n) != srtp_err_status_ok)
+			return FALSE;
+		if (v->history && (gsize)n <= sizeof(v->history->data)) {
+			guint16 seq = v->seq - 1;
+			struct tx_packet *h = &v->history[seq % TX_HISTORY];
+
+			h->seq = seq;
+			h->size = n;
+			h->sent = v->now;
+			h->resent = 0;
+			h->resends = 0;
+			memcpy(h->data, packet, n);
+		}
+		v->rc.sent++;
+		if (!send(packet, n, data))
 			return FALSE;
 		pos += len;
 	}
+	if (key)
+		v->last_key_at = v->now;
 	return TRUE;
+}
+
+/* The rate the current source may use before feedback lowers it. */
+static guint rate_ceiling(const struct call_video *v)
+{
+	return v->screen_kbps ? v->screen_kbps : v->kbps;
+}
+
+static guint rate_current(const struct call_video *v)
+{
+	guint ceiling = rate_ceiling(v);
+
+	return v->rc.target ? MIN(v->rc.target, ceiling) : ceiling;
+}
+
+static void rate_set(struct call_video *v, guint kbps, gint64 now)
+{
+	guint ceiling = rate_ceiling(v);
+
+	(void)now;
+	kbps = MAX(kbps, (guint)MIN_KBPS);
+	/* At the ceiling with no REMB limit, feedback no longer applies. */
+	v->rc.target = kbps >= ceiling ? 0 : kbps;
+}
+
+/*
+ * Choose the camera picture size for the rate, WebRTC-style: step down
+ * by a quarter when each pixel gets too few bits, step up again only
+ * when the larger size would get clearly more, after a longer wait.
+ */
+static void rate_scale(struct call_video *v, gint64 now)
+{
+	struct rate_control *rc = &v->rc;
+	guint kbps = rate_current(v);
+	guint fps = MAX(1u, MIN(v->fps, kbps < 120 ? 10u :
+					kbps < 250 ? 15u :
+						     v->fps));
+	double pixels = (double)v->source_w * v->source_h;
+
+	if (v->group_tx || v->screen_kbps || !pixels)
+		return;
+	double bpp = 0;
+	guint e = scale_eighths[rc->scale];
+
+	bpp = kbps * 1000.0 / (pixels * e * e / 64 * fps);
+	if (bpp < 0.05 && rc->scale + 1 < G_N_ELEMENTS(scale_eighths) &&
+	    now - rc->scaled_at >= 2 * G_USEC_PER_SEC) {
+		rc->scale++;
+		rc->scaled_at = now;
+		v->recovery.scaled++;
+		return;
+	}
+	if (!rc->scale)
+		return;
+	e = scale_eighths[rc->scale - 1];
+	bpp = kbps * 1000.0 / (pixels * e * e / 64 * fps);
+	if (bpp > 0.09 && now - rc->scaled_at >= 4 * G_USEC_PER_SEC) {
+		rc->scale--;
+		rc->scaled_at = now;
+		v->recovery.scaled++;
+	}
+}
+
+/*
+ * Loss-based control after Google Congestion Control: above 10% loss
+ * cut by half the loss rate, below 2% grow 8% a second, in between hold.
+ * Windows of at least half a second and 20 packets.
+ */
+static void rate_update(struct call_video *v, gint64 now)
+{
+	struct rate_control *rc = &v->rc;
+
+	if (!v->tx)
+		return;
+	if (!rc->window_start) {
+		rc->window_start = now;
+		return;
+	}
+	gint64 span = now - rc->window_start;
+
+	if (span < G_USEC_PER_SEC / 2 ||
+	    (rc->sent < 20 && span < 2 * G_USEC_PER_SEC))
+		return;
+	double loss = rc->sent ? (double)rc->lost / rc->sent : 0;
+	guint current = rate_current(v), next = current;
+
+	/* Receiver reports separate real losses from reordering. */
+	loss = v->rr_seen ? rc->report_loss :
+			    MAX(MIN(loss, 1.0), rc->report_loss);
+	/* A peer that only asks for keyframes still signals a bad path. */
+	if (rc->firs > 1 && !rc->feedback)
+		loss = MAX(loss, 0.12);
+	gboolean remb = rc->remb && now - rc->remb_at < 5 * G_USEC_PER_SEC / 2;
+
+	/* One loss cut a second: reports lag the queue they describe. */
+	if (loss > 0.10 && now - rc->decreased_at >= G_USEC_PER_SEC) {
+		next = current * (1 - loss / 2);
+		if (remb)
+			next = MAX(next, rc->remb * 7 / 10);
+		rc->decreased_at = now;
+	} else if (loss < 0.02 && rc->target) {
+		/* Recover faster once the path has been calm for a while. */
+		double growth = now - rc->decreased_at >= 3 * G_USEC_PER_SEC ?
+					0.25 :
+					0.10;
+
+		next = current +
+		       MAX(current * growth, 8.0) * span / G_USEC_PER_SEC;
+	}
+	if (remb)
+		next = MIN(next, rc->remb);
+	if (next != current)
+		rate_set(v, next, now);
+	rc->window_start = now;
+	rc->sent = rc->lost = rc->firs = 0;
+	rc->report_loss = 0;
+	rate_scale(v, now);
 }
 
 void call_video_keyframe(struct call_video *v)
@@ -926,6 +1196,12 @@ gboolean call_video_encode(struct call_video *v,
 	if (!v || !v->tx || !send || !frame || now < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		goto failed;
+	v->now = now;
+	if (v->key_due && now >= v->key_due) {
+		v->key_due = 0;
+		v->sender.force_key = TRUE;
+	}
+	rate_update(v, now);
 	/* Accept jitter, and switch sources immediately even at the same size. */
 	if (v->sender.ready && v->last_encoded >= 0) {
 		if (v->next_layer_frame) {
@@ -936,8 +1212,7 @@ gboolean call_video_encode(struct call_video *v,
 			return TRUE;
 		}
 	}
-	if (!sender_image(&img, frame) ||
-	    (v->group_tx && !group_encoder_image(v, &img)) ||
+	if (!sender_image(&img, frame) || !encoder_image(v, &img) ||
 	    !configure_encoder(v, img.d_w, img.d_h))
 		goto failed;
 	if (v->epoch < 0)
@@ -1007,6 +1282,10 @@ static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 		return FALSE;
 	}
 	v->need_key = FALSE;
+	v->next_fir = 0;
+	v->fir_interval =
+		v->group_rx ? G_USEC_PER_SEC :
+			      MAX((gint64)KEY_SPACING_US, 2 * v->rtx_rtt_us);
 	v->stats.hidden += !shown;
 	return TRUE;
 }
@@ -1494,6 +1773,338 @@ static void record_group_rtp_extensions(struct call_video *v, const guint8 *p,
 	v->stats.rtp_other_extension += !vfd && !ved;
 }
 
+static gboolean feedback_enabled(void)
+{
+	return g_strcmp0(g_getenv("LINE_CALL_FEEDBACK"), "0") != 0;
+}
+
+/* A gap shorter than the usual reordering is not worth a request. */
+static gint64 rtx_grace(const struct call_video *v)
+{
+	return CLAMP(v->reorder_us * 3 / 4, 5000, 100000);
+}
+
+/* How long a missing packet holds later ones: reordering, or a resend. */
+static gint64 rx_hold(const struct call_video *v)
+{
+	gint64 hold = v->reorder_us;
+
+	if (v->rtx_answered)
+		/* Room for a request and one repeat. */
+		hold = MAX(hold,
+			   MIN(rtx_grace(v) + v->rtx_rtt_us * 5 / 2 + 30000,
+			       500000));
+	return hold;
+}
+
+static void rtx_sample(struct call_video *v, gint64 sample)
+{
+	sample = CLAMP(sample, 1000, (gint64)G_USEC_PER_SEC);
+	v->rtx_answered = TRUE;
+	v->recovery.retransmitted++;
+	/* Follow increases at once and decreases slowly. */
+	v->rtx_rtt_us = sample > v->rtx_rtt_us ?
+				sample :
+				v->rtx_rtt_us - (v->rtx_rtt_us - sample) / 32;
+}
+
+static void reorder_sample(struct call_video *v, gint64 sample)
+{
+	gint64 decayed = v->reorder_us - MAX(0, v->reorder_us - 20000) / 64;
+
+	v->reorder_us =
+		CLAMP(MAX(decayed, sample * 5 / 4 + 5000), 20000, 150000);
+}
+
+/*
+ * Passes buffered packets on in sequence order, skipping expired gaps.
+ * FALSE when picture assembly rejected any of them.
+ */
+static gboolean rx_release(struct call_video *v, gint64 now, gboolean flush,
+			   call_video_display_fn display, gpointer data)
+{
+	gboolean ok = TRUE;
+
+	while (v->rx_held) {
+		struct rx_packet *r = &v->rx_ring[v->rx_next % RX_SLOTS];
+
+		if (r->seq == v->rx_next && r->payload) {
+			gsize n;
+			GBytes *payload = g_steal_pointer(&r->payload);
+			const guint8 *p = g_bytes_get_data(payload, &n);
+
+			v->rx_held--;
+			v->rx_next++;
+			ok &= accept_fragment(v, p, n, r->seq, r->ts, r->marker,
+					      display, data);
+			g_bytes_unref(payload);
+			continue;
+		}
+		if (!flush && r->seq == v->rx_next &&
+		    now - r->missing_since < rx_hold(v))
+			break;
+		v->recovery.gave_up++;
+		v->rr.lost++;
+		v->rx_next++;
+	}
+	return ok;
+}
+
+/*
+ * Receive-side delay estimate in the manner of WebRTC's REMB: the delay
+ * of each picture above the lowest of the last 15-30 s is
+ * queueing at a bottleneck. Growing queues cut the estimate to 85% of
+ * the measured arrival rate; short queues let it grow 8% a second.
+ */
+static void remb_packet(struct call_video *v, guint32 ts, gsize size,
+			gboolean marker, gint64 now)
+{
+	struct remb_estimate *e = &v->remb;
+
+	if (!e->started) {
+		*e = (struct remb_estimate){ .started = TRUE,
+					     .base_us = now,
+					     .base_ts = ts,
+					     .min_delay = G_MAXINT64,
+					     .min_next = G_MAXINT64,
+					     .min_reset =
+						     now + 15 * G_USEC_PER_SEC,
+					     .window_start = now,
+					     .updated = now };
+	}
+	e->window_bytes += size;
+	if (now - e->window_start >= G_USEC_PER_SEC / 2) {
+		double rate =
+			e->window_bytes * 8000.0 / (now - e->window_start);
+
+		e->rate_kbps = e->rate_kbps ? (e->rate_kbps + rate) / 2 : rate;
+		e->window_bytes = 0;
+		e->window_start = now;
+	}
+	if (!e->have_ts || ts != e->last_ts) {
+		e->have_ts = TRUE;
+		e->last_ts = ts;
+		e->picture_bytes = 0;
+	}
+	e->picture_bytes += size;
+	if (!marker)
+		return;
+	gint64 media = (gint64)(gint32)(ts - e->base_ts) * 1000 / 90;
+	/* Time each picture by its last packet. */
+	gint64 own = e->rate_kbps ? e->picture_bytes * 8000.0 / e->rate_kbps :
+				    0;
+	gint64 delay = now - e->base_us - media;
+
+	e->min_delay = MIN(e->min_delay, delay);
+	e->min_next = MIN(e->min_next, delay);
+	if (now >= e->min_reset) {
+		e->min_delay = e->min_next;
+		e->min_next = delay;
+		e->min_reset = now + 15 * G_USEC_PER_SEC;
+	}
+	double previous = e->queue_ms;
+	double dt = (now - e->updated) / 1e6;
+
+	e->updated = now;
+	/*
+	 * Overuse uses the whole delay. Growth may ignore the picture's own
+	 * crossing time, an upper bound since the arrival rate bounds the
+	 * bottleneck from below, so a slow link can still recover.
+	 */
+	gint64 queued = delay - e->min_delay;
+
+	e->queue_ms += (queued / 1000.0 - e->queue_ms) / 8;
+	e->calm_ms += (MAX(0, queued - own) / 1000.0 - e->calm_ms) / 8;
+	if (!e->rate_kbps)
+		return;
+	if (((e->queue_ms > 50 && e->queue_ms > previous) ||
+	     e->queue_ms > 120) &&
+	    now - e->decreased_at >= G_USEC_PER_SEC / 2) {
+		/* A long queue needs a deeper cut to drain. */
+		double drain = CLAMP(1 - (e->queue_ms - 50) / 400, 0.5, 1.0);
+		double cut = 0.85 * e->rate_kbps * drain;
+
+		e->estimate = e->estimate ? MIN(e->estimate, cut) : cut;
+		e->estimate = MAX(e->estimate, (double)MIN_KBPS);
+		e->decreased_at = now;
+		e->send_now = TRUE;
+	} else if (e->estimate && e->calm_ms < 30) {
+		gboolean calm = now - e->decreased_at >= 3 * G_USEC_PER_SEC;
+		double cap = 1.5 * e->rate_kbps + 50;
+
+		e->estimate *= pow(calm ? 1.25 : 1.10, MIN(dt, 1.0));
+		/* An estimate that no longer limits the sender is dropped. */
+		if (e->estimate >= cap && calm)
+			e->estimate = 0;
+		else
+			e->estimate = MIN(e->estimate, cap);
+	}
+}
+
+/* Whether a fragment starts a VP8 keyframe in any supported framing. */
+static gboolean starts_keyframe(const guint8 *p, gsize n, gboolean marker)
+{
+	struct video_payload out;
+
+	if (parse_vp8(p, n, marker, &out) && out.start &&
+	    vp8_key_at(p + out.offset, n - out.offset))
+		return TRUE;
+	for (int sized = 0; sized < 2; sized++) {
+		if (!parse_evs3_framed(p, n, sized, &out) || !out.start)
+			continue;
+		struct video_payload wide = out, profiled = out;
+
+		if (vp8_key_at(p + out.offset, n - out.offset) ||
+		    (evs3_wide_size(p, n, &wide) &&
+		     vp8_key_at(p + wide.offset, n - wide.offset)) ||
+		    (evs3_profiled_size(p, n, &profiled) &&
+		     vp8_key_at(p + profiled.offset, n - profiled.offset)))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+/*
+ * Nothing before a keyframe matters to the decoder. When the held packets
+ * ending at the marker seq form a whole keyframe, return its first seq.
+ */
+static gboolean held_keyframe(const struct call_video *v, guint16 end,
+			      guint16 *start)
+{
+	const struct rx_packet *last = &v->rx_ring[end % RX_SLOTS];
+
+	for (guint16 seq = end; (gint16)(seq - v->rx_next) >= 0; seq--) {
+		const struct rx_packet *r = &v->rx_ring[seq % RX_SLOTS];
+		gsize n;
+
+		if (r->seq != seq || !r->payload || r->ts != last->ts)
+			return FALSE;
+		const guint8 *p = g_bytes_get_data(r->payload, &n);
+
+		if (starts_keyframe(p, n, r->marker)) {
+			*start = seq;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+static void rx_init_missing(struct call_video *v, guint16 from, guint16 to,
+			    gint64 now)
+{
+	for (guint16 seq = from; seq != to; seq++) {
+		struct rx_packet *r = &v->rx_ring[seq % RX_SLOTS];
+
+		g_clear_pointer(&r->payload, g_bytes_unref);
+		*r = (struct rx_packet){ .seq = seq, .missing_since = now };
+	}
+}
+
+/*
+ * A small jitter buffer in front of picture assembly. Packets in order
+ * pass straight through; after a gap, later packets wait for reordering
+ * or a retransmission, at most rx_hold(), before assembly sees the loss.
+ */
+static gboolean reorder(struct call_video *v, const guint8 *p, gsize n,
+			guint16 seq, guint32 ts, gboolean marker, gsize wire,
+			call_video_display_fn display, gpointer data)
+{
+	gint64 now = g_get_monotonic_time();
+	struct rx_packet *r = &v->rx_ring[seq % RX_SLOTS];
+
+	remb_packet(v, ts, wire, marker, now);
+	if (!v->rx_started) {
+		v->rx_started = TRUE;
+		v->rx_next = seq;
+		v->rx_high = seq - 1;
+		v->rr.first = seq;
+	}
+	gint16 ahead = seq - v->rx_next;
+
+	/* Far behind is a restarted sequence, not a late packet. */
+	if (ahead < -RX_SLOTS) {
+		(void)rx_release(v, now, TRUE, display, data);
+		v->rx_next = seq;
+		v->rx_high = seq - 1;
+		ahead = 0;
+	}
+	if (ahead < 0) {
+		/* A resend after the gap expired still measures the delay. */
+		if (r->seq == seq && !r->payload && r->requested_at) {
+			rtx_sample(v, now - r->requested_at);
+			r->requested_at = 0;
+		}
+		/* The picture still assembling takes fragments in any order. */
+		if (v->have_ts && ts == v->rx_ts && !v->finished)
+			return accept_fragment(v, p, n, seq, ts, marker,
+					       display, data);
+		v->recovery.late++;
+		return FALSE;
+	}
+	if (ahead >= RX_SLOTS) {
+		(void)rx_release(v, now, TRUE, display, data);
+		v->rx_next = seq;
+		v->rx_high = seq - 1;
+		ahead = 0;
+	}
+	if (!ahead && !v->rx_held) {
+		v->rx_next = seq + 1;
+		if ((gint16)(seq - v->rx_high) > 0)
+			v->rx_high = seq;
+		return accept_fragment(v, p, n, seq, ts, marker, display, data);
+	}
+	if ((gint16)(seq - v->rx_high) > 0) {
+		rx_init_missing(v, v->rx_high + 1, seq, now);
+		v->rx_high = seq;
+	} else if (r->seq == seq && !r->payload) {
+		/* Soon after a request it was reordering, not a resend. */
+		if (r->requested_at &&
+		    now - r->requested_at >= v->rtx_rtt_us / 2) {
+			rtx_sample(v, now - r->requested_at);
+			v->rr.lost++;
+		} else {
+			reorder_sample(v, now - r->missing_since);
+		}
+	} else {
+		return FALSE;
+	}
+	r->seq = seq;
+	r->ts = ts;
+	r->marker = marker;
+	r->requested_at = 0;
+	r->payload = g_bytes_new(p, n);
+	v->rx_held++;
+	guint16 key;
+	gboolean ok = TRUE;
+
+	if (marker && held_keyframe(v, seq, &key)) {
+		/* Pass older packets on and stop waiting for older gaps. */
+		while (v->rx_next != key) {
+			struct rx_packet *old =
+				&v->rx_ring[v->rx_next % RX_SLOTS];
+
+			if (old->seq == v->rx_next && old->payload) {
+				gsize size;
+				GBytes *payload =
+					g_steal_pointer(&old->payload);
+				const guint8 *bytes =
+					g_bytes_get_data(payload, &size);
+
+				v->rx_held--;
+				ok &= accept_fragment(v, bytes, size, old->seq,
+						      old->ts, old->marker,
+						      display, data);
+				g_bytes_unref(payload);
+			} else {
+				v->recovery.gave_up++;
+				v->rr.lost++;
+			}
+			v->rx_next++;
+		}
+	}
+	return rx_release(v, now, FALSE, display, data) && ok;
+}
+
 gboolean call_video_receive(struct call_video *v, const guint8 *packet,
 			    gsize size, call_video_display_fn display,
 			    gpointer data)
@@ -1536,9 +2147,8 @@ gboolean call_video_receive(struct call_video *v, const guint8 *packet,
 			return FALSE;
 		end -= pad;
 	}
-	return accept_fragment(v, buf + pos, end - pos, read16(buf + 2),
-			       read32(buf + 4), !!(buf[1] & 0x80), display,
-			       data);
+	return reorder(v, buf + pos, end - pos, read16(buf + 2),
+		       read32(buf + 4), !!(buf[1] & 0x80), size, display, data);
 }
 
 gboolean call_video_needs_keyframe(const struct call_video *v)
@@ -1652,6 +2262,254 @@ gboolean call_video_send_feedback(struct call_video *v, call_video_send_fn send,
 	return call_video_send_peer_feedback(v, v, send, data);
 }
 
+/* LINE's retransmission request, RTPFB format 5: a count and a list of
+ * 16-bit sequence numbers, word aligned with RTCP padding.
+ */
+static gboolean send_rrr(struct call_video *tx, const struct call_video *rx,
+			 const guint16 *list, guint count,
+			 call_video_send_fn send, gpointer data)
+{
+	guint8 packet[16 + 2 * RRR_MAX + SRTP_MAX_TRAILER_LEN] = { 0 };
+	gsize body = 14 + 2 * count, size = (body + 3) & ~(gsize)3;
+	int n = size;
+
+	if (!tx || !tx->tx || !count || count > RRR_MAX)
+		return FALSE;
+	packet[0] = 0x80 | LINE_RRR | (size != body ? 0x20 : 0);
+	packet[1] = RTCP_RTPFB;
+	write16(packet + 2, size / 4 - 1);
+	write32(packet + 4, tx->tx_ssrc);
+	write32(packet + 8, rx->rx_ssrc);
+	write16(packet + 12, count);
+	for (guint i = 0; i < count; i++)
+		write16(packet + 14 + 2 * i, list[i]);
+	if (size != body)
+		packet[size - 1] = size - body;
+	return srtp_protect_rtcp(tx->tx, packet, &n) == srtp_err_status_ok &&
+	       send(packet, n, data);
+}
+
+/* Standard REMB (draft-alvestrand-rmcat-remb): PSFB format 15. */
+static gboolean send_remb(struct call_video *tx, const struct call_video *rx,
+			  guint64 bps, call_video_send_fn send, gpointer data)
+{
+	guint8 packet[24 + SRTP_MAX_TRAILER_LEN] = { 0 };
+	guint exponent = 0;
+	int n = 24;
+
+	if (!tx || !tx->tx)
+		return FALSE;
+	while ((bps >> exponent) >= 1u << 18)
+		exponent++;
+	guint32 mantissa = bps >> exponent;
+
+	packet[0] = 0x80 | RTCP_REMB;
+	packet[1] = RTCP_PSFB;
+	write16(packet + 2, 5);
+	write32(packet + 4, tx->tx_ssrc);
+	memcpy(packet + 12, "REMB", 4);
+	packet[16] = 1;
+	packet[17] = (exponent << 2) | (mantissa >> 16);
+	write16(packet + 18, mantissa);
+	write32(packet + 20, rx->rx_ssrc);
+	return srtp_protect_rtcp(tx->tx, packet, &n) == srtp_err_status_ok &&
+	       send(packet, n, data);
+}
+
+/* RFC 3550 receiver report. Its loss counts packets that neither arrived
+ * nor were repaired; reordered packets are not lost.
+ */
+static gboolean send_rr(struct call_video *tx, struct call_video *rx,
+			call_video_send_fn send, gpointer data)
+{
+	guint8 packet[32 + SRTP_MAX_TRAILER_LEN] = { 0 };
+	int n = 32;
+
+	if (!tx || !tx->tx || !rx->rx_started)
+		return FALSE;
+	if ((guint16)(rx->rx_high - rx->rr.last_high) > 0x8000)
+		rx->rr.cycles += 1u << 16;
+	if (rx->rx_high < rx->rr.last_high)
+		rx->rr.cycles += 1u << 16;
+	rx->rr.last_high = rx->rx_high;
+	guint32 extended = rx->rr.cycles | rx->rx_high;
+	guint32 expected = (guint32)(extended - rx->rr.first) + 1;
+	guint32 interval = expected - rx->rr.expected_prior;
+	guint32 lost = MIN(rx->rr.lost, interval);
+
+	rx->rr.lost_total += lost;
+	rx->rr.expected_prior = expected;
+	rx->rr.lost = 0;
+	packet[0] = 0x81;
+	packet[1] = RTCP_RR;
+	write16(packet + 2, 7);
+	write32(packet + 4, tx->tx_ssrc);
+	write32(packet + 8, rx->rx_ssrc);
+	packet[12] = interval ? MIN(255u, lost * 256 / interval) : 0;
+	packet[13] = MIN(rx->rr.lost_total, 0x7fffffu) >> 16;
+	write16(packet + 14, MIN(rx->rr.lost_total, 0x7fffffu));
+	write32(packet + 16, extended);
+	return srtp_protect_rtcp(tx->tx, packet, &n) == srtp_err_status_ok &&
+	       send(packet, n, data);
+}
+
+gint64 call_video_poll(struct call_video *rx, struct call_video *feedback,
+		       gint64 now, gboolean keyframes, call_video_send_fn send,
+		       gpointer data, call_video_display_fn display,
+		       gpointer display_data)
+{
+	gint64 next = G_MAXINT64;
+
+	if (!rx || !rx->rx || !display)
+		return next;
+	(void)rx_release(rx, now, FALSE, display, display_data);
+	gboolean requests = !rx->group_rx && send && feedback_enabled();
+
+	if (rx->rx_held && requests) {
+		guint16 list[RRR_MAX];
+		guint count = 0;
+		gint64 hold = rx_hold(rx);
+		gint64 grace = rtx_grace(rx);
+		gint64 retry = MAX(rx->rtx_rtt_us * 5 / 4, 40000);
+
+		for (guint16 seq = rx->rx_next;
+		     seq != (guint16)(rx->rx_high + 1) && count < RRR_MAX;
+		     seq++) {
+			struct rx_packet *r = &rx->rx_ring[seq % RX_SLOTS];
+
+			if (r->seq != seq || r->payload || r->requests >= 3 ||
+			    now - r->missing_since >= hold)
+				continue;
+			gint64 due = r->requested_at ? r->requested_at + retry :
+						       r->missing_since + grace;
+
+			if (due > now) {
+				next = MIN(next, due);
+				continue;
+			}
+			list[count++] = seq;
+			r->requested_at = now;
+			r->requests++;
+		}
+		if (count && send_rrr(feedback, rx, list, count, send, data)) {
+			rx->recovery.requests++;
+			rx->recovery.requested += count;
+		}
+	}
+	if (rx->rx_held) {
+		const struct rx_packet *r =
+			&rx->rx_ring[rx->rx_next % RX_SLOTS];
+
+		next = MIN(next, r->seq == rx->rx_next && !r->payload ?
+					 r->missing_since + rx_hold(rx) :
+					 now);
+	}
+	if (keyframes && rx->need_key && send) {
+		if (now >= rx->next_fir) {
+			if (call_video_send_peer_feedback(feedback, rx, send,
+							  data))
+				rx->recovery.firs++;
+			rx->next_fir = now + rx->fir_interval;
+			/* A conference relay rate-limits keyframes itself. */
+			rx->fir_interval = rx->group_rx ?
+						   G_USEC_PER_SEC :
+						   MIN(rx->fir_interval * 2,
+						       G_USEC_PER_SEC);
+		}
+		next = MIN(next, rx->next_fir);
+	}
+	struct remb_estimate *e = &rx->remb;
+
+	if (requests && e->estimate &&
+	    (e->send_now || now - e->sent_at >= G_USEC_PER_SEC)) {
+		if (send_remb(feedback, rx, (guint64)(e->estimate * 1000), send,
+			      data))
+			rx->recovery.rembs++;
+		e->send_now = FALSE;
+		e->sent_at = now;
+	}
+	if (requests && e->estimate)
+		next = MIN(next, e->sent_at + G_USEC_PER_SEC);
+	if (requests && rx->rx_started) {
+		if (now - rx->rr.sent_at >= G_USEC_PER_SEC) {
+			send_rr(feedback, rx, send, data);
+			rx->rr.sent_at = now;
+		}
+		next = MIN(next, rx->rr.sent_at + G_USEC_PER_SEC);
+	}
+	return next;
+}
+
+guint call_video_retransmit(struct call_video *v, const guint16 *list,
+			    guint count, gint64 now, call_video_send_fn send,
+			    gpointer data)
+{
+	guint sent = 0;
+
+	if (!v || !v->history || !list || !send)
+		return 0;
+	if (now - v->rtx_window >= G_USEC_PER_SEC) {
+		v->rtx_window = now;
+		v->rtx_bytes = 0;
+	}
+	/* Resends may add about a third to the rate, at least 8 KB/s. */
+	guint budget = MAX(rate_current(v) * 40, 8000u);
+
+	for (guint i = 0; i < count; i++) {
+		struct tx_packet *h = &v->history[list[i] % TX_HISTORY];
+
+		if (h->seq != list[i] || !h->size || now - h->sent > RTX_AGE_US)
+			continue;
+		if (!h->resends && !h->resent)
+			v->rc.lost++;
+		if (h->resends >= 3 || (h->resent && now - h->resent < 20000) ||
+		    v->rtx_bytes + h->size > budget)
+			continue;
+		h->resent = now;
+		h->resends++;
+		if (!send(h->data, h->size, data))
+			break;
+		v->rtx_bytes += h->size;
+		v->recovery.retransmitted++;
+		sent++;
+	}
+	return sent;
+}
+
+void call_video_recovery(const struct call_video *v,
+			 struct call_video_recovery *out)
+{
+	*out = (struct call_video_recovery){ 0 };
+	if (!v)
+		return;
+	*out = (struct call_video_recovery){
+		.requests = v->recovery.requests,
+		.requested = v->recovery.requested,
+		.retransmitted = v->recovery.retransmitted,
+		.gave_up = v->recovery.gave_up,
+		.late = v->recovery.late,
+		.keyframe_requests = v->recovery.firs,
+		.rembs = v->recovery.rembs,
+		.rate_changes = v->recovery.rate_changes,
+		.rescales = v->recovery.scaled,
+		.target_kbps = v->tx ? rate_current(v) : 0,
+		.encoder_kbps = v->sender.kbps,
+		.rtt_ms = v->rtx_rtt_us / 1000,
+		.hold_ms = v->rx ? rx_hold(v) / 1000 : 0,
+		.width = v->sender.width,
+		.height = v->sender.height,
+	};
+}
+
+void call_video_uplink_loss(struct call_video *v, guint packets, guint received)
+{
+	if (v && v->tx && packets >= 10 && received <= packets) {
+		v->rc.feedback = TRUE;
+		v->rc.report_loss = MAX(v->rc.report_loss,
+					1.0 - (double)received / packets);
+	}
+}
+
 static gboolean picture_feedback(const guint8 *p, gsize size, guint32 local,
 				 guint32 remote)
 {
@@ -1708,6 +2566,131 @@ gboolean call_video_receive_feedback(struct call_video *v, const guint8 *packet,
 		return FALSE;
 	call_video_keyframe(v);
 	return TRUE;
+}
+
+static void request_keyframe(struct call_video *v, gint64 now)
+{
+	v->rc.firs++;
+	v->rc.last_fir = now;
+	/* Requests that cross a keyframe in flight wait for its spacing. */
+	if (!v->last_key_at || now - v->last_key_at >= KEY_SPACING_US)
+		v->sender.force_key = TRUE;
+	else if (!v->key_due)
+		v->key_due = v->last_key_at + KEY_SPACING_US;
+}
+
+/* Returns TRUE for a feedback block addressed to this sender. */
+static gboolean sender_feedback(struct call_video *v, const guint8 *p,
+				gsize size, gint64 now, call_video_send_fn send,
+				gpointer data)
+{
+	guint fmt = p[0] & 31;
+
+	if (picture_feedback(p, size, v->tx_ssrc, v->rx_ssrc)) {
+		request_keyframe(v, now);
+		return TRUE;
+	}
+	if ((p[1] == RTCP_RTPFB || p[1] == RTCP_PSFB) &&
+	    (fmt == LINE_RRR || fmt == RTCP_NACK || fmt == RTCP_REMB))
+		v->rc.feedback = TRUE;
+	if (p[1] == RTCP_RTPFB && size >= 16 && read32(p + 8) == v->tx_ssrc &&
+	    (fmt == LINE_RRR || fmt == RTCP_NACK)) {
+		guint16 list[RRR_MAX + 16 * 17];
+		guint count = 0;
+
+		if (fmt == LINE_RRR) {
+			guint n = read16(p + 12);
+
+			if (!n || n > RRR_MAX || 14 + 2 * (gsize)n > size)
+				return FALSE;
+			for (guint i = 0; i < n; i++)
+				list[count++] = read16(p + 14 + 2 * i);
+		} else {
+			for (gsize pos = 12; pos + 4 <= size &&
+					     count + 17 <= G_N_ELEMENTS(list);
+			     pos += 4) {
+				guint16 pid = read16(p + pos);
+				guint16 mask = read16(p + pos + 2);
+
+				list[count++] = pid;
+				for (guint b = 0; b < 16; b++)
+					if (mask & (1u << b))
+						list[count++] = pid + b + 1;
+			}
+		}
+		call_video_retransmit(v, list, count, now, send, data);
+		return TRUE;
+	}
+	if (p[1] == RTCP_PSFB && fmt == RTCP_REMB && size >= 24 &&
+	    !memcmp(p + 12, "REMB", 4) && 20 + 4 * (gsize)p[16] <= size) {
+		guint64 bps = (((guint32)(p[17] & 3) << 16) | read16(p + 18))
+			      << (p[17] >> 2);
+		gboolean ours = FALSE;
+
+		for (guint i = 0; i < p[16]; i++)
+			ours |= read32(p + 20 + 4 * i) == v->tx_ssrc;
+		if (!ours)
+			return FALSE;
+		v->rc.remb = MAX(bps / 1000, (guint64)MIN_KBPS);
+		v->rc.remb_at = now;
+		if (v->rc.remb < rate_current(v)) {
+			rate_set(v, v->rc.remb, now);
+			v->rc.decreased_at = now;
+		}
+		return TRUE;
+	}
+	if ((p[1] == RTCP_SR || p[1] == RTCP_RR) && fmt) {
+		gsize pos = p[1] == RTCP_SR ? 28 : 8;
+		gboolean ours = FALSE;
+
+		for (guint i = 0; i < fmt && pos + 24 <= size; i++, pos += 24) {
+			if (read32(p + pos) != v->tx_ssrc)
+				continue;
+			v->rc.report_loss =
+				MAX(v->rc.report_loss, p[pos + 4] / 256.0);
+			v->rc.feedback = ours = TRUE;
+			v->rr_seen = TRUE;
+		}
+		return ours;
+	}
+	return FALSE;
+}
+
+gboolean call_video_receive_rtcp(struct call_video *v, const guint8 *packet,
+				 gsize size, gint64 now,
+				 call_video_send_fn send, gpointer data)
+{
+	guint8 buf[MAX_DATAGRAM];
+	int plain = size;
+	gboolean known = FALSE;
+	gsize pos = 0;
+
+	if (!v || !v->tx || !v->rx || !packet || size <= 8 + SRTCP_TRAILER ||
+	    size > sizeof(buf) || packet[0] >> 6 != 2 || packet[1] < 192 ||
+	    packet[1] > 223 || read32(packet + 4) != v->rx_ssrc)
+		return FALSE;
+	memcpy(buf, packet, size);
+	if (srtp_unprotect_rtcp(v->rx, buf, &plain) != srtp_err_status_ok)
+		return FALSE;
+	while ((gsize)plain - pos >= 4) {
+		const guint8 *p = buf + pos;
+		gsize bytes = 4u * (1u + read16(p + 2)), payload = bytes;
+
+		if (p[0] >> 6 != 2 || bytes > (gsize)plain - pos)
+			return FALSE;
+		if (p[0] & 0x20) {
+			guint8 padding = p[bytes - 1];
+
+			if (!padding || padding > bytes - 4)
+				return FALSE;
+			payload -= padding;
+		}
+		known |= sender_feedback(v, p, payload, now, send, data);
+		pos += bytes;
+	}
+	if (known)
+		rate_update(v, now);
+	return known && pos == (gsize)plain;
 }
 
 gboolean call_video_receive_group_feedback(struct call_video *v,

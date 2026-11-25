@@ -186,6 +186,8 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `LINE_DISABLE_SANDBOX=1` | เริ่ม worker โดยไม่มีแซนด์บ็อกซ์ เช่นเพื่อต่อ `gdb` หรือ `strace` เข้ากับ worker |
 | `LINE_DISABLE_UDP_BATCH=1` | ส่งและรับมีเดียของการโทรครั้งละหนึ่งดาตาแกรมต่อ system call แทนการใช้ `sendmmsg`, `recvmmsg` และ `UDP_SEGMENT` |
 | `LINE_NOISE_SUPPRESSION=0` | ส่งเสียงไมค์ดิบ ไม่ผ่าน RNNoise |
+| `LINE_CALL_FEEDBACK=0` | หยุดส่งคำขอส่งวิดีโอซ้ำ receiver report และ REMB ในการโทรแบบตัวต่อตัว เพื่อใช้แก้ปัญหา ([เครือข่ายที่ไม่ดี](calls.md#8-เครือข่ายที่ไม่ดี)) |
+| `LINE_CALL_DSCP=0` | ส่งแพ็กเก็ตการโทรโดยไม่ทำเครื่องหมาย DSCP (EF สำหรับเสียง AF41 สำหรับวิดีโอ) |
 | `LINE_CALL_VIDEO_KBPS=<n>` | กำหนดบิตเรตการส่งวิดีโอเอง การโทรแบบตัวต่อตัวส่ง HD อย่างน้อย 1500 kbit/s เว้นแต่ตั้งค่านี้ให้ต่ำกว่า |
 | `LINE_CAMERA_DEVICE=<path>` | อุปกรณ์กล้อง (ค่าเริ่มต้น `/dev/video0`) |
 | `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`, `LINE_SHARE_KBPS` | เพดานของการจับและเข้ารหัสภาพตอนแชร์หน้าจอ |

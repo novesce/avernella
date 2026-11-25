@@ -186,6 +186,8 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `LINE_DISABLE_SANDBOX=1` | Starts the worker without its sandbox, for example to attach `gdb` or `strace` to it |
 | `LINE_DISABLE_UDP_BATCH=1` | Sends and receives call media one datagram per system call instead of with `sendmmsg`, `recvmmsg` and `UDP_SEGMENT` |
 | `LINE_NOISE_SUPPRESSION=0` | Sends the raw microphone, without RNNoise |
+| `LINE_CALL_FEEDBACK=0` | Stops sending video retransmission requests, receiver reports and REMB in one-to-one calls, for troubleshooting ([Bad networks](calls.md#8-bad-networks)) |
+| `LINE_CALL_DSCP=0` | Sends call packets without the DSCP marks (EF for voice, AF41 for video) |
 | `LINE_CALL_VIDEO_KBPS=<n>` | Overrides the video sending bitrate. Direct calls send at least 1500 kbit/s HD unless this is set lower |
 | `LINE_CAMERA_DEVICE=<path>` | Camera device (default `/dev/video0`) |
 | `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`, `LINE_SHARE_KBPS` | Caps on screen-share capture and encoding |

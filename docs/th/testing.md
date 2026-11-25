@@ -59,7 +59,7 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-obs` | `obs_http.c` | คำขอและเฮดเดอร์ของ OBS (ห่อ libcurl) |
 | `test-media-io` | `media_io.c` | lease การปิดผนึก การส่งเฟรม descriptor ของ lease ที่ส่งไปพร้อมบรรทัด JSON (รวมถึงเมื่ออ่านทีละ 1 ไบต์) worker ที่เป็น non-dumpable |
 | `test-gpu-health` | `gpu_health.c` | สถานะของ GPU NVIDIA บนโครงสร้าง sysfs จำลอง (ปกติ ไม่มีไดรเวอร์ ไม่มีอุปกรณ์แสดงผล ส่งต่อให้ VM GPU หายไป ไม่มีไดรเวอร์ NVIDIA) การสลับตอนเริ่มแอป และค่าไดรเวอร์ Vulkan ที่ผู้ใช้ตั้งเอง |
-| `test-udp-batch` | `udp_batch.c` | `sendto`, `sendmmsg`, `UDP_SEGMENT`, `recvfrom` และ `recvmmsg` ผ่าน loopback ส่งดาตาแกรมเดียวกันตามลำดับเดิม การถอยกลับเมื่อเคอร์เนลปฏิเสธ `UDP_SEGMENT` และภายใต้ตัวกรอง seccomp ที่ปฏิเสธ `sendmmsg` กับ `recvmmsg` และเวลา CPU ต่อดาตาแกรมด้วย `-m perf` |
+| `test-udp-batch` | `udp_batch.c` | `sendto`, `sendmmsg`, `UDP_SEGMENT`, `recvfrom` และ `recvmmsg` ผ่าน loopback ส่งดาตาแกรมเดียวกันตามลำดับเดิม การถอยกลับเมื่อเคอร์เนลปฏิเสธ `UDP_SEGMENT` และภายใต้ตัวกรอง seccomp ที่ปฏิเสธ `sendmmsg` กับ `recvmmsg` เครื่องหมาย DSCP ที่อ่านกลับด้วย `IP_RECVTOS` และเวลา CPU ต่อดาตาแกรมด้วย `-m perf` |
 | `test-sandbox` | `sandbox.c` | ในโปรเซสลูก: สิ่งที่แซนด์บ็อกซ์ของ worker ปฏิเสธ (exec, namespace, ptrace, io_uring, clone3, BPF, ioctl ที่พิมพ์ใส่เทอร์มินัล รวมถึงเมื่อตั้งบิตสูงไว้, การรอรับ TCP, สัญญาณไปข้างนอก) การครอบคลุมเธรดที่เริ่มไว้ก่อน การที่เธรด fork, memfd, UDP แบบรวมชุด และ TCP ขาออกยังใช้ได้ `LINE_DISABLE_SANDBOX=1` และการใช้ซ้ำสองครั้ง |
 | `test-friends` | `friends.c` | การค้นหา การเพิ่ม รายชื่อและการแบ่งหน้า รายการโปรด ชื่อ การซ่อนและบล็อก คำขอ การ์ด |
 | `test-groups` | `groups.c` | การสร้าง การตรวจก่อนเชิญ สมาชิก คำเชิญ การเปลี่ยนชื่อ ลิงก์ การออกจากกลุ่ม |
@@ -78,7 +78,8 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-screencast-portal` | `screencast.c` | ทดสอบการเลือกพอร์ทัล การปฏิเสธสิทธิ์ การยกเลิก และเงื่อนไขที่จะใช้ตัวเลือกจอของ Cinnamon ผ่าน D-Bus แยกสำหรับการทดสอบ |
 | `test-screencast-cinnamon` | `screencast_cinnamon.c` | การเลือกจอ การเปลี่ยนจอระหว่างเลือก การล็อกหน้าจอ และการปิดเซสชันแชร์หน้าจอ |
 | `test-monitor-picker` | `ui_monitor_picker.c` | การเลือกด้วยเมาส์และแป้นพิมพ์ การยืนยันก่อนแชร์ การยกเลิก และการปิดตัวเลือกจอเมื่อวางสาย |
-| `test-audio` | `call_audio.c` | การจัดเฟรม Opus และ EAS2 การเล่น (ห่อ `SDL_QueueAudio`) |
+| `test-audio` | `call_audio.c` | การจัดเฟรม Opus และ EAS2 การเล่นผ่าน jitter buffer (ห่อ `SDL_QueueAudio`) |
+| `test-call-net` | `call_video.c`, `call_audio.c` | วิดีโอและเสียงผ่านเครือข่ายที่ไม่ดีแบบจำลองบนนาฬิกาเสมือน: การสูญหายเป็นช่วงแบบ Gilbert-Elliott ความหน่วง ความหน่วงไม่สม่ำเสมอ การสลับลำดับ คิวที่จำกัดแบนด์วิดท์ การขาดหาย และการค้างของ Wi-Fi ล้มเหลวเมื่อเฟรมเรต เวลาภาพค้าง screen PSNR เวลาฟื้นตัว ช่วงเงียบ หรือความหน่วงการเล่นแย่กว่าเกณฑ์ของแต่ละสถานการณ์ `--verbose` พิมพ์ค่าที่วัดได้ ([เครือข่ายที่ไม่ดี](calls.md#8-เครือข่ายที่ไม่ดี)) |
 | `test-denoise` | `call_denoise.c` | RNNoise กับเสียงสังเคราะห์ |
 | `test-video-record` | `video_record.c` | อัดภาพและเสียงสังเคราะห์ ตรวจด้วย ffprobe การยกเลิก การเก็บกวาด |
 | `test-video-play` | `video_play.c` | การจัดการโปรเซสเล่นวิดีโอ |

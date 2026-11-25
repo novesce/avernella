@@ -73,7 +73,7 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-obs` | `obs_http.c` | OBS requests and headers (wrapped libcurl) |
 | `test-media-io` | `media_io.c` | Leases, sealing, frame passing, lease descriptors passed with their JSON line (also split into 1-byte reads), a non-dumpable worker |
 | `test-gpu-health` | `gpu_health.c` | NVIDIA GPU health on synthetic sysfs trees (healthy, no driver, no display device, passthrough, GPU gone, no NVIDIA driver); the start-up switch and the user's own Vulkan driver settings |
-| `test-udp-batch` | `udp_batch.c` | `sendto`, `sendmmsg`, `UDP_SEGMENT`, `recvfrom` and `recvmmsg` over loopback deliver the same datagrams in order; fallback when the kernel refuses `UDP_SEGMENT` and inside a seccomp filter that refuses `sendmmsg` and `recvmmsg`; `-m perf` CPU time per datagram |
+| `test-udp-batch` | `udp_batch.c` | `sendto`, `sendmmsg`, `UDP_SEGMENT`, `recvfrom` and `recvmmsg` over loopback deliver the same datagrams in order; fallback when the kernel refuses `UDP_SEGMENT` and inside a seccomp filter that refuses `sendmmsg` and `recvmmsg`; DSCP marks read back with `IP_RECVTOS`; `-m perf` CPU time per datagram |
 | `test-sandbox` | `sandbox.c` | In a child process: what the worker sandbox refuses (exec, namespaces, ptrace, io_uring, clone3, BPF, terminal-typing ioctls including with high bits set, TCP listening, outside signals), that threads started earlier are covered, that threads, fork, memfds, batched UDP and outgoing TCP keep working, `LINE_DISABLE_SANDBOX=1`, applying it twice |
 | `test-friends` | `friends.c` | Lookup, add, rosters and paging, favorites, names, hide and block, requests, cards |
 | `test-groups` | `groups.c` | Create, invite preflight, members, invitations, rename, links, leave |
@@ -92,7 +92,8 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-screencast-portal` | `screencast.c` | Portal selection, permission denial, cancellation and Cinnamon fallback policy on a private D-Bus |
 | `test-screencast-cinnamon` | `screencast_cinnamon.c` | Monitor selection, display changes, screen lock and capture-session cleanup |
 | `test-monitor-picker` | `ui_monitor_picker.c` | Mouse and keyboard selection, explicit confirmation, cancellation and call teardown |
-| `test-audio` | `call_audio.c` | Opus and EAS2 framing, playout (wrapped `SDL_QueueAudio`) |
+| `test-audio` | `call_audio.c` | Opus and EAS2 framing, jitter buffer playout (wrapped `SDL_QueueAudio`) |
+| `test-call-net` | `call_video.c`, `call_audio.c` | Video and audio over a simulated bad network on a virtual clock: Gilbert-Elliott burst loss, delay, jitter, reordering, a bandwidth-limited queue, outages and Wi-Fi stalls. Fails when frame rate, freeze time, screen PSNR, recovery time, dead air or playout delay fall below the marks in each scenario. `--verbose` prints the metrics ([Bad networks](calls.md#8-bad-networks)) |
 | `test-denoise` | `call_denoise.c` | RNNoise on synthetic audio |
 | `test-video-record` | `video_record.c` | Recording a generated picture and tone, checked with ffprobe, cancellation, cleanup |
 | `test-video-play` | `video_play.c` | Playback process handling |

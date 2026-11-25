@@ -67,4 +67,26 @@ gboolean line_udp_tx_pending(const struct line_udp_tx *t);
 enum line_udp_mode line_udp_tx_mode(const struct line_udp_tx *t);
 struct line_udp_stats line_udp_tx_stats(const struct line_udp_tx *t);
 
+/*
+ * DiffServ classes for call media (RFC 4594): Expedited Forwarding for
+ * voice, AF41 for video and everything else on the call socket. Linux
+ * maps them to the Wi-Fi WMM voice and video access categories.
+ */
+#define LINE_DSCP_VOICE 46
+#define LINE_DSCP_VIDEO 34
+
+/*
+ * Prepares a call socket: 1 MiB send and receive buffers (the kernel caps
+ * them at net.core.wmem_max and rmem_max) and AF41 as the default class.
+ * LINE_CALL_DSCP=0 leaves packets unmarked. Returns the class in use.
+ */
+guint line_udp_tune(int fd, int family);
+/*
+ * sendto() with this datagram marked dscp, for voice on a socket whose
+ * default class is video. Falls back to an unmarked send if refused.
+ */
+ssize_t line_udp_send_class(int fd, int family, const void *to,
+			    socklen_t to_len, const guint8 *data, gsize size,
+			    guint dscp);
+
 #endif
