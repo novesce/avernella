@@ -489,19 +489,31 @@ static void free_request(gpointer data)
 	g_free(request);
 }
 
-static void post_packet(guint generation, char *line)
+/* A line and, for a media lease, the descriptor that came with it. */
+static void post_packet(guint generation, char *line, int fd)
 {
 	SDL_Event e = { 0 };
 
 	if (g_atomic_int_get(&wire.stopping)) {
 		g_free(line);
+		if (fd >= 0)
+			close(fd);
 		return;
 	}
 	e.type = wire.packet_event;
 	e.user.code = (Sint32)generation;
 	e.user.data1 = line;
-	if (SDL_PushEvent(&e) != 1)
+	e.user.data2 = GINT_TO_POINTER(fd + 1);
+	if (SDL_PushEvent(&e) != 1) {
 		g_free(line);
+		if (fd >= 0)
+			close(fd);
+	}
+}
+
+static void post_line(char *text, int fd, gpointer data)
+{
+	post_packet(*(guint *)data, text, fd);
 }
 
 struct wire_write {
@@ -546,9 +558,11 @@ static void pump_preview(guint generation)
 static gpointer pump(gpointer data)
 {
 	guint generation = GPOINTER_TO_UINT(data);
-	GString *input = g_string_new(NULL);
 	struct wire_write *writing = NULL;
 	size_t offset = 0;
+	struct line_wire_reader reader;
+
+	line_wire_reader_init(&reader);
 
 	for (;;) {
 		gboolean stopping = g_atomic_int_get(&wire.stopping);
@@ -576,29 +590,16 @@ static gpointer pump(gpointer data)
 			(void)n;
 		}
 		if (fds[0].revents & (POLLIN | POLLHUP | POLLERR)) {
-			char buf[8192];
-			ssize_t got = recv(wire.fd, buf, sizeof(buf), 0);
+			/* A chat history reply is often hundreds of KiB. */
+			static char buf[64 * 1024];
+			ssize_t got = line_wire_read(&reader, wire.fd, buf,
+						     sizeof(buf), post_line,
+						     &generation);
 
 			if (got < 0 && (errno == EINTR || errno == EAGAIN))
 				continue;
 			if (got <= 0)
 				break;
-			if (g_atomic_int_get(&wire.stopping))
-				continue;
-			size_t start = 0;
-
-			for (size_t i = 0; i < (size_t)got; i++) {
-				if (buf[i] != '\n')
-					continue;
-				g_string_append_len(input, buf + start,
-						    (gssize)(i - start));
-				post_packet(generation,
-					    g_string_free(input, FALSE));
-				input = g_string_new(NULL);
-				start = i + 1;
-			}
-			g_string_append_len(input, buf + start,
-					    got - (ssize_t)start);
 		}
 		if (writing && (fds[0].revents & POLLOUT)) {
 			size_t left = writing->size - offset;
@@ -622,8 +623,8 @@ static gpointer pump(gpointer data)
 			break;
 	}
 	g_free(writing);
-	g_string_free(input, TRUE);
-	post_packet(generation, NULL);
+	line_wire_reader_clear(&reader);
+	post_packet(generation, NULL, -1);
 	return NULL;
 }
 
@@ -2627,16 +2628,37 @@ static void event(SDL_Event *e)
 	}
 	if (e->type == wire.packet_event) {
 		g_autofree char *line = e->user.data1;
+		int fd = GPOINTER_TO_INT(e->user.data2) - 1;
 
-		if ((guint)e->user.code != wire.generation || ui.quitting)
+		if ((guint)e->user.code != wire.generation || ui.quitting) {
+			if (fd >= 0)
+				close(fd);
 			return;
+		}
 		Json *packet = line ? json_tokener_parse(line) : NULL;
+		Json *result = ui_field(packet, "result");
 
+		/* Only a descriptor the kernel passed may appear as "fd". */
+		if (json_object_is_type(result, json_type_object)) {
+			json_object_object_del(result, "fd");
+			if (fd >= 0 && ui_field(result, "lease")) {
+				json_object_object_add(result, "fd",
+						       json_object_new_int(fd));
+				fd = -1;
+			}
+		}
+		if (fd >= 0)
+			close(fd);
 		if (json_object_is_type(packet, json_type_object))
 			handle_packet(packet);
 		else
 			reset_login(_(
 				"The LINE connection closed. Sign in again to reconnect."));
+		/* A reply nobody used still owns its descriptor. */
+		Json *unused = ui_field(result, "fd");
+
+		if (json_object_is_type(unused, json_type_int))
+			close(json_object_get_int(unused));
 		json_object_put(packet);
 		return;
 	}

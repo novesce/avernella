@@ -32,6 +32,7 @@ Optional parts build only when their SDKs exist: `avernella-vulkan.so` (Vulkan +
 - **Thrift as JSON.** Requests are json-c objects with typed keys (`"1:i32"`, `"2:str"`, `"3:obj"`, `"4:list:str"`, `"5:map:str:str"`). Decoded replies use bare numeric keys (`"1"`, `"4"`). Read with `field()` / `strfield()` from `line.h`, which return `NULL` on a missing or wrongly typed value. Result field 0 is success, field 1 the exception. Details: [docs/en/protocol-basics.md](docs/en/protocol-basics.md).
 - **Request sequence.** Every state-changing RPC carries a `reqSeq` that must never repeat. Reserve it with `reserve_sequence()` in `dispatch()` before the RPC (it persists to disk first). Never add an extra `++s->seq`.
 - **Secrets stay in the worker.** Never give the access token, refresh token or private keys to the UI, the call thread or the image thread. Wipe secrets with `OPENSSL_cleanse()` / `explicit_bzero()`. Never print tokens, keys, LIFF page URLs or message contents, including in debug output.
+- **The worker is sandboxed** (`sandbox.c`): non-dumpable, and under seccomp it gets `EPERM` for `execve`, namespaces, `ptrace`, `bpf` and similar, and `ENOSYS` for `io_uring` and `clone3`. Code in the worker must never run programs, and media go to the UI as passed descriptors (`line_wire_send()`), never as `/proc/<pid>` paths. `LINE_DISABLE_SANDBOX=1` turns it off for debugging. See [docs/en/architecture.md](docs/en/architecture.md#the-worker-sandbox).
 - **Look like one ordinary client.** Every request uses `LINE_APP_HEADER`, `LINE_USER_AGENT` and `line_language_tag()` from `line.h`; never hard-code another version or language. Respect `Retry-After`, keep polling gentle, and pace user-triggered bursts: friend searches and adds go through `paced()` in `main.c` (see [docs/en/social.md](docs/en/social.md#pacing-searches-and-adds)). Never add loops that search, add, message or fetch history in bulk.
 - **`contentMetadata` (Message field 18) is not encrypted.** Confidential data goes in the sealed payload (`line_seal_payload()`).
 - **Emoji and mention ranges are UTF-16 code units**, not bytes.
@@ -52,7 +53,7 @@ All tests are offline GLib tests with synthetic data. Protocol tests replace `li
 
 ## Debugging switches
 
-`LINE_DEBUG_TIMING=1`, `LINE_DEBUG_SYNC=1`, `LINE_DEBUG_SESSION=1`, `LINE_DEBUG_MEDIA=1`, `LINE_DEBUG_LIFF=1`, `LINE_CALL_DEBUG=1`, `LINE_RENDER_LOG=1`, `LINE_DISABLE_GPU=1`. Full table: [docs/en/building.md](docs/en/building.md#environment-variables).
+`LINE_DEBUG_TIMING=1`, `LINE_DEBUG_SANDBOX=1`, `LINE_DEBUG_SYNC=1`, `LINE_DEBUG_SESSION=1`, `LINE_DEBUG_MEDIA=1`, `LINE_DEBUG_LIFF=1`, `LINE_CALL_DEBUG=1`, `LINE_RENDER_LOG=1`, `LINE_DISABLE_GPU=1`. Full table: [docs/en/building.md](docs/en/building.md#environment-variables).
 
 ## Keep in sync
 

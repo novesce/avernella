@@ -71,7 +71,9 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-emoji-message` | `emoji_message.c` | Sealed LINE emoji in text, including Thai and astral Unicode |
 | `test-media` | `media.c` | Attachment envelopes, previews, video hash objects, file names, rejected uploads, corruption, metadata relabeling |
 | `test-obs` | `obs_http.c` | OBS requests and headers (wrapped libcurl) |
-| `test-media-io` | `media_io.c` | Leases, sealing, frame passing |
+| `test-media-io` | `media_io.c` | Leases, sealing, frame passing, lease descriptors passed with their JSON line (also split into 1-byte reads), a non-dumpable worker |
+| `test-udp-batch` | `udp_batch.c` | `sendto`, `sendmmsg`, `UDP_SEGMENT`, `recvfrom` and `recvmmsg` over loopback deliver the same datagrams in order; fallback when the kernel refuses `UDP_SEGMENT` and inside a seccomp filter that refuses `sendmmsg` and `recvmmsg`; `-m perf` CPU time per datagram |
+| `test-sandbox` | `sandbox.c` | In a child process: what the worker sandbox refuses (exec, namespaces, ptrace, io_uring, clone3, BPF, terminal-typing ioctls including with high bits set, TCP listening, outside signals), that threads started earlier are covered, that threads, fork, memfds, batched UDP and outgoing TCP keep working, `LINE_DISABLE_SANDBOX=1`, applying it twice |
 | `test-friends` | `friends.c` | Lookup, add, rosters and paging, favorites, names, hide and block, requests, cards |
 | `test-groups` | `groups.c` | Create, invite preflight, members, invitations, rename, links, leave |
 | `test-stickers` | `stickers.c` | Catalog, entitlement, asset URLs, sending |

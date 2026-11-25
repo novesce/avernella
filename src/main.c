@@ -20,6 +20,7 @@
 #include "live_sync.h"
 #include "net_route.h"
 #include "monitor_picker.h"
+#include "sandbox.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -104,36 +105,33 @@ struct line_worker {
 	guint generation;
 };
 
-void line_emit(J *packet)
+/* One JSON line to the UI, with a lease descriptor when fd >= 0. */
+static void emit_line(J *packet, int fd)
 {
 	static GMutex output_lock;
 	size_t length;
 	const char *text = json_object_to_json_string_length(
 		packet, JSON_C_TO_STRING_PLAIN, &length);
-	struct iovec parts[] = { { (void *)text, length }, { "\n", 1 } };
-	int first = 0;
 
 	g_mutex_lock(&output_lock);
-	while (first < (int)G_N_ELEMENTS(parts)) {
-		ssize_t sent = writev(STDOUT_FILENO, parts + first,
-				      G_N_ELEMENTS(parts) - first);
-
-		if (sent < 0 && errno == EINTR)
-			continue;
-		if (sent <= 0)
-			break;
-		while (first < (int)G_N_ELEMENTS(parts) &&
-		       (size_t)sent >= parts[first].iov_len) {
-			sent -= parts[first].iov_len;
-			first++;
-		}
-		if (first < (int)G_N_ELEMENTS(parts)) {
-			parts[first].iov_base =
-				(char *)parts[first].iov_base + sent;
-			parts[first].iov_len -= sent;
-		}
-	}
+	line_wire_send(STDOUT_FILENO, text, length, fd);
 	g_mutex_unlock(&output_lock);
+}
+
+void line_emit(J *packet)
+{
+	emit_line(packet, -1);
+}
+
+/* A reply, with the lease's memory attached when its result is a lease. */
+static void emit_reply(struct line_worker *w, J *reply)
+{
+	const char *lease = strfield(field(reply, "result"), "lease");
+	int fd = lease ? line_media_lease_open(w->leases, lease) : -1;
+
+	emit_line(reply, fd);
+	if (fd >= 0)
+		close(fd);
 }
 
 void line_event(const char *name, const char *key, const char *value)
@@ -2200,7 +2198,7 @@ static void finish_images(struct line_worker *w)
 				json_object_new_string(
 					job->error ? job->error->message :
 						     "Image expired."));
-		line_emit(reply);
+		emit_reply(w, reply);
 		w->image_count--;
 		image_free(job);
 	}
@@ -2260,7 +2258,7 @@ static void handle(struct line_worker *w, const char *line)
 			json_object_new_string(error ? error->message :
 						       "Request failed."));
 	line_reply_retry(reply, error, !g_strcmp0(method, "login"));
-	line_emit(reply);
+	emit_reply(w, reply);
 	/* A request LINE answered with an auth refusal ends the session. */
 	if (w->ready && w->session.denied) {
 		end_session(w);
@@ -2796,6 +2794,8 @@ static int worker(int credentials_fd)
 	} else {
 		frame_fd = -1;
 	}
+	/* Before any thread starts, so every later thread inherits it. */
+	line_sandbox_worker();
 	struct line_worker w = {
 		.dir = -1,
 		.credentials_fd = credentials_fd,
@@ -2833,7 +2833,7 @@ static int worker(int credentials_fd)
 			break;
 		}
 		if (fds[0].revents) {
-			char block[8192];
+			static char block[64 * 1024];
 			ssize_t n = read(STDIN_FILENO, block, sizeof(block));
 
 			if (n < 0 && errno == EINTR)

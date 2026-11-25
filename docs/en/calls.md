@@ -42,6 +42,10 @@ The worker's main thread handles call requests (`callStart`, `callAccept`, `call
 
 The main thread and the call thread share `struct call_task` (atomics for done, muted, camera and share wishes, and a mutex for the latest frames). The main thread wakes the call thread through an eventfd (`signal_task()`).
 
+The call thread uses one UDP socket for everything ([`udp_batch.c`](../../src/udp_batch.c)). It drains all waiting datagrams with one `recvmmsg()` and skips `poll()` while some are left. A video picture's packets go out back to back with no pacing between them, so `send_video_packet()` queues them and sends the burst when the packet with the RTP marker bit arrives (RTCP has the same bit set and goes at once). The burst leaves in one `sendmmsg()`, with runs of equal-size packets as `UDP_SEGMENT` messages that the kernel splits into the same datagrams. Every other send (`send_to()`) sends the queue first, so datagrams keep their order. With `LINE_DISABLE_UDP_BATCH=1`, or on a kernel or sandbox that refuses these calls, the socket sends and receives one datagram per system call, as before.
+
+`./build/test-udp-batch -m perf -p /udp-batch/perf/send/UDP_SEGMENT` (and the `sendto`, `sendmmsg`, `receive/recvfrom` and `receive/recvmmsg` cases) measures CPU time per datagram for a 48-packet burst over loopback. On a Ryzen machine with Linux 7.3 it measured 2.27 µs (`sendto`), 1.93 µs (`sendmmsg`) and 0.17 µs (`UDP_SEGMENT`) to send, and 0.64 µs (`recvfrom`) and 0.49 µs (`recvmmsg`) to receive. Loopback defers segmentation to delivery, so expect a smaller gain over a real network card without UDP segmentation offload.
+
 ## 1. Getting a call route
 
 **Outgoing** (`callStart`, `line_call_start()`): `acquireCallRoute` on `/V4` with `{2: peer MID, 3: 1 (audio) or 2 (video), 4: {"devname": "Avernella"}}`. The route reply:

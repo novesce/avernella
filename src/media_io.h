@@ -33,5 +33,36 @@ int line_media_recv_frame(int socket, struct line_preview_frame *frame);
 
 GHashTable *line_leases_new(void);
 J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error);
+/*
+ * A read-only descriptor for a lease, sent to the UI with the reply
+ * (SCM_RIGHTS). The worker is not dumpable, so the UI cannot open the
+ * worker's /proc/<pid>/fd itself. -1 for an unknown lease.
+ */
+int line_media_lease_open(GHashTable *leases, const char *lease);
+
+/*
+ * The worker's JSON lines to the UI. line_wire_send() writes one line and,
+ * with fd >= 0, passes the descriptor with its first byte (SCM_RIGHTS). A
+ * stream read ends just after a segment that carries descriptors, so
+ * line_wire_read() gives each descriptor to the line it came with.
+ */
+gboolean line_wire_send(int socket, const char *text, gsize length, int fd);
+
+struct line_wire_reader {
+	GString *input;
+	int pending_fd; /* for a lease line that continues in the next read */
+};
+
+void line_wire_reader_init(struct line_wire_reader *r);
+void line_wire_reader_clear(struct line_wire_reader *r);
+/*
+ * One read into buf. Calls line() for each complete line with the line
+ * (owned by the callee) and its descriptor or -1 (also owned by the
+ * callee). Returns what recvmsg() returned.
+ */
+ssize_t line_wire_read(struct line_wire_reader *r, int socket, char *buf,
+		       gsize size,
+		       void (*line)(char *text, int fd, gpointer data),
+		       gpointer data);
 gboolean line_save_media(const char *path, GBytes *bytes, gboolean replace,
 			 GError **error);

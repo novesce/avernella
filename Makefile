@@ -58,7 +58,7 @@ endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
-SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode
+SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
 # Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
 JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
@@ -88,7 +88,9 @@ CHECKPATCH ?= $(firstword $(shell command -v checkpatch.pl 2>/dev/null) \
 # g_autoptr needs typedefs, environ is declared extern, protocol words in
 # messages are mistaken for function names, `Type type` declarations look
 # like repeated words, and the curl option macros jump to their cleanup.
-CHECKPATCH_IGNORE = NEW_TYPEDEFS,AVOID_EXTERNS,EMBEDDED_FUNCTION_NAME,FILE_PATH_CHANGES,REPEATED_WORD,MACRO_WITH_FLOW_CONTROL
+# ENOSYS: user space reads it as "no such system call" from an old kernel or
+# a seccomp filter (udp_batch.c, sandbox.c), which is its only meaning here.
+CHECKPATCH_IGNORE = NEW_TYPEDEFS,AVOID_EXTERNS,EMBEDDED_FUNCTION_NAME,FILE_PATH_CHANGES,REPEATED_WORD,MACRO_WITH_FLOW_CONTROL,ENOSYS
 CHECKPATCH_FLAGS = --no-tree --file --terse --quiet --show-types --typedefsfile .checkpatch-typedefs --ignore $(CHECKPATCH_IGNORE)
 # Test fixtures keep long JSON and protocol strings split across lines.
 CHECKPATCH_TEST_FLAGS = $(CHECKPATCH_FLAGS) --ignore SPLIT_STRING,MISSING_SPACE
@@ -109,6 +111,7 @@ TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
+TESTS += build/test-udp-batch build/test-sandbox
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -228,9 +231,11 @@ build/test-ui-apng: tests/ui_apng.c build/ui_apng.o build/ui_pixels.o
 build/test-emoji: tests/emoji.c build/emoji.o
 build/test-media: tests/media.c build/media.o build/media_crypto.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
 build/test-call: LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_QueueAudio,--wrap=SDL_DequeueAudio
-build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o
+build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o build/udp_batch.o
 build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
+build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
+build/test-sandbox: tests/sandbox.c build/sandbox.o build/udp_batch.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o
 build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/camera_pixels.o
 ifeq ($(CALL_VP8_JETSON),1)

@@ -8,6 +8,7 @@
 #include "call_video.h"
 #include "media_io.h"
 #include "camera.h"
+#include "udp_batch.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
@@ -212,6 +213,9 @@ struct voice_call {
 	struct call_endpoint relay, media;
 	struct media_route audio_route, video_route, data_route;
 	int fd;
+	/* Batched receive and video bursts on fd (see udp_batch.c). */
+	struct line_udp_rx *udp_rx;
+	struct line_udp_tx *udp_tx;
 	gint64 deadline, next_ka, next_capture;
 	guint ka_seconds;
 	gboolean invited, ringing, remote_end, muted, incoming, decline,
@@ -291,6 +295,9 @@ static gboolean send_to(struct voice_call *c, const struct call_endpoint *to,
 {
 	ssize_t n;
 
+	/* Keep datagrams in order behind a queued video burst. */
+	if (line_udp_tx_pending(c->udp_tx))
+		line_udp_tx_flush(c->udp_tx);
 	do {
 		n = sendto(c->fd, pkt.p, pkt.n, MSG_NOSIGNAL,
 			   (const void *)&to->addr, to->len);
@@ -388,6 +395,10 @@ static void free_call(struct voice_call *c)
 	line_screencast_stop(c->cast);
 	call_share_encoder_free(c->share_tx);
 	g_clear_pointer(&c->share_video_frame, g_bytes_unref);
+	if (c->udp_tx)
+		line_udp_tx_flush(c->udp_tx);
+	g_clear_pointer(&c->udp_tx, line_udp_tx_free);
+	g_clear_pointer(&c->udp_rx, line_udp_rx_free);
 	if (c->fd >= 0)
 		close(c->fd);
 	call_wire_clear(&c->wire);
@@ -521,10 +532,17 @@ static gboolean endpoint_from_addr(struct voice_call *c, Slice addr)
 static gboolean send_video_packet(const guint8 *data, gsize size, gpointer user)
 {
 	struct voice_call *c = user;
+	const struct call_endpoint *to = &c->video_route.current;
 
+	/*
+	 * A picture's packets leave back to back. Queue them and send the
+	 * burst at its marker packet; RTCP has the same bit set and goes now.
+	 */
 	gboolean sent =
-		send_to(c, &c->video_route.current, (Slice){ data, size });
+		line_udp_tx_queue(c->udp_tx, &to->addr, to->len, data, size);
 
+	if (size < 2 || data[1] & 0x80)
+		sent = line_udp_tx_flush(c->udp_tx) && sent;
 	if (sent && c->stats.next && size >= 12 &&
 	    (data[1] & 127) == c->video_pt) {
 		c->stats.camera_sent++;
@@ -3245,8 +3263,19 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			next = MIN(next, call_pdtp_poll(c->data, now,
 							send_data_packet, c));
 		int timeout = (int)CLAMP((next - now + 999) / 1000, 0, 60000);
-		int r = poll(fds, G_N_ELEMENTS(fds), timeout);
 
+		if (line_udp_tx_pending(c->udp_tx))
+			line_udp_tx_flush(c->udp_tx);
+		/* Datagrams left from the last batch need no poll(). */
+		int r = line_udp_rx_pending(c->udp_rx) ?
+				0 :
+				poll(fds, G_N_ELEMENTS(fds), timeout);
+
+		if (r == 0 && line_udp_rx_pending(c->udp_rx)) {
+			for (gsize i = 0; i < G_N_ELEMENTS(fds); i++)
+				fds[i].revents = 0;
+			fds[1].revents = POLLIN;
+		}
 		if (r < 0) {
 			if (errno == EINTR)
 				continue;
@@ -3283,8 +3312,8 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			continue;
 		guint8 data[4096];
 		struct call_endpoint source = { .len = sizeof(source.addr) };
-		ssize_t n = recvfrom(c->fd, data, sizeof(data), 0,
-				     (void *)&source.addr, &source.len);
+		ssize_t n = line_udp_rx_next(c->udp_rx, data, sizeof(data),
+					     &source.addr, &source.len);
 		if (n <= 0)
 			continue;
 		Slice pkt = { data, (gsize)n };
@@ -3807,6 +3836,8 @@ static gboolean setup_relay(struct voice_call *c, const char *host,
 		set_error(e, "Could not open the UDP call socket.");
 		return FALSE;
 	}
+	c->udp_rx = line_udp_rx_new(c->fd, line_udp_default_mode());
+	c->udp_tx = line_udp_tx_new(c->fd, line_udp_default_mode());
 	CallInfo *s = &c->info;
 
 	s->cid = g_uuid_string_random();

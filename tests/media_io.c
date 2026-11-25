@@ -4,6 +4,8 @@
 #include <fcntl.h>
 #include <glib/gstdio.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -14,19 +16,150 @@ static void anonymous_image(void)
 	g_autoptr(GError) e = NULL;
 	g_autoptr(J) result = line_media_lease(leases, image, &e);
 	g_assert_no_error(e);
-	const char *path = strfield(result, "path");
-	int fd = open(path, O_RDWR | O_CLOEXEC);
+	/* No path into the worker's /proc: the UI gets a descriptor. */
+	g_assert_null(strfield(result, "path"));
+	const char *lease = strfield(result, "lease");
+	int fd = line_media_lease_open(leases, lease);
 
 	g_assert_cmpint(fd, >=, 0);
+	int seals = fcntl(fd, F_GET_SEALS);
+
+	g_assert_cmpint(seals & F_SEAL_WRITE, ==, F_SEAL_WRITE);
 	g_assert_cmpint(write(fd, "x", 1), ==, -1);
-	g_assert_cmpint(errno, ==, EPERM);
+	g_assert_cmpint(errno, ==, EBADF);
 	char bytes[7];
 
+	/* A fresh open file: it reads from the start. */
 	g_assert_cmpint(read(fd, bytes, 7), ==, 7);
 	g_assert_cmpmem(bytes, 7, "fixture", 7);
-	g_assert_true(g_hash_table_remove(leases, strfield(result, "lease")));
-	g_assert_false(g_file_test(path, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(line_media_lease_open(leases, "unknown"), ==, -1);
+	g_assert_true(g_hash_table_remove(leases, lease));
+	g_assert_cmpint(line_media_lease_open(leases, lease), ==, -1);
+	/* The UI's descriptor outlives the worker's release. */
+	g_assert_cmpint(pread(fd, bytes, 7, 0), ==, 7);
 	close(fd);
+}
+
+/* A worker that is not dumpable can still reopen its own leases. */
+static void lease_not_dumpable(void)
+{
+	if (g_test_subprocess()) {
+		g_autoptr(GHashTable) leases = line_leases_new();
+		g_autoptr(GBytes) image = g_bytes_new_static("pixels", 6);
+		g_autoptr(J) result = line_media_lease(leases, image, NULL);
+
+		g_assert_cmpint(prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), ==, 0);
+		int fd = line_media_lease_open(leases,
+					       strfield(result, "lease"));
+		char bytes[6];
+
+		g_assert_cmpint(fd, >=, 0);
+		g_assert_cmpint(read(fd, bytes, 6), ==, 6);
+		g_assert_cmpmem(bytes, 6, "pixels", 6);
+		close(fd);
+		return;
+	}
+	g_test_trap_subprocess(NULL, 0, G_TEST_SUBPROCESS_DEFAULT);
+	g_test_trap_assert_passed();
+}
+
+struct wire_line {
+	char *text;
+	int fd;
+};
+
+static void collect(char *text, int fd, gpointer data)
+{
+	struct wire_line line = { text, fd };
+
+	g_array_append_val(data, line);
+}
+
+static int memfd_with(const char *text)
+{
+	int fd = memfd_create("wire", MFD_CLOEXEC);
+
+	g_assert_cmpint(write(fd, text, strlen(text)), ==,
+			(ssize_t)strlen(text));
+	return fd;
+}
+
+static void expect_fd(int fd, const char *text)
+{
+	char bytes[64] = { 0 };
+
+	g_assert_cmpint(fd, >=, 0);
+	g_assert_cmpint(pread(fd, bytes, sizeof(bytes) - 1, 0), ==,
+			(ssize_t)strlen(text));
+	g_assert_cmpstr(bytes, ==, text);
+	close(fd);
+}
+
+/* Lines in order; each lease descriptor stays with its own line. */
+static void wire_leases(gconstpointer data)
+{
+	gsize buffer = GPOINTER_TO_SIZE(data);
+	static const char *const lines[] = {
+		"{\"id\":1,\"result\":true}",
+		"{\"id\":2,\"result\":{\"lease\":\"a\"}}",
+		"{\"event\":\"changed\"}",
+		"{\"id\":3,\"result\":{\"lease\":\"b\"}}",
+		"{\"id\":4,\"result\":{\"lease\":\"c\"}}",
+		"{\"id\":5,\"result\":false}",
+	};
+	static const char *const contents[] = { NULL,	  "first", NULL,
+						"second", "third", NULL };
+	int pair[2];
+
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+				   pair),
+			==, 0);
+	for (gsize i = 0; i < G_N_ELEMENTS(lines); i++) {
+		int fd = contents[i] ? memfd_with(contents[i]) : -1;
+
+		g_assert_true(line_wire_send(pair[0], lines[i],
+					     strlen(lines[i]), fd));
+		if (fd >= 0)
+			close(fd);
+	}
+	close(pair[0]);
+	g_autoptr(GArray) got =
+		g_array_new(FALSE, FALSE, sizeof(struct wire_line));
+	g_autofree char *buf = g_malloc(buffer);
+	struct line_wire_reader reader;
+
+	line_wire_reader_init(&reader);
+	while (line_wire_read(&reader, pair[1], buf, buffer, collect, got) > 0)
+		;
+	line_wire_reader_clear(&reader);
+	close(pair[1]);
+	g_assert_cmpuint(got->len, ==, G_N_ELEMENTS(lines));
+	for (guint i = 0; i < got->len; i++) {
+		struct wire_line *line =
+			&g_array_index(got, struct wire_line, i);
+
+		g_assert_cmpstr(line->text, ==, lines[i]);
+		if (contents[i])
+			expect_fd(line->fd, contents[i]);
+		else
+			g_assert_cmpint(line->fd, ==, -1);
+		g_free(line->text);
+	}
+}
+
+/* Standard output that is not a socket still gets the line. */
+static void wire_not_socket(void)
+{
+	int pipefd[2], fd = memfd_with("x");
+	char bytes[16] = { 0 };
+
+	g_assert_cmpint(pipe2(pipefd, O_CLOEXEC), ==, 0);
+	g_assert_true(line_wire_send(pipefd[1], "{}", 2, fd));
+	g_assert_cmpint(read(pipefd[0], bytes, sizeof(bytes)), ==, 3);
+	g_assert_cmpstr(bytes, ==, "{}\n");
+	close(fd);
+	close(pipefd[0]);
+	close(pipefd[1]);
 }
 
 static void preview_descriptor(gconstpointer data)
@@ -190,6 +323,15 @@ int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/media-io/sealed-lease", anonymous_image);
+	g_test_add_func("/media-io/lease-not-dumpable", lease_not_dumpable);
+	g_test_add_data_func("/media-io/wire-leases", GSIZE_TO_POINTER(65536),
+			     wire_leases);
+	/* Every lease line split over several reads. */
+	g_test_add_data_func("/media-io/wire-leases-split", GSIZE_TO_POINTER(7),
+			     wire_leases);
+	g_test_add_data_func("/media-io/wire-leases-byte", GSIZE_TO_POINTER(1),
+			     wire_leases);
+	g_test_add_func("/media-io/wire-not-socket", wire_not_socket);
 	g_test_add_data_func("/media-io/direct-share",
 			     GUINT_TO_POINTER(LINE_PREVIEW_SCREEN),
 			     preview_descriptor);

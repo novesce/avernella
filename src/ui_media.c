@@ -556,6 +556,30 @@ static int open_regular(const char *path, gsize bound)
 	return fd;
 }
 
+/*
+ * The memory behind a worker media lease: the descriptor the reply carried
+ * (see read_worker() in ui.c), or a file path from a test fixture.
+ */
+static int lease_fd(Json *result, gsize bound)
+{
+	Json *passed = ui_field(result, "fd");
+
+	if (!json_object_is_type(passed, json_type_int))
+		return open_regular(ui_string(result, "path", NULL), bound);
+	int fd = json_object_get_int(passed);
+	struct stat st;
+
+	json_object_object_del(result, "fd");
+	if (fd < 0)
+		return -1;
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_size <= 0 ||
+	    (guint64)st.st_size > bound || lseek(fd, 0, SEEK_SET)) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
 static gboolean image_shape(int w, int h)
 {
 	return w > 0 && h > 0 && w <= 32768 && h <= 32768 &&
@@ -2810,8 +2834,7 @@ static void video_frame(Json *result, gboolean self, gboolean share)
 	if (!line_preview_size_valid(width, height, share) ||
 	    strcmp(ui_string(result, "format", ""), "i420"))
 		return;
-	int fd = open_regular(ui_string(result, "path", NULL),
-			      line_camera_i420_size(width, height));
+	int fd = lease_fd(result, line_camera_i420_size(width, height));
 
 	if (fd < 0)
 		return;
@@ -3671,8 +3694,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 				NULL;
 		gboolean current = entry && entry->serial == tag;
 		int fd = current && !error ?
-				 open_regular(ui_string(result, "path", NULL),
-					      LINE_FLEX_ASSET_LIMIT) :
+				 lease_fd(result, LINE_FLEX_ASSET_LIMIT) :
 				 -1;
 		Json *lease = ui_field(result, "lease");
 
@@ -3721,8 +3743,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 				   !g_strcmp0(chat, m.chat) &&
 				   !g_strcmp0(id, m.id);
 		int fd = current && !error ?
-				 open_regular(ui_string(result, "path", NULL),
-					      LINE_MEDIA_LIMIT) :
+				 lease_fd(result, LINE_MEDIA_LIMIT) :
 				 -1;
 		Json *lease = ui_field(result, "lease");
 
@@ -3799,10 +3820,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		gboolean current = owner && owner->serial == tag;
 		gsize limit = !strcmp(method, "sticker") ? 8 * 1024 * 1024 :
 							   4 * 1024 * 1024;
-		int fd = current && !error ?
-				 open_regular(ui_string(result, "path", NULL),
-					      limit) :
-				 -1;
+		int fd = current && !error ? lease_fd(result, limit) : -1;
 		Json *lease = ui_field(result, "lease");
 
 		if (lease) {
@@ -3835,9 +3853,8 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			avatar ? (owner && owner->serial == tag) :
 				 (tag ? (m.mode == VIEW && m.serial == tag) :
 					current);
-		int fd = display ? open_regular(ui_string(result, "path", NULL),
-						IMAGE_BOUND) :
-				   -1;
+		int fd = display ? lease_fd(result, IMAGE_BOUND) : -1;
+
 		if (lease) {
 			Json *a = args(NULL, NULL);
 

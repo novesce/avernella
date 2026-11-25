@@ -5,11 +5,31 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+#ifndef MFD_NOEXEC_SEAL
+#define MFD_NOEXEC_SEAL 0x0008U
+#endif
+
+/*
+ * Pixels and media are never code. Linux 6.3 and later seal the memory
+ * non-executable at creation, which vm.memfd_noexec=2 also requires; older
+ * kernels refuse the flag and get the plain sealable memfd.
+ */
+static int sealable_memfd(const char *name)
+{
+	int fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING |
+					    MFD_NOEXEC_SEAL);
+
+	if (fd < 0 && errno == EINVAL)
+		fd = memfd_create(name, MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	return fd;
+}
 
 static void close_lease(gpointer value)
 {
@@ -110,7 +130,7 @@ gboolean line_media_send_frame(int socket,
 	if (ready < 0 || !(pfd.revents & POLLOUT) ||
 	    pfd.revents & (POLLERR | POLLHUP | POLLNVAL))
 		return FALSE;
-	int fd = memfd_create("line-preview", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	int fd = sealable_memfd("line-preview");
 
 	if (fd < 0)
 		return FALSE;
@@ -203,7 +223,7 @@ J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error)
 				    "Finish opening another image first.");
 		return NULL;
 	}
-	int fd = memfd_create("line-image", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	int fd = sealable_memfd("line-image");
 
 	if (fd < 0 || !write_bytes(fd, bytes) || !seal(fd)) {
 		g_set_error(error, LINE_ERROR, 1,
@@ -216,13 +236,24 @@ J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error)
 	char *lease = g_uuid_string_random();
 
 	g_hash_table_insert(leases, lease, GINT_TO_POINTER(fd));
-	g_autofree char *path =
-		g_strdup_printf("/proc/%ld/fd/%d", (long)getpid(), fd);
 	J *result = obj();
 
 	json_object_object_add(result, "lease", json_object_new_string(lease));
-	json_object_object_add(result, "path", json_object_new_string(path));
 	return result;
+}
+
+int line_media_lease_open(GHashTable *leases, const char *lease)
+{
+	gpointer value;
+	char path[64];
+
+	if (!lease ||
+	    !g_hash_table_lookup_extended(leases, lease, NULL, &value))
+		return -1;
+	/* A new read-only open file, with its own offset, like open(2) had. */
+	g_snprintf(path, sizeof(path), "/proc/self/fd/%d",
+		   GPOINTER_TO_INT(value));
+	return open(path, O_RDONLY | O_CLOEXEC);
 }
 
 gboolean line_save_media(const char *path, GBytes *bytes, gboolean replace,
@@ -273,4 +304,170 @@ failed:
 	g_set_error(error, LINE_ERROR, 1, "Could not save the attachment: %s.",
 		    g_strerror(errno));
 	return FALSE;
+}
+
+gboolean line_wire_send(int socket, const char *text, gsize length, int fd)
+{
+	struct iovec parts[] = { { (void *)text, length }, { "\n", 1 } };
+	union {
+		struct cmsghdr align;
+		char bytes[CMSG_SPACE(sizeof(int))];
+	} control = { 0 };
+	struct msghdr message = { 0 };
+	int first = 0;
+
+	if (fd >= 0) {
+		struct cmsghdr *cm = &control.align;
+
+		message.msg_control = control.bytes;
+		message.msg_controllen = sizeof(control.bytes);
+		cm->cmsg_level = SOL_SOCKET;
+		cm->cmsg_type = SCM_RIGHTS;
+		cm->cmsg_len = CMSG_LEN(sizeof(int));
+		memcpy(CMSG_DATA(cm), &fd, sizeof(fd));
+	}
+	while (first < (int)G_N_ELEMENTS(parts)) {
+		ssize_t sent;
+
+		message.msg_iov = parts + first;
+		message.msg_iovlen = G_N_ELEMENTS(parts) - first;
+		sent = message.msg_control ?
+			       sendmsg(socket, &message, MSG_NOSIGNAL) :
+			       writev(socket, parts + first,
+				      G_N_ELEMENTS(parts) - first);
+		if (sent < 0 && errno == EINTR)
+			continue;
+		if (sent < 0 && errno == ENOTSOCK && message.msg_control) {
+			/* Not the UI's socket: the line still goes out. */
+			message.msg_control = NULL;
+			message.msg_controllen = 0;
+			continue;
+		}
+		if (sent <= 0)
+			return FALSE;
+		/* The descriptor went with the first bytes. */
+		message.msg_control = NULL;
+		message.msg_controllen = 0;
+		while (first < (int)G_N_ELEMENTS(parts) &&
+		       (size_t)sent >= parts[first].iov_len) {
+			sent -= parts[first].iov_len;
+			first++;
+		}
+		if (first < (int)G_N_ELEMENTS(parts)) {
+			parts[first].iov_base =
+				(char *)parts[first].iov_base + sent;
+			parts[first].iov_len -= sent;
+		}
+	}
+	return TRUE;
+}
+
+void line_wire_reader_init(struct line_wire_reader *r)
+{
+	r->input = g_string_new(NULL);
+	r->pending_fd = -1;
+}
+
+void line_wire_reader_clear(struct line_wire_reader *r)
+{
+	if (r->input)
+		g_string_free(r->input, TRUE);
+	r->input = NULL;
+	if (r->pending_fd >= 0)
+		close(r->pending_fd);
+	r->pending_fd = -1;
+}
+
+/* Keeps at most one passed descriptor and closes the rest. */
+static int passed_fd(struct msghdr *message, ssize_t got)
+{
+	int fd = -1;
+
+	for (struct cmsghdr *cm = CMSG_FIRSTHDR(message); cm;
+	     cm = CMSG_NXTHDR(message, cm)) {
+		if (cm->cmsg_level != SOL_SOCKET || cm->cmsg_type != SCM_RIGHTS)
+			continue;
+		gsize count = (cm->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+
+		for (gsize i = 0; i < count; i++) {
+			int passed;
+
+			memcpy(&passed, CMSG_DATA(cm) + i * sizeof(int),
+			       sizeof(passed));
+			if (fd < 0 && got > 0)
+				fd = passed;
+			else
+				close(passed);
+		}
+	}
+	if (message->msg_flags & MSG_CTRUNC && fd >= 0) {
+		close(fd);
+		fd = -1;
+	}
+	return fd;
+}
+
+ssize_t line_wire_read(struct line_wire_reader *r, int socket, char *buf,
+		       gsize size,
+		       void (*line)(char *text, int fd, gpointer data),
+		       gpointer data)
+{
+	union {
+		struct cmsghdr align;
+		char bytes[CMSG_SPACE(4 * sizeof(int))];
+	} control;
+	struct iovec iov = { buf, size };
+	struct msghdr message = { .msg_iov = &iov,
+				  .msg_iovlen = 1,
+				  .msg_control = control.bytes,
+				  .msg_controllen = sizeof(control.bytes) };
+	ssize_t got = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
+
+	if (got <= 0)
+		return got;
+	int fd = passed_fd(&message, got);
+	ssize_t fd_line = -1;
+
+	if (fd >= 0) {
+		/* The last line that starts here: skip its own newline. */
+		ssize_t i = got - 1;
+
+		if (buf[i] == '\n')
+			i--;
+		while (i >= 0 && buf[i] != '\n')
+			i--;
+		fd_line = i + 1;
+		/* A lease must start its own line. */
+		if (!fd_line && r->input->len) {
+			close(fd);
+			fd = -1;
+		}
+	}
+	gsize start = 0;
+
+	for (gsize i = 0; i < (gsize)got; i++) {
+		if (buf[i] != '\n')
+			continue;
+		int line_fd = -1;
+
+		if (fd >= 0 && (ssize_t)start == fd_line) {
+			line_fd = fd;
+			fd = -1;
+		} else if (!start && r->pending_fd >= 0) {
+			line_fd = r->pending_fd;
+			r->pending_fd = -1;
+		}
+		g_string_append_len(r->input, buf + start, (gssize)(i - start));
+		line(g_string_free(r->input, FALSE), line_fd, data);
+		r->input = g_string_new(NULL);
+		start = i + 1;
+	}
+	if (fd >= 0) {
+		/* The lease's line continues in the next read. */
+		if (r->pending_fd >= 0)
+			close(r->pending_fd);
+		r->pending_fd = fd;
+	}
+	g_string_append_len(r->input, buf + start, got - (ssize_t)start);
+	return got;
 }

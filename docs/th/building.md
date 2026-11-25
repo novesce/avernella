@@ -176,12 +176,15 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `LINE_CALL_DEBUG=1` | รายงานการต่อรองการโทร ข้อความควบคุม จำนวนแพ็กเก็ตทุกห้าวินาที และจังหวะที่ได้เฟรมแรก | `call.c`, `camera.c`, `ui_media.c` |
 | `LINE_CALL_PDTP_DUMP=<dir>` | เมื่อเปิด `LINE_CALL_DEBUG=1` จะเก็บข้อมูลดิบของสตรีม LINE และ PLANET ในไดเรกทอรีที่สร้างไว้และให้สิทธิ์เฉพาะเจ้าของ (0700) | `call.c` |
 | `LINE_RENDER_LOG=1` | บอกว่าเลือกตัววาดตัวไหนและทำไมต้องถอยไปตัวสำรอง | `ui_gpu.c`, `ui_draw.c` |
+| `LINE_DEBUG_SANDBOX=1` | พิมพ์ว่าแซนด์บ็อกซ์ของ worker ชั้นใดทำงานอยู่: `line-sandbox no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1` | `sandbox.c` |
 
 ### พฤติกรรม
 
 | ตัวแปร | ผล |
 | ------ | -- |
 | `LINE_EXPERIMENTAL_VIDEO=0` | ปิดวิดีโอคอล (โทรเสียงยังใช้ได้) |
+| `LINE_DISABLE_SANDBOX=1` | เริ่ม worker โดยไม่มีแซนด์บ็อกซ์ เช่นเพื่อต่อ `gdb` หรือ `strace` เข้ากับ worker |
+| `LINE_DISABLE_UDP_BATCH=1` | ส่งและรับมีเดียของการโทรครั้งละหนึ่งดาตาแกรมต่อ system call แทนการใช้ `sendmmsg`, `recvmmsg` และ `UDP_SEGMENT` |
 | `LINE_NOISE_SUPPRESSION=0` | ส่งเสียงไมค์ดิบ ไม่ผ่าน RNNoise |
 | `LINE_CALL_VIDEO_KBPS=<n>` | กำหนดบิตเรตการส่งวิดีโอเอง การโทรแบบตัวต่อตัวส่ง HD อย่างน้อย 1500 kbit/s เว้นแต่ตั้งค่านี้ให้ต่ำกว่า |
 | `LINE_CAMERA_DEVICE=<path>` | อุปกรณ์กล้อง (ค่าเริ่มต้น `/dev/video0`) |

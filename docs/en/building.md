@@ -176,12 +176,15 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `LINE_CALL_DEBUG=1` | Reports call negotiation, control messages, packet counts every five seconds and first-frame milestones | `call.c`, `camera.c`, `ui_media.c` |
 | `LINE_CALL_PDTP_DUMP=<dir>` | With `LINE_CALL_DEBUG=1`, stores raw LINE and PLANET stream data in an existing owner-only directory (mode 0700) | `call.c` |
 | `LINE_RENDER_LOG=1` | Says which renderer was chosen and why fallbacks happened | `ui_gpu.c`, `ui_draw.c` |
+| `LINE_DEBUG_SANDBOX=1` | Prints which worker sandbox layers are active: `line-sandbox no-dump=1 no-new-privs=1 seccomp=1 landlock-net=1 landlock-signal=1` | `sandbox.c` |
 
 ### Behavior
 
 | Variable | Effect |
 | -------- | ------ |
 | `LINE_EXPERIMENTAL_VIDEO=0` | Turns off video calls (voice still works) |
+| `LINE_DISABLE_SANDBOX=1` | Starts the worker without its sandbox, for example to attach `gdb` or `strace` to it |
+| `LINE_DISABLE_UDP_BATCH=1` | Sends and receives call media one datagram per system call instead of with `sendmmsg`, `recvmmsg` and `UDP_SEGMENT` |
 | `LINE_NOISE_SUPPRESSION=0` | Sends the raw microphone, without RNNoise |
 | `LINE_CALL_VIDEO_KBPS=<n>` | Overrides the video sending bitrate. Direct calls send at least 1500 kbit/s HD unless this is set lower |
 | `LINE_CAMERA_DEVICE=<path>` | Camera device (default `/dev/video0`) |

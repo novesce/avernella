@@ -170,13 +170,15 @@ A **generation** number protects against stale replies: `stop_worker()` incremen
 
 ### Large data: media leases
 
-Pictures, files and video posters are too large for a JSON line. The worker writes them into a **sealed memfd** instead (`line_media_lease()` in [`media_io.c`](../../src/media_io.c)): it creates the file with `memfd_create`, writes the bytes, adds `F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL`, and replies:
+Pictures, files and video posters are too large for a JSON line. The worker writes them into a **sealed memfd** instead (`line_media_lease()` in [`media_io.c`](../../src/media_io.c)): it creates the file with `memfd_create` (non-executable with `MFD_NOEXEC_SEAL` on Linux 6.3 and later), writes the bytes, adds `F_SEAL_GROW | F_SEAL_SHRINK | F_SEAL_WRITE | F_SEAL_SEAL`, and replies:
 
 ```json
-{"lease": "4b1c…-uuid", "path": "/proc/<worker pid>/fd/<n>"}
+{"lease": "4b1c…-uuid"}
 ```
 
-The UI opens that path (it runs as the same user), maps or reads it, and sends `releaseMedia` with the lease so the worker closes the descriptor. Because the file is sealed, the UI can map it without fearing that the bytes change under it. At most four leases may be open at once.
+The descriptor travels with that reply line. `emit_reply()` in `main.c` reopens the memfd read-only through the worker's own `/proc/self/fd` and passes it with the line's first byte as `SCM_RIGHTS` (`line_wire_send()`). On a Unix stream socket, the kernel ends a read just after a segment that carries descriptors, so `line_wire_read()` in the UI's `line-ipc` thread gives the descriptor to the last line that started in that read. The UI then puts it in the reply's result as `"fd"`, removing any `"fd"` the worker wrote itself. `lease_fd()` in `ui_media.c` takes it, checks that it is a regular file of an expected size, and maps or reads it. The UI sends `releaseMedia` with the lease so the worker closes its copy, and closes any descriptor no handler took. Because the file is sealed, the UI can map it without fearing that the bytes change under it. At most four leases may be open at once.
+
+Earlier versions sent a `/proc/<worker pid>/fd/<n>` path instead. The worker is now non-dumpable (see [the worker sandbox](#the-worker-sandbox)), so the kernel refuses that path to every other process, the UI included.
 
 ### Call video frames
 
@@ -225,6 +227,7 @@ Avernella was called *kitatide* before, and started from *line-linux*. Their fil
 | HTTPS transport, token renewal, `Retry-After` | `transport.c` |
 | libcurl tuning, shared DNS and TLS caches | `http_tune.c` |
 | glibc and scheduler tuning | `tune.c` |
+| Worker sandbox: no-dump, seccomp, Landlock | `sandbox.c` |
 | Thrift Compact and Binary encoder and decoder | `thrift.c` |
 | QR pairing | `pair.c` |
 | Email and password sign-in | `password_login.c` |
@@ -235,7 +238,7 @@ Avernella was called *kitatide* before, and started from *line-linux*. Their fil
 | Letter Sealing | `sealing.c` |
 | Encrypted attachments | `media.c`, `media_crypto.c` |
 | Object storage HTTP, avatars, public CDN assets | `obs_http.c` |
-| Media leases, preview frames, saving files | `media_io.c` |
+| Media leases, preview frames, saving files, lease descriptors on the JSON channel | `media_io.c` |
 | Friends, profiles, friend requests, recommendations | `friends.c` |
 | Profile picture conversion and upload | `profile_image.c` |
 | Groups and invitations | `groups.c` |
@@ -251,6 +254,7 @@ Avernella was called *kitatide* before, and started from *line-linux*. Their fil
 | PLANET signalling messages | `call_schema.c` |
 | PLANET packet encryption, protobuf helpers, media key derivation | `call_wire.c` |
 | SRTP contexts | `call_srtp.c` |
+| Batched call UDP: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` | `udp_batch.c` |
 | PDTP (screen sharing transport) | `call_pdtp.c` |
 | Call audio (SDL, Opus, EAS2) | `call_audio.c` |
 | Noise suppression | `call_denoise.c` |
@@ -297,6 +301,8 @@ Avernella leans on the kernel and glibc instead of frameworks. Knowing these hel
 
 **Processes**
 - `posix_spawn` of `/proc/self/exe` for the worker, `pidfd_spawn` (clone3 with a pidfd) for the browser helper, `PR_SET_PDEATHSIG` in both children.
+- The UI waits for the worker through `pidfd_open` and signals it only while it is still unreaped, so the PID can't have been reused.
+- The worker confines itself at start-up with `PR_SET_DUMPABLE`, `PR_SET_NO_NEW_PRIVS`, seccomp and Landlock ([the worker sandbox](#the-worker-sandbox)).
 - `posix_spawn_file_actions_addclosefrom_np` so children inherit only the descriptors they need.
 
 **Waiting without timers**
@@ -312,10 +318,12 @@ Avernella leans on the kernel and glibc instead of frameworks. Knowing these hel
 
 **Scheduling**
 - Image fetching and decoding run under `SCHED_BATCH` at lower priority (`LINE_THREAD_BACKGROUND`).
-- The call's media thread asks for tight timer slack (`LINE_THREAD_MEDIA`).
+- The call's media thread asks for tight timer slack (`LINE_THREAD_MEDIA`). With `sched_setattr` it also asks for a 1 ms EEVDF slice (Linux 6.12 and later) and a utilization floor of 256 of 1024 (uclamp). Both stay in the normal scheduling class and need no privilege. On a 16-CPU machine with every CPU busy, the slice cut how late a 20 ms audio timer woke from about 2 ms to under 40 µs (99th percentile). A kernel without uclamp keeps the slice alone; older kernels ignore both.
 
-**Network** ([`http_tune.c`](../../src/http_tune.c))
+**Network** ([`http_tune.c`](../../src/http_tune.c), [`udp_batch.c`](../../src/udp_batch.c))
 - libcurl with TLS 1.2 or newer, certificate and host name checks, HTTP/2, TCP Fast Open and keepalive.
+- Call media: the call thread reads every waiting datagram with one `recvmmsg()` and skips `poll()` while datagrams are left over. It sends each video picture's packets as one `sendmmsg()`, with each run of equal-size packets as one `UDP_SEGMENT` (UDP GSO) message. The datagrams on the wire are the same. Each socket falls back on its own, to `sendmmsg()` and then to plain `sendto()`/`recvfrom()`, when the kernel or a seccomp filter refuses a step. `LINE_DISABLE_UDP_BATCH=1` turns batching off.
+- The UI and the worker read their socket 64 KiB at a time, so a large chat history reply takes a few reads instead of dozens.
 - Shared DNS and TLS session caches across threads, with a separate connection pool per thread.
 - `Retry-After` on HTTP 429 or 503 pauses all RPCs for the given time (`line_transport_retry_after()`).
 
@@ -324,9 +332,30 @@ Avernella leans on the kernel and glibc instead of frameworks. Knowing these hel
 - `oom_score_adj` raised, so the kernel reclaims it before the client; a 1 ms timer slack inherited by WebKit's processes.
 - WebKit's web processes are capped at 512 MB, and the network process trims caches above 128 MB.
 
+## The worker sandbox
+
+The worker holds every secret and parses everything LINE sends: Thrift replies, pictures, video and call media. An exploit would most likely land there. [`sandbox.c`](../../src/sandbox.c) confines it at start-up, before any thread exists (`line_sandbox_worker()`, called from `worker()` in `main.c`):
+
+| Layer | Kernel | What it stops |
+| ----- | ------ | ------------- |
+| `PR_SET_DUMPABLE 0` | any | Other processes of the same user reading `/proc/<pid>/mem`, `fd` or `environ`, `ptrace` without `CAP_SYS_PTRACE`, and core dumps that would contain the session |
+| `PR_SET_NO_NEW_PRIVS` | 3.5 | Gaining privilege through a set-user-ID program |
+| seccomp filter | 3.5 (all threads at once: 3.17) | Typing into a terminal the worker inherited (`TIOCSTI` and `TIOCLINUX` ioctls), running programs (`execve`), new namespaces (`unshare`, `setns`, `clone` with namespace flags), mounts, `ptrace` and `process_vm_*`, `pidfd_getfd`, `bpf`, `perf_event_open`, `userfaultfd`, `io_uring`, module and kexec loading, clock setting and other administration calls, and any other system call ABI (i386, x32) |
+| Landlock ABI 4 | 6.7 | Listening TCP sockets |
+| Landlock ABI 6 | 6.12 | Signals to processes outside the worker |
+
+The filter answers with an errno instead of killing the worker: `EPERM` for refused calls, and `ENOSYS` for `io_uring` and `clone3`, so a library falls back as it would on an older kernel. `clone3` passes its flags in memory, where seccomp can't inspect them. glibc then uses `clone`, whose namespace flags the filter checks.
+
+Each layer is optional. A kernel that lacks one, or an outer sandbox (Flatpak, a container) that refuses one, leaves the rest in force. Files are not restricted, because the worker saves attachments wherever the user chooses. `LINE_DEBUG_SANDBOX=1` prints which layers are active. `LINE_DISABLE_SANDBOX=1` applies none, for attaching a debugger.
+
+The UI is not confined the same way: it starts the WebKit browser helper, whose own sandbox (bubblewrap) needs namespaces, and seccomp filters pass to child processes.
+
+Avernella doesn't use io_uring. The worker's I/O is a few sockets and small files, where `poll()` and plain reads already cost little, and many systems turn io_uring off (`kernel.io_uring_disabled`, container and Flatpak profiles). The sandbox refuses it, which removes that kernel interface from an attacker's reach.
+
 ## Security boundaries in one place
 
 - Tokens and keys live only in the worker. The UI never sees the access token, the refresh token or a private key.
+- The worker is non-dumpable and runs under seccomp and Landlock ([the worker sandbox](#the-worker-sandbox)). Media reach the UI as passed descriptors, never as paths into the worker's `/proc`.
 - The call thread receives only call-local data, never the account token.
 - The browser helper receives LINE app tokens only through its socket, never in arguments or the environment, and they are never logged.
 - Picture downloads from arbitrary hosts (Flex, rich messages) are anonymous, HTTPS-only, and refuse private and local network addresses ([`flex_asset.c`](../../src/flex_asset.c)).
