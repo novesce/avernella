@@ -223,7 +223,7 @@ build/%.o: src/%.c Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 build/test-emoji-message: tests/emoji_message.c build/messaging.o build/rich_message.o build/sealing.o build/thrift.o build/liff_url.o
-build/test-ui-emoji: tests/ui_emoji.c build/ui_emoji.o $(UI_LANG_OBJECTS)
+build/test-ui-emoji: tests/ui_emoji.c build/ui_emoji.o build/ui_motion.o $(UI_LANG_OBJECTS)
 build/test-ui-apng: tests/ui_apng.c build/ui_apng.o build/ui_pixels.o
 build/test-emoji: tests/emoji.c build/emoji.o
 build/test-media: tests/media.c build/media.o build/media_crypto.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
@@ -314,7 +314,7 @@ build/test-shared-content: tests/shared_content.c build/shared_content.o build/h
 build/test-ui-instance: tests/ui_instance.c build/ui_instance.o
 build/test-ui-tray: tests/ui_tray.c build/ui_tray.o build/ui_logo.o build/ui_pixels.o $(UI_LANG_OBJECTS)
 build/test-ui-notifications: tests/ui_notifications.c build/ui_notifications.o $(UI_LANG_OBJECTS)
-build/test-ui-friends: tests/ui_friends.c build/ui_friends.o $(UI_LANG_OBJECTS)
+build/test-ui-friends: tests/ui_friends.c build/ui_friends.o build/ui_motion.o $(UI_LANG_OBJECTS)
 build/test-ui-read: tests/ui_read.c
 build/test-stickers: tests/stickers.c build/stickers.o build/thrift.o
 build/test-sealing: tests/sealing.c build/sealing.o build/thrift.o

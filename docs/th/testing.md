@@ -84,7 +84,7 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-qr-scan` | `qr_scan.c` | การโหลด ZBar และการถอดรหัส (ห่อ `dlopen`) |
 | `test-chat-lists` | `chat_lists.c` | โฟลเดอร์ หมุด การปิดเสียง ปุ่มลัด ความปลอดภัยของไฟล์ |
 | `test-chiptune` | `chiptune.c` | ชิปเสียงและเสียงทุกตัว |
-| `test-ui-motion` | `ui_motion.c` | นาฬิกาเฟรม การเลื่อนและเป้าหมายการเลื่อน ความลึกของการกดปุ่ม และเส้นโค้งการ glide รวมถึงจังหวะที่ 60, 144 และ 240 Hz |
+| `test-ui-motion` | `ui_motion.c` | นาฬิกาเฟรม การเลื่อนและเป้าหมายการเลื่อน ความลึกของการกดปุ่ม เส้นโค้งการ glide ทิศทางล้อเมาส์ และการรวมเศษแถวจากทัชแพด รวมถึงจังหวะที่ 60, 144 และ 240 Hz |
 | `test-ui-pixels` | `ui_pixels.c` | premultiply คณิตของการคัดลอกตอนเลื่อน |
 | `test-ui-apng` | `ui_apng.c` | เฟรมและจังหวะของ PNG เคลื่อนไหว |
 | `test-ui-emoji` | `ui_emoji.c` | โทเค็นในฉบับร่างและช่วงที่ส่งออก |

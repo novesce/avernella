@@ -163,6 +163,63 @@ static void glide(void)
 	g_assert_cmpint(g.end_us, ==, 0);
 }
 
+static void wheel_direction(void)
+{
+	/* A flipped event carries the desktop's natural scrolling already. */
+	SDL_MouseWheelEvent natural = { .type = SDL_MOUSEWHEEL,
+					.y = -1,
+					.direction = SDL_MOUSEWHEEL_FLIPPED };
+	SDL_MouseWheelEvent traditional = { .type = SDL_MOUSEWHEEL,
+					    .y = 1,
+					    .direction =
+						    SDL_MOUSEWHEEL_NORMAL };
+
+	g_assert_cmpfloat(ui_wheel_y(&natural), ==, -1.);
+	g_assert_cmpfloat(ui_wheel_y(&traditional), ==, 1.);
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+	/* Touchpads: the precise delta wins over the rounded notch count. */
+	natural.preciseY = -.25f;
+	natural.y = 0;
+	g_assert_cmpfloat(ui_wheel_y(&natural), ==, -.25);
+	traditional.preciseY = 2.5f;
+	g_assert_cmpfloat(ui_wheel_y(&traditional), ==, 2.5);
+#endif
+	g_assert_cmpfloat(ui_wheel_steps(3, 0.), ==, 3.);
+	g_assert_cmpfloat(ui_wheel_steps(1, NAN), ==, 1.);
+
+	/* Row lists add fractions up to whole rows in either direction. */
+	double carry = 0.;
+	int rows = 0;
+
+	for (int i = 0; i < 10; i++)
+		rows += ui_wheel_rows(.1, &carry);
+	g_assert_cmpint(rows, ==, 1);
+	for (int i = 0; i < 8; i++)
+		rows += ui_wheel_rows(.125, &carry);
+	g_assert_cmpint(rows, ==, 2);
+	g_assert_cmpint(ui_wheel_rows(.75, &carry), ==, 0);
+	/* Reversing drops the old remainder instead of fighting it. */
+	g_assert_cmpint(ui_wheel_rows(-.5, &carry), ==, 0);
+	g_assert_cmpint(ui_wheel_rows(-.5, &carry), ==, -1);
+	g_assert_cmpint(ui_wheel_rows(-3., &carry), ==, -3);
+	g_assert_cmpint(ui_wheel_rows(INFINITY, &carry), ==, 0);
+	g_assert_cmpint(ui_wheel_rows(0., &carry), ==, 0);
+
+	/* The smooth scroll follows both signs from the same mapping. */
+	UiScroll scroll = { 0 };
+	int offset = 500;
+
+	ui_scroll_reset(&scroll, offset);
+	ui_scroll_by(&scroll, &offset, -48. * ui_wheel_y(&natural), 1000,
+		     100000, FALSE);
+	g_assert_false(ui_scroll_sample(&scroll, &offset, 1000, 300000, FALSE));
+	g_assert_cmpint(offset, ==, 512);
+	ui_scroll_by(&scroll, &offset, -48. * ui_wheel_y(&traditional), 1000,
+		     400000, FALSE);
+	g_assert_false(ui_scroll_sample(&scroll, &offset, 1000, 600000, FALSE));
+	g_assert_cmpint(offset, ==, 392);
+}
+
 static int compare_us(gconstpointer a, gconstpointer b)
 {
 	const gint64 x = *(const gint64 *)a, y = *(const gint64 *)b;
@@ -303,6 +360,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/motion/scroll", scrolling);
 	g_test_add_func("/motion/scroll-target", targets);
 	g_test_add_func("/motion/glide", glide);
+	g_test_add_func("/motion/wheel-direction", wheel_direction);
 	g_test_add_func("/motion/preference", preferences);
 	g_test_add_func("/motion/control-feedback", control_motion);
 	g_test_add_func("/motion/headless-sdl", sdl_timing);

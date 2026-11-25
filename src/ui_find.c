@@ -3,6 +3,7 @@
 #include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_friends.h"
+#include "ui_motion.h"
 #include <string.h>
 
 enum {
@@ -588,7 +589,7 @@ gboolean ui_find_event(SDL_Event *e)
 		f.drag = FALSE;
 		return TRUE;
 	case SDL_MOUSEWHEEL:
-		scroll(-48 * e->wheel.y);
+		scroll((int)lround(-48. * ui_wheel_y(&e->wheel)));
 		return TRUE;
 	case SDL_DROPFILE:
 		SDL_free(e->drop.file);

@@ -620,9 +620,11 @@ gboolean ui_lists_event(SDL_Event *e)
 		return TRUE;
 	}
 	if (e->type == SDL_MOUSEWHEEL) {
+		static double carry;
 		int max = MAX(0, (int)panel.rows->len - slots());
+		int rows = ui_wheel_rows(ui_wheel_y(&e->wheel), &carry);
 
-		panel.first = CLAMP(panel.first - 2 * e->wheel.y, 0, max);
+		panel.first = CLAMP(panel.first - 2 * rows, 0, max);
 		ui.dirty = TRUE;
 		return TRUE;
 	}

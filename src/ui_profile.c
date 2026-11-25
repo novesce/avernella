@@ -1408,7 +1408,10 @@ gboolean ui_profile_event(SDL_Event *e)
 		if (p.view == SETTINGS) {
 			int max = MAX(0, p.content_h - ui.height + 120);
 
-			p.scroll = CLAMP(p.scroll - e->wheel.y * 48, 0, max);
+			p.scroll = CLAMP(
+				p.scroll -
+					(int)lround(ui_wheel_y(&e->wheel) * 48),
+				0, max);
 			ui.dirty = TRUE;
 		}
 		return TRUE;

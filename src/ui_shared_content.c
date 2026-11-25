@@ -4,6 +4,7 @@
 #include "ui_theme.h"
 #include "ui_find.h"
 #include "ui_friends.h"
+#include "ui_motion.h"
 #include <string.h>
 
 enum shared_view {
@@ -522,15 +523,23 @@ gboolean ui_shared_event(SDL_Event *e)
 		if (view.page == NOTE_FORM && view.focus == BODY)
 			set(&ui.composition, e->edit.text);
 		return TRUE;
-	case SDL_MOUSEWHEEL:
+	case SDL_MOUSEWHEEL: {
+		static double carry;
+		double steps = ui_wheel_y(&e->wheel);
+
 		if (view.page == DETAIL) {
-			view.detail_scroll =
-				CLAMP(view.detail_scroll - e->wheel.y * 70, 0,
-				      MAX(0, view.detail_height - view.body.h));
+			view.detail_scroll = CLAMP(
+				view.detail_scroll - (int)lround(steps * 70), 0,
+				MAX(0, view.detail_height - view.body.h));
 			ui.dirty = TRUE;
-		} else
-			position(view.index - e->wheel.y * 2);
+		} else {
+			int rows = ui_wheel_rows(steps, &carry);
+
+			if (rows)
+				position(view.index - rows * 2);
+		}
 		return TRUE;
+	}
 	case SDL_MOUSEBUTTONDOWN: {
 		int x = e->button.x, y = e->button.y;
 

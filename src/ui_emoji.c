@@ -3,6 +3,7 @@
 #include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_apng.h"
+#include "ui_motion.h"
 #include <math.h>
 #include <string.h>
 
@@ -823,11 +824,14 @@ gboolean ui_emoji_input(SDL_Event *e)
 			}
 		}
 		return TRUE;
-	case SDL_MOUSEWHEEL:
-		if (e->wheel.y)
-			move(e->wheel.y > 0 ? -palette.per_page :
-					      palette.per_page);
+	case SDL_MOUSEWHEEL: {
+		static double carry;
+		int pages = ui_wheel_rows(ui_wheel_y(&e->wheel), &carry);
+
+		if (pages)
+			move(pages > 0 ? -palette.per_page : palette.per_page);
 		return TRUE;
+	}
 	case SDL_TEXTINPUT:
 		if (g_utf8_validate(e->text.text, -1, NULL) &&
 		    (!palette.query || strlen(palette.query) < 192)) {

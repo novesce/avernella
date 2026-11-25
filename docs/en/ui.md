@@ -114,6 +114,10 @@ Motion follows a few rules. Input takes effect on the frame it arrives in, and t
 
 The new-message glide runs only when the reader is at the bottom and the previous newest row is still there, followed by new rows. Loading an earlier page, a resize, a theme change, or a batch taller than the view snaps instead. While the glide or fade runs, `ui_draw_animation()` repaints only the conversation area, and `reusable_history()` turns scroll reuse off. Message-row hover in the history stays instant, so scroll reuse keeps working while the pointer rests on the history. With reduced motion, every row of the table reaches its end state on the same frame.
 
+#### Scroll direction
+
+Scrolling follows the desktop's natural-scrolling setting, separately for the touchpad and the mouse if the desktop splits them (GNOME, Cinnamon and KDE all do). The desktop applies the setting through libinput before SDL sees the event, so Avernella uses the values as they arrive: `ui_wheel_y()` in [`ui_motion.h`](../../src/ui_motion.h) returns SDL's precise delta (`preciseY`) when there is one, and the whole-notch count otherwise. `SDL_MOUSEWHEEL_FLIPPED` only reports that the values were already inverted. Compositors with `wl_seat` version 9 or later (GNOME 45 and later, KDE Plasma 6) send it, and inverting such an event again would undo natural scrolling, so no view does that. Every scrolled view goes through `ui_wheel_y()`: the message history and chat list (smooth, in pixels), Find, User Settings and shared-content details (pixels), and the friend, group, folder, chat-tool, attachment-picker, call-roster and emoji lists (rows). Row lists add fractional touchpad steps up to whole rows with `ui_wheel_rows()`, which drops the remainder when the direction reverses. The monitor picker runs in its own process and reads SDL's notch count, which follows the desktop in the same way. `tests/ui_motion.c` (`/motion/wheel-direction`) checks the mapping.
+
 ## Themes
 
 [`ui_theme.c`](../../src/ui_theme.c) and [`ui_theme.h`](../../src/ui_theme.h) define two layouts that share one palette.

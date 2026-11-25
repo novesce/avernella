@@ -4551,13 +4551,14 @@ gboolean ui_media_event(SDL_Event *e)
 		else if (e->type == SDL_MOUSEWHEEL) {
 			SDL_GetMouseState(&x, &y);
 			if (m.mode == CALL && at(m.call_roster, x, y)) {
-				int steps = CLAMP(e->wheel.y, -8, 8);
+				static double carry;
+				int steps = CLAMP(
+					ui_wheel_rows(ui_wheel_y(&e->wheel),
+						      &carry),
+					-8, 8);
 				int limit = call_roster_count() -
 					    m.call_roster_rows;
 
-				if (e->wheel.direction ==
-				    SDL_MOUSEWHEEL_FLIPPED)
-					steps = -steps;
 				m.call_roster_offset =
 					CLAMP(m.call_roster_offset - steps, 0,
 					      MAX(0, limit));
@@ -4616,15 +4617,19 @@ gboolean ui_media_event(SDL_Event *e)
 				}
 			}
 			return TRUE;
-		case SDL_MOUSEWHEEL:
+		case SDL_MOUSEWHEEL: {
+			static double carry;
+			int rows = ui_wheel_rows(ui_wheel_y(&e->wheel), &carry);
+
 			if (m.mode == PICK && m.entries) {
 				m.offset =
-					CLAMP(m.offset - 3 * e->wheel.y, 0,
+					CLAMP(m.offset - 3 * rows, 0,
 					      MAX(0, (int)m.entries->len -
 							     visible_rows()));
 				ui.dirty = TRUE;
 			}
 			return TRUE;
+		}
 		case SDL_TEXTINPUT:
 			if (m.mode == PICK && !m.working)
 				ui_insert(&m.edit, e->text.text);

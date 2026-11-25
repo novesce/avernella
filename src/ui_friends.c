@@ -2,6 +2,7 @@
 #include "ui_friends.h"
 #include "ui_lang.h"
 #include "ui_theme.h"
+#include "ui_motion.h"
 #include <string.h>
 
 enum {
@@ -1535,16 +1536,20 @@ gboolean ui_friends_event(SDL_Event *e)
 	case SDL_MOUSEBUTTONUP:
 		f.drag = FALSE;
 		return TRUE;
-	case SDL_MOUSEWHEEL:
+	case SDL_MOUSEWHEEL: {
+		static double carry;
+		int rows = ui_wheel_rows(ui_wheel_y(&e->wheel), &carry);
+
 		if (ui.hover_x < ui_content_x())
 			return FALSE;
 		if (f.page == ROSTER && f.filtered) {
-			f.first = CLAMP(f.first - 3 * e->wheel.y, 0,
+			f.first = CLAMP(f.first - 3 * rows, 0,
 					MAX(0, (int)f.filtered->len -
 						       f.list.h / ROW_H));
 			ui.dirty = TRUE;
 		}
 		return TRUE;
+	}
 	case SDL_DROPFILE:
 		if (f.page == FIND)
 			ui_friend_scan_file(e->drop.file);

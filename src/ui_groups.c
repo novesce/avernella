@@ -3,6 +3,7 @@
 #include "ui_lang.h"
 #include "ui_theme.h"
 #include "ui_friends.h"
+#include "ui_motion.h"
 #include <string.h>
 
 enum group_pane {
@@ -1009,9 +1010,10 @@ gboolean ui_groups_event(SDL_Event *e)
 		return TRUE;
 	}
 	if (e->type == SDL_MOUSEWHEEL) {
-		int d = e->wheel.y *
-			(e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ? 1 : -1);
-		g.first = CLAMP(g.first + 3 * d, 0,
+		static double carry;
+		int rows = ui_wheel_rows(ui_wheel_y(&e->wheel), &carry);
+
+		g.first = CLAMP(g.first - 3 * rows, 0,
 				MAX(0, (int)g.rows->len - slots()));
 		ui.dirty = TRUE;
 		return TRUE;

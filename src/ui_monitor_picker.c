@@ -194,10 +194,9 @@ static int pick(struct picker *p)
 			break;
 		}
 		case SDL_MOUSEWHEEL: {
+			/* The desktop has already applied natural scrolling. */
 			gint64 steps = event.wheel.y;
 
-			if (event.wheel.direction == SDL_MOUSEWHEEL_FLIPPED)
-				steps = -steps;
 			p->first =
 				CLAMP(p->first - steps, 0, p->count - p->rows);
 			dirty = TRUE;

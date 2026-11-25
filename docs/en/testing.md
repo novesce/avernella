@@ -98,7 +98,7 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-qr-scan` | `qr_scan.c` | ZBar loading and decoding (wrapped `dlopen`) |
 | `test-chat-lists` | `chat_lists.c` | Folders, pins, mutes, shortcuts, file safety |
 | `test-chiptune` | `chiptune.c` | The sound chip and every sound |
-| `test-ui-motion` | `ui_motion.c` | Frame clock, scrolling and scroll targets, press depth and the glide curve, including timing at 60, 144 and 240 Hz |
+| `test-ui-motion` | `ui_motion.c` | Frame clock, scrolling and scroll targets, press depth, the glide curve, wheel direction and touchpad row carry, including timing at 60, 144 and 240 Hz |
 | `test-ui-pixels` | `ui_pixels.c` | Premultiplication, scroll copy maths |
 | `test-ui-apng` | `ui_apng.c` | Animated PNG frames and timing |
 | `test-ui-emoji` | `ui_emoji.c` | Draft tokens and export ranges |

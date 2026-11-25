@@ -2758,15 +2758,9 @@ static void event(SDL_Event *e)
 		int x, y;
 
 		SDL_GetMouseState(&x, &y);
-		double steps = e->wheel.y;
-#if SDL_VERSION_ATLEAST(2, 0, 18)
-		if (e->wheel.preciseY != 0)
-			steps = e->wheel.preciseY;
-#endif
-		double distance =
-			steps * (e->wheel.direction == SDL_MOUSEWHEEL_FLIPPED ?
-					 48.0 :
-					 -48.0);
+		/* Natural or traditional, as the desktop has set it. */
+		double distance = -48. * ui_wheel_y(&e->wheel);
+
 		if (ui_list_visible() && inside(ui.list_box, x, y)) {
 			scroll_by(&list_scroll, &ui.list_offset, distance,
 				  max_list_scroll());

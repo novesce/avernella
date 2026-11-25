@@ -236,3 +236,23 @@ double ui_press_depth(UiPress press, gint64 now, gint64 *deadline)
 	*deadline = release + RELEASE_US;
 	return ui_settle((double)(now - release) / RELEASE_US);
 }
+
+double ui_wheel_steps(int notches, double precise)
+{
+	return precise != 0. && isfinite(precise) ? precise : notches;
+}
+
+int ui_wheel_rows(double steps, double *carry)
+{
+	if (!isfinite(steps) || steps == 0.)
+		return 0;
+	/* A reversal drops what was left over in the old direction. */
+	if ((steps > 0. && *carry < 0.) || (steps < 0. && *carry > 0.))
+		*carry = 0.;
+	*carry += steps;
+	/* Tenths and eighths of a notch must add up to exactly one row. */
+	double whole = trunc(*carry + (*carry > 0. ? 1e-9 : -1e-9));
+
+	*carry -= whole;
+	return (int)CLAMP(whole, -1000., 1000.);
+}

@@ -1,5 +1,7 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
+#include <SDL_events.h>
+#include <SDL_version.h>
 #include <glib.h>
 
 typedef struct {
@@ -56,3 +58,25 @@ typedef struct {
 
 /* A short tap still reaches full depth; holding at rest needs no frames. */
 double ui_press_depth(UiPress press, gint64 now, gint64 *deadline);
+
+/*
+ * Wheel and touchpad steps toward the start of the content, positive for a
+ * traditional wheel turned away from the reader. The desktop has already
+ * applied its natural-scrolling setting to SDL's values, and
+ * SDL_MOUSEWHEEL_FLIPPED only says so, so the values are used as they come:
+ * inverting a flipped event again would undo the desktop's choice. Precise
+ * touchpad deltas are preferred over SDL's whole-notch counts.
+ */
+double ui_wheel_steps(int notches, double precise);
+
+static inline double ui_wheel_y(const SDL_MouseWheelEvent *wheel)
+{
+#if SDL_VERSION_ATLEAST(2, 0, 18)
+	return ui_wheel_steps(wheel->y, wheel->preciseY);
+#else
+	return ui_wheel_steps(wheel->y, 0.);
+#endif
+}
+
+/* Whole list rows from fractional steps; the carry keeps the remainder. */
+int ui_wheel_rows(double steps, double *carry);

@@ -5,6 +5,7 @@
 #include "ui_find.h"
 #include "ui_friends.h"
 #include "ui_shared_content.h"
+#include "ui_motion.h"
 
 enum tools_page {
 	CLOSED,
@@ -306,14 +307,18 @@ gboolean ui_chat_tools_event(SDL_Event *event)
 			filter_chats();
 		}
 		return TRUE;
-	case SDL_MOUSEWHEEL:
+	case SDL_MOUSEWHEEL: {
+		static double carry;
+		int rows = ui_wheel_rows(ui_wheel_y(&event->wheel), &carry);
+
 		if (!tools.pending) {
 			tools.offset = CLAMP(
-				tools.offset - event->wheel.y * 3, 0,
+				tools.offset - rows * 3, 0,
 				MAX(0, (int)row_count() - visible_rows()));
 			ui.dirty = TRUE;
 		}
 		return TRUE;
+	}
 	case SDL_MOUSEBUTTONDOWN: {
 		int x = event->button.x, y = event->button.y;
 
