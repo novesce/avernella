@@ -20,3 +20,6 @@ GBytes *line_profile_image_prepare(const char *path, GError **error);
 
 /* Replaces the account's profile picture with the file at 'path'. */
 J *line_own_picture_update(Line *s, const char *path, GError **error);
+/* Replaces a group's picture on OBS /r/talk/g/<chat>. */
+J *line_group_picture_update(Line *s, const char *chat, const char *path,
+			     GError **error);

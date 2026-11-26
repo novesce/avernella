@@ -10,7 +10,7 @@
 static J *products, *last_send;
 static unsigned int requests, sends, downloads, short_page, repeat_page;
 static int shop_failure, send_failure, asset_failure;
-static gboolean bad_receipt, bad_image;
+static gboolean bad_receipt, bad_image, sound_mode;
 static char *last_url;
 
 static void reset(void)
@@ -22,7 +22,7 @@ static void reset(void)
 	requests = sends = downloads = 0;
 	short_page = 100;
 	repeat_page = shop_failure = send_failure = asset_failure = 0;
-	bad_receipt = bad_image = FALSE;
+	bad_receipt = bad_image = sound_mode = FALSE;
 }
 
 static J *unpack(const char *method, J *args)
@@ -105,6 +105,12 @@ GBytes *line_public_asset(const char *url, gsize limit, GError **error)
 	}
 	if (bad_image)
 		return g_bytes_new_static("not a png", 9);
+	if (sound_mode) {
+		static const guint8 m4a[] = { 0,   0,	0,   0x18, 'f', 't',
+					      'y', 'p', 'M', '4',  'A', ' ',
+					      0,   0,	0,   0 };
+		return g_bytes_new_static(m4a, sizeof(m4a));
+	}
 	gsize len;
 	guint8 *data = g_base64_decode(
 		"iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9Zl1sAAAAASUVORK5CYII=",
@@ -376,6 +382,46 @@ static void receive(void)
 	g_assert_cmpuint(requests, ==, 0);
 }
 
+static void sound_stickers(void)
+{
+	reset();
+	g_autoptr(GError) e = NULL;
+	g_autoptr(J) plain = json_tokener_parse(
+		"{\"15\":7,\"18\":{\"STKID\":\"5\",\"STKOPT\":\"P\"}}");
+	g_assert_null(line_sticker_message_sound(plain, &e));
+	g_assert_error(e, LINE_ERROR, 1);
+	g_clear_error(&e);
+
+	g_autoptr(J) sound = json_tokener_parse(
+		"{\"15\":7,\"18\":{\"STKID\":\"42\",\"STKOPT\":\"AS\"}}");
+	g_autofree char *url = line_sticker_message_sound(sound, &e);
+
+	g_assert_no_error(e);
+	g_assert_cmpstr(url, ==,
+			ROOT "v1/sticker/42/android/sticker_sound.m4a");
+
+	sound_mode = TRUE;
+	g_autoptr(GBytes) clip = line_sticker_sound_fetch(url, &e);
+	g_assert_no_error(e);
+	g_assert_nonnull(clip);
+	g_assert_cmpstr(last_url, ==, url);
+
+	bad_image = TRUE;
+	g_assert_null(line_sticker_sound_fetch(url, &e));
+	g_assert_error(e, LINE_ERROR, 1);
+	g_clear_error(&e);
+	bad_image = FALSE;
+
+	g_assert_null(line_sticker_sound_fetch(
+		ROOT "v1/sticker/42/android/sticker.png", &e));
+	g_assert_error(e, LINE_ERROR, 1);
+	g_clear_error(&e);
+	g_assert_null(line_sticker_sound_fetch(
+		"https://example.org/sticker_sound.m4a", &e));
+	g_assert_error(e, LINE_ERROR, 1);
+	g_clear_error(&e);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -385,6 +431,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/stickers/ownership", ownership);
 	g_test_add_func("/stickers/ambiguous-send", ambiguous_send);
 	g_test_add_func("/stickers/received-artwork", receive);
+	g_test_add_func("/stickers/sound", sound_stickers);
 	int result = g_test_run();
 
 	g_clear_pointer(&products, json_object_put);

@@ -30,6 +30,9 @@ J *line_peer_read_counts(const char *self, const char *chat, J *messages,
 J *line_history(Line *s, const char *chat, GError **error);
 J *line_send(Line *s, const char *chat, const char *text, GError **error);
 J *line_forward_text(Line *s, const char *chat, J *message, GError **error);
+J *line_forward_sticker(Line *s, const char *chat, J *message, GError **error);
+J *line_forward_location(Line *s, const char *chat, J *message, GError **error);
+J *line_forward_contact(Line *s, const char *chat, J *message, GError **error);
 char *line_message_preview(Line *s, J *message, GError **error);
 
 /* Encoded metadata and chunks are borrowed. Increments seq exactly once. */

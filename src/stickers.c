@@ -492,6 +492,53 @@ GBytes *line_sticker_fetch(const char *url, GError **e)
 	return data;
 }
 
+char *line_sticker_message_sound(J *message, GError **e)
+{
+	J *meta = field(message, "18");
+	const char *id = checked_string(meta, "STKID"),
+		   *opt = checked_string(meta, "STKOPT");
+
+	if (integer(message, "15") != 7 || !decimal_id(id, NULL) || !opt ||
+	    (strcmp(opt, "S") && strcmp(opt, "AS") && strcmp(opt, "PS")))
+		return fail(e, "This sticker has no sound.");
+	return g_strdup_printf(
+		STICKER_ROOT "v1/sticker/%s/android/sticker_sound.m4a", id);
+}
+
+static gboolean trusted_sound_url(const char *url)
+{
+	if (!url || !g_str_has_prefix(url, STICKER_ROOT) || strlen(url) > 320)
+		return FALSE;
+	g_auto(GStrv) fields = g_strsplit(url + strlen(STICKER_ROOT), "/", -1);
+	guint n = g_strv_length(fields);
+
+	return n == 5 && !strcmp(fields[0], "v1") &&
+	       !strcmp(fields[1], "sticker") && decimal_id(fields[2], NULL) &&
+	       !strcmp(fields[3], "android") &&
+	       !strcmp(fields[4], "sticker_sound.m4a");
+}
+
+GBytes *line_sticker_sound_fetch(const char *url, GError **e)
+{
+	const gsize max = 2 * 1024 * 1024;
+
+	if (!trusted_sound_url(url))
+		return fail(e, "The LINE sticker sound URL is invalid.");
+	GBytes *data = line_public_asset(url, max, e);
+
+	if (!data)
+		return NULL;
+	gsize size;
+	const guint8 *bytes = g_bytes_get_data(data, &size);
+
+	/* Expect an ISO BMFF / M4A container ("ftyp" at offset 4). */
+	if (size < 16 || size > max || memcmp(bytes + 4, "ftyp", 4)) {
+		g_bytes_unref(data);
+		return fail(e, "LINE returned an unreadable sticker sound.");
+	}
+	return data;
+}
+
 J *line_sticker_metadata(Line *s, LineStickers *c, const char *product,
 			 const char *id, GError **e)
 {

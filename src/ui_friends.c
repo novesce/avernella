@@ -18,7 +18,7 @@ enum {
 	TAB_SELECTED = UI_SELECTED,
 	/* Discord friend rows: 62 px with a divider between them. */
 	ROW_H = 62,
-	N_TABS = 7
+	N_TABS = 8
 };
 
 enum friends_page {
@@ -53,6 +53,8 @@ enum friend_command {
 	GET_PROFILE,
 	EDIT_PROFILE,
 	ADD_RECOMMENDED,
+	DELETE_FRIEND,
+	KEEP_MEMO,
 	N_REQUESTS
 };
 
@@ -72,13 +74,15 @@ enum friends_control {
 	BLOCKED_PAGE,
 	HIDE_PERSON,
 	BLOCK_PERSON,
+	DELETE_PERSON,
 	CONFIRM,
 	CANCEL,
 	PROFILE_PAGE,
 	RECOMMEND_PAGE,
 	EDIT_MY_NAME,
 	EDIT_MY_STATUS,
-	ALL_PAGE
+	ALL_PAGE,
+	KEEP_MEMO_BTN
 };
 
 struct friend_request {
@@ -86,17 +90,18 @@ struct friend_request {
 	char *subject, *sent_name;
 };
 
-static const char *const methods[] = {
-	"friends",	"findFriend",	   "addFriend",
-	"openFriend",	"friendInvite",	   "setFriendFavorite",
-	"renameFriend", "setFriendHidden", "setFriendBlocked",
-	"myProfile",	"updateMyProfile", "addRecommendation"
-};
+static const char *const methods[] = { "friends",	   "findFriend",
+				       "addFriend",	   "openFriend",
+				       "friendInvite",	   "setFriendFavorite",
+				       "renameFriend",	   "setFriendHidden",
+				       "setFriendBlocked", "myProfile",
+				       "updateMyProfile",  "addRecommendation",
+				       "deleteFriend",	   "openKeepMemo" };
 
 static struct {
 	enum friends_page page;
 	enum friends_directory directory;
-	gboolean confirming;
+	gboolean confirming, confirming_delete;
 	enum friends_control focus;
 	guint serial, view;
 	struct friend_request pending[N_REQUESTS];
@@ -113,7 +118,7 @@ static struct {
 	enum friends_control tab_id[N_TABS];
 	int tabs;
 	Rect bounds, back, add, invite, entry, list, more, submit, scan, card,
-		fav, save, manage, hidden, blocked, confirm, cancel,
+		fav, save, manage, hidden, blocked, remove_btn, confirm, cancel,
 		profile_button, recommendations;
 } f;
 
@@ -304,6 +309,7 @@ static void page(enum friends_page page)
 	f.view++;
 	f.page = page;
 	f.confirming = FALSE;
+	f.confirming_delete = FALSE;
 	g_clear_pointer(&f.open_target, g_free);
 	f.drag = FALSE;
 	clear_card();
@@ -560,8 +566,18 @@ gboolean ui_friends_reply(const char *method, guint tag, Json *result,
 					_("Could not read your friends list."));
 		return TRUE;
 	}
-	if ((cmd == BLOCKING || cmd == VISIBILITY) && !error &&
-	    !g_strcmp0(subject, ui_string(result, "id", NULL))) {
+	if (cmd == KEEP_MEMO) {
+		if (!error && json_object_is_type(result, json_type_object) &&
+		    *ui_string(result, "id", "")) {
+			page(OFF);
+			ui_open_conversation(result);
+		} else if (same)
+			replace(&f.note,
+				error ? error : _("Could not open Keep Memo."));
+		return TRUE;
+	}
+	if ((cmd == BLOCKING || cmd == VISIBILITY || cmd == DELETE_FRIEND) &&
+	    !error && !g_strcmp0(subject, ui_string(result, "id", NULL))) {
 		forget_roster();
 		if (same || f.page == ROSTER)
 			page(ROSTER);
@@ -737,6 +753,7 @@ static void header(int x0, int w)
 		{ PROFILE_PAGE, _("Profile"), _("Profile"), 66, 56 },
 		{ QR_PAGE, _("My QR Code"), "QR", 102, 40 },
 		{ ADD_PAGE, _("Add Friend"), _("Add"), 98, 52 },
+		{ KEEP_MEMO_BTN, _("Keep Memo"), _("Memo"), 92, 54 },
 	};
 	int x = x0 + 16, y = 12;
 
@@ -806,7 +823,8 @@ void ui_friends_draw(void)
 	header(x0, w);
 	f.add = f.invite = f.entry = f.list = f.more = f.submit = f.scan =
 		f.card = f.save = f.fav = (Rect){ 0 };
-	f.manage = f.hidden = f.blocked = f.confirm = f.cancel = (Rect){ 0 };
+	f.manage = f.hidden = f.blocked = f.remove_btn = f.confirm = f.cancel =
+		(Rect){ 0 };
 	f.profile_button = f.recommendations = (Rect){ 0 };
 	if (f.page == PROFILE) {
 		if (f.profile) {
@@ -1058,18 +1076,25 @@ void ui_friends_draw(void)
 					      450, MUTED, TRUE);
 			return;
 		}
-		if (f.confirming) {
-			ui_draw_label(_("Block this friend?"),
+		if (f.confirming || f.confirming_delete) {
+			ui_draw_label(f.confirming_delete ?
+					      _("Delete this friend?") :
+					      _("Block this friend?"),
 				      (Rect){ x, 174, content, 34 }, 20, 650,
 				      INK, FALSE);
 			ui_draw_label(
-				_("LINE will stop delivering their messages and calls."),
+				f.confirming_delete ?
+					_("This removes them from your LINE friends list.") :
+					_("LINE will stop delivering their messages and calls."),
 				(Rect){ x, 219, content, 52 }, 15, 450, MUTED,
 				TRUE);
 			f.cancel = (Rect){ x, 285, 100, 36 };
 			f.confirm = (Rect){ x + 112, 285, 145, 36 };
 			button(f.cancel, _("Cancel"), FALSE, CANCEL);
-			button(f.confirm, _("Confirm block"), TRUE, CONFIRM);
+			button(f.confirm,
+			       f.confirming_delete ? _("Confirm delete") :
+						     _("Confirm block"),
+			       TRUE, CONFIRM);
 			if (f.note)
 				ui_draw_label(f.note,
 					      (Rect){ x, 343, content, 56 }, 14,
@@ -1086,6 +1111,8 @@ void ui_friends_draw(void)
 				button(f.hidden, _("Unhide"), FALSE,
 				       HIDE_PERSON);
 			}
+			f.remove_btn = (Rect){ x + 136, 170, 124, 36 };
+			button(f.remove_btn, _("Delete"), FALSE, DELETE_PERSON);
 			if (f.note)
 				ui_draw_label(f.note,
 					      (Rect){ x, 230, content, 60 }, 14,
@@ -1110,8 +1137,10 @@ void ui_friends_draw(void)
 		       FALSE, SAVE_NAME);
 		f.hidden = (Rect){ x, 363, 115, 34 };
 		f.blocked = (Rect){ x + 128, 363, 115, 34 };
+		f.remove_btn = (Rect){ x + 256, 363, 115, 34 };
 		button(f.hidden, _("Hide"), FALSE, HIDE_PERSON);
 		button(f.blocked, _("Block"), FALSE, BLOCK_PERSON);
+		button(f.remove_btn, _("Delete"), FALSE, DELETE_PERSON);
 		if (f.note)
 			ui_draw_label(f.note, (Rect){ x, 412, content, 56 }, 14,
 				      450, MUTED, TRUE);
@@ -1149,8 +1178,10 @@ static void leave(void)
 			page(PROFILE);
 	} else if (f.page == PROFILE)
 		roster(EVERYONE);
-	else if (f.confirming && !f.pending[BLOCKING].tag) {
+	else if ((f.confirming || f.confirming_delete) &&
+		 !f.pending[BLOCKING].tag && !f.pending[DELETE_FRIEND].tag) {
 		f.confirming = FALSE;
+		f.confirming_delete = FALSE;
 		focus(BLOCK_PERSON);
 		ui.dirty = TRUE;
 	} else if (f.page == MANAGE)
@@ -1164,7 +1195,8 @@ static void leave(void)
 static void press(enum friends_control c)
 {
 	gboolean busy = f.pending[FAVORITE].tag || f.pending[RENAME].tag ||
-			f.pending[VISIBILITY].tag || f.pending[BLOCKING].tag;
+			f.pending[VISIBILITY].tag || f.pending[BLOCKING].tag ||
+			f.pending[DELETE_FRIEND].tag;
 	if (f.page == DETAILS && busy && c != CHATS)
 		return;
 	switch (c) {
@@ -1203,17 +1235,33 @@ static void press(enum friends_control c)
 			rpc(BLOCKING, "id", ui_string(f.person, "id", ""));
 		else {
 			f.confirming = TRUE;
+			f.confirming_delete = FALSE;
 			focus(CANCEL);
 			ui.dirty = TRUE;
 		}
 		break;
+	case DELETE_PERSON:
+		if (!f.person)
+			break;
+		f.confirming = FALSE;
+		f.confirming_delete = TRUE;
+		focus(CANCEL);
+		ui.dirty = TRUE;
+		break;
+	case KEEP_MEMO_BTN:
+		rpc(KEEP_MEMO, NULL, NULL);
+		break;
 	case CANCEL:
 		f.confirming = FALSE;
+		f.confirming_delete = FALSE;
 		focus(BLOCK_PERSON);
 		ui.dirty = TRUE;
 		break;
 	case CONFIRM:
-		if (f.confirming && f.person && !known(f.person, "blocked"))
+		if (f.confirming_delete && f.person)
+			rpc(DELETE_FRIEND, "id", ui_string(f.person, "id", ""));
+		else if (f.confirming && f.person &&
+			 !known(f.person, "blocked"))
 			rpc(BLOCKING, "id", ui_string(f.person, "id", ""));
 		break;
 	case CHATS:
@@ -1305,7 +1353,7 @@ static void tab(gboolean back)
 		if (f.directory == RECOMMENDED) {
 			if (f.submit.w)
 				list[n++] = SUBMIT;
-		} else if (f.confirming) {
+		} else if (f.confirming || f.confirming_delete) {
 			list[n++] = CANCEL;
 			list[n++] = CONFIRM;
 		} else {
@@ -1319,6 +1367,8 @@ static void tab(gboolean back)
 				list[n++] = HIDE_PERSON;
 			if (f.blocked.w)
 				list[n++] = BLOCK_PERSON;
+			if (f.remove_btn.w)
+				list[n++] = DELETE_PERSON;
 		}
 	} else if (f.page == FIND) {
 		list[n++] = FIELD;
@@ -1472,6 +1522,8 @@ gboolean ui_friends_event(SDL_Event *e)
 			press(f.page == MANAGE ? HIDDEN_PAGE : HIDE_PERSON);
 		else if (hit(f.blocked, x, y))
 			press(f.page == MANAGE ? BLOCKED_PAGE : BLOCK_PERSON);
+		else if (hit(f.remove_btn, x, y))
+			press(DELETE_PERSON);
 		else if (hit(f.cancel, x, y))
 			press(CANCEL);
 		else if (hit(f.confirm, x, y))

@@ -28,9 +28,9 @@ Because `SquareException` uses a separate numeric namespace from `TalkException`
 
 | Area | Methods |
 | --- | --- |
-| Directory & detail | `getJoinedSquares`, `getJoinedSquareChats`, `getJoinableSquareChats`, `getSquare`, `getSquareChat`, `getSquareCategories` |
+| Directory & detail | `getJoinedSquares`, `getJoinedSquareChats`, `getJoinableSquareChats`, `getSquare`, `getSquareChat`, `getSquareCategories`, `getPopularKeywords`, `searchSquares` |
 | History & live sync | `fetchSquareChatEvents` (`BACKWARD = 2` for history & older pages), `fetchMyEvents` (event-stream polling with `subscriptionId` and `syncToken`) |
-| Messaging | `sendMessage`, `unsendMessage`, `destroyMessage` (admin/co-admin delete), `reactToMessage`, `markAsRead` |
+| Messaging | `sendMessage` (including sticker, location, and contact forwarding), `searchSquareChatMentionables` (inline `@` mention autocomplete), `unsendMessage`, `destroyMessage` (admin/co-admin delete), `reactToMessage`, `markAsRead` |
 | Announcements | `getSquareChatAnnouncements`, `createSquareChatAnnouncement`, `deleteSquareChatAnnouncement` |
 | Joining & creation | `findSquareByInvitationTicketV2` (with `findSquareByInvitationTicket` V1 fallback), `checkJoinCode`, `joinSquare`, `joinSquareChat`, `leaveSquare`, `leaveSquareChat`, `createSquare`, `createSquareChat`, `getInvitationTicketUrl` |
 | Settings, profile & moderation | `updateSquare`, `updateSquareChat`, `updateSquareMember`, `searchSquareMembers`, `getSquareMember`, `approveSquareMembers`, `rejectSquareMembers` |

@@ -46,7 +46,7 @@ struct image_job {
 	GBytes *bytes;
 	GError *error;
 	guint generation;
-	gboolean animated, sticker, flex;
+	gboolean animated, sticker, sticker_sound, flex;
 };
 
 struct line_worker {
@@ -986,12 +986,24 @@ static J *friend_action(struct line_worker *w, const char *method, J *params,
 	if (!row)
 		return problem(error, "Select a person from your friends.");
 	gboolean hide = !strcmp(method, "setFriendHidden"),
-		 block = !strcmp(method, "setFriendBlocked");
-	if (!hide && !block && !visible_friend(row))
+		 block = !strcmp(method, "setFriendBlocked"),
+		 del = !strcmp(method, "deleteFriend");
+	if (!hide && !block && !del && !visible_friend(row))
 		return problem(error,
 			       "Choose a visible friend from your directory.");
 	if (!strcmp(method, "openFriend"))
 		return open_conversation(w, row);
+	if (del) {
+		gint32 seq = reserve_sequence(w, error);
+
+		if (!seq)
+			return NULL;
+		J *ack = line_friend_delete(&w->session, row, seq, error);
+
+		if (ack && w->friends)
+			json_object_object_del(w->friends, id);
+		return ack;
+	}
 	gboolean rename = !strcmp(method, "renameFriend");
 	const char *name = strfield(params, "name");
 	J *flag = field(params, hide  ? "hidden" :
@@ -1400,7 +1412,8 @@ static J *forward_message(struct line_worker *w, const char *destination,
 			       "Select a message and a destination chat.");
 	int kind = json_object_get_int(field(message, "15"));
 
-	if (kind != 0 && kind != LINE_MEDIA_IMAGE && kind != LINE_MEDIA_FILE &&
+	if (kind != 0 && kind != 7 && kind != 13 && kind != 15 &&
+	    kind != LINE_MEDIA_IMAGE && kind != LINE_MEDIA_FILE &&
 	    kind != LINE_MEDIA_AUDIO && kind != LINE_MEDIA_VIDEO)
 		return problem(error, "This message type cannot be forwarded.");
 	gint32 seq = reserve_sequence(w, error);
@@ -1422,6 +1435,15 @@ static J *forward_message(struct line_worker *w, const char *destination,
 							    error) :
 				      NULL;
 		}
+		if (kind == 7)
+			return line_square_forward_sticker(
+				s, destination, my_mid, message, seq, error);
+		if (kind == 15)
+			return line_square_forward_location(
+				s, destination, my_mid, message, seq, error);
+		if (kind == 13)
+			return line_square_forward_contact(
+				s, destination, my_mid, message, seq, error);
 		return line_forward_square_attachment(s, destination, my_mid,
 						      message, seq, error);
 	}
@@ -1429,6 +1451,12 @@ static J *forward_message(struct line_worker *w, const char *destination,
 	J *receipt =
 		kind == 0 ?
 			line_forward_text(s, destination, message, error) :
+		kind == 7 ?
+			line_forward_sticker(s, destination, message, error) :
+		kind == 15 ?
+			line_forward_location(s, destination, message, error) :
+		kind == 13 ?
+			line_forward_contact(s, destination, message, error) :
 			line_forward_attachment(s, destination, message, error);
 
 	s->seq = seq;
@@ -1794,6 +1822,11 @@ static J *square_dispatch(struct line_worker *w, const char *method, J *params,
 		return square_list_hub(w, error);
 	if (!strcmp(method, "squareCategories"))
 		return line_square_categories(s, error);
+	if (!strcmp(method, "squarePopularKeywords"))
+		return line_square_popular_keywords(s, error);
+	if (!strcmp(method, "squareSearch"))
+		return line_square_search(s, strfield(params, "query"),
+					  strfield(params, "cursor"), error);
 	if (!strcmp(method, "squareFindTicket"))
 		return line_square_find_ticket(s, strfield(params, "input"),
 					       error);
@@ -2005,6 +2038,18 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		return chat_directory(w, error);
 	if (!strcmp(method, "friends"))
 		return friend_directory(w, params, error);
+	if (!strcmp(method, "openKeepMemo")) {
+		if (!s->mid)
+			return problem(error, "Sign in to open Keep Memo.");
+		g_autoptr(J) row = obj();
+
+		json_object_object_add(row, "id",
+				       json_object_new_string(s->mid));
+		json_object_object_add(row, "name",
+				       json_object_new_string("Keep Memo"));
+		ensure(&w->opened_chats);
+		return open_conversation(w, row);
+	}
 	if (!strcmp(method, "myProfile"))
 		return line_own_profile(s, error);
 	if (!strcmp(method, "updateMyProfile")) {
@@ -2035,6 +2080,21 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "updateMyPicture"))
 		return line_own_picture_update(s, strfield(params, "path"),
 					       error);
+	if (!strcmp(method, "accountSettings"))
+		return line_account_settings(s, error);
+	if (!strcmp(method, "updateAccountSetting")) {
+		const char *key = strfield(params, "key");
+		J *val = field(params, "value");
+
+		if (!key || !json_object_is_type(val, json_type_boolean))
+			return problem(error, "Choose a LINE account setting.");
+		gint32 seq = reserve_sequence(w, error);
+
+		return seq ? line_account_settings_update(
+				     s, key, json_object_get_boolean(val), seq,
+				     error) :
+			     NULL;
+	}
 	if (!strcmp(method, "addRecommendation"))
 		return add_recommendation(w, strfield(params, "id"), error);
 	if (!strcmp(method, "findFriend"))
@@ -2049,7 +2109,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "openFriend") || !strcmp(method, "renameFriend") ||
 	    !strcmp(method, "setFriendFavorite") ||
 	    !strcmp(method, "setFriendHidden") ||
-	    !strcmp(method, "setFriendBlocked"))
+	    !strcmp(method, "setFriendBlocked") ||
+	    !strcmp(method, "deleteFriend"))
 		return friend_action(w, method, params, error);
 	if (!strcmp(method, "findAllMessages"))
 		return find_all_messages(w, params, error);
@@ -2217,12 +2278,57 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			       "Select a conversation from your chat list.");
 	if (!strcmp(method, "groupMembers"))
 		return line_group_members(s, chat, error);
+	if (!strcmp(method, "mentionCandidates")) {
+		const char *q = strfield(params, "query");
+
+		if (line_is_square_chat(chat))
+			return line_square_search_mentionables(s, chat, q,
+							       error);
+		if (*chat != 'c')
+			return json_object_new_array();
+		g_autoptr(J) detail = line_group_members(s, chat, error);
+
+		if (!detail)
+			return NULL;
+		J *members = field(detail, "members");
+		J *out = json_object_new_array();
+
+		for (size_t i = 0;
+		     json_object_is_type(members, json_type_array) &&
+		     i < json_object_array_length(members);
+		     i++) {
+			J *m = json_object_array_get_idx(members, i);
+			const char *mid = strfield(m, "id");
+			const char *name = strfield(m, "name");
+
+			if (!mid || !g_strcmp0(mid, s->mid) || !name)
+				continue;
+			if (q && *q && !g_str_match_string(q, name, TRUE))
+				continue;
+			json_object_array_add(out, json_object_get(m));
+			if (json_object_array_length(out) >= 20)
+				break;
+		}
+		return out;
+	}
 	if (!strcmp(method, "inviteGroup"))
 		return change_group(w, chat, params, error);
 	if (!strcmp(method, "groupLink"))
 		return line_group_link(s, chat, error);
+	if (!strcmp(method, "updateGroupPicture"))
+		return line_group_picture_update(s, chat, path, error);
 	if (!strcmp(method, "sharedList") || !strcmp(method, "sharedPost") ||
-	    !strcmp(method, "sharedPhotos"))
+	    !strcmp(method, "sharedPhotos") ||
+	    !strcmp(method, "sharedCreateAlbum") ||
+	    !strcmp(method, "sharedRenameAlbum") ||
+	    !strcmp(method, "sharedDeleteAlbum") ||
+	    !strcmp(method, "sharedDeletePhoto") ||
+	    !strcmp(method, "sharedUpdateNote") ||
+	    !strcmp(method, "sharedDeleteNote") ||
+	    !strcmp(method, "sharedToggleLike") ||
+	    !strcmp(method, "sharedComments") ||
+	    !strcmp(method, "sharedCommentPost") ||
+	    !strcmp(method, "sharedCommentDelete"))
 		return line_shared_content(s, method, params, error);
 	if (!strcmp(method, "sharedPhoto")) {
 		g_autoptr(GBytes) image = line_shared_photo(s, params, error);
@@ -2372,6 +2478,17 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	gboolean open_video = !strcmp(method, "openVideo");
 	gboolean video_poster = !strcmp(method, "videoPoster");
 
+	if (!strcmp(method, "openAudio")) {
+		if (!msg ||
+		    json_object_get_int(field(msg, "15")) != LINE_MEDIA_AUDIO)
+			return problem(
+				error,
+				"Select an audio message from this conversation.");
+		g_autoptr(GBytes) bytes =
+			line_download_attachment(s, msg, error);
+
+		return bytes ? line_media_lease(w->leases, bytes, error) : NULL;
+	}
 	if (open_video || video_poster) {
 		if (!msg ||
 		    json_object_get_int(field(msg, "15")) != LINE_MEDIA_VIDEO)
@@ -2565,7 +2682,10 @@ static gpointer fetch_images(gpointer data)
 				job->next_access =
 					g_steal_pointer(&session.access);
 			line_secret_free(session.access);
-		} else if (job->sticker)
+		} else if (job->sticker_sound)
+			job->bytes = line_sticker_sound_fetch(job->path,
+							      &job->error);
+		else if (job->sticker)
 			job->bytes = line_sticker_fetch(job->path, &job->error);
 		else if (job->flex)
 			job->bytes = line_flex_image_download(job->path,
@@ -2643,6 +2763,7 @@ static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
 			    const char *method, GError **error)
 {
 	gboolean emoji = !strcmp(method, "emoji");
+	gboolean sticker_sound = !strcmp(method, "stickerSound");
 	gboolean sticker = sticker_msg || !strcmp(method, "sticker");
 	gboolean flex = !strcmp(method, "flexImage");
 	J *params = field(request, "params");
@@ -2656,7 +2777,22 @@ static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
 		problem(error, "Image download is unavailable.");
 		return FALSE;
 	}
-	if (flex) {
+	if (sticker_sound) {
+		const char *chat = strfield(params, "chat");
+		J *raw = chat && id && !g_strcmp0(chat, w->history_chat) &&
+					 g_hash_table_contains(w->chats, chat) ?
+				 field(w->messages, id) :
+				 NULL;
+
+		if (!raw) {
+			problem(error,
+				"Reload this conversation to play the sticker sound.");
+			return FALSE;
+		}
+		sticker_url = line_sticker_message_sound(raw, error);
+		if (!sticker_url)
+			return FALSE;
+	} else if (flex) {
 		path = strfield(params, "url");
 		if (!line_flex_image_allowed(path) ||
 		    strlen(path) != (size_t)json_object_get_string_len(
@@ -2688,8 +2824,10 @@ static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
 		return FALSE;
 	struct image_job *job = g_new0(struct image_job, 1);
 
-	job->path = sticker ? g_steal_pointer(&sticker_url) : g_strdup(path);
+	job->path = sticker || sticker_sound ? g_steal_pointer(&sticker_url) :
+					       g_strdup(path);
 	job->sticker = sticker;
+	job->sticker_sound = sticker_sound;
 	job->flex = flex;
 	job->product = emoji ? g_strdup(product) : NULL;
 	job->emoji = emoji ? g_strdup(entry) : NULL;
@@ -2794,7 +2932,8 @@ static void handle(struct line_worker *w, const char *line)
 		problem(&error, "Missing request ID.");
 	else if (sticker_msg || !g_strcmp0(method, "avatar") ||
 		 !g_strcmp0(method, "flexImage") ||
-		 !g_strcmp0(method, "emoji") || !g_strcmp0(method, "sticker")) {
+		 !g_strcmp0(method, "emoji") || !g_strcmp0(method, "sticker") ||
+		 !g_strcmp0(method, "stickerSound")) {
 		if (queue_image(w, req, sticker_msg, method, &error))
 			return;
 	} else {

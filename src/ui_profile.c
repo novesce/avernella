@@ -79,7 +79,8 @@ enum action {
 	A_ACCEPT,
 	A_DECLINE,
 	A_ADD_BACK,
-	A_PERSON
+	A_PERSON,
+	A_ACCT_SETTING
 };
 
 struct control {
@@ -107,8 +108,8 @@ static struct {
 	guint card_tag, action_tag;
 	gboolean busy;
 	/* Account. */
-	Json *me;
-	guint me_tag, save_tag, picture_tag;
+	Json *me, *acct_settings;
+	guint me_tag, save_tag, picture_tag, acct_tag, acct_save_tag;
 	enum section section;
 	Editor name, status;
 	int editing; /* 0 none, 1 name, 2 status */
@@ -523,10 +524,25 @@ static gboolean form_changed(void)
 			  ui_string(p.me, "status", "")));
 }
 
+static const char *const acct_setting_keys[] = {
+	"searchById",	       "searchByPhone",	 "receiveFromNonFriends",
+	"allowSecondaryLogin", "e2eeEnable",	 "notifyEnable",
+	"notifyShowPreview",   "notifyMentions", "notifyReactions"
+};
+
+static gboolean acct_flag(int index)
+{
+	return p.acct_settings && index >= 0 &&
+	       (guint)index < G_N_ELEMENTS(acct_setting_keys) &&
+	       flag(p.acct_settings, acct_setting_keys[index]);
+}
+
 static void request_me(void)
 {
 	p.me_tag = next_tag();
 	ui_rpc("myProfile", NULL, p.me_tag);
+	p.acct_tag = next_tag();
+	ui_rpc("accountSettings", NULL, p.acct_tag);
 }
 
 void ui_settings_open(void)
@@ -753,6 +769,31 @@ static int privacy_section(int x, int y, int w)
 		x, y, w, _("Friend suggestions"),
 		_("People LINE recommends, including some who added you."),
 		_("View"), A_VIEW, 3, FALSE, FALSE);
+	if (p.acct_settings) {
+		y += 8;
+		caption(_("LINE account privacy"), x, y, w);
+		y += 26;
+		y += setting_row(
+			x, y, w, _("Allow others to add by LINE ID"),
+			_("Let people look up your account using your LINE ID."),
+			NULL, A_ACCT_SETTING, 0, TRUE, acct_flag(0));
+		y += setting_row(
+			x, y, w, _("Allow others to add by phone number"),
+			_("Let people who have your number find your account."),
+			NULL, A_ACCT_SETTING, 1, TRUE, acct_flag(1));
+		y += setting_row(
+			x, y, w, _("Allow messages from non-friends"),
+			_("Receive direct messages from accounts not on your friends list."),
+			NULL, A_ACCT_SETTING, 2, TRUE, acct_flag(2));
+		y += setting_row(
+			x, y, w, _("Allow login on other devices"),
+			_("Permit desktop and tablet companion logins for this LINE account."),
+			NULL, A_ACCT_SETTING, 3, TRUE, acct_flag(3));
+		y += setting_row(
+			x, y, w, _("Letter Sealing"),
+			_("End-to-end encryption for supported LINE messages."),
+			NULL, A_ACCT_SETTING, 4, TRUE, acct_flag(4));
+	}
 	return y - top;
 }
 
@@ -770,6 +811,27 @@ static int notifications_section(int x, int y, int w)
 		x, y, w, _("Sounds"),
 		_("Ringtone, call sounds and a chime for new messages, played on an emulated NES sound chip."),
 		NULL, A_SOUNDS, 0, TRUE, ui_sounds_enabled());
+	if (p.acct_settings) {
+		y += 8;
+		caption(_("LINE account notifications"), x, y, w);
+		y += 26;
+		y += setting_row(
+			x, y, w, _("Account notifications"),
+			_("Enable server-side LINE notifications for your account."),
+			NULL, A_ACCT_SETTING, 5, TRUE, acct_flag(5));
+		y += setting_row(
+			x, y, w, _("Show message preview"),
+			_("Include message content in LINE push notifications."),
+			NULL, A_ACCT_SETTING, 6, TRUE, acct_flag(6));
+		y += setting_row(
+			x, y, w, _("Mention notifications"),
+			_("Notify when someone mentions you in a group chat."),
+			NULL, A_ACCT_SETTING, 7, TRUE, acct_flag(7));
+		y += setting_row(
+			x, y, w, _("Reaction notifications"),
+			_("Notify when someone reacts to your messages."), NULL,
+			A_ACCT_SETTING, 8, TRUE, acct_flag(8));
+	}
 	ui_draw_label(
 		_("To mute one conversation, right-click it in the list and choose Mute conversation."),
 		(Rect){ x, y, w, 40 }, 14, 400, MUTED, TRUE);
@@ -1281,6 +1343,22 @@ static void activate(struct control c, int x)
 			ui_profile_open(row, NULL, c.r);
 		break;
 	}
+	case A_ACCT_SETTING:
+		if (p.acct_settings && !p.acct_save_tag && c.arg >= 0 &&
+		    (guint)c.arg < G_N_ELEMENTS(acct_setting_keys)) {
+			const char *key = acct_setting_keys[c.arg];
+			gboolean next = !acct_flag(c.arg);
+			Json *params = json_object_new_object();
+
+			json_object_object_add(params, "key",
+					       json_object_new_string(key));
+			json_object_object_add(params, "value",
+					       json_object_new_boolean(next));
+			p.acct_save_tag = next_tag();
+			set_text(&p.settings_note, _("Saving…"));
+			ui_rpc("updateAccountSetting", params, p.acct_save_tag);
+		}
+		break;
 	default:
 		break;
 	}
@@ -1545,6 +1623,28 @@ gboolean ui_profile_reply(const char *method, guint tag, Json *result,
 			apply_self(result);
 		return TRUE;
 	}
+	if (!strcmp(method, "accountSettings") && tag == p.acct_tag) {
+		p.acct_tag = 0;
+		if (!error && json_object_is_type(result, json_type_object))
+			set_json(&p.acct_settings, result);
+		return TRUE;
+	}
+	if (!strcmp(method, "updateAccountSetting") && tag == p.acct_save_tag) {
+		p.acct_save_tag = 0;
+		if (error) {
+			set_text(&p.settings_note, error);
+		} else {
+			const char *k = ui_string(result, "key", NULL);
+
+			if (k && p.acct_settings)
+				json_object_object_add(
+					p.acct_settings, k,
+					json_object_new_boolean(
+						flag(result, "value")));
+			set_text(&p.settings_note, _("Saved."));
+		}
+		return TRUE;
+	}
 	if (tag == p.save_tag || tag == p.picture_tag) {
 		gboolean picture = tag == p.picture_tag;
 
@@ -1688,9 +1788,11 @@ void ui_profile_reset(void)
 	p.unseen = 0;
 	p.requests_loaded = FALSE;
 	p.card_tag = p.action_tag = p.me_tag = p.save_tag = p.picture_tag =
-		p.requests_tag = p.answer_tag = 0;
+		p.acct_tag = p.acct_save_tag = p.requests_tag = p.answer_tag =
+			0;
 	g_clear_pointer(&p.card, json_object_put);
 	g_clear_pointer(&p.me, json_object_put);
+	g_clear_pointer(&p.acct_settings, json_object_put);
 	g_clear_pointer(&p.requests, json_object_put);
 	g_clear_pointer(&p.adds, json_object_put);
 	g_clear_pointer(&p.toast, json_object_put);

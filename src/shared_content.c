@@ -412,6 +412,9 @@ static J *photos(Line *s, const char *chat, const char *album,
 				NULL;
 		J *it = item(items, id, name, desc);
 
+		if (number && segment(number))
+			json_object_object_add(it, "photoId",
+					       json_object_new_string(number));
 		json_object_object_add(it, "viewable",
 				       json_object_new_boolean(!video));
 	}
@@ -457,6 +460,264 @@ static J *create_note(Line *s, const char *chat, J *p, GError **e)
 	J *ack = obj();
 
 	json_object_object_add(ack, "saved", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *update_note(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *id = value(p, "id"), *text = value(p, "text");
+
+	if (!segment(id) || !strfield(p, "text") || !text || !*text ||
+	    strlen(text) > 10000)
+		return fail(e, "Enter a note of up to 10,000 UTF-8 bytes.");
+	g_autoptr(J) body = json_tokener_parse(
+		"{\"postInfo\":{\"readPermission\":{\"type\":\"GROUP\",\"gids\":[]}},\"contents\":{\"contentsStyle\":{\"textStyle\":{\"textSizeMode\":\"NORMAL\",\"backgroundColor\":\"#FFFFFF\",\"textAnimation\":\"NONE\"},\"mediaStyle\":{\"displayType\":\"GRID_1_A\"}},\"media\":[],\"stickers\":[],\"locations\":[]}}");
+	json_object_object_add(field(body, "postInfo"), "postId",
+			       json_object_new_string(id));
+	json_object_array_add(
+		field(field(field(body, "postInfo"), "readPermission"), "gids"),
+		json_object_new_string(chat));
+	json_object_object_add(field(body, "contents"), "text",
+			       json_object_new_string(text));
+	g_autofree char *path = g_strdup_printf(
+		"/ext/note/nt/api/v57/post/update.json?homeId=%s&sourceType=TALKROOM",
+		chat);
+	g_autoptr(J) reply = request(s, NOTE, path, "POST", body, NULL, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "saved", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *delete_note(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *id = value(p, "id");
+
+	if (!segment(id))
+		return fail(e, "Choose a group note to delete.");
+	g_autofree char *path = g_strdup_printf(
+		"/ext/note/nt/api/v57/post/delete.json?homeId=%s&postId=%s",
+		chat, id);
+	g_autoptr(J) reply = request(s, NOTE, path, "GET", NULL, NULL, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "deleted", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *toggle_note_like(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *id = value(p, "id"), *actor = value(p, "actorId");
+	gboolean like = json_object_get_boolean(field(p, "like"));
+
+	if (!segment(id) || !chat_id(actor))
+		return fail(e, "Choose a group note to react to.");
+	g_autofree char *path = NULL;
+
+	g_autoptr(J) body = NULL;
+
+	if (like) {
+		path = g_strdup_printf(
+			"/ext/note/nt/api/v57/like/create.json?homeId=%s",
+			chat);
+		body = obj();
+		json_object_object_add(body, "contentId",
+				       json_object_new_string(id));
+		json_object_object_add(body, "actorId",
+				       json_object_new_string(actor));
+		json_object_object_add(body, "likeType",
+				       json_object_new_string("1001"));
+	} else {
+		path = g_strdup_printf(
+			"/ext/note/nt/api/v57/like/cancel.json?homeId=%s&contentId=%s&actorId=%s",
+			chat, id, actor);
+	}
+	g_autoptr(J) reply =
+		request(s, NOTE, path, like ? "POST" : "GET", body, NULL, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "liked", json_object_new_boolean(like));
+	return ack;
+}
+
+static J *note_comments(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *id = value(p, "id"), *actor = value(p, "actorId");
+
+	if (!segment(id) || !chat_id(actor))
+		return fail(e, "Choose a group note.");
+	g_autofree char *path = g_strdup_printf(
+		"/ext/note/nt/api/v57/comment/getList.json?homeId=%s&contentId=%s&actorId=%s&limit=50",
+		chat, id, actor);
+	g_autoptr(J) reply = request(s, NOTE, path, "GET", NULL, NULL, e);
+	if (!reply)
+		return NULL;
+	J *list = field(reply, "commentList");
+
+	if (!list)
+		list = field(reply, "comments");
+	J *items = json_object_new_array();
+
+	for (size_t i = 0; json_object_is_type(list, json_type_array) &&
+			   i < json_object_array_length(list);
+	     i++) {
+		J *c = json_object_array_get_idx(list, i);
+		J *user = field(c, "userInfo");
+		const char *cid = value(c, "commentNo");
+
+		if (!cid)
+			cid = value(c, "commentId");
+		const char *who = value(user, "displayName");
+		const char *mid = value(user, "mid");
+		const char *text = value(c, "commentText");
+
+		if (!cid || !segment(cid))
+			continue;
+		J *it = item(items, cid, who ? who : "Member",
+			     text ? text : "");
+
+		json_object_object_add(it, "own",
+				       json_object_new_boolean(
+					       mid && !g_strcmp0(mid, s->mid)));
+	}
+	return page(items, NULL);
+}
+
+static J *post_comment(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *id = value(p, "id"), *actor = value(p, "actorId"),
+		   *text = value(p, "text");
+
+	if (!segment(id) || !chat_id(actor) || !strfield(p, "text") || !text ||
+	    !*text || strlen(text) > 2000)
+		return fail(e, "Enter a comment of up to 2,000 UTF-8 bytes.");
+	g_autoptr(J) body = obj();
+	json_object_object_add(body, "contentId", json_object_new_string(id));
+	json_object_object_add(body, "actorId", json_object_new_string(actor));
+	json_object_object_add(body, "commentText",
+			       json_object_new_string(text));
+	json_object_object_add(body, "contentsList", json_object_new_array());
+	g_autofree char *path = g_strdup_printf(
+		"/ext/note/nt/api/v57/comment/create.json?homeId=%s", chat);
+	g_autoptr(J) reply = request(s, NOTE, path, "POST", body, NULL, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "saved", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *delete_comment(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *cid = value(p, "commentId"), *actor = value(p, "actorId");
+
+	if (!segment(cid) || !chat_id(actor))
+		return fail(e, "Choose a comment to delete.");
+	g_autofree char *path = g_strdup_printf(
+		"/ext/note/nt/api/v57/comment/delete.json?homeId=%s&commentId=%s&actorId=%s",
+		chat, cid, actor);
+	g_autoptr(J) reply = request(s, NOTE, path, "GET", NULL, NULL, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "deleted", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *create_album(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *title = value(p, "title");
+
+	if (!strfield(p, "title") || !title || !*title || strlen(title) > 100)
+		return fail(e, "Enter an album title of up to 100 bytes.");
+	g_autoptr(J) body = obj();
+	json_object_object_add(body, "title", json_object_new_string(title));
+	g_autoptr(J) reply = request(
+		s, ALBUM,
+		"/ext/album/api/v6/albums/create?modifyDuplicateTitle=true",
+		"POST", body, chat, e);
+	if (!reply)
+		return NULL;
+	const char *id = value(reply, "id");
+
+	if (!id)
+		id = value(reply, "albumId");
+	if (id && segment(id))
+		g_hash_table_add(s->shared->albums, g_strdup(id));
+	J *ack = obj();
+
+	json_object_object_add(ack, "saved", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *rename_album(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *album = value(p, "album"), *title = value(p, "title");
+
+	if (!segment(album) ||
+	    !g_hash_table_contains(s->shared->albums, album) ||
+	    !strfield(p, "title") || !title || !*title || strlen(title) > 100)
+		return fail(e, "Choose an album and enter a new title.");
+	g_autoptr(J) body = obj();
+	json_object_object_add(body, "title", json_object_new_string(title));
+	g_autofree char *path =
+		g_strdup_printf("/ext/album/api/v6/albums/%s/update", album);
+	g_autoptr(J) reply = request(s, ALBUM, path, "POST", body, chat, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "saved", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *delete_album(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *album = value(p, "album");
+
+	if (!segment(album) || !g_hash_table_contains(s->shared->albums, album))
+		return fail(e, "Choose an album from this chat.");
+	g_autoptr(J) body = obj();
+	g_autofree char *path =
+		g_strdup_printf("/ext/album/api/v6/albums/%s/delete", album);
+	g_autoptr(J) reply = request(s, ALBUM, path, "POST", body, chat, e);
+	if (!reply)
+		return NULL;
+	g_hash_table_remove(s->shared->albums, album);
+	J *ack = obj();
+
+	json_object_object_add(ack, "deleted", json_object_new_boolean(TRUE));
+	return ack;
+}
+
+static J *delete_album_photo(Line *s, const char *chat, J *p, GError **e)
+{
+	const char *album = value(p, "album"), *pid = value(p, "photoId");
+
+	if (!segment(album) ||
+	    !g_hash_table_contains(s->shared->albums, album) || !segment(pid))
+		return fail(e, "Choose a photo from this album.");
+	g_autoptr(J) body = obj();
+	J *ids = json_object_new_array();
+
+	json_object_array_add(ids, json_object_new_string(pid));
+	json_object_object_add(body, "photoIds", ids);
+	g_autofree char *path = g_strdup_printf(
+		"/ext/album/api/v6/albums/%s/photos/delete", album);
+	g_autoptr(J) reply = request(s, ALBUM, path, "POST", body, chat, e);
+	if (!reply)
+		return NULL;
+	J *ack = obj();
+
+	json_object_object_add(ack, "deleted", json_object_new_boolean(TRUE));
 	return ack;
 }
 
@@ -521,9 +782,30 @@ static J *notes(Line *s, const char *chat, const char *cursor, gboolean polls,
 			text = value(r, "text");
 		if (!segment(id))
 			continue;
-		item(items, id,
-		     from ? from : (polls ? "Poll note" : "Group note"),
-		     text && *text ? text : "Media or shared content");
+		J *it = item(items, id,
+			     from ? from : (polls ? "Poll note" : "Group note"),
+			     text && *text ? text : "Media or shared content");
+		const char *author = value(user, "mid");
+
+		if (author && chat_id(author))
+			json_object_object_add(it, "authorMid",
+					       json_object_new_string(author));
+		json_object_object_add(
+			it, "own",
+			json_object_new_boolean(author &&
+						!g_strcmp0(author, s->mid)));
+		json_object_object_add(
+			it, "liked",
+			json_object_new_boolean(
+				json_object_get_boolean(field(info, "liked"))));
+		json_object_object_add(
+			it, "likeCount",
+			json_object_new_int64(json_object_get_int64(
+				field(info, "likeCount"))));
+		json_object_object_add(
+			it, "commentCount",
+			json_object_new_int64(json_object_get_int64(
+				field(info, "commentCount"))));
 		if (i + 1 == json_object_array_length(rows) && !polls) {
 			gint64 time = json_object_get_int64(
 				field(info, "updatedTime"));
@@ -545,12 +827,32 @@ J *line_shared_content(Line *s, const char *method, J *p, GError **e)
 	scope(s, chat);
 	if (!strcmp(method, "sharedPhotos"))
 		return photos(s, chat, value(p, "album"), cursor, e);
+	if (!strcmp(method, "sharedCreateAlbum"))
+		return create_album(s, chat, p, e);
+	if (!strcmp(method, "sharedRenameAlbum"))
+		return rename_album(s, chat, p, e);
+	if (!strcmp(method, "sharedDeleteAlbum"))
+		return delete_album(s, chat, p, e);
+	if (!strcmp(method, "sharedDeletePhoto"))
+		return delete_album_photo(s, chat, p, e);
 	if (!strcmp(method, "sharedList") && !g_strcmp0(kind, "albums"))
 		return albums(s, chat, cursor, e);
 	if (*chat != 'c')
 		return fail(e, "Open a group conversation to use group notes.");
 	if (!strcmp(method, "sharedPost"))
 		return create_note(s, chat, p, e);
+	if (!strcmp(method, "sharedUpdateNote"))
+		return update_note(s, chat, p, e);
+	if (!strcmp(method, "sharedDeleteNote"))
+		return delete_note(s, chat, p, e);
+	if (!strcmp(method, "sharedToggleLike"))
+		return toggle_note_like(s, chat, p, e);
+	if (!strcmp(method, "sharedComments"))
+		return note_comments(s, chat, p, e);
+	if (!strcmp(method, "sharedCommentPost"))
+		return post_comment(s, chat, p, e);
+	if (!strcmp(method, "sharedCommentDelete"))
+		return delete_comment(s, chat, p, e);
 	if (!strcmp(method, "sharedList") &&
 	    (!g_strcmp0(kind, "notes") || !g_strcmp0(kind, "polls")))
 		return notes(s, chat, cursor, !strcmp(kind, "polls"), e);

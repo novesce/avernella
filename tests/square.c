@@ -336,6 +336,24 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"\",\"4\":\"1010\",\"5\":1700000010000,\"10\":\"Ping\"}}}}}],"
 			"\"3\":\"sync-2\"}");
 	}
+	if (!strcmp(method, "getPopularKeywords")) {
+		return json_tokener_parse(
+			"{\"1\":[{\"1\":\"Linux\"},{\"1\":\"Music\"}]}");
+	}
+	if (!strcmp(method, "searchSquares")) {
+		g_assert_cmpstr(strfield(req, "2:str"), ==, "linux");
+		return json_tokener_parse(
+			"{\"1\":[{\"1\":\"" SQ_MID
+			"\",\"2\":\"Linux Club\",\"5\":\"Open source\","
+			"\"9\":\"https://line.me/ti/g2/inv123\"}],"
+			"\"2\":{\"" SQ_MID "\":{\"1\":42}},\"4\":\"next2\"}");
+	}
+	if (!strcmp(method, "searchSquareChatMentionables")) {
+		g_assert_cmpstr(strfield(req, "1:str"), ==, CHAT_MID);
+		return json_tokener_parse(
+			"{\"1\":[{\"1\":\"" PEER_MEM
+			"\",\"2\":\"Alice\",\"3\":\"0hAlice\"}]}");
+	}
 	g_error("Unexpected RPC method: %s", method);
 	return NULL;
 }
@@ -629,6 +647,61 @@ static void test_lifecycle_and_sync(void)
 	g_clear_pointer(&last_method, g_free);
 }
 
+static void test_discover_and_forward(void)
+{
+	Line s = { .mid = SELF_MID, .pictures = obj() };
+
+	g_autoptr(GError) error = NULL;
+
+	g_autoptr(J) kws = line_square_popular_keywords(&s, &error);
+	g_assert_no_error(error);
+	g_assert_cmpuint(json_object_array_length(kws), ==, 2);
+	g_assert_cmpstr(
+		json_object_get_string(json_object_array_get_idx(kws, 0)), ==,
+		"Linux");
+
+	g_autoptr(J) found = line_square_search(&s, "linux", NULL, &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(found, "cursor"), ==, "next2");
+	J *items = field(found, "squares");
+
+	g_assert_cmpuint(json_object_array_length(items), ==, 1);
+	g_assert_cmpstr(strfield(json_object_array_get_idx(items, 0), "name"),
+			==, "Linux Club");
+
+	g_autoptr(J) ments =
+		line_square_search_mentionables(&s, CHAT_MID, "Al", &error);
+	g_assert_no_error(error);
+	g_assert_cmpuint(json_object_array_length(ments), ==, 1);
+	g_assert_cmpstr(strfield(json_object_array_get_idx(ments, 0), "id"), ==,
+			PEER_MEM);
+
+	g_autoptr(J) raw_stk = json_tokener_parse(
+		"{\"15\":7,\"18\":{\"STKID\":\"55\",\"STKPKGID\":\"7\",\"STKVER\":\"1\"}}");
+	g_autoptr(J) fs = line_square_forward_sticker(&s, CHAT_MID, ME_MEM,
+						      raw_stk, 10, &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(fs, "id"), ==, "1009");
+
+	g_autoptr(J) raw_loc = json_tokener_parse(
+		"{\"15\":15,\"11\":{\"1\":\"Park\",\"2\":\"Main\",\"3\":1.5,\"4\":2.5}}");
+	g_autoptr(J) fl = line_square_forward_location(&s, CHAT_MID, ME_MEM,
+						       raw_loc, 11, &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(fl, "id"), ==, "1009");
+
+	g_autoptr(J) raw_cnt =
+		json_tokener_parse("{\"15\":13,\"18\":{\"mid\":\"" SELF_MID
+				   "\",\"displayName\":\"Me\"}}");
+	g_autoptr(J) fc = line_square_forward_contact(&s, CHAT_MID, ME_MEM,
+						      raw_cnt, 12, &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(fc, "id"), ==, "1009");
+
+	json_object_put(s.pictures);
+	g_clear_pointer(&last_method, g_free);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -637,5 +710,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/square/chats-and-history", test_chats_and_history);
 	g_test_add_func("/square/messaging", test_messaging);
 	g_test_add_func("/square/lifecycle-and-sync", test_lifecycle_and_sync);
+	g_test_add_func("/square/discover-and-forward",
+			test_discover_and_forward);
 	return g_test_run();
 }

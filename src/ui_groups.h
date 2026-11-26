@@ -11,6 +11,7 @@ gboolean ui_groups_reply(const char *method, guint tag, Json *result,
 			 const char *error);
 void ui_groups_overlay(void);
 void ui_groups_resume_input(void);
+void ui_groups_avatar_picked(const char *path);
 
 /* Remove the departed group from the active UI session. */
 void ui_group_left(const char *id);

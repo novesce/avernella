@@ -1057,3 +1057,107 @@ J *line_friend_add_from(Line *s, J *row, enum line_friend_source source,
 		put_string(friend, "status", status ? status : "");
 	return friend;
 }
+
+/*
+ * RelationService deleteFriend / deleteFromBlockList (LINE 26.19.0
+ * p97.o1 / p97.q1): { 1: reqSeq, 2: friendMid / targetUserMid }.
+ */
+J *line_friend_delete(Line *s, J *row, gint32 seq, GError **error)
+{
+	const char *id = clean_string(field(row, "id"), 33);
+
+	if (seq <= 0 || !valid_mid(id) || !g_strcmp0(id, s->mid) ||
+	    !flag(row, "friend") || flag(row, "official"))
+		return fail(error, "Select a friend to remove.");
+	gboolean blocked = flag(row, "blocked");
+
+	g_autoptr(J) args = obj();
+	J *req = child(args, "1:obj");
+
+	json_object_object_add(req, "1:i32", json_object_new_int(seq));
+	put_string(req, "2:str", id);
+	g_autoptr(J) ack =
+		relation(s, blocked ? "deleteFromBlockList" : "deleteFriend",
+			 args, error);
+	if (!ack)
+		return NULL;
+	J *out = obj();
+
+	put_string(out, "id", id);
+	put_bool(out, "deleted", TRUE);
+	return out;
+}
+
+struct account_setting_def {
+	const char *key;
+	int field_id;
+};
+
+/* TalkService Settings & SettingsAttributeEx (LINE 26.19.0 jm8.zg / jm8.pp). */
+static const struct account_setting_def account_settings_map[] = {
+	{ "notifyEnable", 10 },	       { "notifyShowPreview", 14 },
+	{ "notifyMentions", 68 },      { "notifyReactions", 95 },
+	{ "searchByPhone", 21 },       { "searchById", 22 },
+	{ "allowSecondaryLogin", 24 }, { "receiveFromNonFriends", 26 },
+	{ "e2eeEnable", 61 },
+};
+
+J *line_account_settings(Line *s, GError **error)
+{
+	g_autoptr(J) args = obj();
+
+	json_object_object_add(args, "2:i32",
+			       json_object_new_int(8)); /* USER_INITIATED */
+	g_autoptr(J) raw = line_rpc(s, "/S4", "getSettings", args, error);
+	if (!raw)
+		return NULL;
+	if (!json_object_is_type(raw, json_type_object))
+		return fail(error,
+			    "LINE returned unreadable account settings.");
+	J *out = obj();
+
+	for (guint i = 0; i < G_N_ELEMENTS(account_settings_map); i++) {
+		char fid[16];
+
+		g_snprintf(fid, sizeof(fid), "%d",
+			   account_settings_map[i].field_id);
+		put_bool(out, account_settings_map[i].key,
+			 json_object_get_boolean(field(raw, fid)));
+	}
+	return out;
+}
+
+J *line_account_settings_update(Line *s, const char *key, gboolean value,
+				gint32 seq, GError **error)
+{
+	if (seq <= 0 || !key)
+		return fail(error, "Choose a LINE account setting.");
+	int field_id = 0;
+
+	for (guint i = 0; i < G_N_ELEMENTS(account_settings_map); i++)
+		if (!strcmp(account_settings_map[i].key, key)) {
+			field_id = account_settings_map[i].field_id;
+			break;
+		}
+	if (!field_id)
+		return fail(error, "Unknown LINE account setting.");
+	g_autoptr(J) args = obj();
+	J *settings = obj(), *attrs = json_object_new_array();
+	char fspec[24];
+
+	g_snprintf(fspec, sizeof(fspec), "%d:bool", field_id);
+	put_bool(settings, fspec, value);
+	json_object_array_add(attrs, json_object_new_int(field_id));
+	json_object_object_add(args, "1:i32", json_object_new_int(seq));
+	json_object_object_add(args, "3:obj", settings);
+	json_object_object_add(args, "4:set:i32", attrs);
+	g_autoptr(J) ack =
+		line_rpc(s, "/S4", "updateSettingsAttributes2", args, error);
+	if (!ack)
+		return NULL;
+	J *out = obj();
+
+	put_string(out, "key", key);
+	put_bool(out, "value", value);
+	return out;
+}

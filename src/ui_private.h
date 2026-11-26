@@ -148,6 +148,10 @@ guint ui_blend(guint a, guint b, double v);
 guint ui_avatar_shade(const char *seed);
 /* The sender avatar or name under the pointer, with its message row. */
 Json *ui_sender_at(int x, int y, Rect *anchor);
+/* A contact or location card under the pointer, with its message row. */
+Json *ui_card_at(int x, int y, Rect *anchor);
+/* Mention autocomplete popup drawn above the composer. */
+void ui_mentions_draw(void);
 /* A clickable area of a rich message, and the scene it switches to. */
 Json *ui_rich_area_at(int x, int y, Json **message, int *key);
 void ui_rich_set_scene(Json *message, const char *scene);

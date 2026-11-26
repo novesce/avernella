@@ -72,6 +72,164 @@ struct draft_mention {
 static GHashTable *mentions;
 static char *pending_link;
 
+/* Inline @mention autocomplete popup state for groups ('c') and OpenChats ('m'). */
+static struct {
+	gboolean open;
+	int at_pos;
+	char *chat, *query;
+	Json *items;
+	int cursor;
+	guint serial, pending;
+	Rect box;
+} mp;
+
+static void mention_popup_close(void)
+{
+	mp.open = FALSE;
+	mp.pending = 0;
+	g_clear_pointer(&mp.chat, g_free);
+	g_clear_pointer(&mp.query, g_free);
+	g_clear_pointer(&mp.items, json_object_put);
+	mp.box = (Rect){ 0 };
+}
+
+static gboolean mention_popup_reply(const char *method, guint tag, Json *result,
+				    const char *error)
+{
+	if (strcmp(method, "mentionCandidates"))
+		return FALSE;
+	if (!mp.open || !mp.pending || tag != mp.pending)
+		return TRUE;
+	mp.pending = 0;
+	g_clear_pointer(&mp.items, json_object_put);
+	if (!error && json_object_is_type(result, json_type_array) &&
+	    json_object_array_length(result)) {
+		mp.items = json_object_get(result);
+		mp.cursor = 0;
+	} else
+		mp.open = FALSE;
+	ui.dirty = TRUE;
+	return TRUE;
+}
+
+static void mention_popup_update(void)
+{
+	if (!ui.connected || !ui.selected || ui.focus != F_MESSAGE ||
+	    (*ui.selected != 'c' && *ui.selected != 'm') || !ui.message.value ||
+	    ui.message.cursor != ui.message.anchor) {
+		mention_popup_close();
+		return;
+	}
+	const char *s = ui.message.value->str;
+	int cur = ui.message.cursor;
+	int p = cur;
+
+	while (p > 0 && s[p - 1] != ' ' && s[p - 1] != '\n' &&
+	       s[p - 1] != '\t' && s[p - 1] != '@')
+		p--;
+	if (p <= 0 || s[p - 1] != '@') {
+		mention_popup_close();
+		return;
+	}
+	int at = p - 1;
+
+	if (at > 0 && s[at - 1] != ' ' && s[at - 1] != '\n' &&
+	    s[at - 1] != '\t') {
+		mention_popup_close();
+		return;
+	}
+	/* Ignore if cursor sits inside an already committed mention span. */
+	GArray *list = mentions ? g_hash_table_lookup(mentions, ui.selected) :
+				  NULL;
+
+	for (guint i = 0; list && i < list->len; i++) {
+		const struct draft_mention *m =
+			&g_array_index(list, struct draft_mention, i);
+
+		if (at >= m->start && at < m->end) {
+			mention_popup_close();
+			return;
+		}
+	}
+	g_autofree char *q = g_strndup(s + at + 1, (gsize)(cur - at - 1));
+
+	if (mp.open && mp.at_pos == at && !g_strcmp0(mp.chat, ui.selected) &&
+	    !g_strcmp0(mp.query, q))
+		return;
+	mp.open = TRUE;
+	mp.at_pos = at;
+	g_free(mp.chat);
+	mp.chat = g_strdup(ui.selected);
+	g_free(mp.query);
+	mp.query = g_strdup(q);
+	mp.serial = (mp.serial + 1) & 0x1fffffffu;
+	mp.pending = 0x20000000u | mp.serial;
+	Json *args = json_object_new_object();
+
+	json_object_object_add(args, "chat",
+			       json_object_new_string(ui.selected));
+	json_object_object_add(args, "query", json_object_new_string(q));
+	ui_rpc("mentionCandidates", args, mp.pending);
+}
+
+static void mention_popup_pick(int index)
+{
+	if (!mp.open || !mp.items || index < 0 ||
+	    (size_t)index >= json_object_array_length(mp.items))
+		return;
+	Json *row = json_object_array_get_idx(mp.items, index);
+
+	g_autofree char *id = g_strdup(ui_string(row, "id", ""));
+	g_autofree char *name = g_strdup(ui_string(row, "name", ""));
+	int at = mp.at_pos;
+
+	mention_popup_close();
+	if (!*id || !*name)
+		return;
+	if (at >= 0 && at <= ui.message.cursor &&
+	    ui.message.cursor <= (int)ui.message.value->len) {
+		ui.message.anchor = at;
+		ui_insert(&ui.message, "");
+	}
+	ui_mention_member(id, name);
+}
+
+void ui_mentions_draw(void)
+{
+	if (!mp.open || !mp.items || !json_object_array_length(mp.items)) {
+		mp.box = (Rect){ 0 };
+		return;
+	}
+	int count = (int)MIN(json_object_array_length(mp.items), 6u);
+	int row_h = 34;
+	int w = MIN(320, MAX(180, ui.composer.w - 32));
+	int h = count * row_h + 12;
+	int x = ui.composer.x + 12;
+	int y = ui.composer.y -
+		(ui.reply_id && !g_strcmp0(ui.reply_chat, ui.selected) ? 34 :
+									 0) -
+		h - 6;
+
+	if (y < UI_HEADER_H + 8)
+		y = UI_HEADER_H + 8;
+	mp.box = (Rect){ x, y, w, h };
+	ui_draw_rounded((Rect){ x - 1, y - 1, w + 2, h + 2 }, 9, UI_LINE);
+	ui_draw_rounded(mp.box, 8, UI_DIALOG);
+	for (int i = 0; i < count; i++) {
+		Json *row = json_object_array_get_idx(mp.items, i);
+		Rect r = { x + 6, y + 6 + i * row_h, w - 12, row_h - 2 };
+
+		if (i == mp.cursor)
+			ui_draw_rounded(r, 5, UI_SELECTED);
+		ui_draw_avatar(ui_string(row, "name", ""),
+			       ui_string(row, "id", ""),
+			       (Rect){ r.x + 6, r.y + 4, 24, 24 });
+		ui_draw_label(ui_string(row, "name", ""),
+			      (Rect){ r.x + 38, r.y + 6, r.w - 44, 22 }, 14,
+			      550, UI_HEADING, FALSE);
+	}
+}
+
 static GArray *mention_list(const char *chat)
 {
 	return mentions && chat ? g_hash_table_lookup(mentions, chat) : NULL;
@@ -1929,6 +2087,8 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		if (!strcmp(saved->action, "foreground"))
 			break;
 		if (!ui_liff_reply(saved->action, saved->tag, result, error) &&
+		    !mention_popup_reply(saved->action, saved->tag, result,
+					 error) &&
 		    !ui_profile_reply(saved->action, saved->tag, result,
 				      error) &&
 		    !ui_find_reply(saved->action, saved->tag, result, error) &&
@@ -2169,6 +2329,8 @@ void ui_insert(Editor *edit, const char *s)
 		ui_scroll_reset(&list_scroll, 0);
 		ui_refilter_chats();
 	}
+	if (edit == &ui.message)
+		mention_popup_update();
 }
 
 void ui_mention_member(const char *id, const char *name)
@@ -2268,6 +2430,29 @@ static void key(SDL_KeyboardEvent k)
 		 shift = (k.keysym.mod & KMOD_SHIFT) != 0;
 	if (ui.composition && *ui.composition && active_editor())
 		return; /* IME owns composing keys. */
+	if (mp.open && mp.items && json_object_array_length(mp.items) &&
+	    ui.focus == F_MESSAGE) {
+		int count = (int)MIN(json_object_array_length(mp.items), 6u);
+
+		if (code == SDLK_ESCAPE) {
+			mention_popup_close();
+			ui.dirty = TRUE;
+			return;
+		}
+		if (code == SDLK_UP || code == SDLK_DOWN) {
+			mp.cursor = (mp.cursor + (code == SDLK_UP ? -1 : 1) +
+				     count) %
+				    count;
+			ui.dirty = TRUE;
+			return;
+		}
+		if (code == SDLK_TAB || code == SDLK_RETURN ||
+		    code == SDLK_KP_ENTER) {
+			if (!k.repeat)
+				mention_popup_pick(mp.cursor);
+			return;
+		}
+	}
 	if (code == SDLK_TAB) {
 		tab_focus(shift);
 		return;
@@ -2435,11 +2620,21 @@ void ui_edit_key(Editor *edit, SDL_KeyboardEvent k)
 		if (!shift)
 			edit->anchor = edit->cursor;
 	}
+	if (edit == &ui.message)
+		mention_popup_update();
 	ui.dirty = TRUE;
 }
 
 static void click(int x, int y)
 {
+	if (mp.open && mp.items && inside(mp.box, x, y)) {
+		int idx = (y - (mp.box.y + 6)) / 34;
+
+		mention_popup_pick(idx);
+		return;
+	}
+	if (mp.open)
+		mention_popup_close();
 	if (ui.connected && ui.selected && ui_chat_visible()) {
 		if (ui.has_older && inside(ui.older_button, x, y)) {
 			history_page(FALSE);
@@ -2469,6 +2664,47 @@ static void click(int x, int y)
 		if (text_link) {
 			ui_open_chat_link(text_link);
 			return;
+		}
+		Rect card_anchor;
+		Json *card = ui_card_at(x, y, &card_anchor);
+
+		if (card) {
+			const char *cmid = ui_string(card, "contactMid", NULL);
+
+			if (cmid) {
+				Json *who = json_object_new_object();
+
+				json_object_object_add(
+					who, "id",
+					json_object_new_string(cmid));
+				json_object_object_add(
+					who, "name",
+					json_object_new_string(ui_string(
+						card, "contactName", cmid)));
+				json_object_object_add(
+					who, "avatarKey",
+					json_object_new_string(""));
+				ui_profile_open(who, ui.selected, card_anchor);
+				json_object_put(who);
+				return;
+			}
+			Json *loc = ui_field(card, "location");
+
+			if (loc && ui_field(loc, "lat") &&
+			    ui_field(loc, "lon")) {
+				double lat = json_object_get_double(
+					ui_field(loc, "lat"));
+				double lon = json_object_get_double(
+					ui_field(loc, "lon"));
+				g_autofree char *url = g_strdup_printf(
+					"https://www.openstreetmap.org/?mlat=%.6f&mlon=%.6f#map=16/%.6f/%.6f",
+					lat, lon, lat, lon);
+
+				if (SDL_OpenURL(url) != 0)
+					ui_status(_(
+						"Could not open this link in your browser."));
+				return;
+			}
 		}
 		/* Discord opens a profile from an avatar or a name. */
 		Rect anchor;

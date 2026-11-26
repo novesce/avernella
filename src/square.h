@@ -52,6 +52,15 @@ J *line_square_send_sticker(Line *s, LineStickers *stickers, const char *chat,
 J *line_square_send_media_stub(Line *s, const char *chat,
 			       const char *my_member_id, int content_type,
 			       J *metadata, gint32 seq, GError **error);
+J *line_square_forward_sticker(Line *s, const char *chat,
+			       const char *my_member_id, J *message, gint32 seq,
+			       GError **error);
+J *line_square_forward_location(Line *s, const char *chat,
+				const char *my_member_id, J *message,
+				gint32 seq, GError **error);
+J *line_square_forward_contact(Line *s, const char *chat,
+			       const char *my_member_id, J *message, gint32 seq,
+			       GError **error);
 J *line_square_react(Line *s, const char *chat, const char *message_id,
 		     const char *reaction, gint32 seq, GError **error);
 J *line_square_unsend(Line *s, const char *chat, const char *message_id,
@@ -73,6 +82,11 @@ J *line_square_remove_announcement(Line *s, const char *chat, const char *id,
 
 /* Discovery, joining, leaving, and creation. */
 J *line_square_categories(Line *s, GError **error);
+J *line_square_popular_keywords(Line *s, GError **error);
+J *line_square_search(Line *s, const char *query, const char *continuation,
+		      GError **error);
+J *line_square_search_mentionables(Line *s, const char *chat_mid,
+				   const char *query, GError **error);
 J *line_square_find_ticket(Line *s, const char *input, GError **error);
 J *line_square_join(Line *s, const char *square_mid, const char *chat_mid,
 		    const char *display_name, const char *join_code,

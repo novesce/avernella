@@ -24,6 +24,20 @@ static void compact(void)
 	g_assert_no_error(error);
 	g_assert_cmpint(json_object_get_int(field(field(decoded, "1"), "3")),
 			==, -7);
+
+	/* Round-trip IEEE 754 little-endian double in Thrift Compact. */
+	g_autoptr(J) dargs = obj();
+	json_object_object_add(dargs, "3:double",
+			       json_object_new_double(13.75));
+	g_autoptr(GBytes) dpk = line_encode_call("loc", dargs, &error);
+	g_assert_no_error(error);
+	gsize dlen;
+	const guint8 *dbuf = g_bytes_get_data(dpk, &dlen);
+
+	g_autoptr(J) ddec = line_decode_struct(dbuf + 7, dlen - 7, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpfloat(json_object_get_double(field(ddec, "3")), ==, 13.75);
 }
 
 static void replies(void)

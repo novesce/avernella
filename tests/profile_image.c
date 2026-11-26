@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "profile_image.h"
+#include <glib/gstdio.h>
 #include <png.h>
 #include <string.h>
 #include <turbojpeg.h>
+#include <unistd.h>
 #include <webp/encode.h>
 
 /* line_own_picture_update is not exercised here; it needs these. */
@@ -14,10 +16,15 @@ J *line_own_profile(Line *s, GError **error)
 	return NULL;
 }
 
+static gboolean allow_group_upload;
+static char *uploaded_group_mid;
+
 char *line_obs_token(Line *s, GError **error)
 {
 	(void)s;
 	(void)error;
+	if (allow_group_upload)
+		return g_strdup("fixture-obs-token");
 	g_assert_not_reached();
 	return NULL;
 }
@@ -31,6 +38,18 @@ gboolean line_obs_upload_profile(const char *token, const char *mid,
 	(void)error;
 	g_assert_not_reached();
 	return FALSE;
+}
+
+gboolean line_obs_upload_group_profile(const char *token, const char *chat,
+				       GBytes *jpeg, GError **error)
+{
+	(void)error;
+	g_assert_true(allow_group_upload);
+	g_assert_cmpstr(token, ==, "fixture-obs-token");
+	g_assert_nonnull(jpeg);
+	g_free(uploaded_group_mid);
+	uploaded_group_mid = g_strdup(chat);
+	return TRUE;
 }
 
 static void decoded(GBytes *jpeg, int *w, int *h, guint8 *center)
@@ -167,6 +186,46 @@ static void rejects(void)
 	g_assert_null(line_profile_jpeg(NULL, &error));
 }
 
+static void group_picture_update(void)
+{
+	Line s = { 0 };
+	const char *chat = "c00000000000000000000000000000003";
+
+	g_autoptr(GError) error = NULL;
+
+	/* Rejects non-group MIDs before touching the filesystem or OBS. */
+	g_assert_null(line_group_picture_update(
+		&s, "u00000000000000000000000000000001", "/nonexistent",
+		&error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+
+	/* Writes a small valid PNG and uploads it for the group chat. */
+	guint8 rgba[16 * 16 * 4];
+
+	memset(rgba, 0x80, sizeof(rgba));
+	png_image image = { .version = PNG_IMAGE_VERSION,
+			    .width = 16,
+			    .height = 16,
+			    .format = PNG_FORMAT_RGBA };
+	g_autofree char *tmp = NULL;
+	int fd = g_file_open_tmp("avernella-grp-XXXXXX.png", &tmp, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpint(fd, >=, 0);
+	close(fd);
+	g_assert_true(png_image_write_to_file(&image, tmp, 0, rgba, 0, NULL));
+	allow_group_upload = TRUE;
+	g_autoptr(J) res = line_group_picture_update(&s, chat, tmp, &error);
+	allow_group_upload = FALSE;
+	g_unlink(tmp);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(res, "id"), ==, chat);
+	g_assert_true(json_object_get_boolean(field(res, "updated")));
+	g_assert_cmpstr(uploaded_group_mid, ==, chat);
+	g_clear_pointer(&uploaded_group_mid, g_free);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -174,5 +233,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/profile-image/webp-alpha-on-white", webp_transparent);
 	g_test_add_func("/profile-image/jpeg-decoder-scaling", jpeg_tall);
 	g_test_add_func("/profile-image/rejects-other-data", rejects);
+	g_test_add_func("/profile-image/group-picture-update",
+			group_picture_update);
 	return g_test_run();
 }

@@ -320,6 +320,33 @@ gboolean line_obs_upload_profile(const char *token, const char *mid,
 	return reply != NULL;
 }
 
+gboolean line_obs_upload_group_profile(const char *token, const char *chat_mid,
+				       GBytes *jpeg, GError **e)
+{
+	if (!token || !chat_mid || *chat_mid != 'c' || !segment(chat_mid) ||
+	    !jpeg || !g_bytes_get_size(jpeg)) {
+		invalid(e);
+		return FALSE;
+	}
+	g_autoptr(J) params = obj();
+	json_object_object_add(params, "name",
+			       json_object_new_string("profile.jpg"));
+	json_object_object_add(params, "quality",
+			       json_object_new_string("100"));
+	json_object_object_add(params, "type", json_object_new_string("image"));
+	json_object_object_add(params, "ver", json_object_new_string("2.0"));
+	const char *json =
+		json_object_to_json_string_ext(params, JSON_C_TO_STRING_PLAIN);
+	g_autofree char *b64 =
+		g_base64_encode((const guint8 *)json, strlen(json));
+	g_autofree char *hdr = g_strconcat("x-obs-params: ", b64, NULL);
+	g_autofree char *url = g_strconcat(
+		"https://obs.line-apps.com/r/talk/g/", chat_mid, NULL);
+	g_autoptr(GBytes) reply =
+		transfer(url, token, hdr, jpeg, NULL, 65536, 60L, e);
+	return reply != NULL;
+}
+
 static char *download_header(const char *id)
 {
 	guint8 thrift[48] = { 11, 0, 4, 0, 0, 0, 0 };

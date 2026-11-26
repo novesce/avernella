@@ -10,6 +10,7 @@
 enum oc_page {
 	OC_CLOSED,
 	OC_HUB,
+	OC_DISCOVER,
 	OC_JOIN,
 	OC_CREATE,
 	OC_GROUP_LINK,
@@ -43,17 +44,17 @@ static struct {
 	guint serial, pending;
 	char *chat, *square_mid, *notice;
 	char *confirm_member, *confirm_name;
-	char *invite_url, *member_cursor;
+	char *invite_url, *member_cursor, *search_cursor;
 	QRcode *qr;
 	Json *detail, *preview, *group_preview, *categories, *members,
-		*requests;
+		*requests, *keywords, *search_results;
 	GPtrArray *hub_rows;
 	int cursor, offset, field_focus;
 	int cat_index, join_method;
 	gboolean searchable, invite_enabled;
 	Editor ed[5]; /* Reusable text fields per page. */
 	/* Cached hit rectangles computed during draw. */
-	Rect dialog, list, tab[3], close_btn, primary, secondary, extra[8];
+	Rect dialog, list, tab[4], close_btn, primary, secondary, extra[8];
 	Rect ed_rect[5], sw_rect[2], cycle_rect[2];
 } oc;
 
@@ -96,14 +97,17 @@ static void free_hub_item(gpointer data)
 
 static gboolean has_editor(void)
 {
-	return oc.page == OC_JOIN || oc.page == OC_CREATE ||
-	       oc.page == OC_MEMBERS || oc.page == OC_MY_PROFILE ||
-	       oc.page == OC_SETTINGS || oc.page == OC_ROOMS;
+	return oc.page == OC_DISCOVER || oc.page == OC_JOIN ||
+	       oc.page == OC_CREATE || oc.page == OC_MEMBERS ||
+	       oc.page == OC_MY_PROFILE || oc.page == OC_SETTINGS ||
+	       oc.page == OC_ROOMS;
 }
 
 static int editor_count(void)
 {
 	switch (oc.page) {
+	case OC_DISCOVER:
+		return 1;
 	case OC_JOIN:
 		return oc.preview ? 3 : 1;
 	case OC_CREATE:
@@ -147,6 +151,7 @@ void ui_openchat_reset(void)
 	g_free(oc.confirm_name);
 	g_free(oc.invite_url);
 	g_free(oc.member_cursor);
+	g_free(oc.search_cursor);
 	g_clear_pointer(&oc.qr, QRcode_free);
 	json_object_put(oc.detail);
 	json_object_put(oc.preview);
@@ -154,6 +159,8 @@ void ui_openchat_reset(void)
 	json_object_put(oc.categories);
 	json_object_put(oc.members);
 	json_object_put(oc.requests);
+	json_object_put(oc.keywords);
+	json_object_put(oc.search_results);
 	g_clear_pointer(&oc.hub_rows, g_ptr_array_unref);
 	for (guint i = 0; i < G_N_ELEMENTS(oc.ed); i++)
 		if (oc.ed[i].value)
@@ -216,6 +223,35 @@ static void load_hub(void)
 {
 	enter_page(OC_HUB);
 	rpc("squareList", NULL);
+}
+
+static void open_discover_tab(void)
+{
+	enter_page(OC_DISCOVER);
+	if (!oc.keywords)
+		rpc("squarePopularKeywords", NULL);
+}
+
+static void run_discover_search(gboolean more)
+{
+	if (!oc.ed[0].value || !oc.ed[0].value->len) {
+		set_str(&oc.notice, _("Enter a keyword to search OpenChats."));
+		return;
+	}
+	Json *p = json_object_new_object();
+
+	json_object_object_add(p, "query",
+			       json_object_new_string(oc.ed[0].value->str));
+	if (more && oc.search_cursor)
+		json_object_object_add(
+			p, "cursor", json_object_new_string(oc.search_cursor));
+	else {
+		g_clear_pointer(&oc.search_cursor, g_free);
+		g_clear_pointer(&oc.search_results, json_object_put);
+		oc.cursor = -1;
+		oc.offset = 0;
+	}
+	rpc("squareSearch", p);
 }
 
 static void load_info(const char *square_mid, const char *chat_mid)
@@ -358,6 +394,10 @@ static size_t list_count(void)
 {
 	if (oc.page == OC_HUB)
 		return oc.hub_rows ? oc.hub_rows->len : 0;
+	if (oc.page == OC_DISCOVER)
+		return oc.search_results ?
+			       json_object_array_length(oc.search_results) :
+			       0;
 	if (oc.page == OC_MEMBERS)
 		return oc.members ? json_object_array_length(oc.members) : 0;
 	if (oc.page == OC_REQUESTS)
@@ -384,6 +424,25 @@ static void submit_primary(void)
 {
 	if (oc.pending)
 		return;
+	if (oc.page == OC_DISCOVER) {
+		if (oc.cursor >= 0 && oc.search_results &&
+		    (size_t)oc.cursor <
+			    json_object_array_length(oc.search_results)) {
+			Json *sel = json_object_array_get_idx(oc.search_results,
+							      oc.cursor);
+
+			json_object_put(oc.preview);
+			oc.preview = json_object_get(sel);
+			enter_page(OC_JOIN);
+			set_ed(&oc.ed[1], ui.name ? ui.name : "");
+			set_ed(&oc.ed[2], "");
+			oc.field_focus = 1;
+			ui_openchat_resume_input();
+			return;
+		}
+		run_discover_search(FALSE);
+		return;
+	}
 	if (oc.page == OC_JOIN) {
 		if (!oc.preview) {
 			if (!oc.ed[0].value->len) {
@@ -682,6 +741,23 @@ gboolean ui_openchat_reply(const char *method, guint tag, Json *result,
 	}
 	if (!strcmp(method, "squareList")) {
 		rebuild_hub_rows(result);
+	} else if (!strcmp(method, "squarePopularKeywords")) {
+		json_object_put(oc.keywords);
+		oc.keywords = json_object_get(result);
+	} else if (!strcmp(method, "squareSearch")) {
+		Json *list = ui_field(result, "squares");
+
+		if (!oc.search_results)
+			oc.search_results = json_object_new_array();
+		for (size_t i = 0; list && i < json_object_array_length(list);
+		     i++)
+			json_object_array_add(
+				oc.search_results,
+				json_object_get(
+					json_object_array_get_idx(list, i)));
+		set_str(&oc.search_cursor, ui_string(result, "cursor", NULL));
+		if (!json_object_array_length(oc.search_results))
+			set_str(&oc.notice, _("No matching OpenChats found."));
 	} else if (!strcmp(method, "squareCategories")) {
 		json_object_put(oc.categories);
 		oc.categories = json_object_get(result);
@@ -942,18 +1018,22 @@ gboolean ui_openchat_event(SDL_Event *e)
 			close_openchat();
 			return TRUE;
 		}
-		/* Top hub tabs (My OpenChats / Join / Create). */
-		if (oc.page == OC_HUB || oc.page == OC_JOIN ||
-		    oc.page == OC_CREATE) {
+		/* Top hub tabs (My OpenChats / Discover / Join / Create). */
+		if (oc.page == OC_HUB || oc.page == OC_DISCOVER ||
+		    oc.page == OC_JOIN || oc.page == OC_CREATE) {
 			if (hit(oc.tab[0], x, y)) {
 				load_hub();
 				return TRUE;
 			}
 			if (hit(oc.tab[1], x, y)) {
-				open_join_tab(NULL);
+				open_discover_tab();
 				return TRUE;
 			}
 			if (hit(oc.tab[2], x, y)) {
+				open_join_tab(NULL);
+				return TRUE;
+			}
+			if (hit(oc.tab[3], x, y)) {
 				open_create_tab();
 				return TRUE;
 			}
@@ -1040,6 +1120,30 @@ gboolean ui_openchat_event(SDL_Event *e)
 			ui_media_pick_avatar();
 			return TRUE;
 		}
+		if (oc.page == OC_DISCOVER) {
+			if (hit(oc.extra[0], x, y)) {
+				run_discover_search(FALSE);
+				return TRUE;
+			}
+			if (hit(oc.extra[1], x, y) && oc.search_cursor) {
+				run_discover_search(TRUE);
+				return TRUE;
+			}
+			for (int k = 0;
+			     k < 6 && oc.keywords &&
+			     (size_t)k < json_object_array_length(oc.keywords);
+			     k++) {
+				if (hit(oc.extra[2 + k], x, y)) {
+					const char *kw = json_object_get_string(
+						json_object_array_get_idx(
+							oc.keywords, k));
+
+					set_ed(&oc.ed[0], kw);
+					run_discover_search(FALSE);
+					return TRUE;
+				}
+			}
+		}
 		if (oc.page == OC_HUB && hit(oc.extra[0], x, y) &&
 		    oc.cursor >= 0 && oc.hub_rows &&
 		    (guint)oc.cursor < oc.hub_rows->len) {
@@ -1108,7 +1212,9 @@ gboolean ui_openchat_event(SDL_Event *e)
 			if (idx >= 0 && (size_t)idx < list_count()) {
 				oc.cursor = idx;
 				if (e->button.clicks >= 2 &&
-				    (oc.page == OC_HUB || oc.page == OC_ROOMS))
+				    (oc.page == OC_HUB ||
+				     oc.page == OC_DISCOVER ||
+				     oc.page == OC_ROOMS))
 					submit_primary();
 				ui.dirty = TRUE;
 			}
@@ -1140,15 +1246,16 @@ static void draw_square_avatar(const char *id, const char *name,
 
 static void draw_tabs(int x, int y, int w)
 {
-	const char *const labels[3] = { _("My OpenChats"), _("Join by link"),
-					_("Create") };
-	int tw = (w - 16) / 3;
+	const char *const labels[4] = { _("My OpenChats"), _("Discover"),
+					_("Join by link"), _("Create") };
+	int tw = (w - 24) / 4;
 
-	for (int i = 0; i < 3; i++) {
+	for (int i = 0; i < 4; i++) {
 		oc.tab[i] = (Rect){ x + i * (tw + 8), y, tw, 34 };
 		gboolean active = (i == 0 && oc.page == OC_HUB) ||
-				  (i == 1 && oc.page == OC_JOIN) ||
-				  (i == 2 && oc.page == OC_CREATE);
+				  (i == 1 && oc.page == OC_DISCOVER) ||
+				  (i == 2 && oc.page == OC_JOIN) ||
+				  (i == 3 && oc.page == OC_CREATE);
 
 		ui_draw_button(oc.tab[i], labels[i], active);
 	}
@@ -1198,12 +1305,94 @@ void ui_openchat_draw(void)
 	int cx = x + 20, cw = w - 40, cy = y + 58;
 	int bottom = y + h - 54;
 
-	if (oc.page == OC_HUB || oc.page == OC_JOIN || oc.page == OC_CREATE) {
+	if (oc.page == OC_HUB || oc.page == OC_DISCOVER || oc.page == OC_JOIN ||
+	    oc.page == OC_CREATE) {
 		draw_tabs(cx, cy, cw);
 		cy += 46;
 	}
 
-	if (oc.page == OC_HUB) {
+	if (oc.page == OC_DISCOVER) {
+		oc.ed_rect[0] = (Rect){ cx, cy, cw - 108, 36 };
+		ui_draw_edit(&oc.ed[0], oc.ed_rect[0], oc.field_focus == 0,
+			     _("Search public OpenChats…"));
+		oc.extra[0] = (Rect){ cx + cw - 100, cy, 100, 36 };
+		ui_draw_button(oc.extra[0], _("Search"), TRUE);
+		cy += 46;
+		if (oc.keywords && json_object_array_length(oc.keywords)) {
+			int kx = cx;
+
+			for (int k = 0;
+			     k < 6 &&
+			     (size_t)k < json_object_array_length(oc.keywords);
+			     k++) {
+				const char *kw = json_object_get_string(
+					json_object_array_get_idx(oc.keywords,
+								  k));
+				int kw_w =
+					CLAMP(ui_text_width(kw, 12, 550) + 20,
+					      52, 140);
+
+				if (kx + kw_w > cx + cw)
+					break;
+				oc.extra[2 + k] = (Rect){ kx, cy, kw_w, 26 };
+				ui_draw_button(oc.extra[2 + k], kw, FALSE);
+				kx += kw_w + 6;
+			}
+			cy += 34;
+		}
+		oc.list = (Rect){ cx, cy, cw, MAX(60, bottom - cy - 36) };
+		ui_draw_rounded(oc.list, 8, UI_PANEL);
+		size_t n = list_count();
+
+		if (oc.pending)
+			ui_draw_label(_("Searching OpenChats…"),
+				      (Rect){ cx + 14, cy + 16, cw - 28, 28 },
+				      14, 500, UI_MUTED, FALSE);
+		else if (!n)
+			ui_draw_label(
+				_("Search by keyword or click a popular topic above."),
+				(Rect){ cx + 14, cy + 16, cw - 28, 44 }, 14,
+				450, UI_MUTED, TRUE);
+		int rows = visible_rows();
+
+		for (int i = 0; i < rows && (size_t)(oc.offset + i) < n; i++) {
+			Json *sq = json_object_array_get_idx(oc.search_results,
+							     oc.offset + i);
+			Rect r = { oc.list.x + 6,
+				   oc.list.y + 4 + i * row_height(),
+				   oc.list.w - 12, row_height() - 4 };
+
+			if (oc.cursor == oc.offset + i)
+				ui_draw_rounded(r, 6, UI_SELECTED);
+			draw_square_avatar(ui_string(sq, "squareMid", "s"),
+					   ui_string(sq, "name", "OpenChat"),
+					   ui_string(sq, "avatarKey", NULL),
+					   (Rect){ r.x + 6, r.y + 4, 34, 34 });
+			ui_draw_label(ui_string(sq, "name", "OpenChat"),
+				      (Rect){ r.x + 48, r.y + 3, r.w - 56, 20 },
+				      14, 600, UI_HEADING, FALSE);
+			g_autofree char *sub = g_strdup_printf(
+				_("%u members · %s"),
+				(unsigned int)CLAMP(
+					json_object_get_int64(
+						ui_field(sq, "memberCount")),
+					0, G_MAXINT),
+				ui_string(sq, "description", ""));
+			ui_draw_label(
+				sub, (Rect){ r.x + 48, r.y + 23, r.w - 56, 18 },
+				12, 450, UI_MUTED, FALSE);
+		}
+		oc.secondary = (Rect){ cx, bottom, 110, 36 };
+		ui_draw_button(oc.secondary, _("Close"), FALSE);
+		if (oc.search_cursor) {
+			oc.extra[1] = (Rect){ cx + 118, bottom, 100, 36 };
+			ui_draw_button(oc.extra[1], _("More"), FALSE);
+		}
+		if (oc.cursor >= 0 && (size_t)oc.cursor < n) {
+			oc.primary = (Rect){ x + w - 150, bottom, 130, 36 };
+			ui_draw_button(oc.primary, _("Preview & join"), TRUE);
+		}
+	} else if (oc.page == OC_HUB) {
 		oc.list = (Rect){ cx, cy, cw, MAX(60, bottom - cy - 36) };
 		ui_draw_rounded(oc.list, 8, UI_PANEL);
 		size_t n = list_count();

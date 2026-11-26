@@ -753,8 +753,57 @@ static J *format_square_message(Line *s, J *sq_msg, const char *sender_name,
 				 NULL;
 	if (reactions)
 		put(row, "reactions", reactions);
-	if (type == 15 && !text)
-		text = nonempty(field(msg, "11"), "2");
+	if (type == 7) {
+		const char *opt = nonempty(meta, "STKOPT");
+
+		if (opt && (!strcmp(opt, "S") || !strcmp(opt, "AS") ||
+			    !strcmp(opt, "PS")))
+			put_bool(row, "hasSound", TRUE);
+	}
+	if (type == 15) {
+		J *loc = field(msg, "11");
+
+		if (json_object_is_type(loc, json_type_object)) {
+			const char *title = nonempty(loc, "1"),
+				   *addr = nonempty(loc, "2"),
+				   *phone = nonempty(loc, "5");
+			J *lat = field(loc, "3"), *lon = field(loc, "4");
+			J *card = obj();
+
+			if (title)
+				put_str(card, "title", title);
+			if (addr)
+				put_str(card, "address", addr);
+			if (phone)
+				put_str(card, "phone", phone);
+			if (lat && lon &&
+			    (json_object_is_type(lat, json_type_double) ||
+			     json_object_is_type(lat, json_type_int)) &&
+			    (json_object_is_type(lon, json_type_double) ||
+			     json_object_is_type(lon, json_type_int))) {
+				put(card, "lat",
+				    json_object_new_double(
+					    json_object_get_double(lat)));
+				put(card, "lon",
+				    json_object_new_double(
+					    json_object_get_double(lon)));
+			}
+			put(row, "location", card);
+			if (!text)
+				text = title ? title : addr;
+		}
+	}
+	if (type == 13) {
+		const char *cmid = nonempty(meta, "mid");
+		const char *cname = nonempty(meta, "displayName");
+
+		if (cmid && strlen(cmid) == 33 && cmid[0] == 'u')
+			put_str(row, "contactMid", cmid);
+		if (cname)
+			put_str(row, "contactName", cname);
+		if (!text && cname)
+			text = cname;
+	}
 	put_str(row, "id", id ? id : "");
 	put_str(row, "from",
 		own	    ? "You" :
@@ -1112,6 +1161,84 @@ J *line_square_send_media_stub(Line *s, const char *chat,
 	if (metadata && json_object_object_length(metadata))
 		put(msg, "18:map:str:str", json_object_get(metadata));
 	return send_square_message(s, chat, my_member_id, msg, seq, error);
+}
+
+J *line_square_forward_sticker(Line *s, const char *chat,
+			       const char *my_member_id, J *message, gint32 seq,
+			       GError **error)
+{
+	J *src = field(message, "18");
+	const char *stkid = nonempty(src, "STKID"),
+		   *pkg = nonempty(src, "STKPKGID"),
+		   *ver = nonempty(src, "STKVER");
+
+	if (json_object_get_int(field(message, "15")) != 7 || !stkid || !pkg ||
+	    !ver)
+		return problem(error, "This sticker cannot be forwarded.");
+	g_autoptr(J) meta = obj();
+	static const char *const keys[] = { "STKID",  "STKPKGID", "STKVER",
+					    "STKTXT", "STKOPT",	  "STKHASH" };
+
+	for (guint i = 0; i < G_N_ELEMENTS(keys); i++) {
+		const char *v = nonempty(src, keys[i]);
+
+		if (v)
+			put_str(meta, keys[i], v);
+	}
+	return line_square_send_media_stub(s, chat, my_member_id, 7, meta, seq,
+					   error);
+}
+
+J *line_square_forward_location(Line *s, const char *chat,
+				const char *my_member_id, J *message,
+				gint32 seq, GError **error)
+{
+	J *src = field(message, "11");
+
+	if (json_object_get_int(field(message, "15")) != 15 ||
+	    !json_object_is_type(src, json_type_object))
+		return problem(error, "This location cannot be forwarded.");
+	g_autoptr(J) msg = obj();
+	J *loc = obj();
+	const char *title = nonempty(src, "1"), *addr = nonempty(src, "2"),
+		   *phone = nonempty(src, "5");
+	J *lat = field(src, "3"), *lon = field(src, "4");
+
+	if (title)
+		put_str(loc, "1:str", title);
+	if (addr)
+		put_str(loc, "2:str", addr);
+	if (lat)
+		put(loc, "3:double",
+		    json_object_new_double(json_object_get_double(lat)));
+	if (lon)
+		put(loc, "4:double",
+		    json_object_new_double(json_object_get_double(lon)));
+	if (phone)
+		put_str(loc, "5:str", phone);
+	put(msg, "11:obj", loc);
+	put_num(msg, "15:i32", 15);
+	return send_square_message(s, chat, my_member_id, msg, seq, error);
+}
+
+J *line_square_forward_contact(Line *s, const char *chat,
+			       const char *my_member_id, J *message, gint32 seq,
+			       GError **error)
+{
+	J *src = field(message, "18");
+	const char *mid = nonempty(src, "mid"),
+		   *name = nonempty(src, "displayName");
+
+	if (json_object_get_int(field(message, "15")) != 13 || !mid ||
+	    strlen(mid) != 33 || mid[0] != 'u')
+		return problem(error, "This contact card cannot be forwarded.");
+	g_autoptr(J) meta = obj();
+
+	put_str(meta, "mid", mid);
+	if (name)
+		put_str(meta, "displayName", name);
+	return line_square_send_media_stub(s, chat, my_member_id, 13, meta, seq,
+					   error);
 }
 
 J *line_square_react(Line *s, const char *chat, const char *message_id,
@@ -2260,4 +2387,130 @@ J *line_square_poll_events(Line *s, gint64 *subscription_id, char **sync_token,
 		json_object_array_add(out, item);
 	}
 	return out;
+}
+
+J *line_square_popular_keywords(Line *s, GError **error)
+{
+	g_autoptr(J) req = obj();
+	g_autoptr(J) reply = square_rpc(s, "getPopularKeywords", req, error);
+
+	if (!reply)
+		return NULL;
+	J *list = field(reply, "1");
+	J *out = array();
+
+	for (size_t i = 0; i < length(list) && i < 30; i++) {
+		const char *val = nonempty(at(list, i), "1");
+
+		if (val)
+			json_object_array_add(out, string(val));
+	}
+	return out;
+}
+
+J *line_square_search(Line *s, const char *query, const char *continuation,
+		      GError **error)
+{
+	if (!query || !*query || !g_utf8_validate(query, -1, NULL) ||
+	    strlen(query) > 256)
+		return problem(error, "Enter a search term for OpenChats.");
+	g_autoptr(J) req = obj();
+
+	put_str(req, "2:str", query);
+	if (continuation && *continuation)
+		put_str(req, "3:str", continuation);
+	put_num(req, "4:i32", 30);
+	g_autoptr(J) reply = square_rpc(s, "searchSquares", req, error);
+	if (!reply)
+		return NULL;
+	J *squares = field(reply, "1"), *statuses = field(reply, "2"),
+	  *memberships = field(reply, "3");
+	J *rows = array();
+
+	for (size_t i = 0; i < length(squares); i++) {
+		J *sq = at(squares, i);
+		const char *smid = nonempty(sq, "1");
+
+		if (!line_square_id(smid, 's'))
+			continue;
+		const char *name = nonempty(sq, "2");
+		const char *desc = nonempty(sq, "5");
+		const char *hash = nonempty(sq, "4");
+		J *st = field(statuses, smid);
+		J *mem = field(memberships, smid);
+		int jm = json_object_get_int(field(field(sq, "10"), "1"));
+		J *row = obj();
+
+		put_str(row, "squareMid", smid);
+		put_str(row, "name", name ? name : smid);
+		put_str(row, "description", desc ? desc : "");
+		put_num(row, "memberCount",
+			json_object_get_int64(field(st, "1")));
+		put_bool(row, "joined",
+			 mem && json_object_get_int(field(mem, "7")) ==
+					 SQ_STATE_JOINED);
+		put_str(row, "joinMethod",
+			jm == 1 ? "approval" :
+			jm == 2 ? "code" :
+				  "open");
+		if (hash) {
+			g_autofree char *av = g_strconcat("/", hash, NULL);
+
+			put_str(row, "avatarKey", av);
+			remember_square_avatar(s, smid, hash);
+		}
+		json_object_array_add(rows, row);
+	}
+	J *out = obj();
+
+	put(out, "squares", rows);
+	const char *next = nonempty(reply, "4");
+
+	if (next)
+		put_str(out, "cursor", next);
+	return out;
+}
+
+J *line_square_search_mentionables(Line *s, const char *chat_mid,
+				   const char *query, GError **error)
+{
+	if (!line_square_id(chat_mid, 'm'))
+		return problem(error, "Choose an OpenChat conversation.");
+	g_autoptr(J) req = obj();
+	J *opt = obj();
+
+	if (query && *query && g_utf8_validate(query, -1, NULL))
+		put_str(opt, "1:str", query);
+	put_bool(opt, "2:bool", FALSE); /* includingMe */
+	put_str(req, "1:str", chat_mid);
+	put(req, "2:obj", opt);
+	put_num(req, "4:i32", 20);
+	g_autoptr(J) reply =
+		square_rpc(s, "searchSquareChatMentionables", req, error);
+	if (!reply)
+		return NULL;
+	J *list = field(reply, "1");
+	J *rows = array();
+
+	for (size_t i = 0; i < length(list); i++) {
+		J *m = at(list, i);
+		const char *mid = nonempty(m, "1");
+		const char *name = nonempty(m, "2");
+		const char *hash = nonempty(m, "3");
+
+		if (!line_square_id(mid, 'p') || !name)
+			continue;
+		J *row = obj();
+
+		put_str(row, "id", mid);
+		put_str(row, "name", name);
+		if (hash) {
+			g_autofree char *av = g_strconcat("/", hash, NULL);
+
+			put_str(row, "avatarKey", av);
+			remember_square_avatar(s, mid, hash);
+		}
+		json_object_array_add(rows, row);
+	}
+	return rows;
 }

@@ -59,6 +59,7 @@ enum manage_page {
 enum manage_action {
 	M_BACK,
 	M_RENAME,
+	M_PHOTO,
 	M_SAVE,
 	M_LINK,
 	M_COPY,
@@ -393,6 +394,8 @@ static void manage_action(enum manage_action a)
 		g.name.cursor = g.name.value->len;
 		g.name.anchor = 0;
 		manage_page(MG_EDIT);
+	} else if (a == M_PHOTO) {
+		ui_media_pick_avatar();
 	} else if (a == M_LINK || a == M_REFRESH) {
 		manage_page(MG_LINK);
 		manage_link_result(NULL);
@@ -561,9 +564,11 @@ static void manage_draw(void)
 		manage_button((Rect){ x, y, width, 36 }, _("Rename group"),
 			      M_RENAME, FALSE);
 		manage_button((Rect){ x, y + 48, width, 36 },
+			      _("Change group photo"), M_PHOTO, FALSE);
+		manage_button((Rect){ x, y + 96, width, 36 },
 			      _("Invitation link and QR code"), M_LINK, FALSE);
-		manage_button((Rect){ x, y + 96, width, 36 }, _("Leave group…"),
-			      M_LEAVE, FALSE);
+		manage_button((Rect){ x, y + 144, width, 36 },
+			      _("Leave group…"), M_LEAVE, FALSE);
 	} else if (manager.page == MG_EDIT) {
 		g.name_box = (Rect){ x, y, width, 40 };
 		ui_draw_edit(&g.name, g.name_box, manager.focus < 0,
@@ -789,12 +794,23 @@ static void move(int delta)
 	ui.dirty = TRUE;
 }
 
+void ui_groups_avatar_picked(const char *path)
+{
+	if (!ui_groups_active() || !g.chat || !path || !*path || g.pending)
+		return;
+	Json *args = manage_params();
+
+	json_object_object_add(args, "path", json_object_new_string(path));
+	rpc("updateGroupPicture", args, TRUE);
+}
+
 gboolean ui_groups_reply(const char *method, guint tag, Json *result,
 			 const char *error)
 {
 	if (!(tag & 0x80000000u))
 		return FALSE;
 	gboolean management = !strcmp(method, "renameGroup") ||
+			      !strcmp(method, "updateGroupPicture") ||
 			      !strcmp(method, "groupLink") ||
 			      !strcmp(method, "setGroupLink") ||
 			      !strcmp(method, "renewGroupLink") ||

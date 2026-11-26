@@ -185,7 +185,13 @@ In groups, `mentions` is a list of `{id, start, length}` in UTF-16 units, each p
 {"MENTIONEES": [{"S": "0", "E": "6", "M": "u…"}]}
 ```
 
-It is stored as the `MENTION` metadata value. **Note:** metadata isn't encrypted, so LINE's servers can see who was mentioned and where, as with LINE's own apps.
+It is stored as the `MENTION` metadata value. **Note:** metadata isn't encrypted, so LINE's servers can see who was mentioned and where, as with LINE's own apps. Typing `@` in a group or OpenChat queries `mentionCandidates` (`line_group_members()` or `line_square_search_mentionables()`) to show an inline autocomplete popup above the composer.
+
+### Contact cards, location cards and audio playback
+
+- **Contact cards** (`contentType = 13`) expose `contactMid` and `contactName` from `contentMetadata` and render as clickable cards that open the person's profile card (`ui_profile_open()`).
+- **Location cards** (`contentType = 15`) expose `location: {title, address, lat, lon, phone}` from Thrift field `11` and open coordinates on OpenStreetMap via `SDL_OpenURL()`.
+- **Voice messages and sound stickers** play in-app via `ffplay -nodisp -autoexit -i /dev/fd/3` over sealed memory-file leases (`openAudio` and `stickerSound`, fetching `stickershop/v1/sticker/<id>/android/sticker_sound.m4a` and verifying ISO BMFF `ftyp` headers).
 
 ## Reactions and unsend
 
@@ -200,10 +206,11 @@ It is stored as the `MENTION` metadata value. **Note:** metadata isn't encrypted
 
 ## Forwarding
 
-`forwardMessage` takes a message ID from the open chat and a destination chat. `forward_message()` in `main.c` allows text and the four attachment types:
+`forwardMessage` takes a message ID from the open chat and a destination chat. `forward_message()` in `main.c` supports text, attachments, stickers, locations and contact cards across both standard Talk chats and OpenChats:
 
-- **Text** is re-sent with `line_forward_text()`: opened and sealed again for the new chat, with LINE emoji preserved.
+- **Text** is re-sent with `line_forward_text()` (or `line_square_send_text()`): opened and sealed again for the new chat, with LINE emoji preserved.
 - **Attachments** are downloaded, decrypted, and re-uploaded with a fresh key for the destination (`line_forward_attachment()` in `media.c`). A key is never shared between chats.
+- **Stickers, locations and contacts** are forwarded with `line_forward_sticker()`, `line_forward_location()`, and `line_forward_contact()` (and their `line_square_forward_*()` counterparts), preserving sticker metadata (`STKID`/`STKPKGID`/`STKVER`/`STKOPT`/`STKHASH`), location coordinates (`11:obj` with IEEE 754 `double` fields), or contact MID/display name.
 
 ## Announcements
 

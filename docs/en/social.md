@@ -74,8 +74,13 @@ A refused action tells the user how long to wait ("To keep your account safe, wa
 | Favorite | `updateFriendFavorite` | bool |
 | Hide | `updateFriendHidden` | bool |
 | Block, unblock | `blockRelation`, `unblockRelation` | none |
+| Delete | `deleteFriend`, `deleteFromBlockList` | none (confirmed in UI; blocked friends use `deleteFromBlockList`) |
 
-Unblocking also unhides.
+Unblocking also unhides. **Keep Memo** (`openKeepMemo`) opens your own `s->mid` chat directly from the Friends bar.
+
+## Server-side account settings
+
+`accountSettings` (`line_account_settings()`) calls `getSettings` (`2:i32 8`) on `/S4`, and `updateAccountSetting` (`line_account_settings_update()`) calls `updateSettingsAttributes2` (`1:i32 reqSeq`, `3:obj settings`, `4:set:i32 attributesToUpdate`) on `/S4`. Supported boolean fields: notification enable (`10`), message preview (`14`), mention notifications (`68`), reaction notifications (`95`), phone search (`21`), LINE ID search (`22`), secondary device login (`24`), non-friend messages (`26`), and Letter Sealing (`61`). These appear in **User Settings → Privacy & Safety** and **Notifications**.
 
 ## Profile cards
 
@@ -122,6 +127,7 @@ Groups are TalkService *chats* of type GROUP (0). The old type ROOM (1) can be r
 | `createGroup` | `createChat` | `{1: {1: reqSeq, 2: 0 (GROUP), 3: name, 4: set of friend MIDs}}` |
 | `inviteGroup` | `inviteIntoChat` | `{1: {1: reqSeq, 2: chat, 3: set of MIDs}}` |
 | `renameGroup` | `updateChat` | `{1: {1: reqSeq, 2: {2: chat, 6: name}, 3: 1 (NAME)}}` |
+| `updateGroupPicture` | OBS `/r/talk/g/<chat>` | 640×640 JPEG uploaded via `line_group_picture_update()` |
 | `setGroupLink` | `updateChat` | `{1: {1: reqSeq, 2: {2: chat, 8: {1: {2: !enabled}}}, 3: 4 (PREVENTED_JOIN_BY_TICKET)}}` |
 | `renewGroupLink` | `reissueChatTicket` | `{1: {1: reqSeq, 2: chat}}`. Reply field 1 is the new ticket. |
 | `groupLink` | (read only) | Builds the invitation link from the ticket in the group extra |
@@ -138,12 +144,12 @@ You must be a current member for every change except answering an invitation (`j
 
 ## What LINE doesn't offer here
 
-LINE's personal-account API has no presence, no typing indicators for desktop clients, no server-side "mutual groups" and no profile banners, so the client doesn't show them. Deleting friends, group photo editing and auto-add mode aren't implemented yet. [analysis/desktop-features.md](../../analysis/desktop-features.md) tracks the gaps.
+LINE's personal-account API has no presence, no typing indicators for desktop clients, no server-side "mutual groups" and no profile banners, so the client doesn't show them. Mobile-only and financial LINE Android services (LINE Pay, Wallet, Points, Coins, BLE Beacon, SIM registration, Google Drive backup, VOOM) are out of scope. [analysis/desktop-features.md](../../analysis/desktop-features.md) tracks remaining gaps.
 
 ## OpenChat and LINE links
 
 OpenChat uses `SquareService` on `/SQ1` (`src/square.c`, `src/ui_openchat.c`) with distinct 33-character MID prefixes: `s` for a Square community, `m` for a SquareChat room, and `p` for a per-OpenChat member identity. OpenChat messages and `/r/g2/m/<id>` media attachments are plaintext (not Letter-Sealed), and OpenChat/member avatars load from `profile.line-scdn.net/<obsHash>`.
 
-From the **OpenChat** (`#`) entry in the navigation bar or sidebar, users can browse joined OpenChats, join by `line://ti/g2/…` or `https://line.me/ti/g2/…` link (open, passcode, or admin-approval), or create a new OpenChat. Inside an OpenChat room, the header **Member List** icon opens OpenChat info, per-OpenChat profile and photo editing, invite link and QR code, sub-chat rooms, settings, join-request approval, and member moderation (co-admin, kick, ban, and admin message deletion). Live updates poll `fetchMyEvents`.
+From the **OpenChat** (`#`) entry in the navigation bar or sidebar, users can browse joined OpenChats, discover public OpenChats via popular keywords (`getPopularKeywords`) and search (`searchSquares`), join by `line://ti/g2/…` or `https://line.me/ti/g2/…` link (open, passcode, or admin-approval), or create a new OpenChat. Inside an OpenChat room, typing `@` queries `searchSquareChatMentionables` for inline mention autocomplete, and the header **Member List** icon opens OpenChat info, per-OpenChat profile and photo editing, invite link and QR code, sub-chat rooms, settings, join-request approval, and member moderation (co-admin, kick, ban, and admin message deletion). Live updates poll `fetchMyEvents`.
 
 Chat messages highlight and open clickable `https://`, `http://`, `line://`, and `lineb://` links, and `data/avernella.desktop` registers `x-scheme-handler/line` and `x-scheme-handler/lineb` so desktop links forward to the running window over the single-instance socket (`src/ui_instance.c`) and route OpenChat (`/ti/g2/`), group (`/ti/g/` via `findChatByTicket` / `acceptChatInvitationByTicket`), friend (`/ti/p/`), chat (`chatId=`), and LIFF (`/app/`) links in-app. Full protocol notes live in [analysis/openchat.md](../../analysis/openchat.md).

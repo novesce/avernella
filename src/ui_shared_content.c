@@ -13,6 +13,9 @@ enum shared_view {
 	POLLS,
 	PHOTOS,
 	NOTE_FORM,
+	NOTE_EDIT,
+	ALBUM_CREATE,
+	ALBUM_RENAME,
 	DETAIL
 };
 
@@ -22,6 +25,8 @@ enum shared_control {
 	POLLS_TAB,
 	BODY,
 	NEW,
+	ALT1,
+	ALT2,
 	MORE,
 	CLOSE,
 	N_CONTROLS
@@ -29,16 +34,18 @@ enum shared_control {
 
 static struct {
 	char *chat, *album, *headline, *next, *notice;
+	char *note_id, *note_actor;
 	Editor edit;
-	Json *rows;
+	Json *rows, *comments;
 	PangoLayout *detail;
 	int detail_width, detail_scroll, detail_height;
 	enum shared_view page, return_page;
 	enum shared_control focus;
-	guint serial, pending;
-	gboolean writing;
+	guint serial, pending, comment_pending;
+	gboolean writing, confirm_delete;
 	int index, first;
-	Rect panel, tabs[3], body, extra, more, back;
+	Rect panel, tabs[3], body, comment_box, comment_send, extra, alt1, alt2,
+		more, back;
 } view;
 
 enum {
@@ -63,6 +70,12 @@ static gboolean hit(Rect r, int x, int y)
 	       y < r.y + r.h;
 }
 
+static gboolean is_form(void)
+{
+	return view.page == NOTE_FORM || view.page == NOTE_EDIT ||
+	       view.page == ALBUM_CREATE || view.page == ALBUM_RENAME;
+}
+
 void ui_shared_reset(void)
 {
 	g_free(view.chat);
@@ -70,7 +83,10 @@ void ui_shared_reset(void)
 	g_free(view.headline);
 	g_free(view.next);
 	g_free(view.notice);
+	g_free(view.note_id);
+	g_free(view.note_actor);
 	json_object_put(view.rows);
+	json_object_put(view.comments);
 	g_clear_object(&view.detail);
 	if (view.edit.value)
 		g_string_free(view.edit.value, TRUE);
@@ -88,7 +104,7 @@ gboolean ui_shared_active(void)
 
 void ui_shared_resume_input(void)
 {
-	if (view.page == NOTE_FORM && view.focus == BODY)
+	if ((is_form() || view.page == DETAIL) && view.focus == BODY)
 		SDL_StartTextInput();
 	else
 		SDL_StopTextInput();
@@ -106,6 +122,7 @@ static void clear_items(void)
 	json_object_put(view.rows);
 	view.rows = json_object_new_array();
 	view.index = view.first = 0;
+	view.confirm_delete = FALSE;
 	set(&view.next, NULL);
 	set(&view.notice, NULL);
 	g_clear_object(&view.detail);
@@ -123,13 +140,44 @@ static Json *selected(void)
 		       NULL;
 }
 
+static guint next_tag(void)
+{
+	view.serial++;
+	if (!view.serial)
+		view.serial++;
+	return view.serial;
+}
+
 static void rpc(const char *method, Json *p)
 {
-	view.pending = ++view.serial;
-	if (!view.pending)
-		view.pending = ++view.serial;
+	view.pending = next_tag();
 	json_object_object_add(p, "chat", json_object_new_string(view.chat));
 	ui_rpc(method, p, view.pending);
+	ui.dirty = TRUE;
+}
+
+static void set_editor(const char *s)
+{
+	if (!view.edit.value)
+		view.edit.value = g_string_new(NULL);
+	g_string_assign(view.edit.value, s ? s : "");
+	view.edit.cursor = view.edit.anchor = (int)view.edit.value->len;
+	view.edit.scroll = 0;
+}
+
+static void load_comments(void)
+{
+	if (!view.note_id || !view.note_actor || !*view.note_actor)
+		return;
+	g_clear_pointer(&view.comments, json_object_put);
+	view.comment_pending = next_tag();
+	Json *p = json_object_new_object();
+
+	json_object_object_add(p, "chat", json_object_new_string(view.chat));
+	json_object_object_add(p, "id", json_object_new_string(view.note_id));
+	json_object_object_add(p, "actorId",
+			       json_object_new_string(view.note_actor));
+	ui_rpc("sharedComments", p, view.comment_pending);
 	ui.dirty = TRUE;
 }
 
@@ -140,6 +188,7 @@ static void list(enum shared_view page, gboolean more)
 	if (!more)
 		clear_items();
 	view.page = page;
+	view.confirm_delete = FALSE;
 	focus(BODY);
 	Json *p = json_object_new_object();
 
@@ -173,9 +222,13 @@ static void back(void)
 {
 	if (view.writing)
 		return;
-	if (view.page == DETAIL || view.page == NOTE_FORM) {
+	view.confirm_delete = FALSE;
+	if (view.page == DETAIL || is_form()) {
 		view.page = view.return_page;
 		g_clear_object(&view.detail);
+		g_clear_pointer(&view.comments, json_object_put);
+		view.comment_pending = 0;
+		set(&view.notice, NULL);
 		focus(BODY);
 	} else if (view.page == PHOTOS) {
 		list(ALBUMS, FALSE);
@@ -205,23 +258,54 @@ static void open_item(void)
 	} else {
 		view.return_page = view.page;
 		view.page = DETAIL;
+		view.confirm_delete = FALSE;
 		view.detail_scroll = 0;
+		g_clear_object(&view.detail);
+		set(&view.note_id, id);
+		set(&view.note_actor, ui_string(r, "authorMid", ""));
+		set(&view.notice, NULL);
+		set_editor("");
+		load_comments();
 		focus(BODY);
 	}
 }
 
-static void new_note(void)
+static void open_form(enum shared_view form, enum shared_view ret,
+		      const char *initial)
 {
-	view.return_page = NOTES;
-	view.page = NOTE_FORM;
+	view.return_page = ret;
+	view.page = form;
+	view.confirm_delete = FALSE;
 	set(&view.notice, NULL);
+	set_editor(initial);
 	focus(BODY);
 }
 
-static void post(void)
+static void submit_form(void)
 {
 	if (view.writing || !view.edit.value || !view.edit.value->len)
 		return;
+	const char *text = view.edit.value->str;
+
+	if (view.page == ALBUM_CREATE || view.page == ALBUM_RENAME) {
+		if (strlen(text) > 100) {
+			set(&view.notice,
+			    _("Enter an album title of up to 100 bytes."));
+			return;
+		}
+		Json *p = json_object_new_object();
+
+		json_object_object_add(p, "title",
+				       json_object_new_string(text));
+		if (view.page == ALBUM_RENAME)
+			json_object_object_add(
+				p, "album", json_object_new_string(view.album));
+		view.writing = TRUE;
+		rpc(view.page == ALBUM_CREATE ? "sharedCreateAlbum" :
+						"sharedRenameAlbum",
+		    p);
+		return;
+	}
 	if (view.edit.value->len > 10000) {
 		set(&view.notice,
 		    _("Shorten this note to 10,000 UTF-8 bytes."));
@@ -229,19 +313,114 @@ static void post(void)
 	}
 	Json *p = json_object_new_object();
 
+	json_object_object_add(p, "text", json_object_new_string(text));
+	if (view.page == NOTE_EDIT && view.note_id)
+		json_object_object_add(p, "id",
+				       json_object_new_string(view.note_id));
+	view.writing = TRUE;
+	rpc(view.page == NOTE_EDIT ? "sharedUpdateNote" : "sharedPost", p);
+}
+
+static void submit_comment(void)
+{
+	if (view.writing || !view.edit.value || !view.edit.value->len ||
+	    !view.note_id || !view.note_actor || !*view.note_actor)
+		return;
+	Json *p = json_object_new_object();
+
+	json_object_object_add(p, "id", json_object_new_string(view.note_id));
+	json_object_object_add(p, "actorId",
+			       json_object_new_string(view.note_actor));
 	json_object_object_add(p, "text",
 			       json_object_new_string(view.edit.value->str));
 	view.writing = TRUE;
-	rpc("sharedPost", p);
+	rpc("sharedCommentPost", p);
+}
+
+static void toggle_like(void)
+{
+	Json *r = selected();
+
+	if (view.writing || !r || !view.note_id || !view.note_actor ||
+	    !*view.note_actor)
+		return;
+	gboolean liked = json_object_get_boolean(ui_field(r, "liked"));
+	Json *p = json_object_new_object();
+
+	json_object_object_add(p, "id", json_object_new_string(view.note_id));
+	json_object_object_add(p, "actorId",
+			       json_object_new_string(view.note_actor));
+	json_object_object_add(p, "like", json_object_new_boolean(!liked));
+	view.writing = TRUE;
+	rpc("sharedToggleLike", p);
+}
+
+static void delete_current(void)
+{
+	if (view.writing)
+		return;
+	if (!view.confirm_delete) {
+		view.confirm_delete = TRUE;
+		set(&view.notice,
+		    view.page == PHOTOS ?
+			    _("Click Delete album again to confirm.") :
+			    _("Click Delete again to confirm."));
+		return;
+	}
+	view.confirm_delete = FALSE;
+	Json *p = json_object_new_object();
+
+	view.writing = TRUE;
+	if (view.page == PHOTOS) {
+		json_object_object_add(p, "album",
+				       json_object_new_string(view.album));
+		rpc("sharedDeleteAlbum", p);
+	} else if (view.page == DETAIL && view.note_id) {
+		json_object_object_add(p, "id",
+				       json_object_new_string(view.note_id));
+		rpc("sharedDeleteNote", p);
+	} else {
+		json_object_put(p);
+		view.writing = FALSE;
+	}
+}
+
+static void delete_selected_photo(void)
+{
+	Json *r = selected();
+	const char *pid = ui_string(r, "photoId", NULL);
+
+	if (view.writing || !pid || !*pid || !view.album)
+		return;
+	Json *p = json_object_new_object();
+
+	json_object_object_add(p, "album", json_object_new_string(view.album));
+	json_object_object_add(p, "photoId", json_object_new_string(pid));
+	view.writing = TRUE;
+	rpc("sharedDeletePhoto", p);
 }
 
 gboolean ui_shared_reply(const char *method, guint tag, Json *result,
 			 const char *error)
 {
-	if (strcmp(method, "sharedList") && strcmp(method, "sharedPhotos") &&
-	    strcmp(method, "sharedPost"))
+	if (!g_str_has_prefix(method, "shared") ||
+	    !strcmp(method, "sharedPhoto"))
 		return FALSE;
-	if (!ui_shared_active() || view.pending != tag)
+	if (!ui_shared_active())
+		return TRUE;
+	if (!strcmp(method, "sharedComments")) {
+		if (view.comment_pending != tag)
+			return TRUE;
+		view.comment_pending = 0;
+		g_clear_pointer(&view.comments, json_object_put);
+		if (!error && json_object_is_type(ui_field(result, "items"),
+						  json_type_array))
+			view.comments =
+				json_object_get(ui_field(result, "items"));
+		ui.dirty = TRUE;
+		return TRUE;
+	}
+	if (view.pending != tag)
 		return TRUE;
 	view.pending = 0;
 	view.writing = FALSE;
@@ -249,14 +428,63 @@ gboolean ui_shared_reply(const char *method, guint tag, Json *result,
 		set(&view.notice, error);
 		return TRUE;
 	}
-	if (!strcmp(method, "sharedPost")) {
+	if (!strcmp(method, "sharedPost") ||
+	    !strcmp(method, "sharedUpdateNote")) {
 		if (!json_object_get_boolean(ui_field(result, "saved"))) {
 			set(&view.notice, _("LINE did not confirm the note."));
 			return TRUE;
 		}
-		g_string_truncate(view.edit.value, 0);
-		view.edit.cursor = view.edit.anchor = view.edit.scroll = 0;
+		set_editor("");
 		list(NOTES, FALSE);
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedDeleteNote")) {
+		list(NOTES, FALSE);
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedToggleLike")) {
+		Json *r = selected();
+
+		if (r) {
+			gboolean liked = json_object_get_boolean(
+				ui_field(result, "liked"));
+			gint64 likes =
+				json_object_get_int64(ui_field(r, "likeCount"));
+
+			json_object_object_add(r, "liked",
+					       json_object_new_boolean(liked));
+			json_object_object_add(
+				r, "likeCount",
+				json_object_new_int64(
+					MAX(0, likes + (liked ? 1 : -1))));
+		}
+		set(&view.notice, NULL);
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedCommentPost") ||
+	    !strcmp(method, "sharedCommentDelete")) {
+		set_editor("");
+		set(&view.notice, NULL);
+		load_comments();
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedCreateAlbum")) {
+		set_editor("");
+		list(ALBUMS, FALSE);
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedRenameAlbum")) {
+		set(&view.headline, view.edit.value->str);
+		set_editor("");
+		list(PHOTOS, FALSE);
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedDeleteAlbum")) {
+		list(ALBUMS, FALSE);
+		return TRUE;
+	}
+	if (!strcmp(method, "sharedDeletePhoto")) {
+		list(PHOTOS, FALSE);
 		return TRUE;
 	}
 	Json *rows = ui_field(result, "items");
@@ -310,22 +538,26 @@ void ui_shared_draw(void)
 	if (!ui_shared_active())
 		return;
 	ui_scrim();
-	int w = MIN(596, ui.width - 20), h = MIN(580, ui.height - 26);
+	int w = MIN(596, ui.width - 20), h = MIN(600, ui.height - 26);
 	int x = (ui.width - w) / 2, y = (ui.height - h) / 2;
 
 	view.panel = (Rect){ x, y, w, h };
 	ui_draw_box(view.panel, PANEL);
-	const char *title = view.page == PHOTOS	   ? view.headline :
-			    view.page == NOTE_FORM ? _("New group note") :
-			    view.page == DETAIL	   ? _("Group note") :
-						     _("Shared content");
+	const char *title = view.page == PHOTOS	      ? view.headline :
+			    view.page == NOTE_FORM    ? _("New group note") :
+			    view.page == NOTE_EDIT    ? _("Edit group note") :
+			    view.page == ALBUM_CREATE ? _("New album") :
+			    view.page == ALBUM_RENAME ? _("Rename album") :
+			    view.page == DETAIL	      ? _("Group note") :
+							_("Shared content");
 	ui_draw_label(title, (Rect){ x + 16, y + 16, w - 118, 35 }, 21, 700,
 		      INK, FALSE);
 	view.back = (Rect){ x + w - 84, y + 13, 70, 33 };
 	button(view.back, is_root() ? _("Close") : _("Back"), FALSE, CLOSE);
 	int top = y + 65, bottom = y + h - 16;
 
-	view.extra = view.more = (Rect){ 0 };
+	view.extra = view.alt1 = view.alt2 = view.more = (Rect){ 0 };
+	view.comment_box = view.comment_send = (Rect){ 0 };
 	memset(view.tabs, 0, sizeof(view.tabs));
 	if (is_root()) {
 		const char *const labels[] = { _("Albums"), _("Notes"),
@@ -341,22 +573,58 @@ void ui_shared_draw(void)
 		}
 		top += 49;
 	}
-	if (view.page == NOTES || view.page == NOTE_FORM ||
+	if (view.page == NOTES || view.page == ALBUMS || is_form() ||
 	    (view.notice && !view.writing && !view.pending &&
-	     view.page != DETAIL)) {
-		const char *label = view.page == NOTE_FORM ? _("Post note") :
-				    view.page == NOTES	   ? _("New note") :
-							     _("Reload");
-		view.extra = (Rect){ x + 16, bottom - 36, 102, 36 };
+	     view.page != DETAIL && view.page != PHOTOS)) {
+		const char *label =
+			view.page == NOTE_FORM	  ? _("Post note") :
+			view.page == NOTE_EDIT	  ? _("Save note") :
+			view.page == ALBUM_CREATE ? _("Create album") :
+			view.page == ALBUM_RENAME ? _("Save title") :
+			view.page == NOTES	  ? _("New note") :
+			view.page == ALBUMS	  ? _("New album") :
+						    _("Reload");
+		view.extra = (Rect){ x + 16, bottom - 36, 126, 36 };
 		button(view.extra, label,
-		       view.page == NOTE_FORM || view.page == NOTES, NEW);
+		       is_form() || view.page == NOTES || view.page == ALBUMS,
+		       NEW);
+	} else if (view.page == PHOTOS && !view.writing) {
+		view.extra = (Rect){ x + 16, bottom - 36, 126, 36 };
+		button(view.extra, _("Rename album"), FALSE, NEW);
+		view.alt1 = (Rect){ x + 150, bottom - 36, 120, 36 };
+		button(view.alt1, _("Delete album"), FALSE, ALT1);
+		if (selected() && ui_string(selected(), "photoId", NULL)) {
+			view.alt2 = (Rect){ x + 278, bottom - 36, 118, 36 };
+			button(view.alt2, _("Delete photo"), FALSE, ALT2);
+		}
+	} else if (view.page == DETAIL && !view.writing) {
+		Json *r = selected();
+		gboolean liked = json_object_get_boolean(ui_field(r, "liked"));
+		gint64 likes = json_object_get_int64(ui_field(r, "likeCount"));
+
+		g_autofree char *like_lbl =
+			likes > 0 ?
+				g_strdup_printf("%s (%" G_GINT64_FORMAT ")",
+						liked ? _("Unlike") : _("Like"),
+						likes) :
+				g_strdup(liked ? _("Unlike") : _("Like"));
+
+		if (view.note_actor && *view.note_actor) {
+			view.extra = (Rect){ x + 16, bottom - 36, 114, 36 };
+			button(view.extra, like_lbl, liked, NEW);
+		}
+		if (r && json_object_get_boolean(ui_field(r, "own"))) {
+			view.alt1 = (Rect){ x + 138, bottom - 36, 94, 36 };
+			button(view.alt1, _("Edit"), FALSE, ALT1);
+			view.alt2 = (Rect){ x + 240, bottom - 36, 94, 36 };
+			button(view.alt2, _("Delete"), FALSE, ALT2);
+		}
 	}
-	if (view.next && !view.writing && view.page != DETAIL &&
-	    view.page != NOTE_FORM) {
+	if (view.next && !view.writing && view.page != DETAIL && !is_form()) {
 		view.more = (Rect){ x + w - 106, bottom - 36, 90, 36 };
 		button(view.more, _("More"), FALSE, MORE);
 	}
-	if (view.more.w || view.extra.w)
+	if (view.more.w || view.extra.w || view.alt1.w)
 		bottom -= 51;
 	const char *msg = view.notice;
 
@@ -364,35 +632,95 @@ void ui_shared_draw(void)
 		msg = view.writing ? _("Posting…") : _("Loading…");
 	if (!msg && view.page == POLLS)
 		msg = _("Group notes matching “poll”.");
-	if (!msg && view.page == NOTE_FORM)
+	if (!msg && (view.page == NOTE_FORM || view.page == NOTE_EDIT))
 		msg = _("Everyone in this group can read this note.");
 	if (msg) {
-		ui_draw_label(msg, (Rect){ x + 16, top, w - 32, 46 }, 14, 450,
+		ui_draw_label(msg, (Rect){ x + 16, top, w - 32, 42 }, 14, 450,
 			      MUTED, TRUE);
-		top += 48;
+		top += 44;
 	}
 	view.body = (Rect){ x + 16, top, w - 32, MAX(1, bottom - top) };
-	if (view.page == NOTE_FORM) {
+	if (is_form()) {
 		view.body.h = 42;
 		ui_draw_edit(&view.edit, view.body, view.focus == BODY,
-			     _("Write a group note"));
+			     view.page == ALBUM_CREATE ||
+					     view.page == ALBUM_RENAME ?
+				     _("Album title") :
+				     _("Write a group note"));
 		return;
 	}
 	if (view.page == DETAIL) {
 		const char *body = ui_string(selected(), "text", "");
+		int note_h = MIN(180, MAX(60, view.body.h / 2));
+		Rect note_rect = { view.body.x, view.body.y, view.body.w,
+				   note_h };
 
-		if (!view.detail || view.detail_width != view.body.w) {
+		if (!view.detail || view.detail_width != note_rect.w) {
 			g_clear_object(&view.detail);
-			view.detail_width = view.body.w;
-			view.detail = ui_result_layout(body, view.body.w - 4);
+			view.detail_width = note_rect.w;
+			view.detail = ui_result_layout(body, note_rect.w - 4);
 			pango_layout_get_pixel_size(view.detail, NULL,
 						    &view.detail_height);
 		}
 		view.detail_scroll =
 			MIN(view.detail_scroll,
-			    MAX(0, view.detail_height - view.body.h));
-		ui_result_paint(view.detail, view.body.x + 2,
-				view.body.y - view.detail_scroll, view.body);
+			    MAX(0, view.detail_height - note_rect.h));
+		ui_result_paint(view.detail, note_rect.x + 2,
+				note_rect.y - view.detail_scroll, note_rect);
+
+		/* Comments section below the note text. */
+		int cy = note_rect.y + note_rect.h + 10;
+
+		ui_draw_box((Rect){ view.body.x, cy - 5, view.body.w, 1 },
+			    UI_LINE);
+		ui_draw_label(_("Comments"),
+			      (Rect){ view.body.x, cy, view.body.w, 22 }, 13,
+			      700, MUTED, FALSE);
+		cy += 24;
+		int input_y = bottom - 40;
+
+		if (view.note_actor && *view.note_actor) {
+			view.comment_box = (Rect){ view.body.x, input_y,
+						   view.body.w - 88, 36 };
+			view.comment_send =
+				(Rect){ view.body.x + view.body.w - 80, input_y,
+					80, 36 };
+			ui_draw_edit(&view.edit, view.comment_box,
+				     view.focus == BODY, _("Add a comment…"));
+			ui_draw_button(view.comment_send, _("Post"), TRUE);
+		}
+		int list_bottom = view.comment_box.w ? input_y - 8 : bottom;
+
+		if (view.comment_pending)
+			ui_draw_label(_("Loading…"),
+				      (Rect){ view.body.x, cy, view.body.w,
+					      24 },
+				      13, 450, MUTED, FALSE);
+		else if (!view.comments ||
+			 !json_object_array_length(view.comments))
+			ui_draw_label(_("No comments yet."),
+				      (Rect){ view.body.x, cy, view.body.w,
+					      24 },
+				      13, 450, MUTED, FALSE);
+		else {
+			for (size_t i = 0;
+			     i < json_object_array_length(view.comments) &&
+			     cy + 36 <= list_bottom;
+			     i++) {
+				Json *c = json_object_array_get_idx(
+					view.comments, i);
+
+				ui_draw_label(ui_string(c, "title", ""),
+					      (Rect){ view.body.x, cy,
+						      view.body.w, 18 },
+					      12, 650, INK, FALSE);
+				ui_draw_label(ui_string(c, "text", ""),
+					      (Rect){ view.body.x, cy + 17,
+						      view.body.w, 18 },
+					      13, 400, MUTED, FALSE);
+				cy += 38;
+			}
+		}
 		return;
 	}
 	if (!view.pending && !view.notice && !count())
@@ -428,16 +756,37 @@ static void activate(void)
 		list((enum shared_view)view.focus, FALSE);
 		break;
 	case BODY:
-		if (view.page != NOTE_FORM && view.page != DETAIL)
+		if (view.page == DETAIL)
+			submit_comment();
+		else if (!is_form())
 			open_item();
 		break;
 	case NEW:
-		if (view.page == NOTE_FORM)
-			post();
+		if (is_form())
+			submit_form();
 		else if (view.page == NOTES)
-			new_note();
+			open_form(NOTE_FORM, NOTES, "");
+		else if (view.page == ALBUMS)
+			open_form(ALBUM_CREATE, ALBUMS, "");
+		else if (view.page == PHOTOS)
+			open_form(ALBUM_RENAME, PHOTOS, view.headline);
+		else if (view.page == DETAIL)
+			toggle_like();
 		else
 			list(view.page, FALSE);
+		break;
+	case ALT1:
+		if (view.page == PHOTOS)
+			delete_current();
+		else if (view.page == DETAIL && selected())
+			open_form(NOTE_EDIT, DETAIL,
+				  ui_string(selected(), "text", ""));
+		break;
+	case ALT2:
+		if (view.page == PHOTOS)
+			delete_selected_photo();
+		else if (view.page == DETAIL)
+			delete_current();
 		break;
 	case MORE:
 		list(view.page, TRUE);
@@ -452,13 +801,9 @@ static void activate(void)
 
 static void tab(gboolean reverse)
 {
-	gboolean enabled[] = { view.tabs[0].w,
-			       view.tabs[1].w,
-			       view.tabs[2].w,
-			       TRUE,
-			       view.extra.w,
-			       view.more.w,
-			       TRUE };
+	gboolean enabled[] = { view.tabs[0].w, view.tabs[1].w, view.tabs[2].w,
+			       TRUE,	       view.extra.w,   view.alt1.w,
+			       view.alt2.w,    view.more.w,    TRUE };
 	int i = view.focus;
 
 	do {
@@ -474,10 +819,11 @@ gboolean ui_shared_event(SDL_Event *e)
 	switch (e->type) {
 	case SDL_KEYDOWN: {
 		SDL_Keycode key = e->key.keysym.sym;
+		gboolean editing = (is_form() || view.page == DETAIL) &&
+				   view.focus == BODY;
 
 		if (view.writing ||
-		    (view.page == NOTE_FORM && view.focus == BODY &&
-		     ui.composition && *ui.composition))
+		    (editing && ui.composition && *ui.composition))
 			return TRUE;
 		if (key == SDLK_ESCAPE)
 			back();
@@ -485,11 +831,11 @@ gboolean ui_shared_event(SDL_Event *e)
 			tab(e->key.keysym.mod & KMOD_SHIFT);
 		else if ((key == SDLK_RETURN || key == SDLK_KP_ENTER) &&
 			 !e->key.repeat) {
-			if (view.page == NOTE_FORM && view.focus == BODY)
-				focus(NEW);
+			if (is_form() && view.focus == BODY)
+				submit_form();
 			else
 				activate();
-		} else if (view.page == NOTE_FORM && view.focus == BODY) {
+		} else if (editing) {
 			ui_edit_key(&view.edit, e->key);
 			ui.dirty = TRUE;
 		} else if (key == SDLK_UP || key == SDLK_DOWN ||
@@ -500,27 +846,21 @@ gboolean ui_shared_event(SDL_Event *e)
 				(key == SDLK_PAGEUP || key == SDLK_PAGEDOWN ?
 					 slots() :
 					 1);
-			if (view.page == DETAIL)
-				view.detail_scroll = CLAMP(
-					view.detail_scroll + delta * 40, 0,
-					MAX(0,
-					    view.detail_height - view.body.h));
-			else
-				position(view.index + delta);
+			position(view.index + delta);
 			ui.dirty = TRUE;
 		} else if (key == SDLK_SPACE && !e->key.repeat)
 			activate();
 		return TRUE;
 	}
 	case SDL_TEXTINPUT:
-		if (!view.writing && view.page == NOTE_FORM &&
+		if (!view.writing && (is_form() || view.page == DETAIL) &&
 		    view.focus == BODY) {
 			ui_insert(&view.edit, e->text.text);
 			ui.dirty = TRUE;
 		}
 		return TRUE;
 	case SDL_TEXTEDITING:
-		if (view.page == NOTE_FORM && view.focus == BODY)
+		if ((is_form() || view.page == DETAIL) && view.focus == BODY)
 			set(&ui.composition, e->edit.text);
 		return TRUE;
 	case SDL_MOUSEWHEEL: {
@@ -530,7 +870,7 @@ gboolean ui_shared_event(SDL_Event *e)
 		if (view.page == DETAIL) {
 			view.detail_scroll = CLAMP(
 				view.detail_scroll - (int)lround(steps * 70), 0,
-				MAX(0, view.detail_height - view.body.h));
+				MAX(0, view.detail_height - view.body.h / 2));
 			ui.dirty = TRUE;
 		} else {
 			int rows = ui_wheel_rows(steps, &carry);
@@ -552,9 +892,21 @@ gboolean ui_shared_event(SDL_Event *e)
 		else if (hit(view.extra, x, y)) {
 			focus(NEW);
 			activate();
+		} else if (hit(view.alt1, x, y)) {
+			focus(ALT1);
+			activate();
+		} else if (hit(view.alt2, x, y)) {
+			focus(ALT2);
+			activate();
+		} else if (view.page == DETAIL && hit(view.comment_send, x, y))
+			submit_comment();
+		else if (view.page == DETAIL && hit(view.comment_box, x, y)) {
+			focus(BODY);
+			view.edit.cursor = view.edit.anchor =
+				ui_edit_hit(&view.edit, view.comment_box, x);
 		} else if (hit(view.body, x, y)) {
 			focus(BODY);
-			if (view.page == NOTE_FORM)
+			if (is_form())
 				view.edit.cursor = view.edit.anchor =
 					ui_edit_hit(&view.edit, view.body, x);
 			else if (view.page != DETAIL) {

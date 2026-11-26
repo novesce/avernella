@@ -1959,7 +1959,8 @@ struct message_layout {
 	struct ui_flex_layout *flex;
 	int y, w, h, top; /* top: offset of the message below any divider */
 	int x, body_top, body_h, text_origin;
-	gboolean mine, group, photo, video, rich, receipt, notice, has_links;
+	gboolean mine, group, photo, video, rich, receipt, notice, has_links,
+		contact_card, location_card;
 	Json *message; /* borrowed from the cached history */
 };
 
@@ -2275,6 +2276,12 @@ static void prepare_bubbles(Rect area)
 					    maxw, FALSE);
 		row.photo = ui_is_photo(msg);
 		row.video = ui_is_video(msg);
+		row.contact_card =
+			!strcmp(ui_string(msg, "type", ""), "contact") &&
+			ui_string(msg, "contactMid", NULL) != NULL;
+		row.location_card =
+			!strcmp(ui_string(msg, "type", ""), "location") &&
+			ui_field(msg, "location") != NULL;
 		Json *flex = ui_field(msg, "flex");
 		int body_height = 0;
 
@@ -2298,6 +2305,9 @@ static void prepare_bubbles(Rect area)
 			body_height = row.photo ? MIN(220, maxw * 2 / 3) :
 						  MAX(74, row.w * 9 / 16);
 			body_height += 4;
+		} else if (row.contact_card || row.location_card) {
+			row.w = MIN(maxw, 290);
+			body_height = row.location_card ? 90 : 76;
 		} else {
 			const char *body = ui_string(msg, "text", "");
 
@@ -2478,6 +2488,21 @@ Json *ui_sender_at(int x, int y, Rect *anchor)
 	return r->message;
 }
 
+Json *ui_card_at(int x, int y, Rect *anchor)
+{
+	struct message_layout *r = bubble_at(x, y);
+
+	if (!r || (!r->contact_card && !r->location_card))
+		return NULL;
+	Rect body = message_rect(r, ui.conversation);
+
+	if (!contains_point(body, x, y))
+		return NULL;
+	if (anchor)
+		*anchor = body;
+	return r->message;
+}
+
 int ui_message_at(int x, int y)
 {
 	struct message_layout *row = bubble_at(x, y);
@@ -2584,6 +2609,82 @@ static void video_card(Json *row, Rect card)
 
 	box(badge.x, badge.y, badge.w, badge.h, 4, UI_RAIL);
 	centered(label, badge, 11, 600, UI_HEADING);
+}
+
+static void contact_card_draw(Json *row, Rect card)
+{
+	const char *mid = ui_string(row, "contactMid", "");
+	const char *name =
+		ui_string(row, "contactName", ui_string(row, "text", ""));
+	gboolean hover = hovered(card);
+
+	box(card.x, card.y, card.w, card.h, 8, UI_PANEL);
+	outline(card, 8, hover ? UI_ACCENT : UI_LINE, 1);
+	avatar(name, card.x + 12, card.y + (card.h - 44) / 2, 44, mid,
+	       ui.selected, NULL);
+	text(name, card.x + 68, card.y + 14, card.w - 80, 15, 650, UI_HEADING,
+	     FALSE);
+	text(_("Contact · Click to view profile"), card.x + 68, card.y + 38,
+	     card.w - 80, 12, 450, hover ? UI_ACCENT_HOVER : UI_MUTED, FALSE);
+}
+
+static void location_card_draw(Json *row, Rect card)
+{
+	Json *loc = ui_field(row, "location");
+	const char *title = ui_string(loc, "title", NULL);
+	const char *addr = ui_string(loc, "address", NULL);
+	gboolean hover = hovered(card);
+
+	if (!title || !*title)
+		title = addr && *addr ? addr : _("Location");
+	box(card.x, card.y, card.w, card.h, 8, UI_PANEL);
+	outline(card, 8, hover ? UI_ACCENT : UI_LINE, 1);
+	/* Map pin icon on an accent circle. */
+	double cx = card.x + 30, cy = card.y + card.h / 2.;
+
+	dot(cx, cy, 18, UI_SELECTED);
+	color(UI_ACCENT);
+	cairo_new_path(cr);
+	cairo_arc(cr, cx, cy - 3, 6.5, G_PI, 2 * G_PI);
+	cairo_line_to(cr, cx, cy + 9);
+	cairo_close_path(cr);
+	cairo_fill(cr);
+	dot(cx, cy - 3, 2.5, UI_PANEL);
+	text(title, card.x + 58, card.y + 12, card.w - 70, 14, 650, UI_HEADING,
+	     FALSE);
+	if (addr && *addr && g_strcmp0(addr, title))
+		text(addr, card.x + 58, card.y + 33, card.w - 70, 12, 400,
+		     UI_MUTED, FALSE);
+	text(_("Open in map"), card.x + 58, card.y + card.h - 24, card.w - 70,
+	     12, 550, hover ? UI_ACCENT_HOVER : UI_ACCENT, FALSE);
+}
+
+static void sound_badge(Rect r)
+{
+	Rect b = { r.x + r.w - 28, r.y + r.h - 24, 24, 20 };
+
+	box(b.x, b.y, b.w, b.h, 5, UI_RAIL);
+	outline(b, 5, UI_LINE, 1);
+	/* Crisp mini speaker icon. */
+	double x = b.x + 5, y = b.y + 10;
+
+	color(UI_HEADING);
+	cairo_new_path(cr);
+	cairo_move_to(cr, x, y - 2.5);
+	cairo_line_to(cr, x + 3, y - 2.5);
+	cairo_line_to(cr, x + 6.5, y - 5.5);
+	cairo_line_to(cr, x + 6.5, y + 5.5);
+	cairo_line_to(cr, x + 3, y + 2.5);
+	cairo_line_to(cr, x, y + 2.5);
+	cairo_close_path(cr);
+	cairo_fill(cr);
+	cairo_set_line_width(cr, 1.3);
+	cairo_new_path(cr);
+	cairo_arc(cr, x + 7, y, 3.2, -0.7, 0.7);
+	cairo_stroke(cr);
+	cairo_new_path(cr);
+	cairo_arc(cr, x + 7, y, 5.8, -0.7, 0.7);
+	cairo_stroke(cr);
 }
 
 /* Discord opens a conversation with a large avatar and a short preface. */
@@ -3005,12 +3106,22 @@ static void message_rows(Rect area)
 		else if (r->rich)
 			rich_draw(r->message,
 				  (Rect){ x, y + 2, r->w, r->body_h - 4 });
-		else if (r->photo)
-			ui_media_thumb(r->message,
-				       (Rect){ x, y + 2, r->w, r->body_h - 4 });
-		else if (r->video)
+		else if (r->photo) {
+			Rect pr = { x, y + 2, r->w, r->body_h - 4 };
+
+			ui_media_thumb(r->message, pr);
+			if (json_object_get_boolean(
+				    ui_field(r->message, "hasSound")))
+				sound_badge(pr);
+		} else if (r->video)
 			video_card(r->message,
 				   (Rect){ x, y + 2, r->w, r->body_h - 4 });
+		else if (r->contact_card)
+			contact_card_draw(r->message, (Rect){ x, y + 2, r->w,
+							      r->body_h - 4 });
+		else if (r->location_card)
+			location_card_draw(r->message, (Rect){ x, y + 2, r->w,
+							       r->body_h - 4 });
 		else if (cache.line_style)
 			text_bubble(r, body);
 		else
@@ -3425,6 +3536,7 @@ static void chat_view(void)
 		message_rows(r);
 		cairo_restore(cr);
 		composer(s, w);
+		ui_mentions_draw();
 	}
 	if (ui.notice && *ui.notice)
 		text(ui.notice, s + 24,

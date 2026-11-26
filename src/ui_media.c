@@ -22,6 +22,7 @@
 #include "ui_pixels.h"
 #include "screenshot.h"
 #include "clipboard_paste.h"
+#include <gio/gio.h>
 #include <glib/gstdio.h>
 #include "media.h"
 #include "media_io.h"
@@ -140,6 +141,7 @@ static struct {
 	GThread *screenshot_thread;
 	GCancellable *screenshot_cancel;
 	LineVideoPlayback *playback;
+	GSubprocess *audio_clip;
 	guint play_event, play_serial, play_overlay;
 	gboolean play_review;
 	char *recorded, *call_error, *call_note;
@@ -1189,11 +1191,48 @@ void ui_media_select_chat(void)
 		clear_overlay(CLOSED);
 }
 
+static void stop_audio_clip(void)
+{
+	if (!m.audio_clip)
+		return;
+	g_subprocess_force_exit(m.audio_clip);
+	g_clear_object(&m.audio_clip);
+}
+
+static void play_audio_lease(int fd)
+{
+	stop_audio_clip();
+	if (fd < 0)
+		return;
+	g_autofree char *ffplay = g_find_program_in_path("ffplay");
+
+	if (!ffplay) {
+		close(fd);
+		ui_status(_("Install ffplay (ffmpeg) to play audio messages."));
+		return;
+	}
+	g_autoptr(GSubprocessLauncher) launcher =
+		g_subprocess_launcher_new(G_SUBPROCESS_FLAGS_STDIN_PIPE |
+					  G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+					  G_SUBPROCESS_FLAGS_STDERR_SILENCE);
+	g_subprocess_launcher_take_fd(launcher, fd, 3);
+	const char *const argv[] = { ffplay,	  "-nodisp", "-autoexit",
+				     "-loglevel", "quiet",   "-i",
+				     "/dev/fd/3", NULL };
+
+	g_autoptr(GError) err = NULL;
+
+	m.audio_clip = g_subprocess_launcher_spawnv(launcher, argv, &err);
+	if (!m.audio_clip)
+		ui_status(_("Could not play this audio clip."));
+}
+
 void ui_media_reset(void)
 {
 	ui_media_select_chat();
 	clear_overlay(CLOSED);
 	ui_profile_reset();
+	stop_audio_clip();
 	g_clear_pointer(&m.playback, line_video_play_free);
 	if (m.uploads)
 		g_hash_table_remove_all(m.uploads);
@@ -2043,6 +2082,8 @@ static void choose_path(void)
 		clear_overlay(CLOSED);
 		if (ui_openchat_active())
 			ui_openchat_avatar_picked(chosen);
+		else if (ui_groups_active())
+			ui_groups_avatar_picked(chosen);
 		else
 			ui_profile_picture_chosen(chosen);
 		return;
@@ -2087,6 +2128,7 @@ enum message_action {
 	A_ANNOUNCE,
 	A_MENTION,
 	A_PLAY_VIDEO,
+	A_PLAY_SOUND,
 	A_DESTROY
 };
 
@@ -2124,6 +2166,10 @@ static int actions(enum message_action *out)
 	}
 	if (ui_is_video(m.row))
 		out[n++] = A_PLAY_VIDEO;
+	if (!strcmp(kind, "audio") ||
+	    (!strcmp(kind, "sticker") &&
+	     json_object_get_boolean(ui_field(m.row, "hasSound"))))
+		out[n++] = A_PLAY_SOUND;
 	if (ui.files && (file_kind(m.row) || photo_kind(m.row)))
 		out[n++] = A_SAVE;
 	gboolean text =
@@ -2131,7 +2177,9 @@ static int actions(enum message_action *out)
 		!json_object_get_boolean(ui_field(m.row, "unreadable")) &&
 		*ui_string(m.row, "text", "");
 
-	if (text || !strcmp(kind, "photo") || file_kind(m.row))
+	if (text || !strcmp(kind, "photo") || !strcmp(kind, "sticker") ||
+	    !strcmp(kind, "location") || !strcmp(kind, "contact") ||
+	    file_kind(m.row))
 		out[n++] = A_FORWARD;
 	if (text)
 		out[n++] = A_ANNOUNCE;
@@ -2188,6 +2236,15 @@ static void menu_action(enum message_action a)
 	case A_PLAY_VIDEO:
 		open_video(m.row);
 		break;
+	case A_PLAY_SOUND: {
+		gboolean sticker =
+			!strcmp(ui_string(m.row, "type", ""), "sticker");
+		Json *p = args(m.chat, m.id);
+
+		close_overlay();
+		ui_rpc(sticker ? "stickerSound" : "openAudio", p, 0);
+		break;
+	}
 	case A_SAVE:
 		open_picker(TRUE, m.row, FALSE);
 		break;
@@ -3824,6 +3881,23 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 	}
 	if (!strcmp(method, "releaseMedia"))
 		return;
+	if (!strcmp(method, "stickerSound") || !strcmp(method, "openAudio")) {
+		Json *lease = ui_field(result, "lease");
+		int fd = !error ? lease_fd(result, LINE_MEDIA_LIMIT) : -1;
+
+		if (lease) {
+			Json *a = args(NULL, NULL);
+
+			json_object_object_add(a, "lease",
+					       json_object_get(lease));
+			ui_rpc("releaseMedia", a, 0);
+		}
+		if (fd >= 0)
+			play_audio_lease(fd);
+		else if (error)
+			ui_status(error);
+		return;
+	}
 	if (!strcmp(method, "emojiCatalog") ||
 	    !strcmp(method, "stickerCatalog")) {
 		ui_emoji_catalog(tag, result, error);
@@ -4285,7 +4359,7 @@ static gboolean handle_key(SDL_KeyboardEvent k)
 		} else
 			ui_edit_key(&m.edit, k);
 	} else if (m.mode == MENU || m.mode == REACT) {
-		enum message_action arr[12];
+		enum message_action arr[13];
 		int count = m.mode == MENU ? actions(arr) :
 					     (int)G_N_ELEMENTS(reaction_names);
 		if (code == SDLK_UP || code == SDLK_DOWN) {
@@ -4729,11 +4803,23 @@ gboolean ui_media_event(SDL_Event *e)
 		return TRUE;
 	}
 	if (e->button.button == SDL_BUTTON_LEFT && ui_is_photo(row)) {
+		if (!strcmp(ui_string(row, "type", ""), "sticker") &&
+		    json_object_get_boolean(ui_field(row, "hasSound"))) {
+			ui_rpc("stickerSound",
+			       args(ui.selected, ui_string(row, "id", "")), 0);
+			return TRUE;
+		}
 		picture(row);
 		return TRUE;
 	}
 	if (e->button.button == SDL_BUTTON_LEFT && ui_is_video(row)) {
 		open_video(row);
+		return TRUE;
+	}
+	if (e->button.button == SDL_BUTTON_LEFT &&
+	    !strcmp(ui_string(row, "type", ""), "audio")) {
+		ui_rpc("openAudio", args(ui.selected, ui_string(row, "id", "")),
+		       0);
 		return TRUE;
 	}
 	if (e->button.button == SDL_BUTTON_LEFT && ui.files && file_kind(row)) {
@@ -4816,8 +4902,9 @@ void ui_media_overlay(void)
 					       _("Announce…"),
 					       _("Mention sender"),
 					       _("Play video"),
+					       _("Play sound"),
 					       _("Delete for everyone") };
-		enum message_action arr[12];
+		enum message_action arr[13];
 		int count = m.mode == MENU ? actions(arr) :
 					     (int)G_N_ELEMENTS(reaction_labels);
 		int width = MIN(ui.width - 16, 220), height = count * 34 + 16;

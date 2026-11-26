@@ -206,6 +206,17 @@ static void profile_picture(void)
 	g_assert_false(
 		line_obs_upload_profile("test-obs-token", "../x", jpeg, &e));
 	g_clear_error(&e);
+
+	const char *group = "c00000000000000000000000000000003";
+
+	expected_url = "https://obs.line-apps.com/r/talk/g/"
+		       "c00000000000000000000000000000003";
+	g_assert_true(line_obs_upload_group_profile("test-obs-token", group,
+						    jpeg, &e));
+	g_assert_no_error(e);
+	g_assert_false(
+		line_obs_upload_group_profile("test-obs-token", mid, jpeg, &e));
+	g_clear_error(&e);
 	upload = profile_upload = FALSE;
 }
 

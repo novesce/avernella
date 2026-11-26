@@ -269,3 +269,26 @@ J *line_own_picture_update(Line *s, const char *path, GError **error)
 	/* OBS updates the profile itself; read back the new picture path. */
 	return line_own_profile(s, error);
 }
+
+J *line_group_picture_update(Line *s, const char *chat, const char *path,
+			     GError **error)
+{
+	if (!chat || *chat != 'c' || strlen(chat) != 33) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Choose a group conversation.");
+		return NULL;
+	}
+	g_autoptr(GBytes) jpeg = line_profile_image_prepare(path, error);
+
+	if (!jpeg)
+		return NULL;
+	g_autoptr(LineSecret) token = line_obs_token(s, error);
+
+	if (!token || !line_obs_upload_group_profile(token, chat, jpeg, error))
+		return NULL;
+	J *out = obj();
+
+	json_object_object_add(out, "id", json_object_new_string(chat));
+	json_object_object_add(out, "updated", json_object_new_boolean(TRUE));
+	return out;
+}

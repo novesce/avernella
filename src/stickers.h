@@ -13,8 +13,10 @@ J *line_sticker_catalog(Line *s, LineStickers *stickers, guint offset,
 char *line_sticker_asset(LineStickers *stickers, const char *package_id,
 			 const char *sticker_id, GError **error);
 char *line_sticker_message_asset(J *message, GError **error);
+char *line_sticker_message_sound(J *message, GError **error);
 /* May run in a download worker with an owned URL returned by either asset helper. */
 GBytes *line_sticker_fetch(const char *trusted_url, GError **error);
+GBytes *line_sticker_sound_fetch(const char *trusted_url, GError **error);
 J *line_sticker_metadata(Line *s, LineStickers *stickers,
 			 const char *package_id, const char *sticker_id,
 			 GError **error);

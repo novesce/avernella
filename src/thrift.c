@@ -124,6 +124,15 @@ static gboolean write_value(GByteArray *out, const char *spec, J *v, int depth)
 	case I64:
 		integer(out, json_object_get_int64(v));
 		break;
+	case DOUBLE: {
+		double val = json_object_get_double(v);
+		guint64 bits;
+
+		memcpy(&bits, &val, 8);
+		bits = GUINT64_TO_LE(bits);
+		g_byte_array_append(out, (const guint8 *)&bits, 8);
+		break;
+	}
 	case BINARY:
 		if (!json_object_is_type(v, json_type_string))
 			return FALSE;

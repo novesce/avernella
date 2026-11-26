@@ -789,6 +789,70 @@ static void friend_requests(void)
 	g_clear_pointer(&s.pictures, json_object_put);
 }
 
+static void delete_and_settings(void)
+{
+	struct rpc_step steps[] = {
+		{ "/RE4", "deleteFriend",
+		  "{\"1\":{\"1\":12,\"2\":\"" ALICE "\"}}", "{\"0:obj\":{}}" },
+		{ "/RE4", "deleteFromBlockList",
+		  "{\"1\":{\"1\":13,\"2\":\"" BLOCK "\"}}", "{\"0:obj\":{}}" },
+		{ "/S4", "getSettings", "{\"2\":8}",
+		  "{\"0:obj\":{\"10:bool\":true,\"14:bool\":false,"
+		  "\"21:bool\":false,\"22:bool\":true,\"24:bool\":true,"
+		  "\"26:bool\":false,\"61:bool\":true,\"68:bool\":true,"
+		  "\"95:bool\":false}}" },
+		{ "/S4", "updateSettingsAttributes2",
+		  "{\"1\":14,\"3\":{\"22\":false},\"4\":[22]}",
+		  "{\"0:i32\":1}" },
+	};
+	Line s = { .mid = SELF };
+
+	g_autoptr(GError) error = NULL;
+
+	use(steps, G_N_ELEMENTS(steps));
+
+	g_autoptr(J) reg =
+		json_tokener_parse("{\"id\":\"" ALICE "\",\"friend\":true}");
+	g_autoptr(J) d1 = line_friend_delete(&s, reg, 12, &error);
+	g_assert_no_error(error);
+	g_assert_true(json_object_get_boolean(field(d1, "deleted")));
+
+	g_autoptr(J) blk = json_tokener_parse(
+		"{\"id\":\"" BLOCK "\",\"friend\":true,\"blocked\":true}");
+	g_autoptr(J) d2 = line_friend_delete(&s, blk, 13, &error);
+	g_assert_no_error(error);
+	g_assert_true(json_object_get_boolean(field(d2, "deleted")));
+
+	/* Official accounts cannot be deleted through deleteFriend. */
+	g_autoptr(J) off = json_tokener_parse(
+		"{\"id\":\"" OTHER "\",\"friend\":true,\"official\":true}");
+	g_assert_null(line_friend_delete(&s, off, 14, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+
+	g_autoptr(J) cfg = line_account_settings(&s, &error);
+	g_assert_no_error(error);
+	g_assert_true(json_object_get_boolean(field(cfg, "notifyEnable")));
+	g_assert_false(
+		json_object_get_boolean(field(cfg, "notifyShowPreview")));
+	g_assert_true(json_object_get_boolean(field(cfg, "searchById")));
+	g_assert_false(json_object_get_boolean(field(cfg, "searchByPhone")));
+	g_assert_true(json_object_get_boolean(field(cfg, "e2eeEnable")));
+
+	g_autoptr(J) upd = line_account_settings_update(&s, "searchById", FALSE,
+							14, &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(upd, "key"), ==, "searchById");
+	g_assert_false(json_object_get_boolean(field(upd, "value")));
+
+	/* Unknown setting keys are rejected locally. */
+	g_assert_null(
+		line_account_settings_update(&s, "bogusKey", TRUE, 15, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_cmpuint(calls, ==, G_N_ELEMENTS(steps));
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -808,6 +872,8 @@ int main(int argc, char **argv)
 	g_test_add_func("/friends/recommendations", recommendations);
 	g_test_add_func("/friends/profile-card", profile_card);
 	g_test_add_func("/friends/friend-requests", friend_requests);
+	g_test_add_func("/friends/delete-and-account-settings",
+			delete_and_settings);
 	g_test_add_func("/friends/pacing", pacing);
 	return g_test_run();
 }

@@ -163,12 +163,35 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		g_assert_cmpint(json_object_get_int(field(args, "1:i32")), ==,
 				42);
 		J *msg = field(args, "2:obj");
+		int ctype = json_object_get_int(field(msg, "15:i32"));
 
+		g_assert_cmpstr(strfield(msg, "2:str"), ==,
+				expected_chat ? expected_chat : ALICE);
+		if (ctype == 7) {
+			J *meta = field(msg, "18:map:str:str");
+
+			g_assert_cmpstr(strfield(meta, "STKID"), ==, "55");
+			g_assert_cmpstr(strfield(meta, "STKPKGID"), ==, "7");
+			return json_tokener_parse("{\"4\":\"322\"}");
+		}
+		if (ctype == 13) {
+			J *meta = field(msg, "18:map:str:str");
+
+			g_assert_cmpstr(strfield(meta, "mid"), ==, BOB);
+			g_assert_cmpstr(strfield(meta, "displayName"), ==,
+					"Bob");
+			return json_tokener_parse("{\"4\":\"323\"}");
+		}
+		if (ctype == 15) {
+			J *loc = field(msg, "11:obj");
+
+			g_assert_cmpstr(strfield(loc, "1:str"), ==, "Cafe");
+			g_assert_cmpstr(strfield(loc, "2:str"), ==, "123 St");
+			return json_tokener_parse("{\"4\":\"324\"}");
+		}
 		g_assert_null(field(
 			msg,
 			"10:str")); /* plaintext must never be transmitted */
-		g_assert_cmpstr(strfield(msg, "2:str"), ==,
-				expected_chat ? expected_chat : ALICE);
 		g_assert_nonnull(field(msg, "19:byte"));
 		g_assert_cmpint(json_object_get_int(field(msg, "19:byte")), ==,
 				0);
@@ -830,6 +853,67 @@ static void received_filenames(void)
 	g_assert_false(line_safe_filename(long_name));
 }
 
+static void cards_sound_and_forward(void)
+{
+	Line s = { .mid = SELF, .seq = 41 };
+
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) raw = json_tokener_parse(
+		"[{\"1\":\"" ALICE "\",\"4\":\"501\",\"5\":501,\"15\":13,"
+		"\"18\":{\"mid\":\"" BOB "\",\"displayName\":\"Bob\"}},"
+		"{\"1\":\"" ALICE "\",\"4\":\"502\",\"5\":502,\"15\":15,"
+		"\"11\":{\"1\":\"Cafe\",\"2\":\"123 St\",\"3\":13.75,"
+		"\"4\":100.5,\"5\":\"021234\"}},"
+		"{\"1\":\"" ALICE "\",\"4\":\"503\",\"5\":503,\"15\":7,"
+		"\"18\":{\"STKID\":\"55\",\"STKPKGID\":\"7\",\"STKVER\":\"1\",\"STKOPT\":\"AS\"}}]");
+	g_autoptr(J) index = NULL;
+
+	recent_fixture = raw;
+	g_autoptr(J) rows = line_history_raw(&s, ALICE, &index, &error);
+	recent_fixture = NULL;
+	g_assert_no_error(error);
+	g_assert_cmpuint(json_object_array_length(rows), ==, 3);
+
+	J *contact = json_object_array_get_idx(rows, 0);
+
+	g_assert_cmpstr(strfield(contact, "type"), ==, "contact");
+	g_assert_cmpstr(strfield(contact, "contactMid"), ==, BOB);
+	g_assert_cmpstr(strfield(contact, "contactName"), ==, "Bob");
+
+	J *loc = json_object_array_get_idx(rows, 1);
+	J *ld = field(loc, "location");
+
+	g_assert_cmpstr(strfield(loc, "type"), ==, "location");
+	g_assert_nonnull(ld);
+	g_assert_cmpstr(strfield(ld, "title"), ==, "Cafe");
+	g_assert_cmpstr(strfield(ld, "address"), ==, "123 St");
+	g_assert_cmpstr(strfield(ld, "phone"), ==, "021234");
+
+	J *stk = json_object_array_get_idx(rows, 2);
+
+	g_assert_cmpstr(strfield(stk, "type"), ==, "sticker");
+	g_assert_true(json_object_get_boolean(field(stk, "hasSound")));
+
+	s.seq = 41;
+	g_autoptr(J) f1 =
+		line_forward_sticker(&s, ALICE, field(index, "503"), &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(f1, "id"), ==, "322");
+
+	s.seq = 41;
+	g_autoptr(J) f2 =
+		line_forward_contact(&s, ALICE, field(index, "501"), &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(f2, "id"), ==, "323");
+
+	s.seq = 41;
+	g_autoptr(J) f3 =
+		line_forward_location(&s, ALICE, field(index, "502"), &error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(f3, "id"), ==, "324");
+	g_clear_pointer(&s.profiles, g_hash_table_unref);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -850,5 +934,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/messaging/mentions-and-forwarding",
 			mention_and_forward);
 	g_test_add_func("/messaging/announcements", announcements);
+	g_test_add_func("/messaging/cards-sound-and-forward",
+			cards_sound_and_forward);
 	return g_test_run();
 }

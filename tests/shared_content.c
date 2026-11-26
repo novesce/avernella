@@ -274,11 +274,123 @@ static void errors(void)
 	line_shared_clear(&s);
 }
 
+static void crud(void)
+{
+	Line s = { .mid = (char *)self, .access = "offline-token" };
+
+	g_autoptr(J) p = params();
+	g_autoptr(GError) e = NULL;
+
+	/* Create, rename, delete photo, and delete album. */
+	json_object_object_add(p, "title", json_object_new_string("Trip"));
+	prepare("/ext/album/api/v6/albums/create?modifyDuplicateTitle=true",
+		"{\"code\":0,\"result\":{\"albumId\":\"55\"}}", "POST",
+		"1375220249");
+	expected_chat = group;
+	g_autoptr(J) ca = line_shared_content(&s, "sharedCreateAlbum", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(ca, "saved")));
+
+	json_object_object_add(p, "album", json_object_new_string("55"));
+	json_object_object_add(p, "title", json_object_new_string("Road Trip"));
+	prepare("/ext/album/api/v6/albums/55/update",
+		"{\"code\":0,\"result\":{}}", "POST", "1375220249");
+	expected_chat = group;
+	g_autoptr(J) ra = line_shared_content(&s, "sharedRenameAlbum", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(ra, "saved")));
+
+	json_object_object_add(p, "photoId", json_object_new_string("8"));
+	prepare("/ext/album/api/v6/albums/55/photos/delete",
+		"{\"code\":0,\"result\":{}}", "POST", "1375220249");
+	expected_chat = group;
+	g_autoptr(J) dp = line_shared_content(&s, "sharedDeletePhoto", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(dp, "deleted")));
+
+	prepare("/ext/album/api/v6/albums/55/delete",
+		"{\"code\":0,\"result\":{}}", "POST", "1375220249");
+	expected_chat = group;
+	g_autoptr(J) da = line_shared_content(&s, "sharedDeleteAlbum", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(da, "deleted")));
+
+	/* Update note, toggle like, comments CRUD, delete note. */
+	json_object_object_add(p, "id", json_object_new_string("77"));
+	json_object_object_add(p, "text", json_object_new_string("Updated"));
+	g_autofree char *up = g_strdup_printf(
+		"/ext/note/nt/api/v57/post/update.json?homeId=%s&sourceType=TALKROOM",
+		group);
+	prepare(up, "{\"code\":0,\"result\":{}}", "POST", "1341209850");
+	g_autoptr(J) un = line_shared_content(&s, "sharedUpdateNote", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(un, "saved")));
+
+	json_object_object_add(p, "actorId", json_object_new_string(self));
+	json_object_object_add(p, "like", json_object_new_boolean(TRUE));
+	g_autofree char *lc = g_strdup_printf(
+		"/ext/note/nt/api/v57/like/create.json?homeId=%s", group);
+	prepare(lc, "{\"code\":0,\"result\":{}}", "POST", "1341209850");
+	g_autoptr(J) lk = line_shared_content(&s, "sharedToggleLike", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(lk, "liked")));
+
+	json_object_object_add(p, "like", json_object_new_boolean(FALSE));
+	g_autofree char *lx = g_strdup_printf(
+		"/ext/note/nt/api/v57/like/cancel.json?homeId=%s&contentId=77&actorId=%s",
+		group, self);
+	prepare(lx, "{\"code\":0,\"result\":{}}", "GET", "1341209850");
+	g_autoptr(J) ulk = line_shared_content(&s, "sharedToggleLike", p, &e);
+	g_assert_no_error(e);
+	g_assert_false(json_object_get_boolean(field(ulk, "liked")));
+
+	g_autofree char *cg = g_strdup_printf(
+		"/ext/note/nt/api/v57/comment/getList.json?homeId=%s&contentId=77&actorId=%s&limit=50",
+		group, self);
+	prepare(cg,
+		"{\"code\":0,\"result\":{\"commentList\":[{\"commentNo\":\"90\",\"commentText\":\"Nice!\",\"userInfo\":{\"mid\":\"u00000000000000000000000000000000\",\"displayName\":\"Me\"}}]}}",
+		"GET", "1341209850");
+	g_autoptr(J) cm = line_shared_content(&s, "sharedComments", p, &e);
+	g_assert_no_error(e);
+	g_assert_cmpuint(json_object_array_length(field(cm, "items")), ==, 1);
+	J *c0 = json_object_array_get_idx(field(cm, "items"), 0);
+
+	g_assert_cmpstr(strfield(c0, "text"), ==, "Nice!");
+	g_assert_true(json_object_get_boolean(field(c0, "own")));
+
+	g_autofree char *cp = g_strdup_printf(
+		"/ext/note/nt/api/v57/comment/create.json?homeId=%s", group);
+	prepare(cp, "{\"code\":0,\"result\":{}}", "POST", "1341209850");
+	g_autoptr(J) pcr = line_shared_content(&s, "sharedCommentPost", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(pcr, "saved")));
+
+	json_object_object_add(p, "commentId", json_object_new_string("90"));
+	g_autofree char *cd = g_strdup_printf(
+		"/ext/note/nt/api/v57/comment/delete.json?homeId=%s&commentId=90&actorId=%s",
+		group, self);
+	prepare(cd, "{\"code\":0,\"result\":{}}", "GET", "1341209850");
+	g_autoptr(J) dcr =
+		line_shared_content(&s, "sharedCommentDelete", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(dcr, "deleted")));
+
+	g_autofree char *dn = g_strdup_printf(
+		"/ext/note/nt/api/v57/post/delete.json?homeId=%s&postId=77",
+		group);
+	prepare(dn, "{\"code\":0,\"result\":{}}", "GET", "1341209850");
+	g_autoptr(J) dnr = line_shared_content(&s, "sharedDeleteNote", p, &e);
+	g_assert_no_error(e);
+	g_assert_true(json_object_get_boolean(field(dnr, "deleted")));
+	line_shared_clear(&s);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/shared/albums-photos-session", albums);
 	g_test_add_func("/shared/notes-and-poll-search", group_notes);
+	g_test_add_func("/shared/albums-and-notes-crud", crud);
 	g_test_add_func("/shared/page-and-service-errors", errors);
 	return g_test_run();
 }

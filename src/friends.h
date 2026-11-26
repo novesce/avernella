@@ -28,6 +28,11 @@ J *line_friend_visibility(Line *s, J *trusted_row, gboolean hidden,
 			  gint32 reserved_seq, GError **error);
 J *line_friend_block(Line *s, J *trusted_row, gboolean block,
 		     gint32 reserved_seq, GError **error);
+J *line_friend_delete(Line *s, J *trusted_row, gint32 reserved_seq,
+		      GError **error);
+J *line_account_settings(Line *s, GError **error);
+J *line_account_settings_update(Line *s, const char *key, gboolean value,
+				gint32 reserved_seq, GError **error);
 
 J *line_own_profile(Line *s, GError **error);
 J *line_own_profile_update(Line *s, J *changes, gint32 reserved_seq,

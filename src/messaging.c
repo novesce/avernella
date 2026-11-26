@@ -1040,6 +1040,122 @@ J *line_forward_text(Line *s, const char *chat, J *message, GError **error)
 	return line_send_emoji(s, chat, text, NULL, emojis, error);
 }
 
+static J *send_plain_message(Line *s, const char *chat, int type, J *meta,
+			     J *location, GError **error)
+{
+	if (!talk_id(chat) || s->seq < 0 || s->seq >= G_MAXINT32) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Unable to forward this message.");
+		return NULL;
+	}
+	g_autoptr(J) args = obj();
+	J *msg = obj();
+
+	number(args, "1:i32", ++s->seq);
+	put(args, "2:obj", msg);
+	put(msg, "2:str", string(chat));
+	number(msg, "5:i64", 0);
+	number(msg, "6:i64", 0);
+	boolean(msg, "14:bool", FALSE);
+	number(msg, "15:i32", type);
+	if (location)
+		put(msg, "11:obj", json_object_get(location));
+	if (meta && json_object_object_length(meta))
+		put(msg, "18:map:str:str", json_object_get(meta));
+	number(msg, "19:byte", 0);
+	g_autoptr(J) reply = line_rpc(s, "/S4", "sendMessage", args, error);
+	if (!reply)
+		return NULL;
+	const char *id = nonempty(reply, "4");
+
+	if (!id) {
+		g_set_error_literal(
+			error, LINE_ERROR, 1,
+			"LINE returned no message ID. Check the chat before resending.");
+		return NULL;
+	}
+	J *receipt = obj();
+
+	put(receipt, "id", string(id));
+	return receipt;
+}
+
+J *line_forward_sticker(Line *s, const char *chat, J *message, GError **error)
+{
+	J *src = field(message, "18");
+	const char *stkid = exact_text(src, "STKID"),
+		   *pkg = exact_text(src, "STKPKGID"),
+		   *ver = exact_text(src, "STKVER");
+
+	if (json_object_get_int(field(message, "15")) != 7 || !stkid || !pkg ||
+	    !ver) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "This sticker cannot be forwarded.");
+		return NULL;
+	}
+	g_autoptr(J) meta = obj();
+	static const char *const keys[] = { "STKID",  "STKPKGID", "STKVER",
+					    "STKTXT", "STKOPT",	  "STKHASH" };
+
+	for (guint i = 0; i < G_N_ELEMENTS(keys); i++) {
+		const char *v = exact_text(src, keys[i]);
+
+		if (v)
+			put(meta, keys[i], string(v));
+	}
+	return send_plain_message(s, chat, 7, meta, NULL, error);
+}
+
+J *line_forward_location(Line *s, const char *chat, J *message, GError **error)
+{
+	J *src = field(message, "11");
+
+	if (json_object_get_int(field(message, "15")) != 15 ||
+	    !json_object_is_type(src, json_type_object)) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "This location cannot be forwarded.");
+		return NULL;
+	}
+	g_autoptr(J) loc = obj();
+	const char *title = nonempty(src, "1"), *addr = nonempty(src, "2"),
+		   *phone = nonempty(src, "5");
+	J *lat = field(src, "3"), *lon = field(src, "4");
+
+	if (title)
+		put(loc, "1:str", string(title));
+	if (addr)
+		put(loc, "2:str", string(addr));
+	if (lat)
+		put(loc, "3:double",
+		    json_object_new_double(json_object_get_double(lat)));
+	if (lon)
+		put(loc, "4:double",
+		    json_object_new_double(json_object_get_double(lon)));
+	if (phone)
+		put(loc, "5:str", string(phone));
+	return send_plain_message(s, chat, 15, NULL, loc, error);
+}
+
+J *line_forward_contact(Line *s, const char *chat, J *message, GError **error)
+{
+	J *src = field(message, "18");
+	const char *mid = exact_text(src, "mid"),
+		   *name = exact_text(src, "displayName");
+
+	if (json_object_get_int(field(message, "15")) != 13 || !mid ||
+	    !talk_id(mid) || mid[0] != 'u') {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "This contact card cannot be forwarded.");
+		return NULL;
+	}
+	g_autoptr(J) meta = obj();
+
+	put(meta, "mid", string(mid));
+	if (name && *name)
+		put(meta, "displayName", string(name));
+	return send_plain_message(s, chat, 13, meta, NULL, error);
+}
+
 char *line_message_preview(Line *s, J *message, GError **error)
 {
 	g_autoptr(J) payload = text_payload(s, message, error);
@@ -1221,10 +1337,62 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 			}
 			put(row, "reactions", counts);
 		}
-		if (type == 15 && !text)
-			text = nonempty(field(msg, "11"), "2");
-		if (type == 13 && !text)
-			text = nonempty(metadata, "displayName");
+		if (type == 7) {
+			const char *opt = exact_text(metadata, "STKOPT");
+
+			if (opt && (!strcmp(opt, "S") || !strcmp(opt, "AS") ||
+				    !strcmp(opt, "PS")))
+				boolean(row, "hasSound", TRUE);
+		}
+		if (type == 15) {
+			J *loc = field(msg, "11");
+
+			if (json_object_is_type(loc, json_type_object)) {
+				const char *title = nonempty(loc, "1"),
+					   *addr = nonempty(loc, "2"),
+					   *phone = nonempty(loc, "5");
+				J *lat = field(loc, "3"),
+				  *lon = field(loc, "4");
+				J *card = obj();
+
+				if (title)
+					put(card, "title", string(title));
+				if (addr)
+					put(card, "address", string(addr));
+				if (phone)
+					put(card, "phone", string(phone));
+				if (lat && lon &&
+				    (json_object_is_type(lat,
+							 json_type_double) ||
+				     json_object_is_type(lat, json_type_int)) &&
+				    (json_object_is_type(lon,
+							 json_type_double) ||
+				     json_object_is_type(lon, json_type_int))) {
+					put(card, "lat",
+					    json_object_new_double(
+						    json_object_get_double(
+							    lat)));
+					put(card, "lon",
+					    json_object_new_double(
+						    json_object_get_double(
+							    lon)));
+				}
+				put(row, "location", card);
+				if (!text)
+					text = title ? title : addr;
+			}
+		}
+		if (type == 13) {
+			const char *cmid = nonempty(metadata, "mid");
+			const char *cname = nonempty(metadata, "displayName");
+
+			if (cmid && talk_id(cmid) && cmid[0] == 'u')
+				put(row, "contactMid", string(cmid));
+			if (cname)
+				put(row, "contactName", string(cname));
+			if (!text && cname)
+				text = cname;
+		}
 		put(row, "id", string(id ? id : ""));
 		put(row, "from",
 		    string(own	  ? "You" :
