@@ -1559,3 +1559,14 @@ gboolean ui_friends_event(SDL_Event *e)
 		return FALSE;
 	}
 }
+
+void ui_friends_open_link(const char *url)
+{
+	if (!ui.connected || !ui.friends || !url || !*url)
+		return;
+	f.directory = EVERYONE;
+	page(FIND);
+	input(&f.query, url);
+	focus(FIELD);
+	find();
+}

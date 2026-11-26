@@ -550,3 +550,53 @@ J *line_group_renew_link(Line *s, const char *id, gint32 seq, GError **error)
 			"LINE returned no usable group link. Read the current link before trying again.");
 	return ticket_row(group, TRUE, TRUE, field(ack, "1"));
 }
+
+/* FindChatByTicketRequest (jm8.t9 in LINE 26.19.0): { 1: ticketId }. */
+J *line_group_find_ticket(Line *s, const char *input, char **ticket_out,
+			  GError **error)
+{
+	g_autofree char *ticket = line_group_parse_ticket(input);
+
+	if (!ticket)
+		return problem(error, "This is not a LINE group invite link.");
+	g_autoptr(J) args = obj();
+	J *req = obj();
+
+	json_object_object_add(req, "1:str", json_object_new_string(ticket));
+	json_object_object_add(args, "1:obj", req);
+	g_autoptr(J) reply =
+		line_rpc(s, "/S4", "findChatByTicket", args, error);
+	if (!reply)
+		return NULL;
+	J *chat = field(reply, "1");
+	const char *id = strfield(chat, "2");
+
+	if (!mid(id, 'c'))
+		return problem(error, "LINE did not find this group link.");
+	if (ticket_out)
+		*ticket_out = g_steal_pointer(&ticket);
+	return group_row(chat, id);
+}
+
+/* AcceptChatInvitationByTicketRequest (jm8.e): { 1: reqSeq, 2: chatMid, 3: ticketId }. */
+J *line_group_join_ticket(Line *s, const char *chat, const char *ticket,
+			  gint32 seq, GError **error)
+{
+	if (!mid(chat, 'c') || !ticket || !*ticket || seq <= 0)
+		return problem(error, "Open a valid group invite link first.");
+	g_autoptr(J) args = obj();
+	J *req = obj();
+
+	json_object_object_add(req, "1:i32", json_object_new_int(seq));
+	json_object_object_add(req, "2:str", json_object_new_string(chat));
+	json_object_object_add(req, "3:str", json_object_new_string(ticket));
+	json_object_object_add(args, "1:obj", req);
+	g_autoptr(J) ack =
+		line_rpc(s, "/S4", "acceptChatInvitationByTicket", args, error);
+	if (!ack)
+		return NULL;
+	J *out = obj();
+
+	json_object_object_add(out, "id", json_object_new_string(chat));
+	return out;
+}

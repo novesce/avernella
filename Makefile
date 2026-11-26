@@ -75,7 +75,7 @@ endif
 CFLAGS += $(FORTIFY) $(STACK_CLASH) $(HARDEN)
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
-SOURCES = main pair password_login state thrift transport messaging friends groups sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups
+SOURCES = main pair password_login state thrift transport messaging friends groups square sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
@@ -114,7 +114,7 @@ CHECKPATCH_FLAGS = --no-tree --file --terse --quiet --show-types --typedefsfile 
 # Test fixtures keep long JSON and protocol strings split across lines.
 CHECKPATCH_TEST_FLAGS = $(CHECKPATCH_FLAGS) --ignore SPLIT_STRING,MISSING_SPACE
 TESTS = build/test-thrift build/test-state build/test-sealing build/test-messaging build/test-pair build/test-transport build/test-media build/test-call build/test-audio build/test-media-io build/test-obs build/test-video-record build/test-ui-motion build/test-ui-pixels build/test-emoji-message build/test-ui-apng build/test-emoji build/test-ui-emoji
-TESTS += build/test-friends build/test-groups build/test-ui-friends build/test-ui-read
+TESTS += build/test-friends build/test-groups build/test-square build/test-ui-friends build/test-ui-read
 TESTS += build/test-stickers build/test-call-video
 TESTS += build/test-call-group build/test-pdtp
 TESTS += build/test-chat-lists build/test-shared-content build/test-ui-tray build/test-ui-instance
@@ -345,7 +345,8 @@ build/test-denoise: tests/call_denoise.c build/call_denoise.o
 build/test-profile-image: tests/profile_image.c build/profile_image.o
 build/test-rich-message: tests/rich_message.c build/rich_message.o build/liff_url.o
 build/test-clipboard-paste: tests/clipboard_paste.c build/clipboard_paste.o
-build/test-groups: tests/groups.c build/groups.o build/thrift.o
+build/test-groups: tests/groups.c build/groups.o build/thrift.o build/liff_url.o
+build/test-square: tests/square.c build/square.o build/groups.o build/rich_message.o build/profile_image.o build/thrift.o build/liff_url.o
 build/test-chat-lists: tests/chat_lists.c build/chat_lists.o
 build/test-shared-content: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
 build/test-shared-content: tests/shared_content.c build/shared_content.o build/http_tune.o
@@ -387,7 +388,7 @@ build/render-bench: tests/render_bench.c build/ui_gpu.o
 UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene build/test-ui-refresh
 UI_FIXTURE_TARGETS += build/test-ui-chat-refresh
 UI_FIXTURE_TARGETS += build/test-ui-worker-stop
-$(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_find.o
+$(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_openchat.o build/ui_find.o
 $(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 $(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
 $(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o build/sandbox.o $(UI_LANG_OBJECTS)

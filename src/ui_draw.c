@@ -9,6 +9,7 @@
 #include "ui_flex.h"
 #include "ui_find.h"
 #include "ui_groups.h"
+#include "ui_openchat.h"
 #include "ui_gpu_scroll.h"
 #include "ui_motion.h"
 #include "ui_theme.h"
@@ -658,9 +659,10 @@ void ui_layout(void)
 		top = 98;
 	}
 	ui.friends_button = (Rect){ 0 };
+	ui.openchat_button = (Rect){ 0 };
 	ui.rail_chats = (Rect){ 0 };
 	if (nav) {
-		/* The bar lists Friends above Chats, as LINE does. */
+		/* The bar lists Friends, Chats and OpenChat. */
 		int y = 16;
 
 		if (ui.friends) {
@@ -669,9 +671,21 @@ void ui_layout(void)
 			y += 60;
 		}
 		ui.rail_chats = (Rect){ (rail - 48) / 2, y, 48, 48 };
-	} else if (ui.friends) {
-		ui.friends_button = (Rect){ rail + 8, top, list_w - 16, 42 };
-		top += 50;
+		y += 60;
+		if (ui.openchats)
+			ui.openchat_button =
+				(Rect){ (rail - 48) / 2, y, 48, 48 };
+	} else {
+		if (ui.friends) {
+			ui.friends_button =
+				(Rect){ rail + 8, top, list_w - 16, 42 };
+			top += 50;
+		}
+		if (ui.openchats) {
+			ui.openchat_button =
+				(Rect){ rail + 8, top, list_w - 16, 42 };
+			top += 50;
+		}
 	}
 	int heading = top + 10;
 
@@ -726,7 +740,8 @@ void ui_layout(void)
 	ui.call = ui.video = (Rect){ 0 };
 	ui.chat_tools = (Rect){ icon_x, 8, 32, 32 };
 	icon_x -= 40;
-	if (ui.groups && ui.selected && *ui.selected == 'c') {
+	if (ui.selected && ((ui.groups && *ui.selected == 'c') ||
+			    (ui.openchats && *ui.selected == 'm'))) {
 		ui.members = (Rect){ icon_x, 8, 32, 32 };
 		icon_x -= 40;
 	}
@@ -1374,14 +1389,18 @@ static void line_bar(void)
 {
 	int h = ui.height, rail = rail_w();
 	gboolean friends = ui_friends_active();
+	gboolean openchat = ui_openchat_active();
 
 	box(0, 0, rail, h, 0, UI_NAV_RAIL);
 	if (ui.friends)
 		nav_tab(ui.friends_button, UI_ICON_PEOPLE, friends,
 			ui_profile_badge() > 0 ? -1 : 0, ui.focus == F_FRIENDS,
 			_("Friends"));
-	nav_tab(ui.rail_chats, UI_ICON_MESSAGE, !friends, unread_chats(), FALSE,
-		_("Chats"));
+	nav_tab(ui.rail_chats, UI_ICON_MESSAGE, !friends && !openchat,
+		unread_chats(), FALSE, _("Chats"));
+	if (ui.openchats)
+		nav_tab(ui.openchat_button, UI_ICON_OPENCHAT, openchat, 0,
+			ui.focus == F_OPENCHAT, _("OpenChat"));
 	Rect me = bar_self;
 	double mh = strength(HOVER, me, hovered(me));
 
@@ -1767,6 +1786,28 @@ static void chats_panel(void)
 			centered(count, pill, 12, 700, UI_ON_ACCENT);
 		}
 	}
+	gboolean openchat_open = ui_openchat_active();
+
+	if (ui.openchats && (!line_style || !rail)) {
+		Rect o = ui.openchat_button;
+		double hv = strength(HOVER, o, hovered(o));
+		gboolean focus = ui.focus == F_OPENCHAT;
+		gboolean lit = hovered(o) || focus || openchat_open;
+
+		if (openchat_open) {
+			box(o.x, o.y, o.w, o.h, 6, UI_SELECTED);
+			box(o.x, o.y + 11, 3, o.h - 22, 1.5, UI_ACCENT);
+		} else if (hv > 0. || focus)
+			box(o.x, o.y, o.w, o.h, 6,
+			    blend(UI_SIDEBAR, UI_HOVER, focus ? 1. : hv));
+		ui_draw_icon((Rect){ o.x + 10, o.y + 9, 24, 24 },
+			     UI_ICON_OPENCHAT,
+			     openchat_open ? UI_ACCENT :
+			     lit	   ? UI_HEADING :
+					     UI_MUTED);
+		text(_("OpenChat"), o.x + 44, o.y + 11, o.w - 54, 16, 500,
+		     lit ? UI_HEADING : UI_MUTED, FALSE);
+	}
 	int heading_y = ui.list_box.y - 22;
 
 	if (ui_lists_ready()) {
@@ -1918,7 +1959,7 @@ struct message_layout {
 	struct ui_flex_layout *flex;
 	int y, w, h, top; /* top: offset of the message below any divider */
 	int x, body_top, body_h, text_origin;
-	gboolean mine, group, photo, video, rich, receipt, notice;
+	gboolean mine, group, photo, video, rich, receipt, notice, has_links;
 	Json *message; /* borrowed from the cached history */
 };
 
@@ -1997,6 +2038,107 @@ static gboolean show_intro(void)
 		return TRUE;
 	/* An empty latest page can coexist with a known message in the chat list. */
 	return !ui_read_id(ui_string(ui_selected_chat(), "lastId", NULL));
+}
+
+/* Scans s from *pos for an http(s)://, line://, or lineb:// URL span. */
+static gboolean next_url_span(const char *s, size_t *pos, size_t *start,
+			      size_t *end)
+{
+	static const char *const schemes[] = { "https://", "http://", "line://",
+					       "lineb://" };
+	size_t len = strlen(s);
+
+	for (size_t i = *pos; i < len; i++) {
+		if (i > 0 && g_ascii_isalnum((guchar)s[i - 1]))
+			continue;
+		size_t slen = 0;
+
+		for (guint k = 0; k < G_N_ELEMENTS(schemes); k++) {
+			size_t n = strlen(schemes[k]);
+
+			if (i + n < len &&
+			    !g_ascii_strncasecmp(s + i, schemes[k], n)) {
+				slen = n;
+				break;
+			}
+		}
+		if (!slen)
+			continue;
+		size_t j = i + slen;
+
+		while (j < len && (guchar)s[j] > 0x20 && !strchr("<>\"'", s[j]))
+			j++;
+		while (j > i + slen) {
+			char c = s[j - 1];
+
+			if (strchr(".,;:!?", c)) {
+				j--;
+				continue;
+			}
+			if (c == ')' || c == ']' || c == '}') {
+				char open = c == ')' ? '(' :
+					    c == ']' ? '[' :
+						       '{';
+				int depth = 0;
+
+				for (size_t p = i + slen; p < j; p++) {
+					if (s[p] == open)
+						depth++;
+					else if (s[p] == c)
+						depth--;
+				}
+				if (depth < 0) {
+					j--;
+					continue;
+				}
+			}
+			break;
+		}
+		if (j <= i + slen)
+			continue;
+		*start = i;
+		*end = j;
+		*pos = j;
+		return TRUE;
+	}
+	return FALSE;
+}
+
+static gboolean decorate_message_links(PangoLayout *item, size_t skip,
+				       gboolean on_accent)
+{
+	const char *full = pango_layout_get_text(item);
+	size_t pos = skip, start = 0, end = 0;
+	PangoAttrList *attrs = NULL;
+	guint rgb = on_accent ? UI_BUBBLE_OUT_INK : UI_ACCENT_HOVER;
+	guint16 cr16 = (guint16)(((rgb >> 16) & 255) * 257u);
+	guint16 cg16 = (guint16)(((rgb >> 8) & 255) * 257u);
+	guint16 cb16 = (guint16)((rgb & 255) * 257u);
+
+	while (next_url_span(full, &pos, &start, &end)) {
+		if (!attrs) {
+			PangoAttrList *prev = pango_layout_get_attributes(item);
+
+			attrs = prev ? pango_attr_list_copy(prev) :
+				       pango_attr_list_new();
+		}
+		PangoAttribute *ul =
+			pango_attr_underline_new(PANGO_UNDERLINE_SINGLE);
+		ul->start_index = (guint)start;
+		ul->end_index = (guint)end;
+		pango_attr_list_insert(attrs, ul);
+
+		PangoAttribute *fg =
+			pango_attr_foreground_new(cr16, cg16, cb16);
+		fg->start_index = (guint)start;
+		fg->end_index = (guint)end;
+		pango_attr_list_insert(attrs, fg);
+	}
+	if (!attrs)
+		return FALSE;
+	pango_layout_set_attributes(item, attrs);
+	pango_attr_list_unref(attrs);
+	return TRUE;
 }
 
 /* Whether a rich message's first scene draws anything from LINE's CDN. */
@@ -2181,6 +2323,9 @@ static void prepare_bubbles(Rect area)
 			ui_emoji_shape_history(row.body, body,
 					       with_reply ? "↪ Reply\n" : "",
 					       ui_field(msg, "emojis"));
+			row.has_links = decorate_message_links(
+				row.body, with_reply ? strlen("↪ Reply\n") : 0,
+				line_style && row.mine);
 			PangoRectangle logical;
 
 			pango_layout_get_pixel_extents(row.body, NULL,
@@ -2367,6 +2512,36 @@ const char *ui_flex_link_at(int x, int y)
 	return ui_flex_uri_at(row->flex, x - body.x, y - body.y);
 }
 
+char *ui_text_link_at(int x, int y)
+{
+	struct message_layout *row = bubble_at(x, y);
+
+	if (!row || !row->body || !row->has_links || row->notice)
+		return NULL;
+	Rect body = message_rect(row, ui.conversation);
+
+	if (!contains_point(body, x, y))
+		return NULL;
+	int lx = x - (cache.line_style ?
+			      body.x + BUBBLE_PAD_X + row->text_origin :
+			      body.x);
+	int ly = y - (cache.line_style ? body.y + BUBBLE_PAD_Y : body.y);
+	int index = 0, trailing = 0;
+
+	if (!pango_layout_xy_to_index(row->body, lx * PANGO_SCALE,
+				      ly * PANGO_SCALE, &index, &trailing))
+		return NULL;
+	const char *full = pango_layout_get_text(row->body);
+	size_t pos = ui_field(row->message, "replyTo") ? strlen("↪ Reply\n") :
+							 0;
+	size_t start = 0, end = 0;
+
+	while (next_url_span(full, &pos, &start, &end))
+		if (index >= (int)start && index < (int)end)
+			return g_strndup(full + start, end - start);
+	return NULL;
+}
+
 static cairo_surface_t *flex_image(const char *url, gpointer unused)
 {
 	(void)unused;
@@ -2416,7 +2591,8 @@ static void conversation_intro(Rect area, int y)
 {
 	Json *chat = ui_selected_chat();
 	const char *name = ui_string(chat, "name", ui.selected);
-	gboolean group = ui.selected && *ui.selected == 'c';
+	gboolean group = ui.selected &&
+			 (*ui.selected == 'c' || *ui.selected == 'm');
 	int x = area.x + 16;
 
 	avatar(name, x, y + 16, 80, ui.selected, ui.selected,
@@ -2839,6 +3015,14 @@ static void message_rows(Rect area)
 			text_bubble(r, body);
 		else
 			paint(r->body, x, y, UI_BODY);
+		if ((int)i == hover && r->has_links) {
+			g_autofree char *url =
+				ui_text_link_at(ui.hover_x, ui.hover_y);
+
+			if (url)
+				tooltip((Rect){ ui.hover_x, body.y, 0, 0 }, url,
+					FALSE);
+		}
 		if (r->reactions) {
 			int th;
 			Rect pill = reaction_rect(r, body);
@@ -3083,11 +3267,13 @@ static void composer(int s, int w)
 				_("Upload a File"), FALSE);
 	}
 	g_autofree char *placeholder =
-		ui_theme_is_line() ?
-			NULL :
-			g_strdup_printf(_("Message %s%s"),
-					*ui.selected == 'c' ? "" : "@",
-					name ? name : "");
+		ui_theme_is_line() ? NULL :
+				     g_strdup_printf(_("Message %s%s"),
+						     (*ui.selected == 'c' ||
+						      *ui.selected == 'm') ?
+							     "" :
+							     "@",
+						     name ? name : "");
 	draw_editor(&ui.message, ui.entry, ui.focus == F_MESSAGE,
 		    placeholder ? placeholder : _("Write a message"));
 	if (ui.emojis || ui.stickers) {
@@ -3212,7 +3398,9 @@ static void chat_view(void)
 	if (ui.find_messages && ui.selected && ui.find_button.w)
 		header_icon(ui.find_button, ICON_SEARCH,
 			    ui.focus == F_FIND_TEXT);
-	if (ui.groups && ui.selected && *ui.selected == 'c' && ui.members.w)
+	if (ui.selected && ui.members.w &&
+	    ((ui.groups && *ui.selected == 'c') ||
+	     (ui.openchats && *ui.selected == 'm')))
 		header_icon(ui.members, ICON_MEMBERS, ui.focus == F_MEMBERS);
 	if (ui.call.w)
 		header_icon(ui.call, ICON_CALL, FALSE);
@@ -3520,7 +3708,7 @@ static gboolean reusable_history(SDL_Surface *target, SDL_Rect *pixels)
 			break;
 		/* These can paint animated pixels, delayed media or tooltips. */
 		if (row->photo || row->video || row->rich || row->flex ||
-		    ui_field(row->message, "emojis"))
+		    row->has_links || ui_field(row->message, "emojis"))
 			return FALSE;
 	}
 	int sx = target->w / ui.width, sy = target->h / ui.height;
@@ -4090,6 +4278,14 @@ void ui_draw_icon(Rect r, enum ui_icon icon, guint ink)
 		cairo_move_to(cr, x + 17, y + 7);
 		cairo_line_to(cr, x + 7, y + 17);
 		cairo_stroke(cr);
+		break;
+	case UI_ICON_OPENCHAT:
+		cairo_set_line_width(cr, 2.2);
+		cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+		line(x + 9.5, y + 4.5, x + 7.5, y + 19.5, ink, 2.2);
+		line(x + 16.5, y + 4.5, x + 14.5, y + 19.5, ink, 2.2);
+		line(x + 4.5, y + 9, x + 19.5, y + 9, ink, 2.2);
+		line(x + 3.5, y + 15, x + 18.5, y + 15, ink, 2.2);
 		break;
 	}
 }

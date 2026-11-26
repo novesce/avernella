@@ -5,5 +5,6 @@
 
 /* 1 owns the profile's window, 0 activated its owner, -1 on error. */
 int ui_instance_open(GError **error);
+int ui_instance_open_url(const char *url, GError **error);
 gboolean ui_instance_watch(Uint32 event, GError **error);
 void ui_instance_close(void);

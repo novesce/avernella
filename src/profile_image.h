@@ -15,5 +15,8 @@ enum {
  */
 GBytes *line_profile_jpeg(GBytes *image, GError **error);
 
+/* Reads a local picture safely and encodes a centered square baseline JPEG. */
+GBytes *line_profile_image_prepare(const char *path, GError **error);
+
 /* Replaces the account's profile picture with the file at 'path'. */
 J *line_own_picture_update(Line *s, const char *path, GError **error);

@@ -4,6 +4,7 @@
 #include "messaging.h"
 #include "obs_http.h"
 #include "sealing.h"
+#include "square.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <openssl/crypto.h>
@@ -362,6 +363,120 @@ J *line_forward_attachment(Line *s, const char *chat, J *message,
 	return send_attachment_bytes(s, chat, bytes, name, type, error);
 }
 
+static const char *square_media_type(int type)
+{
+	switch (type) {
+	case LINE_MEDIA_IMAGE:
+		return "image";
+	case LINE_MEDIA_VIDEO:
+		return "video";
+	case LINE_MEDIA_AUDIO:
+		return "audio";
+	case LINE_MEDIA_FILE:
+		return "file";
+	default:
+		return NULL;
+	}
+}
+
+/* Consumes its input buffer. Sends plaintext media in an OpenChat (/r/g2/m). */
+static J *send_square_attachment_bytes(Line *s, const char *chat,
+				       const char *my_member_id, GBytes *bytes,
+				       const char *filename, int type,
+				       gint32 seq, GError **error)
+{
+	g_autoptr(GBytes) original = bytes;
+	const char *mtype = square_media_type(type);
+
+	if (!mtype || !line_is_square_chat(chat) || seq <= 0) {
+		media_error(error, "Select an OpenChat conversation.");
+		return NULL;
+	}
+	gsize size = g_bytes_get_size(original);
+	guint64 duration = type == LINE_MEDIA_VIDEO ? video_duration(original) :
+						      0;
+	const char *format = type == LINE_MEDIA_IMAGE ? image_format(original) :
+							NULL;
+	if (type == LINE_MEDIA_IMAGE && !format) {
+		media_error(error, "Choose a JPEG, PNG, GIF or WebP image.");
+		return NULL;
+	}
+	const char *basename = line_safe_filename(filename) ? filename :
+							      "attachment";
+	g_autoptr(J) meta = obj();
+	g_autofree char *size_str = g_strdup_printf("%zu", size);
+
+	if (type == LINE_MEDIA_FILE) {
+		json_object_object_add(meta, "FILE_NAME",
+				       json_object_new_string(basename));
+		json_object_object_add(meta, "FILE_SIZE",
+				       json_object_new_string(size_str));
+	}
+	if (duration) {
+		g_autofree char *millis =
+			g_strdup_printf("%" G_GUINT64_FORMAT, duration);
+
+		json_object_object_add(meta, "DURATION",
+				       json_object_new_string(millis));
+	}
+	g_autoptr(J) receipt = line_square_send_media_stub(
+		s, chat, my_member_id, type, meta, seq, error);
+	if (!receipt)
+		return NULL;
+	const char *msg_id = strfield(receipt, "id");
+
+	g_autoptr(LineSecret) token = line_obs_token(s, error);
+
+	if (!token)
+		return NULL;
+	g_autofree char *upload_name =
+		type == LINE_MEDIA_FILE ?
+			g_strdup(basename) :
+			g_strdup_printf("%s.%s", msg_id,
+					format			 ? format :
+					type == LINE_MEDIA_VIDEO ? "mp4" :
+								   "m4a");
+	g_autofree char *oid = line_obs_upload_square(
+		token, msg_id, upload_name, mtype, original, error);
+	if (!oid)
+		return NULL;
+	return g_steal_pointer(&receipt);
+}
+
+J *line_send_square_attachment(Line *s, const char *chat,
+			       const char *my_member_id, const char *path,
+			       int type, gint32 seq, GError **error)
+{
+	GBytes *original = read_attachment(path, error);
+
+	if (!original)
+		return NULL;
+	g_autofree char *basename = g_path_get_basename(path);
+
+	return send_square_attachment_bytes(s, chat, my_member_id, original,
+					    basename, type, seq, error);
+}
+
+J *line_forward_square_attachment(Line *s, const char *chat,
+				  const char *my_member_id, J *message,
+				  gint32 seq, GError **error)
+{
+	int type = json_object_get_int(field(message, "15"));
+	g_autofree char *name = NULL;
+
+	if (type == LINE_MEDIA_FILE) {
+		name = line_attachment_filename(s, message, error);
+		if (!name)
+			return NULL;
+	}
+	GBytes *bytes = line_download_attachment(s, message, error);
+
+	if (!bytes)
+		return NULL;
+	return send_square_attachment_bytes(s, chat, my_member_id, bytes, name,
+					    type, seq, error);
+}
+
 J *line_send_image(Line *s, const char *chat, const char *path, GError **error)
 {
 	return line_send_attachment(s, chat, path, LINE_MEDIA_IMAGE, error);
@@ -494,13 +609,46 @@ static GBytes *download_sealed_object(Line *s, J *message, gboolean preview,
 	return g_steal_pointer(&result);
 }
 
+static GBytes *download_square_object(Line *s, const char *id, gboolean preview,
+				      GError **error)
+{
+	g_autoptr(GError) failure = NULL;
+
+	for (int i = 0; i < 2; i++) {
+		g_autoptr(LineSecret) token = line_obs_token(s, &failure);
+
+		if (!token)
+			break;
+		GBytes *bytes =
+			preview ? line_obs_download_square_preview(token, id,
+								   &failure) :
+				  line_obs_download_square(token, id, &failure);
+
+		if (bytes)
+			return bytes;
+		if (i || !g_error_matches(failure, LINE_ERROR,
+					  LINE_OBS_UNAUTHORIZED))
+			break;
+		g_clear_error(&failure);
+		line_secret_set(&s->obs_token, NULL);
+		s->obs_until = 0;
+	}
+	if (failure)
+		g_propagate_error(error, g_steal_pointer(&failure));
+	return NULL;
+}
+
 GBytes *line_download_attachment(Line *s, J *message, GError **error)
 {
 	if (!plain_attachment(message))
 		return download_sealed_object(s, message, FALSE, error);
 	const char *id = strfield(message, "4");
+	const char *to = strfield(message, "2");
+	gboolean square = line_is_square_chat(to);
 
-	g_autoptr(GBytes) bytes = download_object(s, "m", id, id, FALSE, error);
+	g_autoptr(GBytes) bytes =
+		square ? download_square_object(s, id, FALSE, error) :
+			 download_object(s, "m", id, id, FALSE, error);
 
 	if (bytes && (!g_bytes_get_size(bytes) ||
 		      g_bytes_get_size(bytes) > LINE_MEDIA_LIMIT)) {
@@ -517,10 +665,14 @@ GBytes *line_download_video_preview(Line *s, J *message, GError **error)
 		return NULL;
 	}
 	const char *id = strfield(message, "4");
+	const char *to = strfield(message, "2");
+	gboolean square = line_is_square_chat(to);
 
 	g_autoptr(GBytes) preview =
 		plain_attachment(message) ?
-			download_object(s, "m", id, id, TRUE, error) :
+			(square ?
+				 download_square_object(s, id, TRUE, error) :
+				 download_object(s, "m", id, id, TRUE, error)) :
 			download_sealed_object(s, message, TRUE, error);
 
 	if (preview && (g_bytes_get_size(preview) > LINE_MEDIA_PREVIEW_LIMIT ||

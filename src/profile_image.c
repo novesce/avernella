@@ -247,12 +247,19 @@ static GBytes *read_picture(const char *path, GError **error)
 	return g_bytes_new_take(buf, size);
 }
 
-J *line_own_picture_update(Line *s, const char *path, GError **error)
+GBytes *line_profile_image_prepare(const char *path, GError **error)
 {
 	g_autoptr(GBytes) original = read_picture(path, error);
+
 	if (!original)
 		return NULL;
-	g_autoptr(GBytes) jpeg = line_profile_jpeg(original, error);
+	return line_profile_jpeg(original, error);
+}
+
+J *line_own_picture_update(Line *s, const char *path, GError **error)
+{
+	g_autoptr(GBytes) jpeg = line_profile_image_prepare(path, error);
+
 	if (!jpeg)
 		return NULL;
 	g_autoptr(LineSecret) token = line_obs_token(s, error);

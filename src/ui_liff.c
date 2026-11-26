@@ -12,6 +12,8 @@
 #include "ui_liff.h"
 #include "flex_asset.h"
 #include "liff_url.h"
+#include "ui_friends.h"
+#include "ui_openchat.h"
 #include "ui_private.h"
 #include <errno.h>
 #include <limits.h>
@@ -280,10 +282,77 @@ static void open_outside(const char *url)
 		ui_status(_("Could not open the link."));
 }
 
-void ui_liff_open_link(const char *url)
+static gboolean is_friend_link(const char *url)
+{
+	return url && (strstr(url, "/ti/p/") ||
+		       !g_ascii_strncasecmp(url, "line://ti/p/", 12) ||
+		       !g_ascii_strncasecmp(url, "lineb://ti/p/", 13) ||
+		       !g_ascii_strncasecmp(url, "line://r/ti/p/", 14) ||
+		       !g_ascii_strncasecmp(url, "lineb://r/ti/p/", 15));
+}
+
+static gboolean is_openchat_link(const char *url)
 {
 	if (!url)
-		return;
+		return FALSE;
+	if (strstr(url, "/ti/g2/") ||
+	    !g_ascii_strncasecmp(url, "line://ti/g2/", 13) ||
+	    !g_ascii_strncasecmp(url, "lineb://ti/g2/", 14) ||
+	    !g_ascii_strncasecmp(url, "line://r/ti/g2/", 15) ||
+	    !g_ascii_strncasecmp(url, "lineb://r/ti/g2/", 16)) {
+		g_autofree char *ticket = line_square_parse_ticket(url);
+
+		return ticket != NULL;
+	}
+	return FALSE;
+}
+
+static gboolean is_group_link(const char *url)
+{
+	if (!url)
+		return FALSE;
+	g_autofree char *ticket = line_group_parse_ticket(url);
+
+	return ticket != NULL;
+}
+
+static char *chat_deep_link_id(const char *url)
+{
+	const char *q = url ? strstr(url, "chatId=") : NULL;
+
+	if (!q)
+		return NULL;
+	q += 7;
+	gsize len = strcspn(q, "&# \t\r\n");
+
+	if (len != 33 || !strchr("ucrm", q[0]))
+		return NULL;
+	for (gsize i = 1; i < 33; i++)
+		if (!g_ascii_isxdigit(q[i]))
+			return NULL;
+	return g_strndup(q, 33);
+}
+
+static gboolean route_line_link(const char *url)
+{
+	if (is_openchat_link(url)) {
+		ui_openchat_open_link(url);
+		return TRUE;
+	}
+	if (is_group_link(url)) {
+		ui_openchat_open_group_link(url);
+		return TRUE;
+	}
+	if (is_friend_link(url)) {
+		ui_friends_open_link(url);
+		return TRUE;
+	}
+	g_autofree char *chat_id = chat_deep_link_id(url);
+
+	if (chat_id) {
+		ui_select_chat_id(chat_id);
+		return TRUE;
+	}
 	if (line_liff_url(url, NULL, NULL)) {
 		enum browser_backend backend;
 		g_autofree char *path = find_browser(&backend);
@@ -291,7 +360,7 @@ void ui_liff_open_link(const char *url)
 		if (lb.fd < 0 && !path) {
 			if (line_flex_link_allowed(url))
 				open_outside(url);
-			return;
+			return TRUE;
 		}
 		Json *args = json_object_new_object();
 
@@ -303,8 +372,17 @@ void ui_liff_open_link(const char *url)
 				json_object_new_string(ui.selected));
 		ui_status(_("Opening the LINE app…"));
 		ui_rpc("liffView", args, 0);
-		return;
+		return TRUE;
 	}
+	return FALSE;
+}
+
+void ui_liff_open_link(const char *url)
+{
+	if (!url || !*url)
+		return;
+	if (route_line_link(url))
+		return;
 	if (line_liff_line_scheme(url)) {
 		ui_status(_("Open this LINE link on your phone."));
 		return;
@@ -312,6 +390,21 @@ void ui_liff_open_link(const char *url)
 	if (!line_flex_link_allowed(url))
 		return;
 	if (!send_browser('W', "web", url))
+		open_outside(url);
+}
+
+void ui_open_chat_link(const char *url)
+{
+	if (!url || !*url)
+		return;
+	if (route_line_link(url))
+		return;
+	if (line_liff_line_scheme(url)) {
+		ui_status(_("Open this LINE link on your phone."));
+		return;
+	}
+	if (!g_ascii_strncasecmp(url, "https://", 8) ||
+	    !g_ascii_strncasecmp(url, "http://", 7))
 		open_outside(url);
 }
 

@@ -20,6 +20,7 @@
 #include "ui_friends.h"
 #include "ui_find.h"
 #include "ui_groups.h"
+#include "ui_openchat.h"
 #include "ui_shared_content.h"
 #include "ui_motion.h"
 #include "ui_notifications.h"
@@ -69,6 +70,7 @@ struct draft_mention {
 };
 
 static GHashTable *mentions;
+static char *pending_link;
 
 static GArray *mention_list(const char *chat)
 {
@@ -1664,6 +1666,17 @@ void ui_open_conversation(Json *row)
 	}
 }
 
+void ui_select_chat_id(const char *id)
+{
+	Json *row = chat_summary(id);
+
+	if (!row) {
+		ui_status(_("Conversation not found in your chat list."));
+		return;
+	}
+	ui_open_conversation(row);
+}
+
 static gboolean can_send(void)
 {
 	if (!ui.selected || ui.logging_out ||
@@ -1811,6 +1824,12 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				set_string(&ui.notice, "");
 			notify_unread(result);
 			show_chats(result);
+			if (pending_link && ui.connected && !ui.logging_out) {
+				g_autofree char *url =
+					g_steal_pointer(&pending_link);
+
+				ui_open_chat_link(url);
+			}
 		}
 		if (wire.chats_again && ui.connected && !ui.logging_out) {
 			wire.chats_again = FALSE;
@@ -1915,6 +1934,8 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		    !ui_find_reply(saved->action, saved->tag, result, error) &&
 		    !ui_groups_reply(saved->action, saved->tag, result,
 				     error) &&
+		    !ui_openchat_reply(saved->action, saved->tag, result,
+				       error) &&
 		    !ui_friends_reply(saved->action, saved->tag, result, error))
 			ui_media_reply(saved->action, saved->params, saved->tag,
 				       result, error);
@@ -2152,8 +2173,11 @@ void ui_insert(Editor *edit, const char *s)
 
 void ui_mention_member(const char *id, const char *name)
 {
-	if (!ui.selected || ui.selected[0] != 'c' || !id || id[0] != 'u' ||
-	    strlen(id) != 33 ||
+	gboolean valid_pair = ui.selected && id &&
+			      ((ui.selected[0] == 'c' && id[0] == 'u') ||
+			       (ui.selected[0] == 'm' && id[0] == 'p'));
+
+	if (!valid_pair || strlen(id) != 33 ||
 	    strspn(id + 1, "0123456789abcdefABCDEF") != 32 || !name || !*name ||
 	    !g_utf8_validate(name, -1, NULL))
 		return;
@@ -2204,11 +2228,11 @@ static void tab_focus(gboolean backwards)
 		focus_on(controls[(i + (backwards ? -1 : 1) + n) % n]);
 		return;
 	}
-	const Focus all[] = { F_FRIENDS, F_GROUP_NEW, F_MEMBERS, F_FIND_TEXT,
-			      F_SEARCH,	 F_LIST,      F_MESSAGE, F_SEND,
-			      F_RELOAD,	 F_LOGOUT };
-	const Focus list[] = { F_FRIENDS, F_GROUP_NEW, F_SEARCH,
-			       F_LIST,	  F_RELOAD,    F_LOGOUT };
+	const Focus all[] = { F_FRIENDS,   F_OPENCHAT, F_GROUP_NEW, F_MEMBERS,
+			      F_FIND_TEXT, F_SEARCH,   F_LIST,	    F_MESSAGE,
+			      F_SEND,	   F_RELOAD,   F_LOGOUT };
+	const Focus list[] = { F_FRIENDS, F_OPENCHAT, F_GROUP_NEW, F_SEARCH,
+			       F_LIST,	  F_RELOAD,   F_LOGOUT };
 	const Focus thread[] = { F_BACK, F_MEMBERS, F_FIND_TEXT, F_MESSAGE,
 				 F_SEND };
 	const Focus *cycle = all;
@@ -2226,9 +2250,11 @@ static void tab_focus(gboolean backwards)
 	while ((cycle[i] == F_FIND_TEXT &&
 		(!ui.selected || !ui.find_messages)) ||
 	       (cycle[i] == F_FRIENDS && !ui.friends) ||
+	       (cycle[i] == F_OPENCHAT && !ui.openchats) ||
 	       (cycle[i] == F_GROUP_NEW && !ui.groups) ||
 	       (cycle[i] == F_MEMBERS &&
-		(!ui.groups || !ui.selected || *ui.selected != 'c')) ||
+		(!ui.selected || !((ui.groups && *ui.selected == 'c') ||
+				   (ui.openchats && *ui.selected == 'm')))) ||
 	       (!ui.selected &&
 		(cycle[i] == F_MESSAGE || cycle[i] == F_SEND)) ||
 	       (!ui.visible->len && cycle[i] == F_LIST));
@@ -2327,11 +2353,16 @@ static void key(SDL_KeyboardEvent k)
 		}
 		if (ui.focus == F_FRIENDS)
 			ui_friends_show();
+		else if (ui.focus == F_OPENCHAT)
+			ui_openchat_open_hub();
 		else if (ui.focus == F_GROUP_NEW)
 			ui_groups_new();
-		else if (ui.focus == F_MEMBERS)
-			ui_groups_members();
-		else if (ui.focus == F_FIND_TEXT)
+		else if (ui.focus == F_MEMBERS) {
+			if (ui.selected && *ui.selected == 'm')
+				ui_openchat_open_info();
+			else
+				ui_groups_members();
+		} else if (ui.focus == F_FIND_TEXT)
 			ui_find_open();
 		else if (ui.focus == F_LIST)
 			select_chat(MAX(0, ui.list_cursor));
@@ -2421,7 +2452,8 @@ static void click(int x, int y)
 		const char *uri = ui_flex_link_at(x, y);
 
 		if (uri && (line_flex_link_allowed(uri) ||
-			    line_liff_url(uri, NULL, NULL))) {
+			    line_liff_url(uri, NULL, NULL) ||
+			    line_liff_line_scheme(uri))) {
 			ui_liff_open_link(uri);
 			return;
 		}
@@ -2432,11 +2464,22 @@ static void click(int x, int y)
 			rich_action(rich, tapped);
 			return;
 		}
+		g_autofree char *text_link = ui_text_link_at(x, y);
+
+		if (text_link) {
+			ui_open_chat_link(text_link);
+			return;
+		}
 		/* Discord opens a profile from an avatar or a name. */
 		Rect anchor;
 		Json *message = ui_sender_at(x, y, &anchor);
 
 		if (message) {
+			if (*ui.selected == 'm') {
+				if (ui.openchats)
+					ui_openchat_open_info();
+				return;
+			}
 			gboolean mine = json_object_get_boolean(
 				ui_field(message, "own"));
 			const char *id = ui_string(message, "senderId",
@@ -2501,6 +2544,9 @@ static void click(int x, int y)
 	else if (ui_list_visible() && ui.friends &&
 		 inside(ui.friends_button, x, y))
 		ui_friends_show();
+	else if (ui_list_visible() && ui.openchats &&
+		 inside(ui.openchat_button, x, y))
+		ui_openchat_open_hub();
 	else if (ui_list_visible() && ui.groups &&
 		 (inside(ui.new_group, x, y) || inside(ui.rail_add, x, y)))
 		ui_groups_new();
@@ -2509,10 +2555,14 @@ static void click(int x, int y)
 	else if (ui_chat_visible() && ui.selected && ui.find_messages &&
 		 inside(ui.find_button, x, y))
 		ui_find_open();
-	else if (ui_chat_visible() && ui.groups && ui.selected &&
-		 *ui.selected == 'c' && inside(ui.members, x, y))
-		ui_groups_members();
-	else if (ui_compact() && ui_chat_visible() && inside(ui.back, x, y))
+	else if (ui_chat_visible() && ui.selected && inside(ui.members, x, y) &&
+		 ((ui.groups && *ui.selected == 'c') ||
+		  (ui.openchats && *ui.selected == 'm'))) {
+		if (*ui.selected == 'm')
+			ui_openchat_open_info();
+		else
+			ui_groups_members();
+	} else if (ui_compact() && ui_chat_visible() && inside(ui.back, x, y))
 		focus_on(F_LIST);
 	else if (ui_list_visible() && inside(ui.logout, x, y))
 		logout();
@@ -2554,6 +2604,9 @@ static int hover_target(int x, int y)
 		return -9;
 	if (ui_list_visible() && ui.friends && inside(ui.friends_button, x, y))
 		return -6;
+	if (ui_list_visible() && ui.openchats &&
+	    inside(ui.openchat_button, x, y))
+		return -2002;
 	if (ui_list_visible() && ui.groups && inside(ui.new_group, x, y))
 		return -7;
 	if (ui_list_visible() && inside(ui.rail_chats, x, y))
@@ -2562,8 +2615,9 @@ static int hover_target(int x, int y)
 		return -11;
 	if (ui_list_visible() && ui_rail_chat_at(x, y))
 		return -12 - (int)(g_str_hash(ui_rail_chat_at(x, y)) % 1000);
-	if (ui_chat_visible() && ui.groups && ui.selected &&
-	    *ui.selected == 'c' && inside(ui.members, x, y))
+	if (ui_chat_visible() && ui.selected && inside(ui.members, x, y) &&
+	    ((ui.groups && *ui.selected == 'c') ||
+	     (ui.openchats && *ui.selected == 'm')))
 		return -8;
 	if (ui_chat_visible() && ui.selected) {
 		if ((ui.emojis || ui.stickers) && inside(ui.emoji, x, y))
@@ -2598,8 +2652,14 @@ static int hover_target(int x, int y)
 
 		if (row >= 0 && ui_rich_area_at(x, y, NULL, &area))
 			return 200000 + row * 64 + area;
-		if (row >= 0)
+		if (row >= 0) {
+			g_autofree char *link = ui_text_link_at(x, y);
+
+			if (link)
+				return 300000 +
+				       (int)(g_str_hash(link) % 100000);
 			return 100000 + row;
+		}
 	}
 	return 0;
 }
@@ -2609,7 +2669,15 @@ static Uint32 activate_event;
 static void event(SDL_Event *e)
 {
 	if (activate_event && e->type == activate_event) {
+		g_autofree char *url = e->user.data1;
+
 		ui_present_window(ui.window);
+		if (url && *url) {
+			if (ui.connected && ui.chats)
+				ui_open_chat_link(url);
+			else
+				set_string(&pending_link, url);
+		}
 		ui.dirty = TRUE;
 		return;
 	}
@@ -2826,7 +2894,9 @@ void ui_show_latest(void)
 
 void ui_restore_input(void)
 {
-	if (ui_lists_active())
+	if (ui_openchat_active())
+		ui_openchat_resume_input();
+	else if (ui_lists_active())
 		ui_lists_resume_input();
 	else if (ui_chat_tools_active())
 		ui_chat_tools_resume_input();
@@ -2850,17 +2920,19 @@ int line_ui(int argc, char **argv)
 	/* Before anything is loaded that might be unloaded again. */
 	line_sandbox_ui_start();
 	g_autoptr(GError) error = NULL;
-	int primary = ui_instance_open(&error);
+	const char *launch_url = argc >= 2 && argv[1] && *argv[1] ? argv[1] :
+								    NULL;
+	int primary = ui_instance_open_url(launch_url, &error);
 	int status = 1;
 
-	(void)argc;
-	(void)argv;
 	if (primary < 0) {
 		g_printerr("Avernella: %s\n", error->message);
 		return 1;
 	}
 	if (!primary)
 		return 0;
+	if (launch_url)
+		pending_link = g_strdup(launch_url);
 	/* Before any thread starts, and before the Vulkan loader. */
 	line_gpu_avoid_broken_nvidia(NULL);
 	if ((g_getenv("WAYLAND_DISPLAY") || g_getenv("WAYLAND_SOCKET") ||
@@ -3009,6 +3081,7 @@ int line_ui(int argc, char **argv)
 	ui_media_shutdown();
 	ui_lists_reset();
 	g_free(ui.selected);
+	g_clear_pointer(&pending_link, g_free);
 	g_clear_pointer(&mentions, g_hash_table_unref);
 	json_object_put(ui.opened);
 	g_free(ui.name);

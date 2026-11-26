@@ -28,6 +28,7 @@ typedef enum {
 	F_LOGOUT,
 	F_BACK,
 	F_FRIENDS,
+	F_OPENCHAT,
 	F_GROUP_NEW,
 	F_MEMBERS,
 	F_FIND_TEXT
@@ -55,8 +56,8 @@ typedef struct {
 	 * sign-in screen offers to resume it or to sign it out.
 	 */
 	gboolean saved_session;
-	gboolean find_messages, friends, friend_invite, groups, emojis,
-		stickers, avatars, photos, files, calls, video_calls,
+	gboolean find_messages, friends, friend_invite, groups, openchats,
+		emojis, stickers, avatars, photos, files, calls, video_calls,
 		group_voice_calls, group_video_calls, incoming_calls,
 		mute_calls;
 	char *self_id, *reply_id, *reply_chat;
@@ -73,10 +74,10 @@ typedef struct {
 	gboolean older_page, older_pending, has_older;
 	Rect older_button, latest_button, folders_button;
 	Rect login_mode, email_box, password_box;
-	Rect chat_tools, find_button, friends_button, new_group, members, emoji,
-		attach, call, video, login, back, logout, reload, search_box,
-		list_box, conversation, entry, send, composer, rail_add,
-		rail_chats;
+	Rect chat_tools, find_button, friends_button, openchat_button,
+		new_group, members, emoji, attach, call, video, login, back,
+		logout, reload, search_box, list_box, conversation, entry, send,
+		composer, rail_add, rail_chats;
 } Interface;
 
 enum {
@@ -118,6 +119,7 @@ int ui_content_x(void);
 enum ui_icon {
 	UI_ICON_PEOPLE,
 	UI_ICON_MESSAGE,
+	UI_ICON_OPENCHAT,
 	UI_ICON_MORE,
 	UI_ICON_GEAR,
 	UI_ICON_INBOX,
@@ -317,6 +319,10 @@ gboolean ui_media_can_call(gboolean video);
 void ui_media_reply_sent(const char *chat);
 Json *ui_row_at(int x, int y);
 const char *ui_flex_link_at(int x, int y);
+/* Newly allocated URL under (x, y) in a text message, or NULL. */
+char *ui_text_link_at(int x, int y);
+void ui_open_chat_link(const char *url);
+void ui_select_chat_id(const char *id);
 cairo_surface_t *ui_flex_image(const char *url);
 /* The picture at url could not be loaded or decoded. */
 gboolean ui_flex_image_failed(const char *url);

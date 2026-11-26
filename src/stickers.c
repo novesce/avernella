@@ -492,13 +492,11 @@ GBytes *line_sticker_fetch(const char *url, GError **e)
 	return data;
 }
 
-J *line_send_sticker(Line *s, LineStickers *c, const char *chat,
-		     const char *product, const char *id, const char *reply_to,
-		     gint32 reserved_seq, GError **e)
+J *line_sticker_metadata(Line *s, LineStickers *c, const char *product,
+			 const char *id, GError **e)
 {
-	if (!talk_id(chat) || reserved_seq <= 0 || !decimal_id(product, NULL) ||
-	    !decimal_id(id, NULL) || (reply_to && !decimal_id(reply_to, NULL)))
-		return fail(e, "Select a chat and a LINE sticker to send.");
+	if (!decimal_id(product, NULL) || !decimal_id(id, NULL))
+		return fail(e, "Select a LINE sticker to send.");
 	if (!load_catalog(s, c, e))
 		return NULL;
 	struct sticker_pack *p = owned(c, product, id, e);
@@ -508,8 +506,32 @@ J *line_send_sticker(Line *s, LineStickers *c, const char *chat,
 	char version[32];
 
 	g_snprintf(version, sizeof(version), "%" G_GINT64_FORMAT, p->version);
+	J *meta = obj();
+
+	putstr(meta, "STKID", id);
+	putstr(meta, "STKPKGID", product);
+	putstr(meta, "STKVER", version);
+	putstr(meta, "STKTXT", p->name);
+	if (*kinds[p->kind].option)
+		putstr(meta, "STKOPT", kinds[p->kind].option);
+	if (p->hash && *p->hash)
+		putstr(meta, "STKHASH", p->hash);
+	return meta;
+}
+
+J *line_send_sticker(Line *s, LineStickers *c, const char *chat,
+		     const char *product, const char *id, const char *reply_to,
+		     gint32 reserved_seq, GError **e)
+{
+	if (!talk_id(chat) || reserved_seq <= 0 || !decimal_id(product, NULL) ||
+	    !decimal_id(id, NULL) || (reply_to && !decimal_id(reply_to, NULL)))
+		return fail(e, "Select a chat and a LINE sticker to send.");
+	J *meta = line_sticker_metadata(s, c, product, id, e);
+
+	if (!meta)
+		return NULL;
 	g_autoptr(J) args = obj();
-	J *msg = obj(), *meta = obj();
+	J *msg = obj();
 
 	putnum(args, "1:i32", reserved_seq);
 	json_object_object_add(args, "2:obj", msg);
@@ -520,14 +542,6 @@ J *line_send_sticker(Line *s, LineStickers *c, const char *chat,
 	putnum(msg, "15:i32", 7);
 	json_object_object_add(msg, "18:map:str:str", meta);
 	putnum(msg, "19:byte", 0);
-	putstr(meta, "STKID", id);
-	putstr(meta, "STKPKGID", product);
-	putstr(meta, "STKVER", version);
-	putstr(meta, "STKTXT", p->name);
-	if (*kinds[p->kind].option)
-		putstr(meta, "STKOPT", kinds[p->kind].option);
-	if (p->hash && *p->hash)
-		putstr(meta, "STKHASH", p->hash);
 	if (reply_to) {
 		putstr(msg, "21:str", reply_to);
 		putnum(msg, "22:i32", 3);

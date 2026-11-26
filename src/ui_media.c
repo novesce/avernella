@@ -12,6 +12,7 @@
 #include "ui_chat_tools.h"
 #include "ui_shared_content.h"
 #include "ui_groups.h"
+#include "ui_openchat.h"
 #include "flex_asset.h"
 #include <dlfcn.h>
 #include <stdbool.h>
@@ -1200,7 +1201,9 @@ void ui_media_reset(void)
 	ui_emoji_reset();
 	ui_friends_reset();
 	ui_groups_reset();
-	ui.find_messages = ui.friends = ui.friend_invite = ui.groups = FALSE;
+	ui_openchat_reset();
+	ui.find_messages = ui.friends = ui.friend_invite = ui.groups =
+		ui.openchats = FALSE;
 	m.emoji_busy = FALSE;
 	ui.emojis = ui.stickers = FALSE;
 	if (m.emoji)
@@ -1449,6 +1452,7 @@ void ui_media_login(Json *r)
 	ui.friends = json_object_get_boolean(ui_field(c, "friends"));
 	ui.friend_invite = json_object_get_boolean(ui_field(c, "friendInvite"));
 	ui.groups = json_object_get_boolean(ui_field(c, "groups"));
+	ui.openchats = json_object_get_boolean(ui_field(c, "openchats"));
 	if (!m.emoji)
 		m.emoji = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
 						thumb_free);
@@ -2037,7 +2041,10 @@ static void choose_path(void)
 		g_autofree char *chosen = g_strdup(path);
 
 		clear_overlay(CLOSED);
-		ui_profile_picture_chosen(chosen);
+		if (ui_openchat_active())
+			ui_openchat_avatar_picked(chosen);
+		else
+			ui_profile_picture_chosen(chosen);
 		return;
 	}
 	if (!m.save) {
@@ -2079,8 +2086,19 @@ enum message_action {
 	A_FORWARD,
 	A_ANNOUNCE,
 	A_MENTION,
-	A_PLAY_VIDEO
+	A_PLAY_VIDEO,
+	A_DESTROY
 };
+
+static gboolean openchat_can_destroy(void)
+{
+	if (!ui.selected || ui.selected[0] != 'm')
+		return FALSE;
+	Json *chat = ui_selected_chat();
+	const char *role = ui_string(chat, "myRole", "");
+
+	return !strcmp(role, "admin") || !strcmp(role, "coadmin");
+}
 
 static int actions(enum message_action *out)
 {
@@ -2117,12 +2135,16 @@ static int actions(enum message_action *out)
 		out[n++] = A_FORWARD;
 	if (text)
 		out[n++] = A_ANNOUNCE;
-	if (ui.selected && ui.selected[0] == 'c' &&
-	    !json_object_get_boolean(ui_field(m.row, "own")) &&
-	    ui_string(m.row, "senderId", "")[0] == 'u')
+	if (ui.selected && !json_object_get_boolean(ui_field(m.row, "own")) &&
+	    ((ui.selected[0] == 'c' &&
+	      ui_string(m.row, "senderId", "")[0] == 'u') ||
+	     (ui.selected[0] == 'm' &&
+	      ui_string(m.row, "senderId", "")[0] == 'p')))
 		out[n++] = A_MENTION;
 	if (json_object_get_boolean(ui_field(m.row, "own")))
 		out[n++] = A_UNSEND;
+	else if (openchat_can_destroy())
+		out[n++] = A_DESTROY;
 	return n;
 }
 
@@ -2195,6 +2217,13 @@ static void menu_action(enum message_action a)
 		m.mode = UNSEND;
 		set(&m.note, _("Remove this message from the conversation?"));
 		break;
+	case A_DESTROY: {
+		Json *p = args(m.chat, m.id);
+
+		close_overlay();
+		ui_rpc("squareDestroyMessage", p, 0);
+		break;
+	}
 	}
 	ui.dirty = TRUE;
 }
@@ -4537,13 +4566,16 @@ gboolean ui_media_event(SDL_Event *e)
 		return TRUE;
 	if (m.mode == CLOSED && ui_groups_active() && ui_groups_event(e))
 		return TRUE;
+	if (m.mode == CLOSED && ui_openchat_active() && ui_openchat_event(e))
+		return TRUE;
 	if (m.mode == CLOSED && ui_find_event(e))
 		return TRUE;
 	if (m.mode == CLOSED && ui_friends_event(e))
 		return TRUE;
 	if (m.mode == CLOSED && !ui_find_active() && !ui_groups_active() &&
-	    !ui_friends_active() && !ui_chat_tools_active() &&
-	    !ui_shared_active() && !ui_lists_active() && ui_lists_event(e))
+	    !ui_openchat_active() && !ui_friends_active() &&
+	    !ui_chat_tools_active() && !ui_shared_active() &&
+	    !ui_lists_active() && ui_lists_event(e))
 		return TRUE;
 	if (m.mode == EMOJI_PICKER && ui_emoji_input(e))
 		return TRUE;
@@ -4724,6 +4756,8 @@ int ui_media_layer(void)
 		return 81;
 	if (m.mode == CLOSED && ui_groups_active())
 		return 80;
+	if (m.mode == CLOSED && ui_openchat_active())
+		return 84;
 	return m.mode == CLOSED			 ? 0 :
 	       m.mode == MENU || m.mode == REACT ? 1 :
 						   (int)m.mode + 2;
@@ -4735,6 +4769,11 @@ void ui_media_overlay(void)
 	/* Settings stay behind the avatar picker. */
 	if (ui_profile_active()) {
 		ui_profile_draw();
+		if (m.mode == CLOSED)
+			return;
+	}
+	if (ui_openchat_active()) {
+		ui_openchat_draw();
 		if (m.mode == CLOSED)
 			return;
 	}
@@ -4776,7 +4815,8 @@ void ui_media_overlay(void)
 					       _("Forward…"),
 					       _("Announce…"),
 					       _("Mention sender"),
-					       _("Play video") };
+					       _("Play video"),
+					       _("Delete for everyone") };
 		enum message_action arr[12];
 		int count = m.mode == MENU ? actions(arr) :
 					     (int)G_N_ELEMENTS(reaction_labels);

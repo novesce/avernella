@@ -164,7 +164,8 @@ J *line_liff_view(Line *s, const char *url, const char *chat, GError **error)
 		J *in_chat = obj();
 
 		put_str(in_chat, "1:str", chat);
-		json_object_object_add(context, "2:obj", in_chat);
+		json_object_object_add(
+			context, chat[0] == 'm' ? "3:obj" : "2:obj", in_chat);
 	} else {
 		json_object_object_add(context, "1:obj", obj());
 	}

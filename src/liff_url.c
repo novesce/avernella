@@ -65,6 +65,71 @@ gboolean line_liff_line_scheme(const char *url)
 		       !g_ascii_strncasecmp(url, "lineb://", 8));
 }
 
+char *line_square_parse_ticket(const char *input)
+{
+	if (!input || !g_utf8_validate(input, -1, NULL))
+		return NULL;
+	g_autofree char *trimmed = g_strdup(input);
+
+	g_strstrip(trimmed);
+	const char *p = trimmed;
+	const char *marker = strstr(p, "/ti/g2/");
+
+	if (marker)
+		p = marker + 7;
+	else if (!g_ascii_strncasecmp(p, "line://ti/g2/", 13))
+		p += 13;
+	else if (!g_ascii_strncasecmp(p, "lineb://ti/g2/", 14))
+		p += 14;
+	else if (!g_ascii_strncasecmp(p, "line://r/ti/g2/", 15))
+		p += 15;
+	else if (!g_ascii_strncasecmp(p, "lineb://r/ti/g2/", 16))
+		p += 16;
+	else if (strstr(p, "://"))
+		return NULL;
+	gsize len = strcspn(p, "?# \t\r\n/");
+
+	if (len < 4 || len > 128)
+		return NULL;
+	for (gsize i = 0; i < len; i++)
+		if (!g_ascii_isalnum(p[i]) && p[i] != '-' && p[i] != '_' &&
+		    p[i] != '.')
+			return NULL;
+	return g_strndup(p, len);
+}
+
+char *line_group_parse_ticket(const char *input)
+{
+	if (!input || !g_utf8_validate(input, -1, NULL))
+		return NULL;
+	g_autofree char *trimmed = g_strdup(input);
+
+	g_strstrip(trimmed);
+	const char *p = trimmed;
+	const char *m = strstr(p, "/ti/g/");
+
+	if (m)
+		p = m + 6;
+	else if (!g_ascii_strncasecmp(p, "line://ti/g/", 12))
+		p += 12;
+	else if (!g_ascii_strncasecmp(p, "lineb://ti/g/", 13))
+		p += 13;
+	else if (!g_ascii_strncasecmp(p, "line://r/ti/g/", 14))
+		p += 14;
+	else if (!g_ascii_strncasecmp(p, "lineb://r/ti/g/", 15))
+		p += 15;
+	else
+		return NULL;
+	gsize len = strcspn(p, "?# \t\r\n/");
+
+	if (len < 4 || len > 128)
+		return NULL;
+	for (gsize i = 0; i < len; i++)
+		if (!g_ascii_isalnum(p[i]) && p[i] != '-' && p[i] != '_')
+			return NULL;
+	return g_strndup(p, len);
+}
+
 gboolean line_liff_debug_url(const char *url)
 {
 	static const char prefix[] = "http://127.0.0.1:";

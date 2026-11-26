@@ -48,11 +48,9 @@ static struct {
 
 static const struct {
 	const char *id, *name;
-} builtins[] = { { "all", N_("All chats") },
-		 { "unread", N_("Unread") },
-		 { "pinned", N_("Pinned") },
-		 { "people", N_("People") },
-		 { "groups", N_("Groups") } };
+} builtins[] = { { "all", N_("All chats") }, { "unread", N_("Unread") },
+		 { "pinned", N_("Pinned") }, { "people", N_("People") },
+		 { "groups", N_("Groups") }, { "openchats", N_("OpenChats") } };
 
 static const char *const commands[] = { [LIST_FOLDERS] = N_("Chat folders"),
 					[LIST_PIN] = N_("Pin or unpin chat"),
@@ -140,6 +138,8 @@ static gboolean matches(Json *row, const char *id)
 		return ui_list_pinned(id);
 	if (!strcmp(view, "groups"))
 		return *id == 'c' || *id == 'r';
+	if (!strcmp(view, "openchats"))
+		return *id == 'm';
 	if (!strcmp(view, "people"))
 		return *id == 'u';
 	if (g_str_has_prefix(view, "folder:"))

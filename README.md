@@ -52,6 +52,14 @@ Use the **+** in the left navigation bar or beside the chat folder name to creat
 
 **Friends → Manage** also opens recommendations and your profile. You can edit your display name and status and choose which recommended accounts to add.
 
+## OpenChat and LINE links
+
+Click **OpenChat** (`#`) in the navigation bar or sidebar to list your joined OpenChats, join an OpenChat by invite link or ticket (`https://line.me/ti/g2/…` or `line://ti/g2/…`, including passcode and admin-approval rooms), or create a new OpenChat. Joined OpenChat rooms also appear in the chat list and under the built-in **OpenChats** folder.
+
+In an OpenChat conversation you can read history and earlier pages, send text, replies, mentions, LINE emoji, stickers, photos, videos, audio and files, react, unsend, manage announcements, and open the header **Member List** icon to inspect OpenChat info, edit your per-OpenChat nickname/bio/photo, view or copy the invite link and QR code, join or create sub-chats, edit settings, approve or reject join requests, and moderate members (promote/demote co-admin, kick, ban, or delete messages for everyone).
+
+URLs in messages (`https://`, `http://`, `line://`, `lineb://`) are underlined and clickable, and installing `avernella.desktop` registers Avernella as a handler for `line://` and `lineb://` desktop links (such as `line://ti/g2/…` for OpenChat, `line://ti/g/…` for groups, `line://ti/p/…` for friends, and `line://app/…` for LIFF). OpenChat requests and link routing are checked offline in `tests/square.c`, `tests/obs_http.c` and `tests/ui_instance.c` and have not yet been exercised against a live account. [OpenChat protocol notes](analysis/openchat.md)
+
 ## Profiles, settings and friend activity
 
 These features use the capabilities supported by the LINE service.

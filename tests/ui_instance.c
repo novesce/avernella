@@ -58,6 +58,29 @@ static void activation(void)
 	SDL_Quit();
 }
 
+static void url_activation(void)
+{
+	g_autoptr(GError) error = NULL;
+	SDL_Event event;
+
+	g_assert_cmpint(ui_instance_open(&error), ==, 1);
+	g_assert_no_error(error);
+	launch("--open-url");
+	g_assert_cmpint(SDL_Init(SDL_INIT_EVENTS), ==, 0);
+	Uint32 type = SDL_RegisterEvents(1);
+
+	g_assert_cmpuint(type, !=, (Uint32)-1);
+	g_assert_true(ui_instance_watch(type, &error));
+	g_assert_no_error(error);
+	g_assert_cmpint(SDL_WaitEventTimeout(&event, 3000), ==, 1);
+	g_assert_cmpuint(event.type, ==, type);
+	g_assert_cmpstr((const char *)event.user.data1, ==,
+			"line://ti/g2/LgnHjUWR4XpyFJ5E2a-9wq5ROBAgg62s0OBrKg");
+	g_free(event.user.data1);
+	ui_instance_close();
+	SDL_Quit();
+}
+
 static void restart(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -182,6 +205,12 @@ int main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "--activate"))
 		return ui_instance_open(NULL) == 0 ? 0 : 1;
+	if (argc == 2 && !strcmp(argv[1], "--open-url"))
+		return ui_instance_open_url(
+			       "line://ti/g2/LgnHjUWR4XpyFJ5E2a-9wq5ROBAgg62s0OBrKg",
+			       NULL) == 0 ?
+			       0 :
+			       1;
 	if (argc == 2 && !strcmp(argv[1], "--claim"))
 		return ui_instance_open(NULL) == 1 ? 0 : 1;
 	if (argc == 2 && !strcmp(argv[1], "--abandon"))
@@ -197,6 +226,7 @@ int main(int argc, char **argv)
 
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
 	g_test_add_func("/instance/early-activation", activation);
+	g_test_add_func("/instance/url-activation", url_activation);
 	g_test_add_func("/instance/restart", restart);
 	g_test_add_func("/instance/zombie-owner", zombie_owner);
 	g_test_add_func("/instance/legacy-owner", legacy_owner);

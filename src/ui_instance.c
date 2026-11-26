@@ -90,7 +90,7 @@ static gboolean answered(int fd)
 /* The directory lock serializes binding, probing and unlinking a dead
  * owner's socket. The kernel queues launches even before SDL is ready.
  */
-static int claim_socket(int dir, int fd)
+static int claim_socket(int dir, int fd, const char *url)
 {
 	struct sockaddr_un addr = { .sun_family = AF_UNIX };
 	struct stat st;
@@ -112,9 +112,19 @@ static int claim_socket(int dir, int fd)
 	enum owner owner = owner_state(dir, st.st_ino);
 
 	if (owner != OWNER_DEAD) {
-		char show = 1;
+		char packet[4098];
+		size_t pkt_len = 1;
+
+		packet[0] = 1;
+		if (url && *url && strlen(url) <= 4096) {
+			size_t ulen = strlen(url);
+
+			packet[0] = 'U';
+			memcpy(packet + 1, url, ulen);
+			pkt_len = ulen + 1;
+		}
 		ssize_t sent = TEMP_FAILURE_RETRY(
-			sendto(fd, &show, sizeof(show), MSG_NOSIGNAL,
+			sendto(fd, packet, pkt_len, MSG_NOSIGNAL,
 			       (struct sockaddr *)&addr, len));
 
 		if (sent < 0 && errno != EAGAIN && errno != ECONNREFUSED)
@@ -138,7 +148,7 @@ static int claim_socket(int dir, int fd)
 	return bind(fd, (struct sockaddr *)&addr, len) ? -1 : 1;
 }
 
-int ui_instance_open(GError **error)
+int ui_instance_open_url(const char *url, GError **error)
 {
 	g_autofree char *path =
 		g_build_filename(g_get_user_state_dir(), "avernella-ui", NULL);
@@ -156,7 +166,7 @@ int ui_instance_open(GError **error)
 	}
 	fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0);
 	if (fd >= 0)
-		result = claim_socket(dir, fd);
+		result = claim_socket(dir, fd, url);
 	if (result == 1 && fstatat(dir, ENDPOINT, &st, AT_SYMLINK_NOFOLLOW))
 		result = -1;
 	if (result == 1) {
@@ -183,6 +193,11 @@ out:
 	return result;
 }
 
+int ui_instance_open(GError **error)
+{
+	return ui_instance_open_url(NULL, error);
+}
+
 static gpointer watch_launch(gpointer unused)
 {
 	struct pollfd fds[] = {
@@ -194,13 +209,20 @@ static gpointer watch_launch(gpointer unused)
 	while (TEMP_FAILURE_RETRY(poll(fds, G_N_ELEMENTS(fds), -1)) > 0) {
 		if (fds[1].revents || !(fds[0].revents & POLLIN))
 			break;
-		char show;
+		char buf[4098];
+		ssize_t n = recv(instance.fd, buf, sizeof(buf) - 1, MSG_TRUNC);
 
-		if (recv(instance.fd, &show, sizeof(show), MSG_TRUNC) == 1 &&
-		    show == 1) {
+		if (n == 1 && buf[0] == 1) {
 			SDL_Event event = { .type = instance.event };
 
 			SDL_PushEvent(&event);
+		} else if (n > 1 && n < (ssize_t)sizeof(buf) && buf[0] == 'U') {
+			buf[n] = '\0';
+			SDL_Event event = { .type = instance.event };
+
+			event.user.data1 = g_strdup(buf + 1);
+			if (SDL_PushEvent(&event) != 1)
+				g_free(event.user.data1);
 		}
 	}
 	return NULL;

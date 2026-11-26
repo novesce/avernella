@@ -17,10 +17,16 @@ enum {
  */
 J *line_send_attachment(Line *s, const char *chat, const char *path,
 			int content_type, GError **error);
+J *line_send_square_attachment(Line *s, const char *chat,
+			       const char *my_member_id, const char *path,
+			       int content_type, gint32 seq, GError **error);
 J *line_send_image(Line *s, const char *chat, const char *path, GError **error);
 J *line_send_file(Line *s, const char *chat, const char *path, GError **error);
 J *line_forward_attachment(Line *s, const char *chat, J *message,
 			   GError **error);
+J *line_forward_square_attachment(Line *s, const char *chat,
+				  const char *my_member_id, J *message,
+				  gint32 seq, GError **error);
 
 /*
  * Input is the original numeric-field Thrift message. Encrypted objects return

@@ -20,6 +20,10 @@ gboolean line_liff_url(const char *url, char **liff_id, char **rest);
 /* LINE's own URL schemes, which only LINE can open. */
 gboolean line_liff_line_scheme(const char *url);
 
+/* Parse OpenChat (/ti/g2/) or group (/ti/g/) invite links and tickets. */
+char *line_square_parse_ticket(const char *input);
+char *line_group_parse_ticket(const char *input);
+
 /* The in-app browser's user agent marks; liff.isInClient() matches them. */
 #define LINE_LIFF_UA_VERSION "9.7.0"
 #define LINE_LIFF_USER_AGENT                                    \

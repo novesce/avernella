@@ -139,3 +139,11 @@ You must be a current member for every change except answering an invitation (`j
 ## What LINE doesn't offer here
 
 LINE's personal-account API has no presence, no typing indicators for desktop clients, no server-side "mutual groups" and no profile banners, so the client doesn't show them. Deleting friends, group photo editing and auto-add mode aren't implemented yet. [analysis/desktop-features.md](../../analysis/desktop-features.md) tracks the gaps.
+
+## OpenChat and LINE links
+
+OpenChat uses `SquareService` on `/SQ1` (`src/square.c`, `src/ui_openchat.c`) with distinct 33-character MID prefixes: `s` for a Square community, `m` for a SquareChat room, and `p` for a per-OpenChat member identity. OpenChat messages and `/r/g2/m/<id>` media attachments are plaintext (not Letter-Sealed), and OpenChat/member avatars load from `profile.line-scdn.net/<obsHash>`.
+
+From the **OpenChat** (`#`) entry in the navigation bar or sidebar, users can browse joined OpenChats, join by `line://ti/g2/…` or `https://line.me/ti/g2/…` link (open, passcode, or admin-approval), or create a new OpenChat. Inside an OpenChat room, the header **Member List** icon opens OpenChat info, per-OpenChat profile and photo editing, invite link and QR code, sub-chat rooms, settings, join-request approval, and member moderation (co-admin, kick, ban, and admin message deletion). Live updates poll `fetchMyEvents`.
+
+Chat messages highlight and open clickable `https://`, `http://`, `line://`, and `lineb://` links, and `data/avernella.desktop` registers `x-scheme-handler/line` and `x-scheme-handler/lineb` so desktop links forward to the running window over the single-instance socket (`src/ui_instance.c`) and route OpenChat (`/ti/g2/`), group (`/ti/g/` via `findChatByTicket` / `acceptChatInvitationByTicket`), friend (`/ti/p/`), chat (`chatId=`), and LIFF (`/app/`) links in-app. Full protocol notes live in [analysis/openchat.md](../../analysis/openchat.md).

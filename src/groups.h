@@ -25,3 +25,8 @@ J *line_group_link(Line *s, const char *chat, GError **error);
 J *line_group_set_link(Line *s, const char *chat, gboolean enabled, gint32 seq,
 		       GError **error);
 J *line_group_renew_link(Line *s, const char *chat, gint32 seq, GError **error);
+char *line_group_parse_ticket(const char *input);
+J *line_group_find_ticket(Line *s, const char *input, char **ticket_out,
+			  GError **error);
+J *line_group_join_ticket(Line *s, const char *chat, const char *ticket,
+			  gint32 seq, GError **error);

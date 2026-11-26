@@ -147,6 +147,56 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 	return g_bytes_ref(preview_blob);
 }
 
+char *line_obs_upload_square(const char *token, const char *message_id,
+			     const char *name, const char *type, GBytes *body,
+			     GError **error)
+{
+	(void)token;
+	(void)message_id;
+	(void)name;
+	(void)type;
+	(void)body;
+	g_set_error_literal(error, LINE_ERROR, 1, "Unused square upload");
+	return NULL;
+}
+
+GBytes *line_obs_download_square(const char *token, const char *message_id,
+				 GError **error)
+{
+	(void)token;
+	(void)message_id;
+	g_set_error_literal(error, LINE_ERROR, 1, "Unused square download");
+	return NULL;
+}
+
+GBytes *line_obs_download_square_preview(const char *token,
+					 const char *message_id, GError **error)
+{
+	(void)token;
+	(void)message_id;
+	g_set_error_literal(error, LINE_ERROR, 1, "Unused square preview");
+	return NULL;
+}
+
+gboolean line_is_square_chat(const char *id)
+{
+	return id && id[0] == 'm' && strlen(id) == 33;
+}
+
+J *line_square_send_media_stub(Line *s, const char *chat,
+			       const char *my_member_id, int content_type,
+			       J *metadata, gint32 seq, GError **error)
+{
+	(void)s;
+	(void)chat;
+	(void)my_member_id;
+	(void)content_type;
+	(void)metadata;
+	(void)seq;
+	g_set_error_literal(error, LINE_ERROR, 1, "Unused square send");
+	return NULL;
+}
+
 J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	    GError **error)
 {

@@ -85,6 +85,7 @@ struct obs_response_body {
 	GByteArray *bytes;
 	gsize limit;
 	char *oid;
+	char *hash;
 };
 
 static size_t receive(char *data, size_t size, size_t count, void *user)
@@ -102,8 +103,10 @@ static size_t header(char *data, size_t size, size_t count, void *user)
 	struct obs_response_body *body = user;
 	size_t n = size * count;
 
-	if (n >= 5 && !g_ascii_strncasecmp(data, "HTTP/", 5))
+	if (n >= 5 && !g_ascii_strncasecmp(data, "HTTP/", 5)) {
 		g_clear_pointer(&body->oid, g_free);
+		g_clear_pointer(&body->hash, g_free);
+	}
 	if (n >= 10 && n <= 540 &&
 	    !g_ascii_strncasecmp(data, "x-obs-oid:", 10)) {
 		g_autofree char *value = g_strndup(data + 10, n - 10);
@@ -112,6 +115,15 @@ static size_t header(char *data, size_t size, size_t count, void *user)
 		if (!segment(value) || body->oid)
 			return 0;
 		body->oid = g_steal_pointer(&value);
+	}
+	if (n >= 11 && n <= 540 &&
+	    !g_ascii_strncasecmp(data, "x-obs-hash:", 11)) {
+		g_autofree char *value = g_strndup(data + 11, n - 11);
+
+		g_strstrip(value);
+		if (!segment(value) || body->hash)
+			return 0;
+		body->hash = g_steal_pointer(&value);
 	}
 	return n;
 }
@@ -128,9 +140,10 @@ void line_obs_http_close(void)
 	g_private_replace(&http_client, NULL);
 }
 
-static GBytes *transfer(const char *url, const char *token,
-			const char *metadata, GBytes *upload, char **oid,
-			gsize limit, long timeout, GError **error)
+static GBytes *transfer_full(const char *url, const char *token,
+			     const char *metadata, GBytes *upload, char **oid,
+			     char **hash, gsize limit, long timeout,
+			     GError **error)
 {
 	if (line_cooldown_check(url, error))
 		return NULL;
@@ -225,12 +238,24 @@ done:
 	else {
 		if (oid)
 			*oid = g_steal_pointer(&body.oid);
+		if (hash)
+			*hash = g_steal_pointer(&body.hash);
 		g_free(body.oid);
+		g_free(body.hash);
 		return g_byte_array_free_to_bytes(body.bytes);
 	}
 	g_free(body.oid);
+	g_free(body.hash);
 	g_byte_array_unref(body.bytes);
 	return NULL;
+}
+
+static GBytes *transfer(const char *url, const char *token,
+			const char *metadata, GBytes *upload, char **oid,
+			gsize limit, long timeout, GError **error)
+{
+	return transfer_full(url, token, metadata, upload, oid, NULL, limit,
+			     timeout, error);
 }
 
 char *line_obs_upload(const char *token, const char *sid, const char *oid,
@@ -357,6 +382,116 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 	if (!data && error)
 		g_propagate_error(e, g_steal_pointer(&error));
 	return data;
+}
+
+/*
+ * OpenChat (Square) attachments live under /r/g2/m/<msgId> and are not
+ * Letter-Sealed (ar8.b in LINE Android 26.16.0).
+ */
+char *line_obs_upload_square(const char *token, const char *message_id,
+			     const char *name, const char *media_type,
+			     GBytes *plain, GError **e)
+{
+	if (!token || !digits(message_id) || !name || !media_type || !plain ||
+	    !g_bytes_get_size(plain) ||
+	    (strcmp(media_type, "image") && strcmp(media_type, "video") &&
+	     strcmp(media_type, "audio") && strcmp(media_type, "file"))) {
+		invalid(e);
+		return NULL;
+	}
+	gsize n = g_bytes_get_size(plain);
+	g_autofree char *size_str = g_strdup_printf("%zu", n);
+
+	g_autoptr(J) params = obj();
+
+	json_object_object_add(params, "name", json_object_new_string(name));
+	json_object_object_add(params, "oid",
+			       json_object_new_string(message_id));
+	json_object_object_add(params, "size",
+			       json_object_new_string(size_str));
+	json_object_object_add(params, "type",
+			       json_object_new_string(media_type));
+	json_object_object_add(params, "ver", json_object_new_string("2.0"));
+	const char *json =
+		json_object_to_json_string_ext(params, JSON_C_TO_STRING_PLAIN);
+	g_autofree char *b64 =
+		g_base64_encode((const guint8 *)json, strlen(json));
+	g_autofree char *hdr = g_strconcat("x-obs-params: ", b64, NULL);
+	g_autofree char *url = g_strconcat("https://obs.line-apps.com/r/g2/m/",
+					   message_id, NULL);
+	char *oid = NULL;
+
+	g_autoptr(GBytes) reply = transfer_full(url, token, hdr, plain, NULL,
+						NULL, 65536, 90L, e);
+
+	if (!reply)
+		return NULL;
+	oid = g_strdup(message_id);
+	return oid;
+}
+
+GBytes *line_obs_download_square(const char *token, const char *message_id,
+				 GError **e)
+{
+	if (!token || !digits(message_id)) {
+		invalid(e);
+		return NULL;
+	}
+	g_autofree char *url = g_strconcat("https://obs.line-apps.com/r/g2/m/",
+					   message_id, NULL);
+
+	return transfer(url, token, NULL, NULL, NULL, LINE_MEDIA_LIMIT + 65536,
+			90L, e);
+}
+
+GBytes *line_obs_download_square_preview(const char *token,
+					 const char *message_id, GError **e)
+{
+	if (!token || !digits(message_id)) {
+		invalid(e);
+		return NULL;
+	}
+	g_autofree char *url = g_strconcat("https://obs.line-apps.com/r/g2/m/",
+					   message_id, "/preview", NULL);
+
+	return transfer(url, token, NULL, NULL, NULL, LINE_MEDIA_PREVIEW_LIMIT,
+			6L, e);
+}
+
+char *line_obs_upload_square_profile(const char *token, const char *scope,
+				     const char *oid, GBytes *jpeg, GError **e)
+{
+	if (!token || !scope ||
+	    (strcmp(scope, "member") && strcmp(scope, "group")) ||
+	    !segment(oid) || !jpeg || !g_bytes_get_size(jpeg)) {
+		invalid(e);
+		return NULL;
+	}
+	g_autoptr(J) params = obj();
+
+	json_object_object_add(params, "name",
+			       json_object_new_string("profile.jpg"));
+	json_object_object_add(params, "quality",
+			       json_object_new_string("100"));
+	json_object_object_add(params, "type", json_object_new_string("image"));
+	json_object_object_add(params, "ver", json_object_new_string("2.0"));
+	const char *json =
+		json_object_to_json_string_ext(params, JSON_C_TO_STRING_PLAIN);
+	g_autofree char *b64 =
+		g_base64_encode((const guint8 *)json, strlen(json));
+	g_autofree char *hdr = g_strconcat("x-obs-params: ", b64, NULL);
+	g_autofree char *url = g_strdup_printf(
+		"https://obs.line-apps.com/r/g2/%s/%s", scope, oid);
+	char *hash = NULL;
+
+	g_autoptr(GBytes) reply = transfer_full(url, token, hdr, jpeg, NULL,
+						&hash, 65536, 60L, e);
+
+	if (!reply) {
+		g_free(hash);
+		return NULL;
+	}
+	return hash ? hash : g_strdup(oid);
 }
 
 GBytes *line_avatar_download(const char *path, GError **e)

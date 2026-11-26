@@ -135,9 +135,12 @@ CURLcode __wrap_curl_easy_perform(CURL *c)
 	g_assert_cmpint(auth, ==, !anonymous);
 	g_assert_cmpint(meta, ==, (!anonymous && !legacy_preview));
 	static const char oid[] = "x-obs-oid: new-oid\r\n";
+	static const char hash[] = "x-obs-hash: 0hSquareHash\r\n";
 
-	if (upload)
+	if (upload) {
 		write_header((char *)oid, 1, strlen(oid), header_data);
+		write_header((char *)hash, 1, strlen(hash), header_data);
+	}
 	if (large_preview) {
 		char chunk[65536] = { 0 };
 
@@ -293,6 +296,45 @@ static void cooldown(void)
 	g_assert_cmpint(performs, ==, 2);
 }
 
+static void square_obs(void)
+{
+	g_autoptr(GError) e = NULL;
+	g_autoptr(GBytes) bytes = g_bytes_new_static("abc", 3);
+
+	upload = profile_upload = TRUE;
+	anonymous = legacy_preview = old_preview_path = large_preview = FALSE;
+	http_status = 200;
+	expected_url = "https://obs.line-apps.com/r/g2/m/1001";
+	g_autofree char *oid = line_obs_upload_square(
+		"test-obs-token", "1001", "photo.jpg", "image", bytes, &e);
+	g_assert_no_error(e);
+	g_assert_cmpstr(oid, ==, "1001");
+
+	profile_upload = TRUE;
+	expected_url = "https://obs.line-apps.com/r/g2/member/"
+		       "p00000000000000000000000000000001";
+	g_autofree char *hash = line_obs_upload_square_profile(
+		"test-obs-token", "member", "p00000000000000000000000000000001",
+		bytes, &e);
+	g_assert_no_error(e);
+	g_assert_cmpstr(hash, ==, "0hSquareHash");
+
+	upload = profile_upload = FALSE;
+	legacy_preview = TRUE;
+	expected_url = "https://obs.line-apps.com/r/g2/m/1001";
+	g_autoptr(GBytes) dl =
+		line_obs_download_square("test-obs-token", "1001", &e);
+	g_assert_no_error(e);
+	g_assert_true(g_bytes_equal(dl, bytes));
+
+	expected_url = "https://obs.line-apps.com/r/g2/m/1001/preview";
+	g_autoptr(GBytes) pv =
+		line_obs_download_square_preview("test-obs-token", "1001", &e);
+	g_assert_no_error(e);
+	g_assert_true(g_bytes_equal(pv, bytes));
+	legacy_preview = FALSE;
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -300,6 +342,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/obs/invalid", invalid);
 	g_test_add_func("/obs/profile-picture-upload", profile_picture);
 	g_test_add_func("/obs/video-preview-paths-and-limit", previews);
+	g_test_add_func("/obs/square", square_obs);
 	g_test_add_func("/obs/cooldown", cooldown);
 	return g_test_run();
 }

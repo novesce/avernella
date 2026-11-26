@@ -5,6 +5,7 @@
 #include "liff.h"
 #include "friends.h"
 #include "groups.h"
+#include "square.h"
 #include "call.h"
 #include "call_group.h"
 #include "emoji.h"
@@ -72,6 +73,16 @@ struct line_worker {
 	GHashTable *leases, *left_groups;
 	J *messages, *friends, *opened_chats, *lookup_result, *invited_groups;
 	J *recommendations;
+	/* OpenChat (Square) session state. */
+	J *squares, *square_members, *square_authorities,
+		*square_chat_to_square, *square_chats_raw;
+	GHashTable *square_history_tokens;
+	char *square_find_token, *square_sync_token;
+	gint64 square_sub_id, square_poll_due;
+	gboolean square_disabled;
+	/* Pending group invite link preview. */
+	J *group_ticket_chat;
+	char *group_ticket_id;
 	/* Profiles the window opened, and incoming friend requests. */
 	J *cards, *requests;
 	J *unread_heads, *read_acks;
@@ -206,6 +217,20 @@ static void clear_view(struct line_worker *w)
 	g_clear_pointer(&w->requests, json_object_put);
 	g_clear_pointer(&w->opened_chats, json_object_put);
 	g_clear_pointer(&w->invited_groups, json_object_put);
+	g_clear_pointer(&w->squares, json_object_put);
+	g_clear_pointer(&w->square_members, json_object_put);
+	g_clear_pointer(&w->square_authorities, json_object_put);
+	g_clear_pointer(&w->square_chat_to_square, json_object_put);
+	g_clear_pointer(&w->square_chats_raw, json_object_put);
+	if (w->square_history_tokens)
+		g_hash_table_remove_all(w->square_history_tokens);
+	g_clear_pointer(&w->square_find_token, g_free);
+	g_clear_pointer(&w->square_sync_token, g_free);
+	w->square_sub_id = 0;
+	w->square_poll_due = 0;
+	w->square_disabled = FALSE;
+	g_clear_pointer(&w->group_ticket_chat, json_object_put);
+	g_clear_pointer(&w->group_ticket_id, g_free);
 	g_clear_pointer(&w->unread_heads, json_object_put);
 	g_clear_pointer(&w->read_acks, json_object_put);
 	g_clear_pointer(&w->peer_ranges, json_object_put);
@@ -457,7 +482,8 @@ static J *login(struct line_worker *w, GError **error)
 	const char *const enabled[] = {
 		"photos",	"files",	 "calls",	 "avatars",
 		"muteCalls",	"incomingCalls", "emojis",	 "friends",
-		"friendInvite", "groups",	 "findMessages", "stickers"
+		"friendInvite", "groups",	 "findMessages", "stickers",
+		"openchats"
 	};
 	for (guint i = 0; i < G_N_ELEMENTS(enabled); i++)
 		json_object_object_add(caps, enabled[i],
@@ -682,9 +708,107 @@ static guint64 history_clear_id(struct line_worker *w, const char *chat)
 	return json_object_get_uint64(field(summary, "clearThrough"));
 }
 
+static const char *square_for_chat(struct line_worker *w, const char *chat)
+{
+	return w->square_chat_to_square ?
+		       strfield(w->square_chat_to_square, chat) :
+		       NULL;
+}
+
+static J *my_square_member(struct line_worker *w, const char *square_mid)
+{
+	return square_mid && w->square_members ?
+		       field(w->square_members, square_mid) :
+		       NULL;
+}
+
+static const char *my_square_member_id(struct line_worker *w, const char *chat)
+{
+	J *m = my_square_member(w, square_for_chat(w, chat));
+
+	return m ? strfield(m, "1") : NULL;
+}
+
+static gboolean my_square_can_announce(struct line_worker *w, const char *chat)
+{
+	const char *sq = square_for_chat(w, chat);
+	J *m = my_square_member(w, sq);
+	J *auth = sq && w->square_authorities ?
+			  field(w->square_authorities, sq) :
+			  NULL;
+	int role = m ? json_object_get_int(field(m, "8")) : 0;
+	int need = auth ? json_object_get_int(field(auth, "12")) : 2;
+
+	return role > 0 && need > 0 && role <= need;
+}
+
+static void remember_square_raw(struct line_worker *w, J *result)
+{
+	J *sq = field(result, "rawSquare");
+	J *mem = field(result, "rawMember");
+	J *auth = field(result, "rawAuthority");
+	J *chat = field(result, "rawChat");
+	const char *smid = sq  ? strfield(sq, "1") :
+			   mem ? strfield(mem, "2") :
+				 NULL;
+
+	if (smid && line_square_id(smid, 's')) {
+		if (!w->squares)
+			w->squares = obj();
+		if (!w->square_members)
+			w->square_members = obj();
+		if (!w->square_authorities)
+			w->square_authorities = obj();
+		if (sq)
+			json_object_object_add(w->squares, smid,
+					       json_object_get(sq));
+		if (mem)
+			json_object_object_add(w->square_members, smid,
+					       json_object_get(mem));
+		if (auth)
+			json_object_object_add(w->square_authorities, smid,
+					       json_object_get(auth));
+	}
+	if (chat && line_square_id(strfield(chat, "1"), 'm')) {
+		if (!w->square_chats_raw)
+			w->square_chats_raw = obj();
+		json_object_object_add(w->square_chats_raw, strfield(chat, "1"),
+				       json_object_get(chat));
+		if (smid && line_square_id(smid, 's')) {
+			if (!w->square_chat_to_square)
+				w->square_chat_to_square = obj();
+			json_object_object_add(w->square_chat_to_square,
+					       strfield(chat, "1"),
+					       json_object_new_string(smid));
+		}
+	}
+	json_object_object_del(result, "rawSquare");
+	json_object_object_del(result, "rawMember");
+	json_object_object_del(result, "rawAuthority");
+	json_object_object_del(result, "rawChat");
+}
+
 static J *recent_history(struct line_worker *w, const char *chat, J **raw,
 			 GError **error)
 {
+	if (line_is_square_chat(chat)) {
+		g_autofree char *next = NULL;
+		gboolean more = FALSE;
+		J *rows = line_square_history(&w->session, chat,
+					      my_square_member_id(w, chat),
+					      NULL, raw, &next, &more, error);
+
+		if (rows) {
+			if (next)
+				g_hash_table_replace(w->square_history_tokens,
+						     g_strdup(chat),
+						     g_steal_pointer(&next));
+			else
+				g_hash_table_remove(w->square_history_tokens,
+						    chat);
+		}
+		return rows;
+	}
 	return line_history_with_summary(&w->session, chat,
 					 g_hash_table_lookup(w->chats, chat),
 					 raw, error);
@@ -693,6 +817,33 @@ static J *recent_history(struct line_worker *w, const char *chat, J **raw,
 static J *previous_history(struct line_worker *w, const char *chat, J *boundary,
 			   J **raw, gboolean *more, GError **error)
 {
+	if (line_is_square_chat(chat)) {
+		const char *token =
+			g_hash_table_lookup(w->square_history_tokens, chat);
+
+		if (!token || !*token) {
+			if (more)
+				*more = FALSE;
+			if (raw)
+				*raw = obj();
+			return json_object_new_array();
+		}
+		g_autofree char *next = NULL;
+		J *rows = line_square_history(&w->session, chat,
+					      my_square_member_id(w, chat),
+					      token, raw, &next, more, error);
+
+		if (rows) {
+			if (next)
+				g_hash_table_replace(w->square_history_tokens,
+						     g_strdup(chat),
+						     g_steal_pointer(&next));
+			else
+				g_hash_table_remove(w->square_history_tokens,
+						    chat);
+		}
+		return rows;
+	}
 	return line_history_older_since(&w->session, chat, boundary,
 					history_clear_id(w, chat), raw, more,
 					error);
@@ -882,6 +1033,16 @@ static J *friend_action(struct line_worker *w, const char *method, J *params,
 	return updated;
 }
 
+static int merged_chat_order(const void *a, const void *b)
+{
+	J *lhs = *(J *const *)a, *rhs = *(J *const *)b;
+	gint64 lt = json_object_get_int64(field(lhs, "time"));
+	gint64 rt = json_object_get_int64(field(rhs, "time"));
+
+	return lt == rt ? strcmp(strfield(lhs, "id"), strfield(rhs, "id")) :
+			  (lt > rt ? -1 : 1);
+}
+
 static J *chat_directory(struct line_worker *w, GError **error)
 {
 	Line *s = &w->session;
@@ -889,6 +1050,39 @@ static J *chat_directory(struct line_worker *w, GError **error)
 
 	if (!rows)
 		return NULL;
+	if (!w->square_disabled) {
+		g_autoptr(GError) sq_err = NULL;
+		g_autoptr(J) sqs = NULL, mems = NULL, auths = NULL, c2s = NULL;
+		g_autoptr(J) sq_rows = line_square_chats(s, &sqs, &mems, &auths,
+							 &c2s, &sq_err);
+
+		if (sq_rows) {
+			g_clear_pointer(&w->squares, json_object_put);
+			g_clear_pointer(&w->square_members, json_object_put);
+			g_clear_pointer(&w->square_authorities,
+					json_object_put);
+			g_clear_pointer(&w->square_chat_to_square,
+					json_object_put);
+			w->squares = g_steal_pointer(&sqs);
+			w->square_members = g_steal_pointer(&mems);
+			w->square_authorities = g_steal_pointer(&auths);
+			w->square_chat_to_square = g_steal_pointer(&c2s);
+			for (size_t i = 0;
+			     i < json_object_array_length(sq_rows); i++)
+				json_object_array_add(
+					rows, json_object_get(
+						      json_object_array_get_idx(
+							      sq_rows, i)));
+			json_object_array_sort(rows, merged_chat_order);
+			if (json_object_object_length(w->squares) &&
+			    !w->square_poll_due)
+				w->square_poll_due = g_get_monotonic_time() +
+						     4 * G_USEC_PER_SEC;
+		} else if (g_error_matches(sq_err, LINE_ERROR,
+					   LINE_METHOD_UNAVAILABLE)) {
+			w->square_disabled = TRUE;
+		}
+	}
 	g_hash_table_remove_all(w->chats);
 	g_clear_pointer(&w->unread_heads, json_object_put);
 	w->unread_heads = obj();
@@ -1098,14 +1292,14 @@ static void show_history(struct line_worker *w, const char *chat, J *raw)
 	json_object_put(w->messages);
 	w->messages = json_object_get(raw);
 	w->latest_history = TRUE;
-	w->publish_reads = TRUE;
+	w->publish_reads = !line_is_square_chat(chat);
 	if (g_strcmp0(w->history_chat, chat)) {
 		g_free(w->history_chat);
 		w->history_chat = g_strdup(chat);
 		g_clear_pointer(&w->peer_ranges, json_object_put);
 		g_clear_pointer(&w->peer_notices, json_object_put);
 		w->peer_notices = obj();
-		w->need_ranges = TRUE;
+		w->need_ranges = !line_is_square_chat(chat);
 		w->ranges_retry_at = 0;
 	}
 }
@@ -1215,6 +1409,22 @@ static J *forward_message(struct line_worker *w, const char *destination,
 		return NULL;
 	Line *s = &w->session;
 
+	if (line_is_square_chat(destination)) {
+		const char *my_mid = my_square_member_id(w, destination);
+
+		if (kind == 0) {
+			g_autofree char *text =
+				line_message_preview(s, message, error);
+
+			return text ? line_square_send_text(s, destination,
+							    my_mid, text, NULL,
+							    NULL, NULL, seq,
+							    error) :
+				      NULL;
+		}
+		return line_forward_square_attachment(s, destination, my_mid,
+						      message, seq, error);
+	}
 	s->seq--;
 	J *receipt =
 		kind == 0 ?
@@ -1228,7 +1438,11 @@ static J *forward_message(struct line_worker *w, const char *destination,
 static J *announcement_list(struct line_worker *w, const char *chat,
 			    GError **error)
 {
-	J *rows = line_announcements(&w->session, chat, error);
+	J *rows = line_is_square_chat(chat) ?
+			  line_square_announcements(
+				  &w->session, chat,
+				  my_square_can_announce(w, chat), error) :
+			  line_announcements(&w->session, chat, error);
 
 	if (rows) {
 		json_object_put(w->announcements);
@@ -1250,13 +1464,19 @@ static J *remove_announcement(struct line_worker *w, const char *chat,
 			if (g_strcmp0(id, strfield(row, "id")) ||
 			    !json_object_get_boolean(field(row, "canRemove")))
 				continue;
-			gint32 seq = reserve_sequence(w, error);
-			J *receipt = seq ? line_remove_announcement(&w->session,
-								    chat, id,
-								    seq,
-								    error) :
-					   NULL;
+			J *receipt;
 
+			if (line_is_square_chat(chat)) {
+				receipt = line_square_remove_announcement(
+					&w->session, chat, id, error);
+			} else {
+				gint32 seq = reserve_sequence(w, error);
+
+				receipt = seq ? line_remove_announcement(
+							&w->session, chat, id,
+							seq, error) :
+						NULL;
+			}
 			if (receipt)
 				json_object_array_del_idx(w->announcements, i,
 							  1);
@@ -1499,6 +1719,259 @@ static J *group_roster(struct line_worker *w, J *members)
 	return roster;
 }
 
+static J *square_list_hub(struct line_worker *w, GError **error)
+{
+	Line *s = &w->session;
+	g_autoptr(J) sqs = NULL, mems = NULL, auths = NULL, c2s = NULL;
+	g_autoptr(J) chat_rows =
+		line_square_chats(s, &sqs, &mems, &auths, &c2s, error);
+
+	if (!chat_rows)
+		return NULL;
+	g_clear_pointer(&w->squares, json_object_put);
+	g_clear_pointer(&w->square_members, json_object_put);
+	g_clear_pointer(&w->square_authorities, json_object_put);
+	g_clear_pointer(&w->square_chat_to_square, json_object_put);
+	w->squares = g_steal_pointer(&sqs);
+	w->square_members = g_steal_pointer(&mems);
+	w->square_authorities = g_steal_pointer(&auths);
+	w->square_chat_to_square = g_steal_pointer(&c2s);
+	if (json_object_object_length(w->squares) && !w->square_poll_due)
+		w->square_poll_due =
+			g_get_monotonic_time() + 4 * G_USEC_PER_SEC;
+	J *out = obj(), *groups = json_object_new_array();
+
+	json_object_object_foreach(w->squares, smid, sq) {
+		J *mem = field(w->square_members, smid);
+		J *entry = obj();
+		const char *name = strfield(sq, "2");
+		const char *desc = strfield(sq, "5");
+		const char *hash = strfield(sq, "4");
+		int role = mem ? json_object_get_int(field(mem, "8")) : 10;
+
+		json_object_object_add(entry, "squareMid",
+				       json_object_new_string(smid));
+		json_object_object_add(
+			entry, "name",
+			json_object_new_string(name && *name ? name : smid));
+		json_object_object_add(entry, "description",
+				       json_object_new_string(desc ? desc :
+								     ""));
+		json_object_object_add(
+			entry, "myRole",
+			json_object_new_string(role == 1 ? "admin" :
+					       role == 2 ? "coadmin" :
+							   "member"));
+		if (hash && *hash) {
+			g_autofree char *av = g_strconcat("/", hash, NULL);
+
+			json_object_object_add(entry, "avatarKey",
+					       json_object_new_string(av));
+		}
+		J *rooms = json_object_new_array();
+
+		for (size_t i = 0; i < json_object_array_length(chat_rows);
+		     i++) {
+			J *cr = json_object_array_get_idx(chat_rows, i);
+
+			if (!g_strcmp0(strfield(cr, "squareMid"), smid))
+				json_object_array_add(rooms,
+						      json_object_get(cr));
+		}
+		json_object_object_add(entry, "chats", rooms);
+		json_object_array_add(groups, entry);
+	}
+	json_object_object_add(out, "squares", groups);
+	return out;
+}
+
+static J *square_dispatch(struct line_worker *w, const char *method, J *params,
+			  GError **error)
+{
+	Line *s = &w->session;
+
+	if (!strcmp(method, "squareList"))
+		return square_list_hub(w, error);
+	if (!strcmp(method, "squareCategories"))
+		return line_square_categories(s, error);
+	if (!strcmp(method, "squareFindTicket"))
+		return line_square_find_ticket(s, strfield(params, "input"),
+					       error);
+	if (!strcmp(method, "squareJoin")) {
+		J *res = line_square_join(s, strfield(params, "squareMid"),
+					  strfield(params, "chatMid"),
+					  strfield(params, "displayName"),
+					  strfield(params, "joinCode"),
+					  strfield(params, "approvalMessage"),
+					  error);
+
+		if (res) {
+			remember_square_raw(w, res);
+			J *chat = field(res, "chat");
+
+			if (chat) {
+				J *opened = open_conversation(w, chat);
+
+				json_object_object_add(res, "chat", opened);
+			}
+			if (!w->square_poll_due)
+				w->square_poll_due = g_get_monotonic_time() +
+						     4 * G_USEC_PER_SEC;
+		}
+		return res;
+	}
+	if (!strcmp(method, "squareJoinChat")) {
+		g_autoptr(J) row = line_square_join_chat(
+			s, strfield(params, "chat"), error);
+
+		return row ? open_conversation(w, row) : NULL;
+	}
+	if (!strcmp(method, "squareCreate")) {
+		gint32 seq = reserve_sequence(w, error);
+
+		if (!seq)
+			return NULL;
+		J *res = line_square_create(
+			s, strfield(params, "name"),
+			strfield(params, "description"),
+			strfield(params, "welcome"),
+			strfield(params, "displayName"),
+			json_object_get_int(field(params, "categoryId")),
+			json_object_get_boolean(field(params, "searchable")),
+			json_object_get_int(field(params, "joinMethod")),
+			strfield(params, "joinCode"),
+			strfield(params, "approvalQuestion"), seq, error);
+
+		if (res) {
+			remember_square_raw(w, res);
+			J *chat = field(res, "chat");
+
+			if (chat) {
+				J *opened = open_conversation(w, chat);
+
+				json_object_object_add(res, "chat", opened);
+			}
+		}
+		return res;
+	}
+	if (!strcmp(method, "squareCreateChat")) {
+		gint32 seq = reserve_sequence(w, error);
+
+		if (!seq)
+			return NULL;
+		g_autoptr(J) row = line_square_create_chat(
+			s, strfield(params, "squareMid"),
+			strfield(params, "name"), seq, error);
+
+		if (!row)
+			return NULL;
+		const char *cid = strfield(row, "id");
+		const char *smid = strfield(params, "squareMid");
+
+		if (cid && smid) {
+			if (!w->square_chat_to_square)
+				w->square_chat_to_square = obj();
+			json_object_object_add(w->square_chat_to_square, cid,
+					       json_object_new_string(smid));
+		}
+		return open_conversation(w, row);
+	}
+	const char *chat = strfield(params, "chat");
+	const char *smid = strfield(params, "squareMid");
+
+	if (!smid && chat)
+		smid = square_for_chat(w, chat);
+	if (!strcmp(method, "squareDetail")) {
+		J *res = line_square_detail(s, smid, chat, error);
+
+		if (res)
+			remember_square_raw(w, res);
+		return res;
+	}
+	if (!strcmp(method, "squareInviteLink"))
+		return line_square_invite_link(s, chat ? chat : smid, error);
+	if (!strcmp(method, "squareUpdate")) {
+		J *cur = smid && w->squares ? field(w->squares, smid) : NULL;
+		J *res = line_square_update(s, cur, params, error);
+
+		if (res)
+			remember_square_raw(w, res);
+		return res;
+	}
+	if (!strcmp(method, "squareUpdateChat")) {
+		J *cur = chat && w->square_chats_raw ?
+				 field(w->square_chats_raw, chat) :
+				 NULL;
+
+		return line_square_update_chat(s, cur, strfield(params, "name"),
+					       error);
+	}
+	if (!strcmp(method, "squareUpdateProfile")) {
+		J *mem = my_square_member(w, smid);
+		J *res = line_square_update_my_profile(
+			s, mem, strfield(params, "displayName"),
+			strfield(params, "bio"), NULL, error);
+
+		if (res)
+			remember_square_raw(w, res);
+		return res;
+	}
+	if (!strcmp(method, "squareUpdatePicture")) {
+		J *mem = my_square_member(w, smid);
+		J *res = line_square_update_picture(
+			s, mem, strfield(params, "path"), error);
+
+		if (res)
+			remember_square_raw(w, res);
+		return res;
+	}
+	if (!strcmp(method, "squareLeave")) {
+		J *res = line_square_leave(s, smid, error);
+
+		if (res && smid) {
+			if (w->squares)
+				json_object_object_del(w->squares, smid);
+			if (w->square_members)
+				json_object_object_del(w->square_members, smid);
+			if (w->square_authorities)
+				json_object_object_del(w->square_authorities,
+						       smid);
+			if (chat) {
+				g_hash_table_remove(w->chats, chat);
+				json_object_object_del(w->opened_chats, chat);
+				json_object_object_del(w->unread_heads, chat);
+			}
+			clear_global_search(w);
+		}
+		return res;
+	}
+	if (!strcmp(method, "squareMembers") ||
+	    !strcmp(method, "squarePendingMembers"))
+		return line_square_members(
+			s, smid, strfield(params, "cursor"),
+			strfield(params, "query"),
+			!strcmp(method, "squarePendingMembers"), error);
+	if (!strcmp(method, "squareModerateMember"))
+		return line_square_moderate_member(s, smid,
+						   strfield(params, "member"),
+						   strfield(params, "action"),
+						   error);
+	if (!strcmp(method, "squareApproveMember") ||
+	    !strcmp(method, "squareRejectMember"))
+		return line_square_answer_join_request(
+			s, smid, strfield(params, "member"),
+			!strcmp(method, "squareApproveMember"), error);
+	if (!strcmp(method, "squareDestroyMessage")) {
+		if (!chat || g_strcmp0(chat, w->history_chat) ||
+		    !field(w->messages, strfield(params, "id")))
+			return problem(error,
+				       "Select a message in this OpenChat.");
+		return line_square_destroy_message(
+			s, chat, strfield(params, "id"), error);
+	}
+	return NULL;
+}
+
 static J *dispatch(struct line_worker *w, const char *method, J *params,
 		   GError **error)
 {
@@ -1584,6 +2057,44 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		return change_group(w, NULL, params, error);
 	if (!strcmp(method, "groupInvitations"))
 		return pending_groups(w, error);
+	if (!strcmp(method, "groupFindTicket")) {
+		g_autofree char *ticket = NULL;
+		J *row = line_group_find_ticket(s, strfield(params, "input"),
+						&ticket, error);
+
+		if (row) {
+			g_clear_pointer(&w->group_ticket_chat, json_object_put);
+			g_clear_pointer(&w->group_ticket_id, g_free);
+			w->group_ticket_chat = json_object_get(row);
+			w->group_ticket_id = g_steal_pointer(&ticket);
+		}
+		return row;
+	}
+	if (!strcmp(method, "groupJoinTicket")) {
+		const char *cid = strfield(params, "chat");
+
+		if (!w->group_ticket_chat || !w->group_ticket_id ||
+		    g_strcmp0(cid, strfield(w->group_ticket_chat, "id")))
+			return problem(error,
+				       "Open a group invite link first.");
+		gint32 seq = reserve_sequence(w, error);
+
+		if (!seq)
+			return NULL;
+		g_autoptr(J) ack = line_group_join_ticket(
+			s, cid, w->group_ticket_id, seq, error);
+
+		if (!ack)
+			return NULL;
+		g_hash_table_remove(w->left_groups, cid);
+		J *opened = open_conversation(w, w->group_ticket_chat);
+
+		g_clear_pointer(&w->group_ticket_chat, json_object_put);
+		g_clear_pointer(&w->group_ticket_id, g_free);
+		return opened;
+	}
+	if (g_str_has_prefix(method, "square"))
+		return square_dispatch(w, method, params, error);
 	gboolean join = !strcmp(method, "joinGroup");
 
 	if (join || !strcmp(method, "declineGroup"))
@@ -1801,9 +2312,14 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		g_autofree char *text = line_message_preview(s, msg, error);
 		gint32 seq = text ? reserve_sequence(w, error) : 0;
 
-		return seq ? line_announce_message(s, chat, id, text, seq,
-						   error) :
-			     NULL;
+		if (!seq)
+			return NULL;
+		if (line_is_square_chat(chat))
+			return line_square_announce_message(
+				s, chat, id, text, strfield(msg, "1"),
+				json_object_get_int64(field(msg, "5")), seq,
+				error);
+		return line_announce_message(s, chat, id, text, seq, error);
 	}
 	if (!strcmp(method, "sendSticker")) {
 		const char *reply_to = strfield(params, "replyTo");
@@ -1818,9 +2334,15 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(error, "Select a message to reply to.");
 		gint32 seq = reserve_sequence(w, error);
 
-		return seq ? line_send_sticker(s, w->stickers, chat, pack,
-					       sticker, reply_to, seq, error) :
-			     NULL;
+		if (!seq)
+			return NULL;
+		if (line_is_square_chat(chat))
+			return line_square_send_sticker(
+				s, w->stickers, chat,
+				my_square_member_id(w, chat), pack, sticker,
+				reply_to, seq, error);
+		return line_send_sticker(s, w->stickers, chat, pack, sticker,
+					 reply_to, seq, error);
 	}
 	if (!strcmp(method, "markRead")) {
 		if (!msg || !w->latest_history ||
@@ -1832,12 +2354,16 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 
 		if (last && !g_strcmp0(id, strfield(last, "id")))
 			return json_object_get(last);
-		gint32 seq = reserve_sequence(w, error);
+		J *ack;
 
-		if (!seq)
-			return NULL;
-		J *ack = line_mark_read(s, chat, id, seq, error);
+		if (line_is_square_chat(chat)) {
+			ack = line_square_mark_read(s, chat, id, error);
+		} else {
+			gint32 seq = reserve_sequence(w, error);
 
+			ack = seq ? line_mark_read(s, chat, id, seq, error) :
+				    NULL;
+		}
 		if (ack)
 			json_object_object_add(w->read_acks, chat,
 					       json_object_get(ack));
@@ -1919,7 +2445,11 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(
 				error,
 				"Select a message in this conversation.");
-		if (unsend && g_strcmp0(strfield(msg, "1"), s->mid))
+		const char *owner_id = line_is_square_chat(chat) ?
+					       my_square_member_id(w, chat) :
+					       s->mid;
+
+		if (unsend && g_strcmp0(strfield(msg, "1"), owner_id))
 			return problem(
 				error,
 				"You can only unsend your own messages.");
@@ -1927,6 +2457,40 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(error, "Choose a reaction.");
 		if ((photo || file) && (!path || !g_path_is_absolute(path)))
 			return problem(error, "Choose an attachment.");
+		if (line_is_square_chat(chat)) {
+			const char *my_mid = my_square_member_id(w, chat);
+
+			if (unsend)
+				return line_square_unsend(s, chat, id, error);
+			gint32 reserved = reserve_sequence(w, error);
+
+			if (!reserved)
+				return NULL;
+			if (text_send)
+				return line_square_send_text(
+					s, chat, my_mid, text, reply_to,
+					field(params, "emojis"),
+					field(params, "mentions"), reserved,
+					error);
+			if (photo)
+				return line_send_square_attachment(
+					s, chat, my_mid, path, LINE_MEDIA_IMAGE,
+					reserved, error);
+			if (file) {
+				const char *kind = strfield(params, "type");
+				int type = !g_strcmp0(kind, "video") ?
+						   LINE_MEDIA_VIDEO :
+					   !g_strcmp0(kind, "audio") ?
+						   LINE_MEDIA_AUDIO :
+						   LINE_MEDIA_FILE;
+
+				return line_send_square_attachment(
+					s, chat, my_mid, path, type, reserved,
+					error);
+			}
+			return line_square_react(s, chat, id, reaction,
+						 reserved, error);
+		}
 		gint32 reserved = reserve_sequence(w, error);
 
 		if (!reserved)
@@ -2445,12 +3009,98 @@ static gint64 maintain_group_roster(struct line_worker *w)
  * LINE's absolute Unix time so suspend and wall-clock changes are respected.
  * Invitation expiry and retry intervals use elapsed monotonic time.
  */
+/*
+ * Gently poll SquareService.fetchMyEvents when the user belongs to at least
+ * one OpenChat. Respects Retry-After and slows down when unfocused.
+ */
+static gint64 maintain_square_sync(struct line_worker *w)
+{
+	if (!w->ready || w->square_disabled || !w->squares ||
+	    !json_object_object_length(w->squares) || !w->square_poll_due)
+		return 0;
+	gint64 now = g_get_monotonic_time();
+
+	if (now < w->square_poll_due)
+		return w->square_poll_due;
+	int cooldown = line_transport_retry_after();
+
+	if (cooldown) {
+		w->square_poll_due = now + (gint64)cooldown * G_USEC_PER_SEC;
+		return w->square_poll_due;
+	}
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) events = line_square_poll_events(
+		&w->session, &w->square_sub_id, &w->square_sync_token,
+		w->square_members, &error);
+	if (!events) {
+		if (g_error_matches(error, LINE_ERROR,
+				    LINE_METHOD_UNAVAILABLE)) {
+			w->square_disabled = TRUE;
+			w->square_poll_due = 0;
+			return 0;
+		}
+		w->square_poll_due = now + 30 * G_USEC_PER_SEC;
+		return w->square_poll_due;
+	}
+	gboolean reload = FALSE;
+	g_autofree char *open_chat = NULL;
+
+	for (size_t i = 0; i < json_object_array_length(events); i++) {
+		J *ev = json_object_array_get_idx(events, i);
+		const char *kind = strfield(ev, "kind");
+		const char *chat = strfield(ev, "chat");
+
+		if (!g_strcmp0(kind, "message") && chat) {
+			struct cached_history *cached =
+				g_hash_table_lookup(w->history_cache, chat);
+
+			if (cached)
+				cached->stale = TRUE;
+			if (!g_strcmp0(chat, w->history_chat)) {
+				g_free(open_chat);
+				open_chat = g_strdup(chat);
+			}
+			g_autoptr(J) pkt = obj();
+
+			json_object_object_add(
+				pkt, "event",
+				json_object_new_string("chat_message"));
+			json_object_object_add(pkt, "chat",
+					       json_object_new_string(chat));
+			if (strfield(ev, "id"))
+				json_object_object_add(
+					pkt, "id",
+					json_object_new_string(
+						strfield(ev, "id")));
+			json_object_object_add(
+				pkt, "time",
+				json_object_get(field(ev, "time")));
+			json_object_object_add(
+				pkt, "mine",
+				json_object_get(field(ev, "mine")));
+			line_emit(pkt);
+		} else {
+			reload = TRUE;
+		}
+	}
+	if (reload)
+		line_event("changed", NULL, NULL);
+	else if (open_chat)
+		revalidate_history(w, open_chat);
+	if (w->session.token_changed)
+		save_rotated_token(w);
+	w->square_poll_due = g_get_monotonic_time() +
+			     (w->foreground ? 4 : 25) * G_USEC_PER_SEC;
+	return w->square_poll_due;
+}
+
 static int maintenance_wait(struct line_worker *w)
 {
 	Line *s = &w->session;
 	gint64 next = line_voice_tick(), renewal = 0;
 
 	next = earlier_deadline(next, maintain_group_roster(w));
+	next = earlier_deadline(next, maintain_square_sync(w));
 	if (w->live && !w->live_failing && s->access) {
 		gint64 now = g_get_monotonic_time();
 		gint64 wall = g_get_real_time() / G_USEC_PER_SEC;
@@ -2816,6 +3466,8 @@ static int worker(int credentials_fd)
 	g_queue_init(&w.history_lru);
 	w.left_groups =
 		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	w.square_history_tokens =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
 	g_autoptr(GString) pending = g_string_sized_new(2048);
 	struct pollfd fds[] = { { .fd = STDIN_FILENO, .events = POLLIN },
 				{ .fd = w.timer, .events = POLLIN },
@@ -2906,10 +3558,23 @@ static int worker(int credentials_fd)
 	line_session_clear(&w.session);
 	g_hash_table_unref(w.chats);
 	g_hash_table_unref(w.left_groups);
+	g_hash_table_unref(w.square_history_tokens);
 	g_free(w.name);
 	line_obs_http_close();
 	line_transport_release();
 	return 0;
+}
+
+static gboolean launch_url_arg(const char *arg)
+{
+	return arg &&
+	       (!g_ascii_strncasecmp(arg, "line://", 7) ||
+		!g_ascii_strncasecmp(arg, "lineb://", 8) ||
+		!g_ascii_strncasecmp(arg, "https://line.me/", 16) ||
+		!g_ascii_strncasecmp(arg, "https://line.naver.jp/", 22) ||
+		!g_ascii_strncasecmp(arg, "https://liff.line.me/", 21) ||
+		!g_ascii_strncasecmp(arg, "https://miniapp.line.me/", 24) ||
+		!g_ascii_strncasecmp(arg, "https://openchat.line.me/", 25));
 }
 
 int main(int argc, char **argv)
@@ -2924,11 +3589,11 @@ int main(int argc, char **argv)
 		return ui_pick_share_monitor(argc - 2, argv + 2);
 	if (argc == 2 &&
 	    (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) {
-		puts("avernella 0.1 — independent Linux client compatible with LINE\nUsage: avernella");
+		puts("avernella 0.1 — independent Linux client compatible with LINE\nUsage: avernella [LINE_URL]");
 		return 0;
 	}
-	if (argc != 1) {
-		fputs("Usage: avernella [--help]\n", stderr);
+	if (argc > 2 || (argc == 2 && !launch_url_arg(argv[1]))) {
+		fputs("Usage: avernella [--help | LINE_URL]\n", stderr);
 		return 2;
 	}
 	return line_ui(argc, argv);

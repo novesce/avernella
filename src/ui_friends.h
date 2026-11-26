@@ -3,6 +3,7 @@
 #include "ui_private.h"
 void ui_friends_reset(void);
 void ui_friends_show(void);
+void ui_friends_open_link(const char *url);
 /* Opens a roster: 0 everyone, 1 hidden, 2 blocked, 3 suggestions. */
 void ui_friends_show_view(int directory);
 gboolean ui_friends_active(void);
