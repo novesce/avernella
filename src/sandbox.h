@@ -37,6 +37,10 @@ enum line_sandbox_layer {
 	LINE_SANDBOX_HEAP_WIPE = 1 << 9,
 	/* LINE replies decoded from a copy that ends at a guard page. */
 	LINE_SANDBOX_GUARD_PAGES = 1 << 10,
+	/* Landlock filesystem confinement (ABI 1..11). */
+	LINE_SANDBOX_LANDLOCK_FS = 1 << 11,
+	/* Landlock ABI 6 (Linux 6.12): no abstract UNIX socket escapes. */
+	LINE_SANDBOX_LANDLOCK_ABSTRACT = 1 << 12,
 };
 
 /*
@@ -61,6 +65,7 @@ guint line_sandbox_worker(void);
  */
 guint line_sandbox_ui_start(void);
 guint line_sandbox_ui_renderer(gboolean jit_free);
+guint line_sandbox_ui_confine(void);
 guint line_sandbox_ui_layers(void);
 
 /*

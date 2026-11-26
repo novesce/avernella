@@ -14,7 +14,7 @@ endif
 ifeq ($(origin CC),default)
 CC = gcc
 endif
-PKGS = sdl2 pangocairo glib-2.0 libqrencode json-c libcurl libcrypto libturbojpeg libpng libwebp opus libsrtp2 gio-2.0 gio-unix-2.0 zlib vpx libpipewire-0.3 rnnoise
+PKGS = sdl2 pangocairo glib-2.0 libqrencode json-c libcurl libcrypto libturbojpeg libpng libwebp opus libsrtp2 gio-2.0 gio-unix-2.0 zlib vpx libpipewire-0.3 rnnoise libseccomp
 CPPFLAGS += -D_GNU_SOURCE -Isrc $(shell pkg-config --cflags $(PKGS))
 ifeq ($(DEBUG),1)
 CFLAGS ?= -Og -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables
@@ -75,9 +75,10 @@ endif
 CFLAGS += $(FORTIFY) $(STACK_CLASH) $(HARDEN)
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
-SOURCES = main pair password_login state thrift transport messaging friends groups square sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
+SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
+SOURCES += security/ipc security/sandbox security/vault
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
 # Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
 JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
@@ -98,7 +99,7 @@ OBJECTS = $(SOURCES:%=build/%.o)
 GIT_COMMIT := $(if $(wildcard .git),$(shell git rev-parse HEAD 2>/dev/null | cut -c1-7))
 COMMIT_DEFINE := \#define LINE_BUILD_COMMIT "$(or $(GIT_COMMIT),unknown commit)"
 CLANG_FORMAT ?= clang-format
-STYLE_SOURCES := $(sort $(wildcard src/*.c src/*.h src/render/*.c src/render/*.h tests/*.c tests/*.h fuzz/*.c fuzz/*.h))
+STYLE_SOURCES := $(sort $(wildcard src/*.c src/*.h src/security/*.c src/security/*.h src/render/*.c src/render/*.h tests/*.c tests/*.h fuzz/*.c fuzz/*.h))
 # The kernel's own style checker, from linux-headers or a kernel tree.
 CHECKPATCH ?= $(firstword $(shell command -v checkpatch.pl 2>/dev/null) \
 	$(wildcard /usr/lib/modules/$(shell uname -r)/build/scripts/checkpatch.pl \
@@ -130,7 +131,7 @@ TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
-TESTS += build/test-udp-batch build/test-sandbox build/test-gpu-health
+TESTS += build/test-udp-batch build/test-sandbox build/test-security-sandbox build/test-gpu-health
 TESTS += build/test-call-net
 
 # The LIFF helpers share the same browser code and IPC.
@@ -252,6 +253,7 @@ build/ui_logo.o: override CPPFLAGS += -Ibuild
 build/ui_logo.o: build/avernella_mark.inc build/avernella_welcome.inc
 
 build/%.o: src/%.c Makefile | build
+	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 build/test-emoji-message: tests/emoji_message.c build/messaging.o build/rich_message.o build/sealing.o build/thrift.o build/liff_url.o
@@ -264,7 +266,8 @@ build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.
 build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
-build/test-sandbox: tests/sandbox.c build/sandbox.o build/udp_batch.o
+build/test-sandbox: tests/sandbox.c build/sandbox.o build/security/sandbox.o build/security/ipc.o build/udp_batch.o
+build/test-security-sandbox: tests/test_sandbox.c build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/thrift.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
 # Bad-network harness: a virtual clock and simulated audio devices.
@@ -346,7 +349,8 @@ build/test-profile-image: tests/profile_image.c build/profile_image.o
 build/test-rich-message: tests/rich_message.c build/rich_message.o build/liff_url.o
 build/test-clipboard-paste: tests/clipboard_paste.c build/clipboard_paste.o
 build/test-groups: tests/groups.c build/groups.o build/thrift.o build/liff_url.o
-build/test-square: tests/square.c build/square.o build/groups.o build/rich_message.o build/profile_image.o build/thrift.o build/liff_url.o
+build/test-square: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
+build/test-square: tests/square.c build/square.o build/square_search.o build/groups.o build/rich_message.o build/profile_image.o build/thrift.o build/liff_url.o build/http_tune.o
 build/test-chat-lists: tests/chat_lists.c build/chat_lists.o
 build/test-shared-content: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
 build/test-shared-content: tests/shared_content.c build/shared_content.o build/http_tune.o
@@ -360,7 +364,7 @@ build/test-sealing: tests/sealing.c build/sealing.o build/thrift.o
 build/test-pair: tests/pair.c build/pair.o
 build/test-password-login: tests/password_login.c build/password_login.o
 build/test-transport: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo,--wrap=curl_slist_free_all
-build/test-transport: tests/transport.c build/transport.o build/thrift.o build/http_tune.o build/sandbox.o
+build/test-transport: tests/transport.c build/transport.o build/thrift.o build/http_tune.o build/sandbox.o build/security/sandbox.o build/security/ipc.o
 build/test-talk-sync: tests/talk_sync.c build/talk_sync.o build/thrift.o
 build/test-live-sync: tests/live_sync.c build/live_sync.o build/talk_sync.o
 build/test-flex-asset: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
@@ -391,7 +395,7 @@ UI_FIXTURE_TARGETS += build/test-ui-worker-stop
 $(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_openchat.o build/ui_find.o
 $(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 $(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
-$(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o build/sandbox.o $(UI_LANG_OBJECTS)
+$(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o build/sandbox.o build/security/sandbox.o build/security/ipc.o $(UI_LANG_OBJECTS)
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
 

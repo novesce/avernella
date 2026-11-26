@@ -46,6 +46,7 @@
  * chooses. Every layer is optional and the worker runs without any.
  */
 #include "sandbox.h"
+#include "security/sandbox.h"
 #include <errno.h>
 #include <gnu/libc-version.h>
 #include <link.h>
@@ -78,6 +79,7 @@ struct line_landlock_ruleset_attr {
 
 #define LINE_LANDLOCK_CREATE_RULESET_VERSION (1U << 0)
 #define LINE_LANDLOCK_ACCESS_NET_BIND_TCP (1ULL << 0)
+#define LINE_LANDLOCK_SCOPE_ABSTRACT_UNIX (1ULL << 0)
 #define LINE_LANDLOCK_SCOPE_SIGNAL (1ULL << 1)
 #define LINE_LANDLOCK_RESTRICT_SELF_TSYNC (1U << 3)
 
@@ -98,8 +100,10 @@ static guint landlock(void)
 	attr.handled_access_net = LINE_LANDLOCK_ACCESS_NET_BIND_TCP;
 	layers |= LINE_SANDBOX_LANDLOCK_NET;
 	if (abi >= 6) {
-		attr.scoped = LINE_LANDLOCK_SCOPE_SIGNAL;
-		layers |= LINE_SANDBOX_LANDLOCK_SIGNAL;
+		attr.scoped = LINE_LANDLOCK_SCOPE_SIGNAL |
+			      LINE_LANDLOCK_SCOPE_ABSTRACT_UNIX;
+		layers |= LINE_SANDBOX_LANDLOCK_SIGNAL |
+			  LINE_SANDBOX_LANDLOCK_ABSTRACT;
 	}
 	/* No rules: nothing handled is allowed. */
 	int ruleset = (int)syscall(SYS_landlock_create_ruleset, &attr,
@@ -682,6 +686,32 @@ guint line_sandbox_ui_renderer(gboolean jit_free)
 	    (ui_layers & LINE_SANDBOX_MDWE))
 		return ui_layers;
 	ui_layers |= mdwe(FALSE);
+	report("ui", ui_layers, 0);
+	return ui_layers;
+}
+
+guint line_sandbox_ui_confine(void)
+{
+	guint off = switched_off();
+	struct avernella_sandbox_opts opts = {
+		.role = SANDBOX_ROLE_UI,
+		.allow_gpu_ioctl = true,
+	};
+	uint32_t active = 0;
+
+	if (off == G_MAXUINT || (off & LINE_SANDBOX_LANDLOCK_NET))
+		return ui_layers;
+	if (!prctl(PR_SET_DUMPABLE, 0, 0, 0, 0))
+		ui_layers |= LINE_SANDBOX_NO_DUMP;
+	if (!prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0)) {
+		ui_layers |= LINE_SANDBOX_NO_NEW_PRIVS;
+		if (avernella_landlock_apply(&opts, &active) == 0) {
+			if (active & AVSB_ACTIVE_LANDLOCK_FS)
+				ui_layers |= LINE_SANDBOX_LANDLOCK_FS;
+			if (active & AVSB_ACTIVE_LANDLOCK_SCOPE)
+				ui_layers |= LINE_SANDBOX_LANDLOCK_SIGNAL;
+		}
+	}
 	report("ui", ui_layers, 0);
 	return ui_layers;
 }

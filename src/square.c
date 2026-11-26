@@ -81,6 +81,7 @@ enum {
 	SQ_EVT_UPDATE_CHAT = 12,
 	SQ_EVT_UPDATE_CHAT_STATUS = 13,
 	SQ_EVT_UPDATE_CHAT_MEMBER = 14,
+	SQ_EVT_CREATE_CHAT_MEMBER = 16,
 	SQ_EVT_SHUTDOWN_SQUARE = 18,
 	SQ_EVT_KICKOUT = 19,
 	SQ_EVT_DELETE_CHAT = 20,
@@ -93,10 +94,14 @@ enum {
 	SQ_EVT_UPDATE_CHAT_NAME = 30,
 	SQ_EVT_UPDATE_CHAT_IMAGE = 31,
 	SQ_EVT_UPDATE_ANNOUNCEMENT = 37,
+	SQ_EVT_UPDATE_CHAT_MAX_MEMBERS = 38,
 	SQ_EVT_MUTATE_MESSAGE = 41,
 	SQ_EVT_NOTIF_NEW_MEMBER = 42,
+	SQ_EVT_UPDATE_READONLY_CHAT = 43,
 	SQ_EVT_NOTIF_REACTION = 47,
-	SQ_EVT_SYSTEM_MESSAGE = 49
+	SQ_EVT_CHAT_POPUP = 48,
+	SQ_EVT_SYSTEM_MESSAGE = 49,
+	SQ_EVT_UPDATE_CHAT_FEATURE_SET = 50
 };
 
 static J *array(void)
@@ -231,6 +236,13 @@ static J *square_rpc(Line *s, const char *method, J *request, GError **error)
 	    g_error_matches(call_err, LINE_ERROR, LINE_ACCESS_DENIED) ||
 	    g_error_matches(call_err, LINE_ERROR, LINE_TIMEOUT)) {
 		g_propagate_error(error, g_steal_pointer(&call_err));
+		return NULL;
+	}
+	if (code == 501) {
+		g_set_error_literal(
+			error, LINE_ERROR, LINE_METHOD_UNAVAILABLE,
+			reason ? reason :
+				 "This OpenChat method is unavailable.");
 		return NULL;
 	}
 	if (code == 503) {
@@ -386,6 +398,216 @@ static J *make_chat_row(Line *s, J *chat, J *status, J *square, J *member)
 	return row;
 }
 
+static const char *square_event_chat_mid(J *event)
+{
+	int type = json_object_get_int(field(event, "3"));
+	J *payload = field(event, "4");
+	J *nested = NULL;
+
+	switch (type) {
+	case SQ_EVT_RECEIVE_MESSAGE:
+		nested = field(payload, "1");
+		break;
+	case SQ_EVT_SEND_MESSAGE:
+		nested = field(payload, "2");
+		break;
+	case SQ_EVT_JOIN_CHAT:
+		nested = field(payload, "3");
+		break;
+	case SQ_EVT_INVITE_CHAT:
+		nested = field(payload, "4");
+		break;
+	case SQ_EVT_LEAVE_CHAT:
+		nested = field(payload, "5");
+		break;
+	case SQ_EVT_UPDATE_CHAT:
+		return nonempty(field(payload, "11"), "2");
+	case SQ_EVT_UPDATE_CHAT_STATUS:
+		nested = field(payload, "15");
+		break;
+	case SQ_EVT_UPDATE_CHAT_MEMBER:
+		nested = field(payload, "12");
+		break;
+	case SQ_EVT_CREATE_CHAT_MEMBER:
+		return nonempty(field(field(payload, "17"), "1"), "1");
+	case SQ_EVT_DELETE_CHAT:
+		nested = field(payload, "21");
+		break;
+	case SQ_EVT_NOTIF_CHAT_DELETE:
+		nested = field(payload, "29");
+		break;
+	case SQ_EVT_NOTIF_MESSAGE:
+		nested = field(payload, "30");
+		break;
+	case SQ_EVT_UPDATE_CHAT_NAME:
+		nested = field(payload, "31");
+		break;
+	case SQ_EVT_UPDATE_CHAT_IMAGE:
+		nested = field(payload, "32");
+		break;
+	case SQ_EVT_UPDATE_CHAT_MAX_MEMBERS:
+		nested = field(payload, "38");
+		break;
+	case SQ_EVT_NOTIF_NEW_MEMBER:
+		nested = field(payload, "42");
+		break;
+	case SQ_EVT_UPDATE_READONLY_CHAT:
+		nested = field(payload, "43");
+		break;
+	case SQ_EVT_CHAT_POPUP:
+		nested = field(payload, "46");
+		break;
+	case SQ_EVT_UPDATE_CHAT_FEATURE_SET:
+		nested = field(payload, "48");
+		break;
+	default:
+		return NULL;
+	}
+	return nonempty(nested, "1");
+}
+
+static J *square_chats_from_events(Line *s, J *squares, J *members,
+				   J *authorities, J *chat_to_sq, J *rows,
+				   GHashTable *seen, GError **error)
+{
+	g_autoptr(GHashTable) candidates =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	g_autoptr(GHashTable) deleted =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	g_autofree char *continuation = NULL;
+
+	for (guint page = 0;; page++) {
+		if (page >= 500)
+			return problem(
+				error,
+				"LINE returned too many OpenChat event pages.");
+		g_autoptr(J) req = obj();
+
+		put_num(req, "2:i32", SQUARE_PAGE_LIMIT);
+		if (continuation)
+			put_str(req, "3:str", continuation);
+		g_autoptr(J) reply = square_rpc(s, "manualRepair", req, error);
+
+		if (!reply)
+			return NULL;
+		J *events = field(reply, "1");
+
+		if (events && !json_object_is_type(events, json_type_array))
+			return problem(
+				error,
+				"LINE returned unreadable OpenChat events.");
+		for (size_t i = 0; i < length(events); i++) {
+			J *event = at(events, i);
+			int type = json_object_get_int(field(event, "3"));
+			const char *cid = square_event_chat_mid(event);
+
+			if (!line_square_id(cid, 'm'))
+				continue;
+			if (type == SQ_EVT_DELETE_CHAT ||
+			    type == SQ_EVT_NOTIF_CHAT_DELETE) {
+				g_hash_table_remove(candidates, cid);
+				g_hash_table_add(deleted, g_strdup(cid));
+				continue;
+			}
+			g_hash_table_remove(deleted, cid);
+			if (g_hash_table_contains(candidates, cid))
+				continue;
+			if (g_hash_table_size(candidates) >= 512)
+				return problem(
+					error,
+					"Too many OpenChat rooms need refreshing.");
+			g_hash_table_add(candidates, g_strdup(cid));
+		}
+		const char *next = nonempty(reply, "3");
+
+		if (!next)
+			break;
+		if (continuation && !strcmp(next, continuation))
+			return problem(error,
+				       "LINE repeated an OpenChat event page.");
+		g_free(continuation);
+		continuation = g_strdup(next);
+	}
+	GHashTableIter iter;
+	gpointer key;
+	gboolean any_reply = FALSE;
+	g_autoptr(GError) first_error = NULL;
+
+	g_hash_table_iter_init(&iter, candidates);
+	while (g_hash_table_iter_next(&iter, &key, NULL)) {
+		const char *cid = key;
+
+		if (g_hash_table_contains(deleted, cid) ||
+		    g_hash_table_contains(seen, cid))
+			continue;
+		g_autoptr(J) req = obj();
+
+		put_str(req, "1:str", cid);
+		g_autoptr(GError) call_error = NULL;
+		g_autoptr(J) reply =
+			square_rpc(s, "getSquareChat", req, &call_error);
+
+		if (!reply) {
+			if (!first_error)
+				first_error = g_steal_pointer(&call_error);
+			continue;
+		}
+		any_reply = TRUE;
+		J *chat = field(reply, "1");
+		J *chat_member = field(reply, "2");
+		const char *smid = nonempty(chat, "2");
+
+		if (json_object_get_int(field(chat, "8")) != 0 ||
+		    (chat_member &&
+		     json_object_get_int(field(chat_member, "4")) != 1) ||
+		    !line_square_id(smid, 's'))
+			continue;
+		if (!field(squares, smid)) {
+			g_autoptr(J) sq_req = obj();
+
+			put_str(sq_req, "1:str", smid);
+			g_autoptr(GError) sq_err = NULL;
+			g_autoptr(J) sq_rep =
+				square_rpc(s, "getSquare", sq_req, &sq_err);
+			if (sq_rep) {
+				J *sq = field(sq_rep, "1");
+				J *mem = field(sq_rep, "2");
+				J *auth = field(sq_rep, "3");
+
+				if (sq) {
+					put(squares, smid, json_object_get(sq));
+					remember_square_avatar(
+						s, smid, nonempty(sq, "4"));
+				}
+				if (mem) {
+					put(members, smid,
+					    json_object_get(mem));
+					remember_square_avatar(
+						s, nonempty(mem, "1"),
+						nonempty(mem, "4"));
+				}
+				if (auth)
+					put(authorities, smid,
+					    json_object_get(auth));
+			}
+		}
+		J *row = make_chat_row(s, chat, field(reply, "3"),
+				       field(squares, smid),
+				       field(members, smid));
+
+		if (!row)
+			continue;
+		g_hash_table_add(seen, g_strdup(cid));
+		json_object_array_add(rows, row);
+		put_str(chat_to_sq, cid, smid);
+	}
+	if (!any_reply && first_error) {
+		g_propagate_error(error, g_steal_pointer(&first_error));
+		return NULL;
+	}
+	return rows;
+}
+
 J *line_square_chats(Line *s, J **squares_out, J **members_out,
 		     J **authorities_out, J **chat_to_square_out,
 		     GError **error)
@@ -394,6 +616,7 @@ J *line_square_chats(Line *s, J **squares_out, J **members_out,
 	g_autoptr(J) chat_to_sq = obj();
 	g_autoptr(J) rows = array();
 	g_autofree char *sq_token = NULL;
+	gboolean need_event_repair = FALSE;
 
 	/* 1. Fetch all joined Squares, my memberships, and authorities. */
 	for (int page = 0; page < 20; page++) {
@@ -402,10 +625,18 @@ J *line_square_chats(Line *s, J **squares_out, J **members_out,
 		if (sq_token)
 			put_str(req, "2:str", sq_token);
 		put_num(req, "3:i32", SQUARE_PAGE_LIMIT);
+		g_autoptr(GError) sq_err = NULL;
 		g_autoptr(J) reply =
-			square_rpc(s, "getJoinedSquares", req, error);
-		if (!reply)
+			square_rpc(s, "getJoinedSquares", req, &sq_err);
+		if (!reply) {
+			if (g_error_matches(sq_err, LINE_ERROR,
+					    LINE_METHOD_UNAVAILABLE)) {
+				need_event_repair = TRUE;
+				break;
+			}
+			g_propagate_error(error, g_steal_pointer(&sq_err));
 			return NULL;
+		}
 		J *list = field(reply, "1");
 		J *mem_map = field(reply, "2");
 		J *auth_map = field(reply, "3");
@@ -450,47 +681,67 @@ J *line_square_chats(Line *s, J **squares_out, J **members_out,
 	g_autoptr(GHashTable) seen =
 		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 
-	for (int page = 0; page < 20; page++) {
-		g_autoptr(J) req = obj();
-
-		if (chat_token)
-			put_str(req, "2:str", chat_token);
-		put_num(req, "3:i32", SQUARE_PAGE_LIMIT);
-		g_autoptr(J) reply =
-			square_rpc(s, "getJoinedSquareChats", req, error);
-		if (!reply)
+	if (need_event_repair) {
+		if (!square_chats_from_events(s, squares, members, authorities,
+					      chat_to_sq, rows, seen, error))
 			return NULL;
-		J *chats = field(reply, "1");
-		J *statuses = field(reply, "3");
+	} else {
+		for (int page = 0; page < 20; page++) {
+			g_autoptr(J) req = obj();
 
-		for (size_t i = 0; i < length(chats); i++) {
-			J *chat = at(chats, i);
-			const char *cid = nonempty(chat, "1");
-			const char *smid = nonempty(chat, "2");
-
-			if (!line_square_id(cid, 'm') ||
-			    !line_square_id(smid, 's') ||
-			    !g_hash_table_add(seen, g_strdup(cid)))
-				continue;
-			/* Skip deleted or suspended chats. */
-			if (json_object_get_int(field(chat, "8")) != 0)
-				continue;
-			J *sq = field(squares, smid);
-			J *mem = field(members, smid);
-			J *st = field(statuses, cid);
-			J *row = make_chat_row(s, chat, st, sq, mem);
-
-			if (row) {
-				json_object_array_add(rows, row);
-				put_str(chat_to_sq, cid, smid);
+			if (chat_token)
+				put_str(req, "2:str", chat_token);
+			put_num(req, "3:i32", SQUARE_PAGE_LIMIT);
+			g_autoptr(GError) list_error = NULL;
+			g_autoptr(J) reply = square_rpc(
+				s, "getJoinedSquareChats", req, &list_error);
+			if (!reply) {
+				if (!g_error_matches(list_error, LINE_ERROR,
+						     LINE_METHOD_UNAVAILABLE)) {
+					g_propagate_error(
+						error,
+						g_steal_pointer(&list_error));
+					return NULL;
+				}
+				g_clear_error(&list_error);
+				if (!square_chats_from_events(
+					    s, squares, members, authorities,
+					    chat_to_sq, rows, seen, error))
+					return NULL;
+				break;
 			}
-		}
-		const char *next = nonempty(reply, "4");
+			J *chats = field(reply, "1");
+			J *statuses = field(reply, "3");
 
-		if (!next || (chat_token && !strcmp(next, chat_token)))
-			break;
-		g_free(chat_token);
-		chat_token = g_strdup(next);
+			for (size_t i = 0; i < length(chats); i++) {
+				J *chat = at(chats, i);
+				const char *cid = nonempty(chat, "1");
+				const char *smid = nonempty(chat, "2");
+
+				if (!line_square_id(cid, 'm') ||
+				    !line_square_id(smid, 's') ||
+				    !g_hash_table_add(seen, g_strdup(cid)))
+					continue;
+				/* Skip deleted or suspended chats. */
+				if (json_object_get_int(field(chat, "8")) != 0)
+					continue;
+				J *sq = field(squares, smid);
+				J *mem = field(members, smid);
+				J *st = field(statuses, cid);
+				J *row = make_chat_row(s, chat, st, sq, mem);
+
+				if (row) {
+					json_object_array_add(rows, row);
+					put_str(chat_to_sq, cid, smid);
+				}
+			}
+			const char *next = nonempty(reply, "4");
+
+			if (!next || (chat_token && !strcmp(next, chat_token)))
+				break;
+			g_free(chat_token);
+			chat_token = g_strdup(next);
+		}
 	}
 	json_object_array_sort(rows, chat_order);
 	if (squares_out)
@@ -843,12 +1094,20 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 		return problem(error, "Choose an OpenChat conversation.");
 	g_autoptr(J) req = obj();
 
+	gboolean older = continuation && *continuation;
+
+	put_num(req, "1:i64", 0);
 	put_str(req, "2:str", chat);
+	put_str(req, "3:str", older ? continuation : "");
 	put_num(req, "4:i32", SQUARE_HISTORY_LIMIT);
-	put_num(req, "5:i32", 2); /* FetchDirection.BACKWARD */
-	put_num(req, "6:i32", 0); /* inclusive = false */
-	if (continuation && *continuation)
-		put_str(req, "7:str", continuation);
+	/*
+	 * LINE /SQ1 initial fetch (empty syncToken) uses FetchDirection.FORWARD
+	 * to return the latest window and a continuationToken for older pages.
+	 * Subsequent older pages pass that continuationToken as syncToken with
+	 * FetchDirection.BACKWARD.
+	 */
+	put_num(req, "5:i32", older ? 2 : 1);
+	put_num(req, "6:i32", 1); /* BooleanState.OFF */
 	put_num(req, "8:i32", 1); /* FetchType.DEFAULT */
 	g_autoptr(J) reply = square_rpc(s, "fetchSquareChatEvents", req, error);
 	if (!reply)
@@ -947,8 +1206,10 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 		json_object_array_add(rows, row);
 	}
 	json_object_array_sort(rows, message_order);
-	const char *next = nonempty(reply, "4");
+	const char *next = nonempty(reply, "3");
 
+	if (!next)
+		next = nonempty(reply, "4");
 	if (next_token_out)
 		*next_token_out = next ? g_strdup(next) : NULL;
 	if (more_out)
@@ -1551,6 +1812,27 @@ static J *square_summary_object(Line *s, J *sq, J *member, J *auth, J *status,
 
 J *line_square_find_ticket(Line *s, const char *input, GError **error)
 {
+	g_autofree char *emid = line_square_parse_emid(input);
+
+	if (emid) {
+		g_autoptr(J) req = obj();
+
+		put_str(req, "1:str", emid);
+		g_autoptr(J) reply =
+			square_rpc(s, "findSquareByEmid", req, error);
+
+		if (!reply)
+			return NULL;
+		J *summary = square_summary_object(s, field(reply, "1"),
+						   field(reply, "2"),
+						   field(reply, "3"),
+						   field(reply, "4"), NULL);
+
+		return summary ?
+			       summary :
+			       problem(error,
+				       "LINE did not return OpenChat details.");
+	}
 	g_autofree char *ticket = line_square_parse_ticket(input);
 
 	if (!ticket)
@@ -2392,10 +2674,16 @@ J *line_square_poll_events(Line *s, gint64 *subscription_id, char **sync_token,
 J *line_square_popular_keywords(Line *s, GError **error)
 {
 	g_autoptr(J) req = obj();
-	g_autoptr(J) reply = square_rpc(s, "getPopularKeywords", req, error);
+	g_autoptr(GError) kw_err = NULL;
+	g_autoptr(J) reply = square_rpc(s, "getPopularKeywords", req, &kw_err);
 
-	if (!reply)
+	if (!reply) {
+		if (g_error_matches(kw_err, LINE_ERROR,
+				    LINE_METHOD_UNAVAILABLE))
+			return array();
+		g_propagate_error(error, g_steal_pointer(&kw_err));
 		return NULL;
+	}
 	J *list = field(reply, "1");
 	J *out = array();
 
@@ -2420,9 +2708,19 @@ J *line_square_search(Line *s, const char *query, const char *continuation,
 	if (continuation && *continuation)
 		put_str(req, "3:str", continuation);
 	put_num(req, "4:i32", 30);
-	g_autoptr(J) reply = square_rpc(s, "searchSquares", req, error);
-	if (!reply)
-		return NULL;
+	g_autoptr(GError) thrift_error = NULL;
+	g_autoptr(J) reply = square_rpc(s, "searchSquares", req, &thrift_error);
+	if (!reply) {
+		if (!g_error_matches(thrift_error, LINE_ERROR,
+				     LINE_METHOD_UNAVAILABLE)) {
+			g_propagate_error(error,
+					  g_steal_pointer(&thrift_error));
+			return NULL;
+		}
+		g_clear_error(&thrift_error);
+		return line_square_search_service(s, query, continuation,
+						  error);
+	}
 	J *squares = field(reply, "1"), *statuses = field(reply, "2"),
 	  *memberships = field(reply, "3");
 	J *rows = array();
@@ -2438,7 +2736,7 @@ J *line_square_search(Line *s, const char *query, const char *continuation,
 		const char *hash = nonempty(sq, "4");
 		J *st = field(statuses, smid);
 		J *mem = field(memberships, smid);
-		int jm = json_object_get_int(field(field(sq, "10"), "1"));
+		int jm = json_object_get_int(field(field(sq, "14"), "1"));
 		J *row = obj();
 
 		put_str(row, "squareMid", smid);

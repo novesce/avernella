@@ -3231,6 +3231,8 @@ int line_ui(int argc, char **argv)
 	 */
 	line_sandbox_ui_renderer(ui_gpu_active() &&
 				 ui_gpu_device_vendor() != UI_VK_VENDOR_MESA);
+	if (!g_strcmp0(g_getenv("LINE_STRICT_UI_SANDBOX"), "1"))
+		line_sandbox_ui_confine();
 	SDL_SetWindowMinimumSize(ui.window, 360, 480);
 	wire.requests = g_hash_table_new_full(g_direct_hash, g_direct_equal,
 					      NULL, free_request);

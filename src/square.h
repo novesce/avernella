@@ -15,6 +15,8 @@ gboolean line_square_id(const char *id, char type);
 gboolean line_is_square_chat(const char *id);
 /* Extracts the invitation ticket from a line.me/ti/g2/... URL or raw ticket. */
 char *line_square_parse_ticket(const char *input);
+/* Extracts the encrypted Square MID from a line://square/home... link. */
+char *line_square_parse_emid(const char *input);
 
 /*
  * Lists joined OpenChats and their chats. On success, returns an array of
@@ -85,6 +87,8 @@ J *line_square_categories(Line *s, GError **error);
 J *line_square_popular_keywords(Line *s, GError **error);
 J *line_square_search(Line *s, const char *query, const char *continuation,
 		      GError **error);
+J *line_square_search_service(Line *s, const char *query,
+			      const char *continuation, GError **error);
 J *line_square_search_mentionables(Line *s, const char *chat_mid,
 				   const char *query, GError **error);
 J *line_square_find_ticket(Line *s, const char *input, GError **error);

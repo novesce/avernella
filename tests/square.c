@@ -5,6 +5,8 @@
 #include "profile_image.h"
 #include "square.h"
 #include "stickers.h"
+#include <curl/curl.h>
+#include <stdarg.h>
 #include <string.h>
 
 #define SQ_MID "s11111111111111111111111111111111"
@@ -16,8 +18,14 @@
 #define SELF_MID "u77777777777777777777777777777777"
 
 static gboolean force_v1_ticket, force_sq_error, checked_join_code;
-static int rpc_calls, sq_error_code;
+static gboolean force_event_directory, force_no_xlt_squares;
+static gboolean force_public_search, anonymous_search, force_no_xlt_keywords;
+static int rpc_calls, sq_error_code, event_pages;
 static char *last_method;
+static const char *search_url;
+static struct curl_slist *search_headers;
+static curl_write_callback search_writer;
+static void *search_userdata;
 
 void line_resolve_names(Line *s, J *names, char type)
 {
@@ -85,6 +93,93 @@ J *line_sticker_metadata(Line *s, LineStickers *cache, const char *package_id,
 	return meta;
 }
 
+CURLcode __wrap_curl_easy_setopt(CURL *curl, CURLoption option, ...)
+{
+	(void)curl;
+	va_list args;
+
+	va_start(args, option);
+	switch (option) {
+	case CURLOPT_URL:
+		search_url = va_arg(args, const char *);
+		break;
+	case CURLOPT_HTTPHEADER:
+		search_headers = va_arg(args, struct curl_slist *);
+		break;
+	case CURLOPT_WRITEFUNCTION:
+		search_writer = va_arg(args, curl_write_callback);
+		break;
+	case CURLOPT_WRITEDATA:
+		search_userdata = va_arg(args, void *);
+		break;
+	default:
+		break;
+	}
+	va_end(args);
+	return CURLE_OK;
+}
+
+static gboolean search_has_header(const char *prefix, const char *contains)
+{
+	for (struct curl_slist *h = search_headers; h; h = h->next)
+		if (g_str_has_prefix(h->data, prefix) &&
+		    strstr(h->data, contains))
+			return TRUE;
+	return FALSE;
+}
+
+CURLcode __wrap_curl_easy_perform(CURL *curl)
+{
+	(void)curl;
+	const char *fixture =
+		"{\"result\":{\"main\":[{\"body\":{\"collectionType\":\"openchat\","
+		"\"area\":\"th\",\"itemList\":[{\"area\":\"th\",\"docId\":\"" SQ_MID
+		"\",\"docRank\":1,\"link\":\"line://square/home?encryptedSquareMid=emidTicket_1234567890&utm_source=line-search\","
+		"\"thumb\":{\"imageUrl\":\"https://example.com/avatar.png\","
+		"\"openchatIconUrl\":\"\"},\"title\":\"Linux Fallback\","
+		"\"desc\":\"Public Linux chat\",\"isPrivate\":false,"
+		"\"memberCountText\":\"81 members\"}],"
+		"\"moreLink\":\"?q=linux&sscode=os.tab.square&start=30&rank=31\"}}]}}";
+
+	if (anonymous_search)
+		g_assert_false(search_has_header("x-line-channeltoken: ", ""));
+	else
+		g_assert_true(search_has_header("x-line-channeltoken: ",
+						"search-channel-token"));
+	g_assert_true(search_has_header("x-line-info: ", SELF_MID));
+	g_assert_true(search_has_header("x-line-info: ", "ANDROID"));
+	g_assert_true(search_has_header("x-line-info: ", "\"region\":\"TH\""));
+	if (strstr(search_url, "rank=31"))
+		g_assert_cmpstr(
+			search_url, ==,
+			"https://legy.line-apps.com/lus/v2/search?q=linux&sscode=os.tab.square&start=30&rank=31");
+	else
+		g_assert_cmpstr(
+			search_url, ==,
+			"https://legy.line-apps.com/lus/v2/search?q=linux&sscode=os.tab.square");
+	size_t n = strlen(fixture);
+
+	g_assert_cmpuint(search_writer((char *)fixture, 1, n, search_userdata),
+			 ==, n);
+	return CURLE_OK;
+}
+
+CURLcode __wrap_curl_easy_getinfo(CURL *curl, CURLINFO option, ...)
+{
+	(void)curl;
+	va_list args;
+
+	va_start(args, option);
+	if (option == CURLINFO_RESPONSE_CODE)
+		*va_arg(args, long *) = 200;
+	else if (option == CURLINFO_RETRY_AFTER)
+		*va_arg(args, curl_off_t *) = 0;
+	else
+		g_assert_not_reached();
+	va_end(args);
+	return CURLE_OK;
+}
+
 J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	    GError **error)
 {
@@ -98,7 +193,20 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	g_assert_no_error(enc_err);
 	g_assert_nonnull(wire);
 
+	if (!strcmp(path, "/CH4")) {
+		g_assert_cmpstr(method, ==,
+				"approveChannelAndIssueChannelToken");
+		g_assert_cmpstr(strfield(args, "1:str"), ==, "1557852768");
+		if (anonymous_search) {
+			g_set_error_literal(error, LINE_ERROR, 1,
+					    "Channel permission denied");
+			return NULL;
+		}
+		return json_tokener_parse("{\"5\":\"search-channel-token\"}");
+	}
 	if (!strcmp(path, "/S4")) {
+		if (!strcmp(method, "getProfile"))
+			return json_tokener_parse("{\"12\":\"TH\"}");
 		J *req = field(args, "1:obj");
 
 		if (!strcmp(method, "findChatByTicket")) {
@@ -131,6 +239,12 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		return NULL;
 	}
 	if (!strcmp(method, "getJoinedSquares")) {
+		if (force_no_xlt_squares) {
+			s->service_code = 501;
+			g_set_error_literal(error, LINE_ERROR, 1,
+					    "NO XLT:Not yet implemented");
+			return NULL;
+		}
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":\"" SQ_MID
 			"\",\"2\":\"Linux Club\",\"3\":\"Welcome!\",\"4\":\"0hSqHash\","
@@ -143,6 +257,12 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"\"4\":{\"" SQ_MID "\":{\"1\":42,\"2\":1,\"4\":2}}}");
 	}
 	if (!strcmp(method, "getJoinedSquareChats")) {
+		if (force_event_directory) {
+			s->service_code = 501;
+			g_set_error_literal(error, LINE_ERROR, 1,
+					    "NO XLT:Not yet implemented");
+			return NULL;
+		}
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":\"" CHAT_MID "\",\"2\":\"" SQ_MID
 			"\",\"3\":1,\"4\":\"Main Room\",\"5\":\"0hChatHash\",\"7\":3}],"
@@ -153,7 +273,16 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"\"5\":{\"1\":10,\"2\":2,\"3\":\"1000\"}}}}");
 	}
 	if (!strcmp(method, "fetchSquareChatEvents")) {
+		const char *tok = strfield(req, "3:str");
+
 		g_assert_cmpstr(strfield(req, "2:str"), ==, CHAT_MID);
+		g_assert_nonnull(tok);
+		g_assert_cmpint(json_object_get_int64(field(req, "1:i64")), ==,
+				0);
+		g_assert_cmpint(json_object_get_int(field(req, "5:i32")), ==,
+				*tok ? 2 : 1);
+		g_assert_cmpint(json_object_get_int(field(req, "6:i32")), ==,
+				1);
 		return json_tokener_parse(
 			"{\"2\":[{\"2\":1700000001000,\"3\":0,\"4\":{\"1\":{\"1\":\"" CHAT_MID
 			"\",\"2\":{\"1\":{\"1\":\"" PEER_MEM
@@ -204,6 +333,14 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	if (!strcmp(method, "getSquareCategories")) {
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":1,\"2\":\"General\"},{\"1\":2,\"2\":\"Tech\"}]}");
+	}
+	if (!strcmp(method, "findSquareByEmid")) {
+		g_assert_cmpstr(strfield(req, "1:str"), ==,
+				"emidTicket_1234567890");
+		return json_tokener_parse(
+			"{\"1\":{\"1\":\"" SQ_MID
+			"\",\"2\":\"Encrypted Club\",\"5\":\"Encrypted desc\","
+			"\"14\":{\"1\":2}},\"4\":{\"1\":86}}");
 	}
 	if (!strcmp(method, "findSquareByInvitationTicketV2")) {
 		if (force_v1_ticket) {
@@ -285,6 +422,12 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"\"4\":{\"1\":42,\"2\":1,\"4\":2}}");
 	}
 	if (!strcmp(method, "getSquareChat")) {
+		if (force_event_directory)
+			return json_tokener_parse(
+				"{\"1\":{\"1\":\"" CHAT_MID "\",\"2\":\"" SQ_MID
+				"\",\"4\":\"Main Room\",\"7\":3},"
+				"\"2\":{\"1\":\"" ME_MEM "\",\"2\":\"" CHAT_MID
+				"\",\"4\":1},\"3\":{\"5\":{\"1\":10,\"2\":2}}}");
 		return json_tokener_parse("{\"1\":{\"1\":\"" CHAT_MID
 					  "\",\"2\":\"" SQ_MID
 					  "\",\"4\":\"Main Room\",\"7\":3}}");
@@ -328,6 +471,22 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	    !strcmp(method, "rejectSquareMembers")) {
 		return obj();
 	}
+	if (!strcmp(method, "manualRepair")) {
+		g_assert_true(force_event_directory);
+		event_pages++;
+		if (!strfield(req, "3:str")) {
+			g_assert_null(field(req, "1:str"));
+			return json_tokener_parse(
+				"{\"1\":[{\"3\":15,\"4\":{\"16\":{\"1\":{\"1\":\"" SQ_MID
+				"\"}}}},{\"3\":16,\"4\":{\"17\":{\"1\":{\"1\":\"" CHAT_MID
+				"\",\"2\":\"" SQ_MID
+				"\",\"4\":\"Main Room\"}}}}],"
+				"\"2\":\"bootstrap-sync\",\"3\":\"events-page-2\"}");
+		}
+		g_assert_cmpstr(strfield(req, "3:str"), ==, "events-page-2");
+		return json_tokener_parse(
+			"{\"1\":[],\"2\":\"bootstrap-sync-2\"}");
+	}
 	if (!strcmp(method, "fetchMyEvents")) {
 		return json_tokener_parse(
 			"{\"1\":{\"1\":555},\"2\":[{\"3\":29,\"4\":{\"30\":{\"1\":\"" CHAT_MID
@@ -337,15 +496,28 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"\"3\":\"sync-2\"}");
 	}
 	if (!strcmp(method, "getPopularKeywords")) {
+		if (force_no_xlt_keywords) {
+			s->service_code = 501;
+			g_set_error_literal(error, LINE_ERROR, 1,
+					    "NO XLT:Not yet implemented");
+			return NULL;
+		}
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":\"Linux\"},{\"1\":\"Music\"}]}");
 	}
 	if (!strcmp(method, "searchSquares")) {
 		g_assert_cmpstr(strfield(req, "2:str"), ==, "linux");
+		if (force_public_search) {
+			s->service_code = 501;
+			g_set_error_literal(error, LINE_ERROR, 1,
+					    "NO XLT:Not yet implemented");
+			return NULL;
+		}
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":\"" SQ_MID
 			"\",\"2\":\"Linux Club\",\"5\":\"Open source\","
-			"\"9\":\"https://line.me/ti/g2/inv123\"}],"
+			"\"9\":\"https://line.me/ti/g2/inv123\",\"10\":7,"
+			"\"14\":{\"1\":2}}],"
 			"\"2\":{\"" SQ_MID "\":{\"1\":42}},\"4\":\"next2\"}");
 	}
 	if (!strcmp(method, "searchSquareChatMentionables")) {
@@ -452,13 +624,61 @@ static void test_chats_and_history(void)
 	g_assert_no_error(error);
 	g_assert_nonnull(hist);
 	g_assert_cmpuint(json_object_array_length(hist), ==, 1);
-	g_assert_cmpstr(next_tok, ==, "next-tok");
+	g_assert_cmpstr(next_tok, ==, "sync-1");
 	g_assert_true(more);
 	J *m = json_object_array_get_idx(hist, 0);
 
 	g_assert_cmpstr(strfield(m, "id"), ==, "1001");
 	g_assert_cmpstr(strfield(m, "from"), ==, "Alice");
 	g_assert_cmpstr(strfield(m, "senderId"), ==, PEER_MEM);
+	json_object_put(s.pictures);
+}
+
+static void test_event_directory(void)
+{
+	Line s = { .mid = SELF_MID, .pictures = obj() };
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) squares = NULL, members = NULL, auths = NULL, c2s = NULL;
+
+	force_event_directory = TRUE;
+	event_pages = 0;
+	g_autoptr(J) chats =
+		line_square_chats(&s, &squares, &members, &auths, &c2s, &error);
+	force_event_directory = FALSE;
+	g_assert_no_error(error);
+	g_assert_nonnull(chats);
+	g_assert_cmpint(event_pages, ==, 2);
+	g_assert_cmpuint(json_object_array_length(chats), ==, 1);
+	J *row = json_object_array_get_idx(chats, 0);
+
+	g_assert_cmpstr(strfield(row, "id"), ==, CHAT_MID);
+	g_assert_cmpstr(strfield(row, "name"), ==, "Main Room");
+	g_assert_cmpint(json_object_get_int(field(row, "unread")), ==, 2);
+	g_assert_cmpstr(strfield(c2s, CHAT_MID), ==, SQ_MID);
+	g_assert_cmpint(s.service_code, ==, -1);
+
+	/*
+	 * LINE 26.19+ also returns 501 NO XLT on getJoinedSquares itself;
+	 * verify manualRepair + getSquareChat + getSquare populates all maps.
+	 */
+	g_autoptr(J) sq2 = NULL, mem2 = NULL, auth2 = NULL, c2s2 = NULL;
+
+	force_event_directory = TRUE;
+	force_no_xlt_squares = TRUE;
+	event_pages = 0;
+	g_autoptr(J) chats2 =
+		line_square_chats(&s, &sq2, &mem2, &auth2, &c2s2, &error);
+	force_no_xlt_squares = FALSE;
+	force_event_directory = FALSE;
+	g_assert_no_error(error);
+	g_assert_nonnull(chats2);
+	g_assert_cmpint(event_pages, ==, 2);
+	g_assert_cmpuint(json_object_array_length(chats2), ==, 1);
+	g_assert_nonnull(field(sq2, SQ_MID));
+	g_assert_nonnull(field(mem2, SQ_MID));
+	g_assert_nonnull(field(auth2, SQ_MID));
+	g_assert_cmpstr(strfield(c2s2, CHAT_MID), ==, SQ_MID);
+	g_assert_cmpint(s.service_code, ==, -1);
 	json_object_put(s.pictures);
 }
 
@@ -532,6 +752,15 @@ static void test_lifecycle_and_sync(void)
 	g_assert_no_error(error);
 	g_assert_cmpstr(strfield(prev, "squareMid"), ==, SQ_MID);
 	g_assert_cmpstr(strfield(prev, "joinMethod"), ==, "code");
+
+	g_autoptr(J) encrypted = line_square_find_ticket(
+		&s,
+		"line://square/home?encryptedSquareMid=emidTicket_1234567890&utm_source=line-search",
+		&error);
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(encrypted, "squareMid"), ==, SQ_MID);
+	g_assert_cmpstr(strfield(encrypted, "name"), ==, "Encrypted Club");
+	g_assert_cmpstr(strfield(encrypted, "joinMethod"), ==, "code");
 
 	/* V2 unavailable falls back to V1. */
 	force_v1_ticket = TRUE;
@@ -649,7 +878,9 @@ static void test_lifecycle_and_sync(void)
 
 static void test_discover_and_forward(void)
 {
-	Line s = { .mid = SELF_MID, .pictures = obj() };
+	Line s = { .mid = SELF_MID,
+		   .access = "offline-token",
+		   .pictures = obj() };
 
 	g_autoptr(GError) error = NULL;
 
@@ -660,6 +891,13 @@ static void test_discover_and_forward(void)
 		json_object_get_string(json_object_array_get_idx(kws, 0)), ==,
 		"Linux");
 
+	force_no_xlt_keywords = TRUE;
+	g_autoptr(J) kws_fallback = line_square_popular_keywords(&s, &error);
+	force_no_xlt_keywords = FALSE;
+	g_assert_no_error(error);
+	g_assert_nonnull(kws_fallback);
+	g_assert_cmpuint(json_object_array_length(kws_fallback), ==, 0);
+
 	g_autoptr(J) found = line_square_search(&s, "linux", NULL, &error);
 	g_assert_no_error(error);
 	g_assert_cmpstr(strfield(found, "cursor"), ==, "next2");
@@ -668,6 +906,46 @@ static void test_discover_and_forward(void)
 	g_assert_cmpuint(json_object_array_length(items), ==, 1);
 	g_assert_cmpstr(strfield(json_object_array_get_idx(items, 0), "name"),
 			==, "Linux Club");
+	g_assert_cmpstr(strfield(json_object_array_get_idx(items, 0),
+				 "joinMethod"),
+			==, "code");
+
+	force_public_search = TRUE;
+	g_autoptr(J) public = line_square_search(&s, "linux", NULL, &error);
+	force_public_search = FALSE;
+	g_assert_no_error(error);
+	g_assert_nonnull(public);
+	J *public_items = field(public, "squares");
+
+	g_assert_cmpuint(json_object_array_length(public_items), ==, 1);
+	J *public_row = json_object_array_get_idx(public_items, 0);
+
+	g_assert_cmpstr(
+		strfield(public_row, "invitationUrl"), ==,
+		"line://square/home?encryptedSquareMid=emidTicket_1234567890&utm_source=line-search");
+	g_assert_cmpstr(strfield(public_row, "memberCountText"), ==,
+			"81 members");
+	g_assert_cmpstr(strfield(public, "cursor"), ==,
+			"?q=linux&sscode=os.tab.square&start=30&rank=31");
+	g_autoptr(J) page2 = line_square_search_service(
+		&s, "linux", strfield(public, "cursor"), &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(page2);
+	g_assert_cmpuint(json_object_array_length(field(page2, "squares")), ==,
+			 1);
+	anonymous_search = TRUE;
+	g_autoptr(J) anonymous =
+		line_square_search_service(&s, "linux", NULL, &error);
+	anonymous_search = FALSE;
+	g_assert_no_error(error);
+	g_assert_nonnull(anonymous);
+	g_assert_cmpuint(json_object_array_length(field(anonymous, "squares")),
+			 ==, 1);
+	g_assert_null(line_square_search_service(
+		&s, "linux", "https://example.com/nope", &error));
+	g_assert_nonnull(error);
+	g_clear_error(&error);
 
 	g_autoptr(J) ments =
 		line_square_search_mentionables(&s, CHAT_MID, "Al", &error);
@@ -708,6 +986,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/square/tickets", test_tickets);
 	g_test_add_func("/square/group-ticket", test_group_ticket);
 	g_test_add_func("/square/chats-and-history", test_chats_and_history);
+	g_test_add_func("/square/event-directory", test_event_directory);
 	g_test_add_func("/square/messaging", test_messaging);
 	g_test_add_func("/square/lifecycle-and-sync", test_lifecycle_and_sync);
 	g_test_add_func("/square/discover-and-forward",

@@ -438,6 +438,18 @@ static void submit_primary(void)
 			set_ed(&oc.ed[2], "");
 			oc.field_focus = 1;
 			ui_openchat_resume_input();
+			const char *invite =
+				ui_string(sel, "invitationUrl", NULL);
+
+			if (invite) {
+				set_ed(&oc.ed[0], invite);
+				Json *p = json_object_new_object();
+
+				json_object_object_add(
+					p, "input",
+					json_object_new_string(invite));
+				rpc("squareFindTicket", p);
+			}
 			return;
 		}
 		run_discover_search(FALSE);
@@ -1371,13 +1383,22 @@ void ui_openchat_draw(void)
 			ui_draw_label(ui_string(sq, "name", "OpenChat"),
 				      (Rect){ r.x + 48, r.y + 3, r.w - 56, 20 },
 				      14, 600, UI_HEADING, FALSE);
-			g_autofree char *sub = g_strdup_printf(
-				_("%u members · %s"),
-				(unsigned int)CLAMP(
-					json_object_get_int64(
-						ui_field(sq, "memberCount")),
-					0, G_MAXINT),
-				ui_string(sq, "description", ""));
+			const char *count_text =
+				ui_string(sq, "memberCountText", NULL);
+			const char *description =
+				ui_string(sq, "description", "");
+			g_autofree char *sub =
+				count_text && *count_text ?
+					g_strdup_printf("%s · %s", count_text,
+							description) :
+					g_strdup_printf(
+						_("%u members · %s"),
+						(unsigned int)CLAMP(
+							json_object_get_int64(ui_field(
+								sq,
+								"memberCount")),
+							0, G_MAXINT),
+						description);
 			ui_draw_label(
 				sub, (Rect){ r.x + 48, r.y + 23, r.w - 56, 18 },
 				12, 450, UI_MUTED, FALSE);

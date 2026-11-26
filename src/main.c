@@ -22,6 +22,9 @@
 #include "net_route.h"
 #include "monitor_picker.h"
 #include "sandbox.h"
+#include "security/ipc.h"
+#include "security/sandbox.h"
+#include "security/vault.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
@@ -542,7 +545,27 @@ static J *open_conversation(struct line_worker *w, J *row)
 
 	json_object_object_add(chat, "avatarKey",
 			       json_object_new_string(avatar ? avatar : ""));
-	json_object_object_add(chat, "time", json_object_new_int(0));
+	json_object_object_add(chat, "time",
+			       json_object_new_int64(json_object_get_int64(
+				       field(row, "time"))));
+	if (json_object_get_boolean(field(row, "square"))) {
+		json_object_object_add(chat, "square",
+				       json_object_new_boolean(TRUE));
+		if (strfield(row, "squareMid"))
+			json_object_object_add(chat, "squareMid",
+					       json_object_new_string(strfield(
+						       row, "squareMid")));
+		if (strfield(row, "myMemberId"))
+			json_object_object_add(chat, "myMemberId",
+					       json_object_new_string(strfield(
+						       row, "myMemberId")));
+		if (strfield(row, "myRole"))
+			json_object_object_add(chat, "myRole",
+					       json_object_new_string(strfield(
+						       row, "myRole")));
+	}
+	if (!w->opened_chats)
+		w->opened_chats = obj();
 	if (!g_hash_table_contains(w->chats, id)) {
 		json_object_object_add(w->opened_chats, id,
 				       json_object_get(chat));
@@ -1764,6 +1787,14 @@ static J *square_list_hub(struct line_worker *w, GError **error)
 	w->square_members = g_steal_pointer(&mems);
 	w->square_authorities = g_steal_pointer(&auths);
 	w->square_chat_to_square = g_steal_pointer(&c2s);
+	w->square_disabled = FALSE;
+	for (size_t i = 0; i < json_object_array_length(chat_rows); i++) {
+		J *cr = json_object_array_get_idx(chat_rows, i);
+		const char *cid = strfield(cr, "id");
+
+		if (cid && !g_hash_table_contains(w->chats, cid))
+			json_object_put(open_conversation(w, cr));
+	}
 	if (json_object_object_length(w->squares) && !w->square_poll_due)
 		w->square_poll_due =
 			g_get_monotonic_time() + 4 * G_USEC_PER_SEC;
@@ -3583,6 +3614,10 @@ static int worker(int credentials_fd)
 	} else {
 		frame_fd = -1;
 	}
+	/* Strip any stray inherited FDs before installing Landlock/seccomp. */
+	avernella_close_extra_fds(frame_fd >= 0	      ? frame_fd :
+				  credentials_fd >= 0 ? credentials_fd :
+							STDERR_FILENO);
 	/* Before any thread starts, so every later thread inherits it. */
 	line_sandbox_worker();
 	struct line_worker w = {

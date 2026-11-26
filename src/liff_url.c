@@ -98,6 +98,28 @@ char *line_square_parse_ticket(const char *input)
 	return g_strndup(p, len);
 }
 
+char *line_square_parse_emid(const char *input)
+{
+	static const char key[] = "encryptedSquareMid=";
+
+	if (!input || strlen(input) > 4096 ||
+	    !g_utf8_validate(input, -1, NULL) || !strstr(input, "square/home"))
+		return NULL;
+	const char *p = strstr(input, key);
+
+	if (!p)
+		return NULL;
+	p += sizeof(key) - 1;
+	gsize len = strcspn(p, "&# \t\r\n/");
+
+	if (len < 16 || len > 512)
+		return NULL;
+	for (gsize i = 0; i < len; i++)
+		if (!g_ascii_isalnum(p[i]) && p[i] != '-' && p[i] != '_')
+			return NULL;
+	return g_strndup(p, len);
+}
+
 char *line_group_parse_ticket(const char *input)
 {
 	if (!input || !g_utf8_validate(input, -1, NULL))
