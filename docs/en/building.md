@@ -197,6 +197,9 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `LINE_NOISE_SUPPRESSION=0` | Sends the raw microphone, without RNNoise |
 | `LINE_CALL_FEEDBACK=0` | Stops sending video retransmission requests, receiver reports and REMB in one-to-one calls, for troubleshooting ([Bad networks](calls.md#8-bad-networks)) |
 | `LINE_CALL_DSCP=0` | Sends call packets without the DSCP marks (EF for voice, AF41 for video) |
+| `LINE_CALL_ENCODER_THREAD=0` | Encodes call video on the call thread instead of its own `line-encode` thread |
+| `LINE_DISABLE_RX_TIMESTAMPS=1` | Times call packets when the call thread reads them, instead of with the kernel's receive stamps |
+| `LINE_DISABLE_SEND_QUEUE=1` | Stops reading the call socket's kernel send queue (`SIOCOUTQ`) for rate control |
 | `LINE_CALL_VIDEO_KBPS=<n>` | Overrides the video sending bitrate. Direct calls send at least 1500 kbit/s HD unless this is set lower |
 | `LINE_CAMERA_DEVICE=<path>` | Camera device (default `/dev/video0`) |
 | `LINE_SHARE_WIDTH`, `LINE_SHARE_HEIGHT`, `LINE_SHARE_FPS`, `LINE_SHARE_KBPS` | Caps on screen-share capture and encoding |

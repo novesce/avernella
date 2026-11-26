@@ -433,6 +433,58 @@ static void perf_receive(gconstpointer data)
 	close(tx);
 }
 
+/*
+ * A datagram that waited in the socket while the thread was busy keeps
+ * the time the kernel received it, in both receive modes.
+ */
+static void receive_timestamps(gconstpointer data)
+{
+	enum line_udp_mode mode = GPOINTER_TO_INT(data);
+	struct sockaddr_in rx_addr, tx_addr;
+	int rx = bound_socket(&rx_addr), tx = bound_socket(&tx_addr);
+	struct line_udp_rx *r = line_udp_rx_new(rx, mode);
+	guint8 packet[200] = { 1 }, got[LINE_UDP_RX_SIZE];
+	struct sockaddr_storage from;
+	socklen_t len;
+
+	g_assert_true(line_udp_rx_timestamps(r));
+	gint64 sent = g_get_monotonic_time();
+
+	for (guint i = 0; i < 3; i++)
+		g_assert_cmpint(sendto(tx, packet, sizeof(packet), 0,
+				       (void *)&rx_addr, sizeof(rx_addr)),
+				==, sizeof(packet));
+	/* The call thread encoding a picture. */
+	g_usleep(30000);
+	for (guint i = 0; i < 3; i++) {
+		g_assert_cmpint(line_udp_rx_next(r, got, sizeof(got), &from,
+						 &len),
+				==, sizeof(packet));
+		gint64 arrival = line_udp_rx_arrival(r);
+
+		g_assert_cmpint(arrival, >=, sent - 1000);
+		g_assert_cmpint(arrival, <, sent + 20000);
+	}
+	g_assert_cmpint(g_get_monotonic_time() - sent, >=, 30000);
+	line_udp_rx_free(r);
+	/* Switched off, the arrival is when the thread read the socket. */
+	g_setenv("LINE_DISABLE_RX_TIMESTAMPS", "1", TRUE);
+	r = line_udp_rx_new(rx, mode);
+	g_assert_false(line_udp_rx_timestamps(r));
+	g_unsetenv("LINE_DISABLE_RX_TIMESTAMPS");
+	sent = g_get_monotonic_time();
+	g_assert_cmpint(sendto(tx, packet, sizeof(packet), 0, (void *)&rx_addr,
+			       sizeof(rx_addr)),
+			==, sizeof(packet));
+	g_usleep(30000);
+	g_assert_cmpint(line_udp_rx_next(r, got, sizeof(got), &from, &len), ==,
+			sizeof(packet));
+	g_assert_cmpint(line_udp_rx_arrival(r), >=, sent + 30000);
+	line_udp_rx_free(r);
+	close(rx);
+	close(tx);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -449,6 +501,12 @@ int main(int argc, char **argv)
 			     GINT_TO_POINTER(LINE_UDP_PLAIN), receive_modes);
 	g_test_add_data_func("/udp-batch/receive/recvmmsg",
 			     GINT_TO_POINTER(LINE_UDP_MMSG), receive_modes);
+	g_test_add_data_func("/udp-batch/receive/timestamps/recvfrom",
+			     GINT_TO_POINTER(LINE_UDP_PLAIN),
+			     receive_timestamps);
+	g_test_add_data_func("/udp-batch/receive/timestamps/recvmmsg",
+			     GINT_TO_POINTER(LINE_UDP_MMSG),
+			     receive_timestamps);
 	g_test_add_func("/udp-batch/sandbox-fallback", sandbox_fallback);
 	g_test_add_func("/udp-batch/default-mode", default_mode);
 	g_test_add_func("/udp-batch/traffic-class", traffic_class);

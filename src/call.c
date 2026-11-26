@@ -1005,6 +1005,18 @@ static void refresh_shared_screen(struct voice_call *c, gint64 now)
 	c->share_video_repeat = MIN(c->share_video_repeat, due);
 }
 
+/*
+ * What the kernel still holds for the call socket, before a picture is
+ * encoded: on a weak Wi-Fi uplink it rises before anything is lost.
+ */
+static void sample_send_queue(struct voice_call *c, gint64 now)
+{
+	gint64 held = line_udp_send_queue(c->fd);
+
+	if (held >= 0)
+		call_video_local_queue(c->video, (guint64)held, now);
+}
+
 static gboolean send_share_video(struct voice_call *c, gint64 now)
 {
 	struct line_camera_frame image;
@@ -1020,6 +1032,7 @@ static gboolean send_share_video(struct voice_call *c, gint64 now)
 	line_camera_i420_frame(&image,
 			       g_bytes_get_data(c->share_video_frame, NULL),
 			       c->share_video_width, c->share_video_height);
+	sample_send_queue(c, now);
 	if (!call_video_encode(c->video, &image, now, send_video_packet, c,
 			       &error)) {
 		stop_sharing(c, error->message);
@@ -1194,6 +1207,19 @@ static void display_video(const struct line_camera_frame *image, gpointer user)
 		line_event("call_frame", "chat", c->info.target);
 }
 
+/*
+ * Camera and screen pictures are encoded on their own thread, so an HD
+ * encode (10-45 ms) never delays incoming audio, the speaker or the
+ * microphone. LINE_CALL_ENCODER_THREAD=0 encodes on the call thread.
+ */
+static void encode_on_own_thread(struct voice_call *c)
+{
+	const char *inline_encode = g_getenv("LINE_CALL_ENCODER_THREAD");
+
+	if (c->video && (!inline_encode || strcmp(inline_encode, "0")))
+		call_video_encode_async(c->video);
+}
+
 static gboolean capture_video(struct voice_call *c, gint64 now, GError **error)
 {
 	struct line_camera_frame frame;
@@ -1237,6 +1263,7 @@ static gboolean capture_video(struct voice_call *c, gint64 now, GError **error)
 		if (notify)
 			line_event("call_self_frame", "chat", c->info.target);
 	}
+	sample_send_queue(c, now);
 	return call_video_encode(c->video, &frame, now, send_video_packet, c,
 				 error);
 }
@@ -1400,6 +1427,7 @@ static gboolean setup_video(struct voice_call *c, Slice offer, Slice key,
 			    tx, rx))
 		c->video = call_video_open(tx, rx, pt, tx_ssrc, rx_ssrc,
 					   c->send_kbps, c->send_fps, error);
+	encode_on_own_thread(c);
 	OPENSSL_cleanse(tx, sizeof(tx));
 	OPENSSL_cleanse(rx, sizeof(rx));
 	if (!c->video && (!error || !*error))
@@ -1921,6 +1949,7 @@ static void setup_group_video(struct voice_call *c,
 						    answer->video_tx,
 						    c->send_kbps, c->send_fps,
 						    &error);
+		encode_on_own_thread(c);
 		OPENSSL_cleanse(tx, sizeof(tx));
 	}
 	if (!c->video) {
@@ -3120,6 +3149,7 @@ static gboolean run_call(struct voice_call *c, GError **e)
 	struct pollfd fds[] = { { .fd = c->task->wake, .events = POLLIN },
 				{ .fd = c->fd, .events = POLLIN },
 				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
 				{ .fd = -1, .events = POLLIN } };
 	while (!g_atomic_int_get(&c->task->done)) {
 		gint64 now = g_get_monotonic_time();
@@ -3240,6 +3270,7 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		if (c->share_video_repeat)
 			next = MIN(next, c->share_video_repeat);
 		fds[3].fd = line_screencast_fd(c->cast);
+		fds[4].fd = call_video_encoder_fd(c->video);
 		fds[2].fd = -1;
 		if (c->camera) {
 			if (now >= c->next_video)
@@ -3326,6 +3357,17 @@ static gboolean run_call(struct voice_call *c, GError **e)
 				group_select_video(c);
 			continue;
 		}
+		/* A finished picture goes out before the next is captured. */
+		if ((fds[4].revents & POLLIN) &&
+		    !call_video_encoded(c->video, g_get_monotonic_time(),
+					send_video_packet, c) &&
+		    c->camera) {
+			g_atomic_int_set(&c->task->camera_enabled, FALSE);
+			line_event(
+				"call_camera_error", "message",
+				"Could not encode or send the call video frame.");
+			camera_state(c);
+		}
 		if (fds[3].revents & POLLIN)
 			share_capture(c, g_get_monotonic_time());
 		if (c->camera && fds[2].revents) {
@@ -3355,6 +3397,8 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		if (n <= 0)
 			continue;
 		Slice pkt = { data, (gsize)n };
+		/* When the kernel received it, not when this thread got here. */
+		gint64 arrival = line_udp_rx_arrival(c->udp_rx);
 
 		if (c->stats.next)
 			c->stats.udp_received++;
@@ -3372,8 +3416,7 @@ static gboolean run_call(struct voice_call *c, GError **e)
 					group_camera_feedback(c, pkt);
 				} else if (!c->group && c->video &&
 					   call_video_receive_rtcp(
-						   c->video, data, n,
-						   g_get_monotonic_time(),
+						   c->video, data, n, arrival,
 						   send_video_packet, c))
 					media_received(c, &c->video_route,
 						       &source);
@@ -3385,8 +3428,6 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			if (c->stats.next && (data[1] & 127) == c->data_pt)
 				c->stats.data_packets++;
 			if (c->data && call_pdtp_matches(c->data, data, n)) {
-				gint64 arrival = g_get_monotonic_time();
-
 				if (call_pdtp_receive(c->data, data, n,
 						      arrival)) {
 					if (c->group) {
@@ -3432,9 +3473,12 @@ static gboolean run_call(struct voice_call *c, GError **e)
 						       receiver) :
 					       0;
 			gboolean ok =
-				video ? call_video_receive(receiver, data, n,
-							   display_video, c) :
-					line_audio_receive(c->audio, data, n);
+				video ? call_video_receive_at(receiver, data, n,
+							      arrival,
+							      display_video,
+							      c) :
+					line_audio_receive_at(c->audio, data, n,
+							      arrival);
 
 			if (video && group_video &&
 			    call_video_authenticated_packets(receiver) !=

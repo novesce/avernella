@@ -240,6 +240,12 @@ The wire format is fixed by LINE, so Avernella improves calls on lossy, jittery 
 - With nothing buffered, playout continues with concealment for up to 200 ms. It then stops and buffers to the target again.
 - Delay more than 60 ms above the target for half a second is shed by playing frames 10% faster. More than 200 ms above the target skips frames.
 
+**The call thread stays free** ([`call_video.c`](../../src/call_video.c)). One thread, `line-voice`, receives every packet, feeds the speaker and captures the microphone. Encoding a 720p camera picture with libvpx took it 13 ms (median) and up to 36 ms on the development machine, and 36–44 ms for a keyframe, while microphone packets went out late and incoming audio waited in the socket. Camera and screen pictures are now encoded on their own thread, `line-encode`. `call_video_encode()` copies the frame (about 0.2 ms at 720p) and returns. When the picture is ready the encoder thread writes an eventfd that the call thread polls, and the call thread packetizes and sends it, so sequence numbers, the retransmission history and rate control stay on one thread. One picture is in flight at a time: a camera frame that arrives while the encoder is busy is skipped. A keyframe request made meanwhile applies to the next picture. Before the encoder is reconfigured or closed, the call thread waits for the picture in flight. Opening or resizing the encoder still happens on the call thread (8–11 ms at 720p). The PDTP presentation encoder still runs inline. `LINE_CALL_ENCODER_THREAD=0` encodes on the call thread as before.
+
+**Kernel receive times.** The call socket asks the kernel to stamp every datagram (`SO_TIMESTAMPNS_NEW`, Linux 5.1, else `SO_TIMESTAMPNS`). `recvmmsg()` returns the stamp in each message's control data, and `line_udp_rx_arrival()` converts it to the monotonic clock. The audio jitter buffer, the video reorder buffer, the REMB delay estimate and RTT then measure when a packet arrived, not when the call thread got to it. A stamp outside the last two seconds (a clock step) counts as now. In the network harness this made no measurable difference once the encoder thread had freed the call thread, because a packet can still not be played before the thread reads it. It costs nothing, and keeps the estimates right when the thread is held up for other reasons. `LINE_DISABLE_RX_TIMESTAMPS=1` turns the stamps off.
+
+**The kernel's send queue.** Before each picture, the call thread asks how much the kernel still holds for the call socket (`ioctl(SIOCOUTQ)`): datagrams waiting in the qdisc, in the Wi-Fi stack's queues or in the driver for the radio. On a weak Wi-Fi uplink this queue grows long before anything is lost, and every picture sent into it only waits. From successive samples and the bytes sent in between, `call_video_local_queue()` measures what the uplink really carries. More than 60 ms of queue for 100 ms cuts the rate to 85% of that measured rate (70% when the queue is above 200 ms), at most half at once, again every 300 ms while the queue still grows, and growth pauses until it drains. The kernel counts whole socket buffers, about twice a full packet's payload, so the delay is coarse. Skipping pictures while the queue is long was tried and dropped: libvpx spends the saved budget on one large picture that refills the queue at once. `LINE_DISABLE_SEND_QUEUE=1` turns the signal off. Busy polling (`SO_BUSY_POLL`) needs `CAP_NET_ADMIN` to raise above the system default, which is 0, so it is not used.
+
 **Socket.** The call socket asks for 1 MiB send and receive buffers (the kernel caps them at `net.core.wmem_max` and `rmem_max`). Video, data and signalling are marked DSCP AF41. Each microphone packet is marked EF through `IP_TOS` or `IPV6_TCLASS` control data on `sendmsg()`. On Wi-Fi, current kernels map EF to the WMM voice and AF41 to the video access category, which wins channel access ahead of bulk traffic. Networks may ignore or clear the marks. `LINE_CALL_DSCP=0` sends unmarked packets. `SO_PRIORITY` is not used: values above 6 need `CAP_NET_ADMIN`, and Wi-Fi drivers ignore lower ones. The call and audio threads already use the short scheduler slice and utilization clamp set in `tune.c`.
 
 **Received video on the GPU.** The native Vulkan renderer draws call video from its I420 planes. When the picture is magnified, it samples luma with a Catmull–Rom bicubic filter, nine bilinear fetches for the exact 16-tap result, and keeps bilinear chroma. On decoded VP8 scaled up to 640 × 360 from 480 × 270 or 320 × 180 at 100–300 kbit/s, Catmull–Rom measured 0.7–1.0 dB PSNR above bilinear. Lanczos-3 did no better, and an unsharp mask added at most 0.2 dB, so neither is used. SDL's renderers and the software path keep bilinear scaling. The filter runs on any Vulkan GPU, NVIDIA, AMD or Intel, in the UI process. The worker and its sandbox are unchanged.
@@ -259,6 +265,24 @@ The wire format is fixed by LINE, so Avernella improves calls on lossy, jittery 
 | 1.2 Mbit/s dropping to 300 kbit/s for 7 s | 9.2 → 13.4 | 7.3 → 2.1 s | 32.7 → 36.0 dB |
 | 600 ms outage | 14.4 → 14.4 | 0.8 → 0.8 s, recovery 178 ms | 44.3 → 44.2 dB |
 | Mobile hotspot (70 ms, 50 ms jitter, 1 Mbit/s falling to 450 kbit/s) | 2.0 → 14.7 | 17.1 → 3.4 s | 19.9 → 41.7 dB |
+
+The harness also measures capture-to-screen latency. A weak Wi-Fi uplink, 700 kbit/s falling to 260 kbit/s for 8 s with up to 600 ms queued in the driver and the air, compares the sender with and without the kernel's send queue:
+
+| Weak Wi-Fi uplink | Send queue ignored | Send queue used |
+| ----------------- | ------------------ | --------------- |
+| Latency, 95th percentile | 570 ms | 170 ms |
+| Latency, mean | 115 ms | 79 ms |
+| Frame rate | 13.7 fps | 14.8 fps |
+| Freeze per 19 s | 420 ms | 287 ms |
+| Screen PSNR | 32.4 dB | 35.1 dB |
+
+A 720p call, with 25 ms delay, 8 ms jitter and 0.5% loss, compares audio when the call thread encodes inline (busy 14 ms of every 33 ms, 45 ms for a keyframe every 3 s) with the encoder thread (3 ms decoding remains):
+
+| Audio during a 720p call | Encoding inline | Encoder thread |
+| ------------------------ | --------------- | -------------- |
+| Mean playout delay | 120 ms | 85 ms |
+| Dead air per minute | 54 ms | 0 ms |
+| Concealed audio per minute | 869 ms | 290 ms |
 
 | Audio scenario | Dead air per minute, before → after | Mean playout delay, before → after |
 | -------------- | ----------------------------------- | ---------------------------------- |

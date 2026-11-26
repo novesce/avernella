@@ -266,10 +266,10 @@ build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/udp_batch.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
-build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o
+build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
 # Bad-network harness: a virtual clock and simulated audio devices.
 build/test-call-net: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time,--wrap=SDL_InitSubSystem,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice,--wrap=SDL_ClearQueuedAudio,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
-build/test-call-net: tests/call_net.c build/call_video.o build/call_srtp.o build/call_audio.o build/call_denoise.o build/camera_pixels.o
+build/test-call-net: tests/call_net.c build/call_video.o build/call_srtp.o build/call_audio.o build/call_denoise.o build/camera_pixels.o build/tune.o
 build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/camera_pixels.o
 ifeq ($(CALL_VP8_JETSON),1)
 build/call_vp8_jetson.o: private CPPFLAGS += $(shell pkg-config --cflags $(JETSON_PKGS))

@@ -139,6 +139,8 @@ struct LineAudio {
 	struct audio_diagnostics *diagnostics;
 	struct line_audio_stats totals;
 	struct jitter_buffer *jb;
+	/* Kernel receive time of the packet being handled, or 0 for now. */
+	gint64 rx_arrival;
 	struct xrtp_track *tracks;
 	guint64 xrtp_packet;
 };
@@ -1659,7 +1661,26 @@ static void diagnose_received_audio(struct audio_diagnostics *d,
 	d->last_seq = frame->seq;
 }
 
+static gboolean receive_packet(LineAudio *a, const guint8 *packet, gsize size);
+
+gboolean line_audio_receive_at(LineAudio *a, const guint8 *packet, gsize size,
+			       gint64 arrival)
+{
+	if (!a)
+		return FALSE;
+	a->rx_arrival = MAX(arrival, 0);
+	gboolean ok = receive_packet(a, packet, size);
+
+	a->rx_arrival = 0;
+	return ok;
+}
+
 gboolean line_audio_receive(LineAudio *a, const guint8 *packet, gsize size)
+{
+	return line_audio_receive_at(a, packet, size, 0);
+}
+
+static gboolean receive_packet(LineAudio *a, const guint8 *packet, gsize size)
 {
 	if (!a || !packet || size < 23 || size > MAX_RTP ||
 	    (packet[0] >> 6) != 2 || (packet[1] & 127) != a->rx_pt)
@@ -1759,7 +1780,8 @@ gboolean line_audio_receive(LineAudio *a, const guint8 *packet, gsize size)
 					plain[0] & 15);
 
 	if (a->jb) {
-		frame.arrival = g_get_monotonic_time();
+		frame.arrival = a->rx_arrival ? a->rx_arrival :
+						g_get_monotonic_time();
 		return jb_insert(a, &frame);
 	}
 	if (a->first_rx || delta == 1 || delta > REORDER_PACKETS + 1) {

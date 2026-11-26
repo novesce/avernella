@@ -19,6 +19,17 @@ G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
 	return fake_now;
 }
 
+/*
+ * Time the call thread spends away from the socket: encoding and decoding
+ * pictures on the same thread, as before the encoder thread, or only
+ * decoding them. Packets wait in the socket meanwhile.
+ */
+struct thread_load {
+	guint busy_ms, every_ms, key_busy_ms, key_every_ms;
+	/* Receivers get the kernel's receive time, not the time of reading. */
+	gboolean kernel_stamps;
+};
+
 /* A one-way path. Times are milliseconds from the start of the run. */
 struct link_profile {
 	const char *name;
@@ -30,10 +41,27 @@ struct link_profile {
 	guint low_kbps, low_from_ms, low_to_ms; /* temporary rate drop */
 	guint outage_from_ms, outage_ms;
 	guint spike_every_ms, spike_ms; /* periodic stalls, as Wi-Fi scans */
+	const struct thread_load *load;
+	/*
+	 * The bottleneck is this machine's Wi-Fi uplink, so the kernel's
+	 * send queue (SIOCOUTQ) shows it to the sender.
+	 */
+	gboolean local_uplink, ignore_local_queue;
 	/* Pass marks, each one the code before this harness failed. */
 	double min_fps, min_screen_psnr;
 	guint max_freeze_ms, max_recovery_ms, max_dead_air_ms, max_delay_ms;
+	guint max_latency_ms;
 };
+
+/* Whether the call thread is busy at t, in ms from the start of the run. */
+static gboolean thread_busy(const struct thread_load *load, gint64 t)
+{
+	if (!load)
+		return FALSE;
+	if (load->key_every_ms && t % load->key_every_ms < load->key_busy_ms)
+		return TRUE;
+	return load->every_ms && t % load->every_ms < load->busy_ms;
+}
 
 struct in_flight {
 	gint64 at;
@@ -135,15 +163,36 @@ static gboolean link_send(struct link *l, const guint8 *data, gsize size)
 	return TRUE;
 }
 
-typedef void (*link_receive_fn)(const guint8 *data, gsize size, gpointer user);
+/* Bytes the kernel would hold for the socket: about twice the payload. */
+static guint64 link_held(const struct link *l, guint kbps)
+{
+	if (!kbps || l->busy_until <= fake_now)
+		return 0;
+	return (guint64)(l->busy_until - fake_now) * kbps / 8000 * 2;
+}
+
+static guint link_rate(const struct link *l)
+{
+	const struct link_profile *p = l->p;
+	gint64 t = (fake_now - l->start) / 1000;
+
+	return p->low_kbps && t >= p->low_from_ms && t < p->low_to_ms ?
+		       p->low_kbps :
+		       p->kbps;
+}
+
+typedef void (*link_receive_fn)(const guint8 *data, gsize size, gint64 arrival,
+				gpointer user);
 
 static void link_deliver(struct link *l, link_receive_fn receive, gpointer user)
 {
 	struct in_flight *f;
+	const struct thread_load *load = l->p->load;
 
 	while ((f = g_queue_peek_head(&l->queue)) && f->at <= fake_now) {
 		g_queue_pop_head(&l->queue);
-		receive(f->data, f->size, user);
+		receive(f->data, f->size,
+			load && load->kernel_stamps ? f->at : 0, user);
 		g_free(f);
 	}
 }
@@ -239,6 +288,10 @@ struct video_run {
 	guint index_at_outage_end;
 	guint8 *cache[8];
 	guint cache_index[8];
+	/* Capture time of each picture, for capture-to-screen latency. */
+	gint64 captured[4096];
+	gint64 latency_sum;
+	guint latency_count, latency_hist[300];
 };
 
 static guint8 sample(const guint8 *p, guint w, guint h, double x, double y)
@@ -332,6 +385,13 @@ static void video_display(const struct line_camera_frame *frame, gpointer data)
 		return;
 	run->shown++;
 	run->decoded_psnr += psnr(run, run->source);
+	gint64 latency = fake_now - run->captured[index & 4095];
+
+	if (latency >= 0 && latency < 3 * G_USEC_PER_SEC) {
+		run->latency_sum += latency;
+		run->latency_count++;
+		run->latency_hist[MIN(latency / 10000, 299)]++;
+	}
 	gint64 gap = fake_now - MAX(run->last_shown, run->measure_from);
 	gint64 frame_us = G_USEC_PER_SEC / VFPS;
 
@@ -370,23 +430,44 @@ static gboolean video_back(const guint8 *packet, gsize size, gpointer data)
 	return link_send(&run->back, packet, size);
 }
 
-static void video_arrive(const guint8 *packet, gsize size, gpointer data)
+static void video_arrive(const guint8 *packet, gsize size, gint64 arrival,
+			 gpointer data)
 {
 	struct video_run *run = data;
 
-	call_video_receive(run->rx, packet, size, video_display, run);
+	call_video_receive_at(run->rx, packet, size, arrival, video_display,
+			      run);
 }
 
-static void feedback_arrive(const guint8 *packet, gsize size, gpointer data)
+static void feedback_arrive(const guint8 *packet, gsize size, gint64 arrival,
+			    gpointer data)
 {
 	struct video_run *run = data;
 
-	call_video_receive_rtcp(run->tx, packet, size, fake_now, video_forward,
+	call_video_receive_rtcp(run->tx, packet, size,
+				arrival ? arrival : fake_now, video_forward,
 				run);
 }
 
+/* Capture to screen, mean and 95th percentile, in milliseconds. */
+static void latency_of(const struct video_run *run, double *mean, guint *p95)
+{
+	guint seen = 0, i = 0;
+
+	*mean = run->latency_count ?
+			(double)run->latency_sum / run->latency_count / 1000 :
+			0;
+	for (; i < G_N_ELEMENTS(run->latency_hist); i++) {
+		seen += run->latency_hist[i];
+		if (seen * 20 >= run->latency_count * 19)
+			break;
+	}
+	*p95 = i * 10 + 10;
+}
+
 struct video_result {
-	double fps, decoded_psnr, screen_psnr, kbps;
+	double fps, decoded_psnr, screen_psnr, kbps, latency_ms;
+	guint latency_p95_ms, local_cuts;
 	gint64 freeze_ms, recovery_ms;
 	guint freezes, firs;
 	double loss;
@@ -431,13 +512,24 @@ static struct video_result run_video(const struct link_profile *profile)
 			struct call_video_recovery t;
 
 			call_video_recovery(run.tx, &t);
-			g_printerr("t=%5.1f target=%u enc=%u %ux%u\n",
-				   (fake_now - start) / 1e6, t.target_kbps,
-				   t.encoder_kbps, t.width, t.height);
+			g_printerr(
+				"t=%5.1f target=%u enc=%u %ux%u local=%ums cuts=%u link=%ukbps\n",
+				(fake_now - start) / 1e6, t.target_kbps,
+				t.encoder_kbps, t.width, t.height,
+				t.local_queue_ms, t.local_cuts,
+				link_rate(&run.forward));
 		}
 		if (fake_now >= next_frame) {
 			source_frame(index, frame, frame + VW * VH,
 				     frame + VW * VH * 5 / 4);
+			run.captured[index & 4095] = fake_now;
+			if (profile->local_uplink &&
+			    !profile->ignore_local_queue)
+				call_video_local_queue(
+					run.tx,
+					link_held(&run.forward,
+						  link_rate(&run.forward)),
+					fake_now);
 			g_assert_true(call_video_encode(run.tx, &image,
 							fake_now, video_forward,
 							&run, &e));
@@ -484,6 +576,7 @@ static struct video_result run_video(const struct link_profile *profile)
 	double seconds = (double)(end - run.measure_from) / G_USEC_PER_SEC;
 	struct video_result r = {
 		.fps = run.shown / seconds,
+		.local_cuts = 0,
 		.decoded_psnr = run.shown ? run.decoded_psnr / run.shown : 0,
 		.screen_psnr = run.screen_samples ?
 				       run.screen_psnr / run.screen_samples :
@@ -502,22 +595,25 @@ static struct video_result run_video(const struct link_profile *profile)
 						   run.forward.sent :
 					   0,
 	};
-	g_test_message(
-		"video %-18s fps=%5.2f freeze-ms=%6" G_GINT64_FORMAT
-		" freezes=%3u psnr-decoded=%5.2f psnr-screen=%5.2f recovery-ms=%5" G_GINT64_FORMAT
-		" sent-kbps=%6.1f path-loss=%4.1f%% keyframe-requests=%u",
-		profile->name, r.fps, r.freeze_ms, r.freezes, r.decoded_psnr,
-		r.screen_psnr, r.recovery_ms, r.kbps, r.loss, r.firs);
+	latency_of(&run, &r.latency_ms, &r.latency_p95_ms);
 	struct call_video_recovery tx, rx;
 
 	call_video_recovery(run.tx, &tx);
 	call_video_recovery(run.rx, &rx);
+	r.local_cuts = tx.local_cuts;
 	g_test_message(
-		"      requests=%u seqs=%u resent=%u answered=%u gave-up=%u late=%u rembs=%u rtt=%ums hold=%ums rate-changes=%u rescales=%u final=%ukbps %ux%u",
+		"video %-18s fps=%5.2f freeze-ms=%6" G_GINT64_FORMAT
+		" freezes=%3u psnr-decoded=%5.2f psnr-screen=%5.2f recovery-ms=%5" G_GINT64_FORMAT
+		" sent-kbps=%6.1f path-loss=%4.1f%% keyframe-requests=%u latency-ms=%6.1f latency-p95-ms=%4u",
+		profile->name, r.fps, r.freeze_ms, r.freezes, r.decoded_psnr,
+		r.screen_psnr, r.recovery_ms, r.kbps, r.loss, r.firs,
+		r.latency_ms, r.latency_p95_ms);
+	g_test_message(
+		"      requests=%u seqs=%u resent=%u answered=%u gave-up=%u late=%u rembs=%u rtt=%ums hold=%ums rate-changes=%u rescales=%u final=%ukbps %ux%u local-cuts=%u",
 		rx.requests, rx.requested, tx.retransmitted, rx.retransmitted,
 		rx.gave_up, rx.late, rx.rembs, rx.rtt_ms, rx.hold_ms,
 		tx.rate_changes, tx.rescales, tx.target_kbps, tx.width,
-		tx.height);
+		tx.height, tx.local_cuts);
 	link_clear(&run.forward);
 	link_clear(&run.back);
 	call_video_close(run.tx);
@@ -657,9 +753,10 @@ struct audio_result {
 	guint64 late, fec;
 };
 
-static void audio_arrive(const guint8 *packet, gsize size, gpointer data)
+static void audio_arrive(const guint8 *packet, gsize size, gint64 arrival,
+			 gpointer data)
 {
-	line_audio_receive(data, packet, size);
+	line_audio_receive_at(data, packet, size, arrival);
 }
 
 static struct audio_result run_audio(const struct link_profile *profile)
@@ -698,7 +795,15 @@ static struct audio_result run_audio(const struct link_profile *profile)
 			line_audio_stats(b, &before);
 			d->queue_sum = d->queue_checks = 0;
 		}
-		if (fake_now >= next_capture) {
+		/*
+		 * Both ends run the same call thread: while it encodes or
+		 * decodes a picture, it neither captures, reads the socket
+		 * nor feeds the speaker. The devices keep running.
+		 */
+		gboolean busy =
+			thread_busy(profile->load, (fake_now - start) / 1000);
+
+		if (!busy && fake_now >= next_capture) {
 			guint8 packet[2048];
 			int n = line_audio_capture(a, packet, sizeof(packet),
 						   &e);
@@ -710,8 +815,10 @@ static struct audio_result run_audio(const struct link_profile *profile)
 				n ? MAX(fake_now + 4000, next_capture + 20000) :
 				    fake_now + 4000;
 		}
-		link_deliver(&link, audio_arrive, b);
-		line_audio_playout(b, fake_now);
+		if (!busy) {
+			link_deliver(&link, audio_arrive, b);
+			line_audio_playout(b, fake_now);
+		}
 		device_consume(d, &next_chunk);
 	}
 	line_audio_stats(b, &stats);
@@ -852,8 +959,100 @@ static const struct link_profile hotspot = {
 	.max_delay_ms = 150,
 };
 
+/*
+ * A weak Wi-Fi uplink, as from the far side of a flat: the radio drops to
+ * a low rate and the driver and air queues hold up to 600 ms. The kernel
+ * sees that queue in the socket's send buffer, before anything is lost.
+ */
+static const struct link_profile uplink = {
+	.name = "weak-wifi-uplink",
+	.loss = 0.005,
+	.delay_ms = 25,
+	.jitter_ms = 8,
+	.kbps = 700,
+	.queue_ms = 600,
+	.low_kbps = 260,
+	.low_from_ms = 5000,
+	.low_to_ms = 13000,
+	.local_uplink = TRUE,
+	.min_fps = 14,
+	.min_screen_psnr = 34,
+	.max_freeze_ms = 1000,
+	.max_latency_ms = 250,
+};
+
+/* The same, with the kernel's send queue ignored, as before. */
+static const struct link_profile uplink_blind = {
+	.name = "weak-wifi-uplink-blind",
+	.loss = 0.005,
+	.delay_ms = 25,
+	.jitter_ms = 8,
+	.kbps = 700,
+	.queue_ms = 600,
+	.low_kbps = 260,
+	.low_from_ms = 5000,
+	.low_to_ms = 13000,
+	.local_uplink = TRUE,
+	.ignore_local_queue = TRUE,
+};
+
 static const struct link_profile *const video_profiles[] = {
-	&clean, &lossy, &wifi, &capped, &fluctuating, &outage, &hotspot,
+	&clean,	 &lossy,   &wifi,   &capped,	   &fluctuating,
+	&outage, &hotspot, &uplink, &uplink_blind,
+};
+
+/*
+ * A 720p call: inline, the call thread encodes (about 11 ms of every
+ * 33 ms, 40 ms for a keyframe every 3 s) and decodes (3 ms) pictures.
+ * With the encoder thread it only decodes, and reads kernel stamps.
+ */
+static const struct thread_load encode_inline = {
+	.busy_ms = 14,
+	.every_ms = 33,
+	.key_busy_ms = 45,
+	.key_every_ms = 3000,
+};
+
+static const struct thread_load encode_threaded = {
+	.busy_ms = 3,
+	.every_ms = 33,
+	.key_busy_ms = 8,
+	.key_every_ms = 3000,
+	.kernel_stamps = TRUE,
+};
+
+/* The encoder thread alone, still reading the clock after the socket. */
+static const struct thread_load encode_threaded_clock = {
+	.busy_ms = 3,
+	.every_ms = 33,
+	.key_busy_ms = 8,
+	.key_every_ms = 3000,
+};
+
+static const struct link_profile hd_threaded_clock = {
+	.name = "hd-video-threaded-clock",
+	.loss = 0.005,
+	.delay_ms = 25,
+	.jitter_ms = 8,
+	.load = &encode_threaded_clock,
+};
+
+static const struct link_profile hd_inline = {
+	.name = "hd-video-inline",
+	.loss = 0.005,
+	.delay_ms = 25,
+	.jitter_ms = 8,
+	.load = &encode_inline,
+};
+
+static const struct link_profile hd_threaded = {
+	.name = "hd-video-threaded",
+	.loss = 0.005,
+	.delay_ms = 25,
+	.jitter_ms = 8,
+	.load = &encode_threaded,
+	.max_dead_air_ms = 50,
+	.max_delay_ms = 90,
 };
 
 static const struct link_profile heavy = {
@@ -869,7 +1068,7 @@ static const struct link_profile heavy = {
 };
 
 static const struct link_profile *const audio_profiles[] = {
-	&clean, &lossy, &heavy, &wifi, &hotspot,
+	&clean, &lossy, &heavy, &wifi, &hotspot, &hd_threaded,
 };
 
 static void video_scenario(gconstpointer data)
@@ -877,9 +1076,13 @@ static void video_scenario(gconstpointer data)
 	const struct link_profile *p = data;
 	struct video_result r = run_video(p);
 
+	if (p->ignore_local_queue)
+		return;
 	g_assert_cmpfloat(r.fps, >=, p->min_fps);
 	g_assert_cmpfloat(r.screen_psnr, >=, p->min_screen_psnr);
 	g_assert_cmpint(r.freeze_ms, <=, p->max_freeze_ms);
+	if (p->max_latency_ms)
+		g_assert_cmpuint(r.latency_p95_ms, <=, p->max_latency_ms);
 	if (p->max_recovery_ms) {
 		g_assert_cmpint(r.recovery_ms, >=, 0);
 		g_assert_cmpint(r.recovery_ms, <=, p->max_recovery_ms);
@@ -893,6 +1096,40 @@ static void audio_scenario(gconstpointer data)
 
 	g_assert_cmpfloat(r.dead_air_ms, <=, p->max_dead_air_ms);
 	g_assert_cmpfloat(r.delay_ms, <=, p->max_delay_ms);
+}
+
+/*
+ * The kernel's send queue lets a weak uplink keep latency low: compared
+ * with the same run that ignores it, delay drops and fps does not.
+ */
+static void uplink_compare(void)
+{
+	struct video_result blind = run_video(&uplink_blind);
+	struct video_result seen = run_video(&uplink);
+
+	g_test_message(
+		"weak uplink latency p95 %u -> %u ms, mean %.0f -> %.0f ms, fps %.1f -> %.1f",
+		blind.latency_p95_ms, seen.latency_p95_ms, blind.latency_ms,
+		seen.latency_ms, blind.fps, seen.fps);
+	g_assert_cmpuint(seen.latency_p95_ms * 3, <=, blind.latency_p95_ms * 2);
+	g_assert_cmpfloat(seen.fps, >=, blind.fps - 1);
+	g_assert_cmpuint(seen.local_cuts, >, 0);
+}
+
+/* The encoder thread and kernel stamps against encoding inline. */
+static void hd_compare(void)
+{
+	struct audio_result before = run_audio(&hd_inline);
+	struct audio_result thread = run_audio(&hd_threaded_clock);
+	struct audio_result after = run_audio(&hd_threaded);
+
+	g_test_message(
+		"720p call audio: playout delay %.1f -> %.1f (thread alone %.1f) ms, dead air %.1f -> %.1f (%.1f) ms/min, concealed %.0f -> %.0f (%.0f) ms/min",
+		before.delay_ms, after.delay_ms, thread.delay_ms,
+		before.dead_air_ms, after.dead_air_ms, thread.dead_air_ms,
+		before.concealed_ms, after.concealed_ms, thread.concealed_ms);
+	g_assert_cmpfloat(after.delay_ms + 10, <, before.delay_ms);
+	g_assert_cmpfloat(after.dead_air_ms, <=, before.dead_air_ms + 1);
 }
 
 int main(int argc, char **argv)
@@ -912,5 +1149,7 @@ int main(int argc, char **argv)
 
 		g_test_add_data_func(path, audio_profiles[i], audio_scenario);
 	}
+	g_test_add_func("/net/compare/weak-wifi-uplink", uplink_compare);
+	g_test_add_func("/net/compare/hd-video-audio", hd_compare);
 	return g_test_run();
 }

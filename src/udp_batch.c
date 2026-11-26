@@ -13,17 +13,37 @@
  * The datagrams on the wire are unchanged. A kernel without a feature, or
  * a seccomp filter that refuses it, moves that socket to the next simpler
  * mode for good: UDP_SEGMENT -> sendmmsg() -> sendto().
+ *
+ * Each datagram also carries the time the kernel received it
+ * (SO_TIMESTAMPNS), so jitter buffers and congestion estimates measure
+ * the network, not how long the call thread was busy before it read the
+ * socket.
  */
 #include "udp_batch.h"
 #include <errno.h>
+#include <linux/sockios.h>
 #include <netinet/in.h>
 #include <netinet/udp.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
+#include <time.h>
 
 #ifndef UDP_SEGMENT
 #define UDP_SEGMENT 103
 #endif
+
+/*
+ * Receive timestamps: SO_TIMESTAMPNS_NEW (Linux 5.1) carries a 64-bit
+ * struct __kernel_timespec on every architecture; the old option carries
+ * the native struct timespec.
+ */
+#define LINE_SO_TIMESTAMPNS_OLD 35
+#define LINE_SO_TIMESTAMPNS_NEW 64
+
+struct line_kernel_timespec {
+	gint64 sec, nsec;
+};
 
 /* Payload limit for one segmented message (IPv4 and IPv6 alike). */
 #define GSO_PAYLOAD_MAX 65000
@@ -42,16 +62,36 @@ static gboolean unsupported(int err)
 	return err == ENOSYS || err == EPERM || err == EOPNOTSUPP;
 }
 
+#define RX_CONTROL CMSG_SPACE(sizeof(struct line_kernel_timespec))
+
 struct line_udp_rx {
 	int fd;
 	enum line_udp_mode mode;
 	guint count, next;
+	int stamp_type;
+	/* CLOCK_MONOTONIC minus CLOCK_REALTIME at the last receive call. */
+	gint64 clock_offset, received_at, arrival;
 	struct line_udp_stats stats;
 	struct mmsghdr msgs[LINE_UDP_RX_BATCH];
 	struct iovec iov[LINE_UDP_RX_BATCH];
 	struct sockaddr_storage from[LINE_UDP_RX_BATCH];
+	/* size_t gives struct cmsghdr its alignment. */
+	size_t control[LINE_UDP_RX_BATCH][RX_CONTROL / sizeof(size_t) + 1];
 	guint8 buf[LINE_UDP_RX_BATCH][LINE_UDP_RX_SIZE];
 };
+
+static int enable_timestamps(int fd)
+{
+	int on = 1;
+
+	if (!setsockopt(fd, SOL_SOCKET, LINE_SO_TIMESTAMPNS_NEW, &on,
+			sizeof(on)))
+		return LINE_SO_TIMESTAMPNS_NEW;
+	if (!setsockopt(fd, SOL_SOCKET, LINE_SO_TIMESTAMPNS_OLD, &on,
+			sizeof(on)))
+		return LINE_SO_TIMESTAMPNS_OLD;
+	return 0;
+}
 
 struct line_udp_rx *line_udp_rx_new(int fd, enum line_udp_mode mode)
 {
@@ -59,6 +99,8 @@ struct line_udp_rx *line_udp_rx_new(int fd, enum line_udp_mode mode)
 
 	r->fd = fd;
 	r->mode = mode == LINE_UDP_PLAIN ? LINE_UDP_PLAIN : LINE_UDP_MMSG;
+	r->stamp_type = line_udp_timestamps_enabled() ? enable_timestamps(fd) :
+							0;
 	for (guint i = 0; i < LINE_UDP_RX_BATCH; i++) {
 		r->iov[i] = (struct iovec){ r->buf[i], LINE_UDP_RX_SIZE };
 		r->msgs[i].msg_hdr.msg_iov = &r->iov[i];
@@ -66,6 +108,80 @@ struct line_udp_rx *line_udp_rx_new(int fd, enum line_udp_mode mode)
 		r->msgs[i].msg_hdr.msg_name = &r->from[i];
 	}
 	return r;
+}
+
+gboolean line_udp_timestamps_enabled(void)
+{
+	const char *off = getenv("LINE_DISABLE_RX_TIMESTAMPS");
+
+	return !off || !*off || !strcmp(off, "0");
+}
+
+gboolean line_udp_rx_timestamps(const struct line_udp_rx *r)
+{
+	return r && r->stamp_type;
+}
+
+gint64 line_udp_rx_arrival(const struct line_udp_rx *r)
+{
+	return r ? r->arrival : 0;
+}
+
+/* Both clocks around the receive call, to turn kernel stamps monotonic. */
+static void sample_clocks(struct line_udp_rx *r)
+{
+	struct timespec real;
+
+	r->received_at = g_get_monotonic_time();
+	if (!r->stamp_type)
+		return;
+	clock_gettime(CLOCK_REALTIME, &real);
+	r->clock_offset = r->received_at -
+			  (gint64)real.tv_sec * G_USEC_PER_SEC -
+			  real.tv_nsec / 1000;
+}
+
+/*
+ * The kernel's receive time of one message, on the monotonic clock. A
+ * missing stamp, or one outside the last two seconds (a clock step),
+ * reads as now.
+ */
+static gint64 stamp_of(const struct line_udp_rx *r, struct msghdr *m)
+{
+	if (!r->stamp_type)
+		return r->received_at;
+	for (struct cmsghdr *c = CMSG_FIRSTHDR(m); c; c = CMSG_NXTHDR(m, c)) {
+		gint64 sec, nsec;
+
+		if (c->cmsg_level != SOL_SOCKET ||
+		    c->cmsg_type != r->stamp_type)
+			continue;
+		if (r->stamp_type == LINE_SO_TIMESTAMPNS_NEW &&
+		    c->cmsg_len >=
+			    CMSG_LEN(sizeof(struct line_kernel_timespec))) {
+			struct line_kernel_timespec t;
+
+			memcpy(&t, CMSG_DATA(c), sizeof(t));
+			sec = t.sec;
+			nsec = t.nsec;
+		} else if (r->stamp_type == LINE_SO_TIMESTAMPNS_OLD &&
+			   c->cmsg_len >= CMSG_LEN(sizeof(struct timespec))) {
+			struct timespec t;
+
+			memcpy(&t, CMSG_DATA(c), sizeof(t));
+			sec = t.tv_sec;
+			nsec = t.tv_nsec;
+		} else {
+			continue;
+		}
+		gint64 at =
+			sec * G_USEC_PER_SEC + nsec / 1000 + r->clock_offset;
+
+		if (at <= r->received_at &&
+		    at > r->received_at - 2 * G_USEC_PER_SEC)
+			return at;
+	}
+	return r->received_at;
 }
 
 void line_udp_rx_free(struct line_udp_rx *r)
@@ -91,15 +207,23 @@ struct line_udp_stats line_udp_rx_stats(const struct line_udp_rx *r)
 static ssize_t rx_plain(struct line_udp_rx *r, guint8 *data, gsize size,
 			struct sockaddr_storage *from, socklen_t *from_len)
 {
+	struct iovec iov = { data, size };
+	struct msghdr m = { .msg_name = from,
+			    .msg_namelen = sizeof(*from),
+			    .msg_iov = &iov,
+			    .msg_iovlen = 1,
+			    .msg_control = r->control[0],
+			    .msg_controllen = r->stamp_type ? RX_CONTROL : 0 };
 	ssize_t n;
 
-	*from_len = sizeof(*from);
 	do {
 		r->stats.syscalls++;
-		n = recvfrom(r->fd, data, size, MSG_DONTWAIT, (void *)from,
-			     from_len);
+		n = recvmsg(r->fd, &m, MSG_DONTWAIT);
 	} while (n < 0 && errno == EINTR);
+	sample_clocks(r);
+	*from_len = m.msg_namelen;
 	r->stats.datagrams += n >= 0;
+	r->arrival = n >= 0 ? stamp_of(r, &m) : 0;
 	return n;
 }
 
@@ -112,13 +236,19 @@ ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
 		r->count = r->next = 0;
 		if (r->mode == LINE_UDP_PLAIN)
 			return rx_plain(r, data, size, from, from_len);
-		for (guint i = 0; i < LINE_UDP_RX_BATCH; i++)
-			r->msgs[i].msg_hdr.msg_namelen = sizeof(r->from[i]);
+		for (guint i = 0; i < LINE_UDP_RX_BATCH; i++) {
+			struct msghdr *h = &r->msgs[i].msg_hdr;
+
+			h->msg_namelen = sizeof(r->from[i]);
+			h->msg_control = r->stamp_type ? r->control[i] : NULL;
+			h->msg_controllen = r->stamp_type ? RX_CONTROL : 0;
+		}
 		do {
 			r->stats.syscalls++;
 			n = recvmmsg(r->fd, r->msgs, LINE_UDP_RX_BATCH,
 				     MSG_DONTWAIT, NULL);
 		} while (n < 0 && errno == EINTR);
+		sample_clocks(r);
 		if (n < 0 && unsupported(errno)) {
 			r->mode = LINE_UDP_PLAIN;
 			return rx_plain(r, data, size, from, from_len);
@@ -138,6 +268,7 @@ ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
 	memcpy(data, r->buf[r->next], len);
 	memcpy(from, &r->from[r->next], name);
 	*from_len = name;
+	r->arrival = stamp_of(r, &m->msg_hdr);
 	r->next++;
 	return (ssize_t)len;
 }
@@ -310,6 +441,17 @@ gboolean line_udp_tx_queue(struct line_udp_tx *t, const void *to,
 	memcpy(t->buf[t->count], data, size);
 	t->sizes[t->count++] = size;
 	return ok;
+}
+
+gint64 line_udp_send_queue(int fd)
+{
+	const char *off = getenv("LINE_DISABLE_SEND_QUEUE");
+	int held = 0;
+
+	if ((off && *off && strcmp(off, "0")) || ioctl(fd, SIOCOUTQ, &held) ||
+	    held < 0)
+		return -1;
+	return held;
 }
 
 static gboolean dscp_enabled(void)

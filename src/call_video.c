@@ -3,7 +3,11 @@
 #include "call_vp8.h"
 #include "call_vp8_encode.h"
 #include "call_srtp.h"
+#include "line.h"
+#include <errno.h>
 #include <math.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include <openssl/rand.h>
 #include <string.h>
 #include <vpx/vp8cx.h>
@@ -52,6 +56,11 @@ enum {
 	RRR_MAX = 64,
 	RTX_AGE_US = 1000000,
 	MIN_KBPS = 60,
+	/* Local queue: cut the rate above HIGH for HOLD; DEEP cuts deeper. */
+	LOCAL_QUEUE_HIGH_MS = 60,
+	LOCAL_QUEUE_HOLD_MS = 100,
+	LOCAL_QUEUE_DEEP_MS = 200,
+	LOCAL_QUEUE_CUT_GAP_MS = 300,
 	KEY_SPACING_US = 300000,
 };
 
@@ -84,6 +93,20 @@ struct rate_control {
 	double report_loss;
 	gboolean feedback; /* the peer sends more than keyframe requests */
 	guint scale; /* 0 full size, then 3/4, 1/2, 3/8, 1/4 */
+};
+
+/*
+ * The kernel's own send queue for the call socket (SIOCOUTQ): datagrams
+ * the qdisc, the Wi-Fi stack or the driver still hold. On a weak Wi-Fi
+ * uplink this grows before anything is lost, so it is the earliest sign
+ * that the sender is too fast, and pictures queued behind it only add
+ * delay.
+ */
+struct local_queue {
+	gint64 at, high_since, cut_at;
+	guint64 held, sent; /* at the last sample; payload sent since */
+	double drain_kbps; /* what actually left, smoothed */
+	guint queue_ms, cut_queue_ms, cuts;
 };
 
 /* Receive-side delay-based estimate, sent to the sender as REMB. */
@@ -276,7 +299,6 @@ static gboolean sender_open_software(struct vp8_sender *s)
 		return FALSE;
 	}
 	s->ready = TRUE;
-	s->force_key = TRUE;
 	return TRUE;
 }
 
@@ -293,9 +315,9 @@ static gboolean sender_open(struct vp8_sender *s, guint w, guint h, guint kbps,
 		s->hw = call_vp8_encoder_open(
 			w, h, kbps, fps,
 			fps * (source == VP8_SCREEN_PDTP ? 10 : 3));
+	s->force_key = TRUE;
 	if (s->hw) {
 		s->ready = TRUE;
-		s->force_key = TRUE;
 		return TRUE;
 	}
 	return sender_open_software(s);
@@ -339,9 +361,9 @@ static gboolean sender_image(vpx_image_t *img,
 	return TRUE;
 }
 
+/* The encoder thread may run this; force_key belongs to the call thread. */
 static void sender_emitted(struct vp8_sender *s)
 {
-	s->force_key = FALSE;
 	if (s->announced)
 		return;
 	s->announced = TRUE;
@@ -353,7 +375,8 @@ static void sender_emitted(struct vp8_sender *s)
 }
 
 static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
-			      gint64 pts, struct vp8_picture *picture)
+			      gint64 pts, gboolean force,
+			      struct vp8_picture *picture)
 {
 	const vpx_codec_cx_pkt_t *pkt;
 	vpx_codec_iter_t iter = NULL;
@@ -368,7 +391,7 @@ static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
 			.stride = { img->stride[0], img->stride[1],
 				    img->stride[2] },
 		};
-		if (call_vp8_encoder_frame(s->hw, &frame, pts, s->force_key,
+		if (call_vp8_encoder_frame(s->hw, &frame, pts, force,
 					   &picture->data, &picture->size,
 					   &picture->key) &&
 		    picture->data && picture->size &&
@@ -389,10 +412,10 @@ static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
 		s->hw_failed = TRUE;
 		if (!sender_open_software(s))
 			return FALSE;
+		force = TRUE;
 	}
 	if (vpx_codec_encode(&s->sw, img, pts, 90000 / s->fps,
-			     s->force_key ? VPX_EFLAG_FORCE_KF : 0,
-			     VPX_DL_REALTIME))
+			     force ? VPX_EFLAG_FORCE_KF : 0, VPX_DL_REALTIME))
 		return FALSE;
 	gint64 elapsed = g_get_monotonic_time() - started;
 
@@ -412,9 +435,185 @@ static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
 	return TRUE;
 }
 
+/*
+ * An encoder thread, so a 10-45 ms HD encode never holds up the call
+ * thread, which also receives and plays audio and captures the
+ * microphone. One picture at a time: a camera frame that arrives while the
+ * thread is busy is skipped, as the call thread used to fall behind
+ * anyway. Packetizing, sequence numbers and the retransmission history
+ * stay on the call thread, which collects the result when the eventfd
+ * fires. While a picture is queued or encoding, only this thread touches
+ * the sender's encoder; the call thread waits (encoder_settle()) before
+ * it reconfigures or closes it.
+ */
+enum encode_state {
+	ENCODE_IDLE,
+	ENCODE_QUEUED,
+	ENCODE_RUNNING,
+	ENCODE_DONE,
+	ENCODE_QUIT,
+};
+
+struct encode_thread {
+	GThread *thread;
+	GMutex lock;
+	GCond cond;
+	int wake;
+	enum encode_state state;
+	struct vp8_sender *sender;
+	/* The picture to encode: a private copy of the frame's planes. */
+	vpx_image_t img;
+	guint8 *pixels;
+	gsize pixels_size;
+	guint64 pts;
+	gint64 captured;
+	gboolean force;
+	/* The result. */
+	gboolean ok, key;
+	guint8 *out;
+	gsize out_size, out_capacity;
+	guint delay_ms;
+};
+
+static gpointer encode_main(gpointer data)
+{
+	struct encode_thread *t = data;
+
+	line_tune_thread(LINE_THREAD_MEDIA);
+	g_mutex_lock(&t->lock);
+	for (;;) {
+		while (t->state != ENCODE_QUEUED && t->state != ENCODE_QUIT)
+			g_cond_wait(&t->cond, &t->lock);
+		if (t->state == ENCODE_QUIT)
+			break;
+		t->state = ENCODE_RUNNING;
+		g_mutex_unlock(&t->lock);
+
+		struct vp8_picture picture = { 0 };
+		gboolean ok = sender_encode(t->sender, &t->img, t->pts,
+					    t->force, &picture);
+
+		if (ok && picture.size > t->out_capacity) {
+			t->out_capacity = picture.size;
+			t->out = g_realloc(t->out, t->out_capacity);
+		}
+		if (ok && picture.size)
+			memcpy(t->out, picture.data, picture.size);
+		g_mutex_lock(&t->lock);
+		t->ok = ok;
+		t->key = picture.key;
+		t->out_size = ok ? picture.size : 0;
+		/* From capture, including any wait behind the last picture. */
+		t->delay_ms = MIN((g_get_monotonic_time() - t->captured) / 1000,
+				  G_MAXUINT16);
+		if (t->state == ENCODE_RUNNING)
+			t->state = ENCODE_DONE;
+		g_cond_broadcast(&t->cond);
+		g_mutex_unlock(&t->lock);
+		(void)eventfd_write(t->wake, 1);
+		g_mutex_lock(&t->lock);
+	}
+	g_mutex_unlock(&t->lock);
+	return NULL;
+}
+
+static struct encode_thread *encoder_start(struct vp8_sender *sender)
+{
+	struct encode_thread *t = g_new0(struct encode_thread, 1);
+
+	t->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (t->wake < 0) {
+		g_free(t);
+		return NULL;
+	}
+	g_mutex_init(&t->lock);
+	g_cond_init(&t->cond);
+	t->sender = sender;
+	t->thread = g_thread_try_new("line-encode", encode_main, t, NULL);
+	if (!t->thread) {
+		close(t->wake);
+		g_mutex_clear(&t->lock);
+		g_cond_clear(&t->cond);
+		g_free(t);
+		return NULL;
+	}
+	return t;
+}
+
+/* Waits for a queued or running picture and drops it. */
+static void encoder_settle(struct encode_thread *t)
+{
+	eventfd_t n;
+
+	if (!t)
+		return;
+	g_mutex_lock(&t->lock);
+	while (t->state == ENCODE_QUEUED || t->state == ENCODE_RUNNING)
+		g_cond_wait(&t->cond, &t->lock);
+	t->state = ENCODE_IDLE;
+	g_mutex_unlock(&t->lock);
+	(void)eventfd_read(t->wake, &n);
+}
+
+static void encoder_stop(struct encode_thread *t)
+{
+	if (!t)
+		return;
+	encoder_settle(t);
+	g_mutex_lock(&t->lock);
+	t->state = ENCODE_QUIT;
+	g_cond_broadcast(&t->cond);
+	g_mutex_unlock(&t->lock);
+	g_thread_join(t->thread);
+	close(t->wake);
+	g_mutex_clear(&t->lock);
+	g_cond_clear(&t->cond);
+	g_free(t->pixels);
+	g_free(t->out);
+	g_free(t);
+}
+
+/* Copies the planes, so the camera may reuse its buffer at once. */
+static void encoder_submit(struct encode_thread *t, const vpx_image_t *img,
+			   guint64 pts, gint64 captured, gboolean force)
+{
+	guint cw = (img->d_w + 1) / 2, ch = (img->d_h + 1) / 2;
+	gsize luma = (gsize)img->d_w * img->d_h, chroma = (gsize)cw * ch;
+	gsize need = luma + 2 * chroma;
+
+	if (need > t->pixels_size) {
+		t->pixels = g_realloc(t->pixels, need);
+		t->pixels_size = need;
+	}
+	t->img = *img;
+	t->img.img_data = NULL;
+	t->img.img_data_owner = 0;
+	t->img.self_allocd = 0;
+	t->img.planes[0] = t->pixels;
+	t->img.planes[1] = t->pixels + luma;
+	t->img.planes[2] = t->pixels + luma + chroma;
+	t->img.stride[0] = img->d_w;
+	t->img.stride[1] = t->img.stride[2] = cw;
+	for (int p = 0; p < 3; p++) {
+		guint w = p ? cw : img->d_w, h = p ? ch : img->d_h;
+
+		for (guint y = 0; y < h; y++)
+			memcpy(t->img.planes[p] + (gsize)y * t->img.stride[p],
+			       img->planes[p] + (gsize)y * img->stride[p], w);
+	}
+	g_mutex_lock(&t->lock);
+	t->pts = pts;
+	t->captured = captured;
+	t->force = force;
+	t->state = ENCODE_QUEUED;
+	g_cond_signal(&t->cond);
+	g_mutex_unlock(&t->lock);
+}
+
 struct call_video {
 	srtp_t tx, rx;
 	struct vp8_sender sender;
+	struct encode_thread *encoder;
 	struct call_vp8_decoder *dec;
 	gboolean need_key;
 	gboolean group_tx;
@@ -444,11 +643,14 @@ struct call_video {
 	guint rx_held;
 	gboolean rx_started, rtx_answered;
 	gint64 reorder_us, rtx_rtt_us, next_fir, fir_interval, now;
+	/* Kernel receive time of the packet being handled, or 0 for now. */
+	gint64 rx_arrival;
 	gint64 last_key_at, key_due, rtx_window;
 	guint source_w, source_h;
 	guint rtx_bytes;
 	struct tx_packet *history;
 	struct rate_control rc;
+	struct local_queue lq;
 	gboolean rr_seen;
 	struct remb_estimate remb;
 	/* Receiver report: losses after repair, from this receiver's view. */
@@ -529,6 +731,7 @@ void call_video_close(struct call_video *v)
 		g_clear_pointer(&v->rx_ring[i].payload, g_bytes_unref);
 	g_free(v->rx_ring);
 	g_free(v->history);
+	encoder_stop(v->encoder);
 	sender_close(&v->sender);
 	call_vp8_close(v->dec);
 	if (v->tx)
@@ -1042,6 +1245,7 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 			memcpy(h->data, packet, n);
 		}
 		v->rc.sent++;
+		v->lq.sent += n;
 		if (!send(packet, n, data))
 			return FALSE;
 		pos += len;
@@ -1149,7 +1353,7 @@ static void rate_update(struct call_video *v, gint64 now)
 		if (remb)
 			next = MAX(next, rc->remb * 7 / 10);
 		rc->decreased_at = now;
-	} else if (loss < 0.02 && rc->target) {
+	} else if (loss < 0.02 && rc->target && !v->lq.high_since) {
 		/* Recover faster once the path has been calm for a while. */
 		double growth = now - rc->decreased_at >= 3 * G_USEC_PER_SEC ?
 					0.25 :
@@ -1168,6 +1372,70 @@ static void rate_update(struct call_video *v, gint64 now)
 	rate_scale(v, now);
 }
 
+void call_video_local_queue(struct call_video *v, guint64 held_bytes,
+			    gint64 now)
+{
+	struct local_queue *q = v ? &v->lq : NULL;
+
+	if (!q || !v->tx)
+		return;
+	/*
+	 * The kernel counts each datagram's whole buffer, about twice the
+	 * payload of a full video packet, so this is a coarse delay.
+	 */
+	guint kbps = MAX(rate_current(v), (guint)MIN_KBPS);
+	gint64 elapsed = q->at ? now - q->at : 0;
+
+	/*
+	 * What the uplink really carried since the last sample: what was
+	 * sent, less what the queue grew by. The kernel measures the
+	 * radio's rate without any feedback from the peer.
+	 */
+	if (elapsed >= 20000 && elapsed <= G_USEC_PER_SEC) {
+		double grew = ((double)held_bytes - (double)q->held) / 2;
+		double drained = MAX((double)q->sent - grew, 0.0);
+		double rate = drained * 8000.0 / elapsed;
+
+		q->drain_kbps =
+			q->drain_kbps ? 0.5 * q->drain_kbps + 0.5 * rate : rate;
+	}
+	q->held = held_bytes;
+	q->sent = 0;
+	/* Time to drain at the rate the uplink really carries. */
+	if (q->drain_kbps >= MIN_KBPS / 2 && held_bytes)
+		kbps = MIN(kbps, (guint)q->drain_kbps);
+	q->queue_ms = MIN(held_bytes * 8 / (2 * (guint64)kbps), G_MAXUINT);
+	q->at = now;
+	if (q->queue_ms < LOCAL_QUEUE_HIGH_MS) {
+		q->high_since = 0;
+		return;
+	}
+	if (!q->high_since)
+		q->high_since = now;
+	/* Again while it still grows; one cut takes a while to show. */
+	if (now - q->high_since < LOCAL_QUEUE_HOLD_MS * 1000 ||
+	    (q->cut_at && (now - q->cut_at < LOCAL_QUEUE_CUT_GAP_MS * 1000 ||
+			   q->queue_ms <= q->cut_queue_ms)))
+		return;
+	/*
+	 * Below what drains, so the queue empties: 85% of it, or 70% when
+	 * a long queue must also clear. Never more than half at once.
+	 */
+	guint next = rate_current(v) * 3 / 4;
+
+	if (q->drain_kbps > 0)
+		next = MIN(next,
+			   (guint)(q->drain_kbps *
+				   (q->queue_ms > LOCAL_QUEUE_DEEP_MS ? 0.70 :
+									0.85)));
+	rate_set(v, MAX(next, rate_current(v) / 2), now);
+	v->rc.decreased_at = now;
+	q->cut_at = now;
+	q->cut_queue_ms = q->queue_ms;
+	q->cuts++;
+	rate_scale(v, now);
+}
+
 void call_video_keyframe(struct call_video *v)
 {
 	if (v && v->tx)
@@ -1179,10 +1447,66 @@ void call_video_screen(struct call_video *v, guint kbps, guint fps)
 	fps = kbps ? CLAMP(fps, 1, 30) : 0;
 	if (!v || !v->tx || (kbps == v->screen_kbps && fps == v->screen_fps))
 		return;
+	encoder_settle(v->encoder);
 	sender_close(&v->sender);
 	v->screen_kbps = kbps;
 	v->screen_fps = fps;
 	v->sender.force_key = TRUE;
+}
+
+gboolean call_video_encode_async(struct call_video *v)
+{
+	if (!v || !v->tx)
+		return FALSE;
+	if (!v->encoder)
+		v->encoder = encoder_start(&v->sender);
+	return v->encoder != NULL;
+}
+
+int call_video_encoder_fd(const struct call_video *v)
+{
+	return v && v->encoder ? v->encoder->wake : -1;
+}
+
+gboolean call_video_encoded(struct call_video *v, gint64 now,
+			    call_video_send_fn send, gpointer data)
+{
+	struct encode_thread *t = v ? v->encoder : NULL;
+	eventfd_t n;
+
+	if (!t || !send)
+		return TRUE;
+	(void)eventfd_read(t->wake, &n);
+	g_mutex_lock(&t->lock);
+	if (t->state != ENCODE_DONE) {
+		g_mutex_unlock(&t->lock);
+		return TRUE;
+	}
+	gboolean ok = t->ok, key = t->key, forced = t->force;
+	gsize size = t->out_size;
+	guint delay_ms = t->delay_ms;
+	guint64 pts = t->pts;
+
+	g_mutex_unlock(&t->lock);
+	/* The buffers stay the call thread's until the next submit. */
+	v->now = now;
+	if (!size && forced)
+		v->sender.force_key = TRUE;
+	ok = ok && (!size || send_picture(v, v->ts_base + pts, t->out, size,
+					  key, delay_ms, send, data));
+	g_mutex_lock(&t->lock);
+	t->state = ENCODE_IDLE;
+	g_mutex_unlock(&t->lock);
+	return ok;
+}
+
+static gboolean encoder_busy(struct encode_thread *t)
+{
+	g_mutex_lock(&t->lock);
+	gboolean busy = t->state != ENCODE_IDLE;
+
+	g_mutex_unlock(&t->lock);
+	return busy;
 }
 
 gboolean call_video_encode(struct call_video *v,
@@ -1196,6 +1520,13 @@ gboolean call_video_encode(struct call_video *v,
 	if (!v || !v->tx || !send || !frame || now < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		goto failed;
+	/* A finished picture goes out first, then the encoder is free. */
+	if (v->encoder && (!call_video_encoded(v, now, send, data) ||
+			   encoder_busy(v->encoder))) {
+		if (encoder_busy(v->encoder))
+			return TRUE;
+		goto failed;
+	}
 	v->now = now;
 	if (v->key_due && now >= v->key_due) {
 		v->key_due = 0;
@@ -1219,8 +1550,16 @@ gboolean call_video_encode(struct call_video *v,
 		v->epoch = now;
 	pts = ((guint64)(now - v->epoch) / 100) * 9 +
 	      ((guint64)(now - v->epoch) % 100) * 9 / 100;
-	if (!sender_encode(&v->sender, &img, pts, &picture))
-		goto failed;
+	if (v->encoder) {
+		encoder_submit(v->encoder, &img, pts, now, v->sender.force_key);
+		v->sender.force_key = FALSE;
+	} else {
+		if (!sender_encode(&v->sender, &img, pts, v->sender.force_key,
+				   &picture))
+			goto failed;
+		if (picture.size)
+			v->sender.force_key = FALSE;
+	}
 	v->last_encoded = now;
 	if (!v->screen_kbps && v->sender.fps < v->fps) {
 		gint64 interval = G_USEC_PER_SEC / v->sender.fps;
@@ -2009,7 +2348,7 @@ static gboolean reorder(struct call_video *v, const guint8 *p, gsize n,
 			guint16 seq, guint32 ts, gboolean marker, gsize wire,
 			call_video_display_fn display, gpointer data)
 {
-	gint64 now = g_get_monotonic_time();
+	gint64 now = v->rx_arrival ? v->rx_arrival : g_get_monotonic_time();
 	struct rx_packet *r = &v->rx_ring[seq % RX_SLOTS];
 
 	remb_packet(v, ts, wire, marker, now);
@@ -2105,9 +2444,33 @@ static gboolean reorder(struct call_video *v, const guint8 *p, gsize n,
 	return rx_release(v, now, FALSE, display, data) && ok;
 }
 
+static gboolean receive_packet(struct call_video *v, const guint8 *packet,
+			       gsize size, call_video_display_fn display,
+			       gpointer data);
+
+gboolean call_video_receive_at(struct call_video *v, const guint8 *packet,
+			       gsize size, gint64 arrival,
+			       call_video_display_fn display, gpointer data)
+{
+	if (!v)
+		return FALSE;
+	v->rx_arrival = MAX(arrival, 0);
+	gboolean ok = receive_packet(v, packet, size, display, data);
+
+	v->rx_arrival = 0;
+	return ok;
+}
+
 gboolean call_video_receive(struct call_video *v, const guint8 *packet,
 			    gsize size, call_video_display_fn display,
 			    gpointer data)
+{
+	return call_video_receive_at(v, packet, size, 0, display, data);
+}
+
+static gboolean receive_packet(struct call_video *v, const guint8 *packet,
+			       gsize size, call_video_display_fn display,
+			       gpointer data)
 {
 	guint8 buf[MAX_DATAGRAM];
 	int plain = size;
@@ -2492,6 +2855,8 @@ void call_video_recovery(const struct call_video *v,
 		.rembs = v->recovery.rembs,
 		.rate_changes = v->recovery.rate_changes,
 		.rescales = v->recovery.scaled,
+		.local_queue_ms = v->lq.queue_ms,
+		.local_cuts = v->lq.cuts,
 		.target_kbps = v->tx ? rate_current(v) : 0,
 		.encoder_kbps = v->sender.kbps,
 		.rtt_ms = v->rtx_rtt_us / 1000,
@@ -2915,11 +3280,13 @@ gboolean call_share_encode(struct call_share_encoder *s,
 	    !sender_open(&s->sender, img.w, img.h, s->kbps, s->fps,
 			 VP8_SCREEN_PDTP))
 		goto failed;
-	if (!sender_encode(&s->sender, &img, (guint64)now * 9 / 100, &picture))
+	if (!sender_encode(&s->sender, &img, (guint64)now * 9 / 100,
+			   s->sender.force_key, &picture))
 		goto failed;
 	s->last_encoded = now;
 	if (!picture.size)
 		return TRUE;
+	s->sender.force_key = FALSE;
 
 	guint16 id = s->picture++;
 	guint res = resolution_class(img.w * img.h);

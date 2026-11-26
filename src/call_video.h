@@ -41,9 +41,29 @@ gboolean call_video_encode(struct call_video *video,
 			   const struct line_camera_frame *frame, gint64 now_us,
 			   call_video_send_fn send, gpointer data,
 			   GError **error);
+/*
+ * Moves encoding of this sending stream to its own thread. Afterwards
+ * call_video_encode() copies the frame and returns at once, skipping a
+ * frame while the previous one is still encoding, and the picture is
+ * packetized and sent by call_video_encoded() on the call thread once
+ * call_video_encoder_fd() is readable. Returns FALSE (and keeps encoding
+ * inline) when no thread could start.
+ */
+gboolean call_video_encode_async(struct call_video *video);
+int call_video_encoder_fd(const struct call_video *video);
+gboolean call_video_encoded(struct call_video *video, gint64 now_us,
+			    call_video_send_fn send, gpointer data);
 gboolean call_video_receive(struct call_video *video, const guint8 *packet,
 			    gsize size, call_video_display_fn display,
 			    gpointer data);
+/*
+ * The same with the time the kernel received the packet (see
+ * line_udp_rx_arrival()), so reordering holds and the REMB delay estimate
+ * measure the network rather than the call thread. Zero means now.
+ */
+gboolean call_video_receive_at(struct call_video *video, const guint8 *packet,
+			       gsize size, gint64 arrival,
+			       call_video_display_fn display, gpointer data);
 /* Source of the decoded group picture, read during its display callback. */
 gboolean call_video_frame_is_screen(const struct call_video *video);
 gboolean call_video_needs_keyframe(const struct call_video *video);
@@ -85,6 +105,8 @@ struct call_video_recovery {
 	guint keyframe_requests, rembs, rate_changes, rescales;
 	guint target_kbps, encoder_kbps, rtt_ms, hold_ms;
 	guint width, height;
+	/* The kernel's send queue: last delay and rate cuts. */
+	guint local_queue_ms, local_cuts;
 };
 void call_video_recovery(const struct call_video *video,
 			 struct call_video_recovery *out);
@@ -96,6 +118,16 @@ gboolean call_video_receive_group_feedback(struct call_video *video,
 					   const guint8 *packet, gsize size,
 					   guint32 sender, gint64 now);
 void call_video_keyframe(struct call_video *video);
+/*
+ * Bytes the kernel still holds for the call socket (SIOCOUTQ, see
+ * line_udp_send_queue()), sampled before each picture. From successive
+ * samples and the bytes sent in between it measures what the uplink
+ * really carries. More than 60 ms of queue for 100 ms cuts the rate to
+ * 85% of that (70% above 200 ms), again every 300 ms while the queue still
+ * grows, and pauses growth until it drains.
+ */
+void call_video_local_queue(struct call_video *video, guint64 held_bytes,
+			    gint64 now_us);
 /* Sets a screen-specific send budget. Zero kbps restores webcam settings. */
 void call_video_screen(struct call_video *video, guint kbps, guint fps);
 

@@ -97,6 +97,7 @@ UI เริ่ม worker ด้วย `SDL_NO_SIGNAL_HANDLERS=1` เพื่�
 | `line-sync` | `line_live_sync_start()` ใน [`live_sync.c`](../../src/live_sync.c) | ถือ long poll `sync` ค้างไว้หนึ่งตัว | ไม่ได้ มีสำเนา access token และการเชื่อมต่อ HTTPS ของตัวเอง |
 | `line-images` | `queue_image()` ใน `main.c` | ดาวน์โหลดอวตาร ภาพสติกเกอร์และอีโมจิ และรูปใน Flex จาก CDN สาธารณะ | ไม่ได้ การดาวน์โหลดไม่ระบุตัวตน |
 | `line-voice` | `launch_call()` ใน [`call.c`](../../src/call.c) | การโทรหนึ่งสาย: ซ็อกเก็ต UDP การส่งสัญญาณ SRTP เสียง วิดีโอ | ไม่ได้ ได้รับเฉพาะข้อมูลของสายนั้น ไม่เคยได้โทเค็นของบัญชี |
+| `line-encode` | `call_video_encode_async()` ใน [`call_video.c`](../../src/call_video.c) | เข้ารหัสภาพจากกล้องหรือหน้าจอของการโทรทีละภาพ การเข้ารหัสระดับ HD จึงไม่หน่วงเสียงบน `line-voice` | ไม่ได้ |
 | `line-screencast` | [`screencast.c`](../../src/screencast.c) | คุยกับ portal ScreenCast และ PipeWire ระหว่างแชร์หน้าจอ | ไม่ได้ |
 
 ทุกเธรดที่ใช้ HTTPS เก็บ curl handle ของตัวเองใน thread-local storage (`static __thread CURL *client` ใน [`transport.c`](../../src/transport.c)) long poll จึงไม่ขวาง RPC
@@ -254,7 +255,7 @@ Avernella เคยชื่อ *kitatide* และเริ่มต้นม�
 | ข้อความส่งสัญญาณ PLANET | `call_schema.c` |
 | การเข้ารหัสแพ็กเก็ต PLANET ตัวช่วย protobuf การสร้างกุญแจมีเดีย | `call_wire.c` |
 | context ของ SRTP | `call_srtp.c` |
-| UDP ของการโทรแบบรวมชุด: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` | `udp_batch.c` |
+| UDP ของการโทรแบบรวมชุด: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` เวลารับจากเคอร์เนล คิวส่ง | `udp_batch.c` |
 | สถานะ GPU NVIDIA; ข้ามไดรเวอร์ Vulkan ของ GPU ที่เสีย | `gpu_health.c` |
 | PDTP (การขนส่งสำหรับแชร์หน้าจอ) | `call_pdtp.c` |
 | เสียงในการโทร (SDL, Opus, EAS2) | `call_audio.c` |
@@ -324,6 +325,8 @@ Avernella พึ่งพาเคอร์เนลและ glibc แทนเ
 **เครือข่าย** ([`http_tune.c`](../../src/http_tune.c), [`udp_batch.c`](../../src/udp_batch.c))
 - libcurl กับ TLS 1.2 ขึ้นไป ตรวจใบรับรองและชื่อโฮสต์ HTTP/2, TCP Fast Open และ keepalive
 - มีเดียของการโทร: เธรดการโทรอ่านดาตาแกรมที่รออยู่ทั้งหมดด้วย `recvmmsg()` ครั้งเดียว และข้าม `poll()` ไปตราบที่ยังมีดาตาแกรมค้างอยู่ แพ็กเก็ตของภาพวิดีโอแต่ละภาพส่งออกด้วย `sendmmsg()` ครั้งเดียว โดยแพ็กเก็ตขนาดเท่ากันที่อยู่ติดกันรวมเป็นข้อความ `UDP_SEGMENT` (UDP GSO) ข้อความเดียว ดาตาแกรมบนสายยังเหมือนเดิมทุกประการ หากเคอร์เนลหรือตัวกรอง seccomp ปฏิเสธขั้นใด ซ็อกเก็ตนั้นจะถอยไปใช้ `sendmmsg()` แล้วจึงเป็น `sendto()`/`recvfrom()` ธรรมดา `LINE_DISABLE_UDP_BATCH=1` ปิดการรวมชุดนี้
+- ดาตาแกรมที่รับมาแต่ละอันมีเวลาที่เคอร์เนลรับไว้ (`SO_TIMESTAMPNS_NEW` ไม่เช่นนั้น `SO_TIMESTAMPNS`) ซึ่ง jitter buffer บัฟเฟอร์จัดลำดับ และ REMB ใช้แทนเวลาที่เธรดการโทรอ่าน ก่อนแต่ละภาพ เธรดการโทรอ่านคิวส่งของซ็อกเก็ตด้วย `ioctl(SIOCOUTQ)` คือดาตาแกรมที่ qdisc สแตก Wi-Fi หรือไดรเวอร์ยังถืออยู่ ซึ่งเผยให้เห็นอัปลิงก์ Wi-Fi ที่อ่อนก่อนจะมีอะไรสูญหาย ([เครือข่ายที่ไม่ดี](calls.md#8-เครือข่ายที่ไม่ดี))
+- ภาพถูกเข้ารหัสบนเธรดของตัวเอง (`line-encode`) ซึ่งส่งแต่ละภาพกลับผ่าน eventfd ใน `poll()` ของเธรดการโทร
 - UI กับ worker อ่านจากซ็อกเก็ตครั้งละ 64 KiB คำตอบประวัติแชตขนาดใหญ่จึงใช้การอ่านไม่กี่ครั้งแทนหลายสิบครั้ง
 - แคช DNS และ TLS session ใช้ร่วมกันข้ามเธรด แต่แต่ละเธรดมีพูลการเชื่อมต่อของตัวเอง
 - `Retry-After` จาก HTTP 429 หรือ 503 ทำให้ RPC ทั้งหมดหยุดรอตามเวลาที่กำหนด (`line_transport_retry_after()`)

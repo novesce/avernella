@@ -97,6 +97,7 @@ Requests are processed one at a time, in order. A slow RPC therefore delays the 
 | `line-sync` | `line_live_sync_start()` in [`live_sync.c`](../../src/live_sync.c) | Keeps one `sync` long poll open | No. It has a copy of the access token and its own HTTPS connection. |
 | `line-images` | `queue_image()` in `main.c` | Downloads avatars, sticker and emoji artwork and Flex pictures from public CDNs | No. Downloads are anonymous. |
 | `line-voice` | `launch_call()` in [`call.c`](../../src/call.c) | One call: UDP sockets, signalling, SRTP, audio, video | No. It gets only call-local data, never the account token. |
+| `line-encode` | `call_video_encode_async()` in [`call_video.c`](../../src/call_video.c) | Encodes the call's camera or screen pictures, one at a time, so an HD encode never holds up audio on `line-voice` | No |
 | `line-screencast` | [`screencast.c`](../../src/screencast.c) | Talks to the ScreenCast portal and PipeWire during a screen share | No |
 
 Each thread that talks HTTPS keeps its own curl handle in thread-local storage (`static __thread CURL *client` in [`transport.c`](../../src/transport.c)), so the long poll never blocks an RPC.
@@ -254,7 +255,7 @@ Avernella was called *kitatide* before, and started from *line-linux*. Their fil
 | PLANET signalling messages | `call_schema.c` |
 | PLANET packet encryption, protobuf helpers, media key derivation | `call_wire.c` |
 | SRTP contexts | `call_srtp.c` |
-| Batched call UDP: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT` | `udp_batch.c` |
+| Batched call UDP: `recvmmsg`, `sendmmsg`, `UDP_SEGMENT`, kernel receive stamps, send queue | `udp_batch.c` |
 | NVIDIA GPU health; skips a broken GPU's Vulkan driver | `gpu_health.c` |
 | PDTP (screen sharing transport) | `call_pdtp.c` |
 | Call audio (SDL, Opus, EAS2) | `call_audio.c` |
@@ -324,6 +325,8 @@ Avernella leans on the kernel and glibc instead of frameworks. Knowing these hel
 **Network** ([`http_tune.c`](../../src/http_tune.c), [`udp_batch.c`](../../src/udp_batch.c))
 - libcurl with TLS 1.2 or newer, certificate and host name checks, HTTP/2, TCP Fast Open and keepalive.
 - Call media: the call thread reads every waiting datagram with one `recvmmsg()` and skips `poll()` while datagrams are left over. It sends each video picture's packets as one `sendmmsg()`, with each run of equal-size packets as one `UDP_SEGMENT` (UDP GSO) message. The datagrams on the wire are the same. Each socket falls back on its own, to `sendmmsg()` and then to plain `sendto()`/`recvfrom()`, when the kernel or a seccomp filter refuses a step. `LINE_DISABLE_UDP_BATCH=1` turns batching off.
+- Each received datagram carries the kernel's receive time (`SO_TIMESTAMPNS_NEW`, else `SO_TIMESTAMPNS`), which the jitter buffer, the reorder buffer and REMB use instead of the time the call thread read it. Before each picture the call thread reads the socket's send queue with `ioctl(SIOCOUTQ)`: datagrams the qdisc, the Wi-Fi stack or the driver still hold. It shows a weak Wi-Fi uplink before anything is lost ([Bad networks](calls.md#8-bad-networks)).
+- Pictures are encoded on their own thread (`line-encode`), which hands each one back through an eventfd in the call thread's `poll()`.
 - The UI and the worker read their socket 64 KiB at a time, so a large chat history reply takes a few reads instead of dozens.
 - Shared DNS and TLS session caches across threads, with a separate connection pool per thread.
 - `Retry-After` on HTTP 429 or 503 pauses all RPCs for the given time (`line_transport_retry_after()`).

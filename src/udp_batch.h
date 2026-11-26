@@ -47,6 +47,15 @@ void line_udp_rx_free(struct line_udp_rx *r);
  */
 ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
 			 struct sockaddr_storage *from, socklen_t *from_len);
+/*
+ * When the kernel received the datagram line_udp_rx_next() returned last,
+ * on the g_get_monotonic_time() clock, from SO_TIMESTAMPNS. Without kernel
+ * stamps it is the time of the receive call; 0 after a failed call.
+ * LINE_DISABLE_RX_TIMESTAMPS=1 turns the stamps off.
+ */
+gint64 line_udp_rx_arrival(const struct line_udp_rx *r);
+gboolean line_udp_rx_timestamps(const struct line_udp_rx *r);
+gboolean line_udp_timestamps_enabled(void);
 /* Datagrams already received and not yet returned. */
 gboolean line_udp_rx_pending(const struct line_udp_rx *r);
 enum line_udp_mode line_udp_rx_mode(const struct line_udp_rx *r);
@@ -81,6 +90,13 @@ struct line_udp_stats line_udp_tx_stats(const struct line_udp_tx *t);
  * LINE_CALL_DSCP=0 leaves packets unmarked. Returns the class in use.
  */
 guint line_udp_tune(int fd, int family);
+/*
+ * Bytes of datagrams the kernel still holds for this socket: queued in
+ * the qdisc, the Wi-Fi stack or the driver and not yet sent (SIOCOUTQ,
+ * the socket's whole buffers). -1 if the kernel does not say.
+ * LINE_DISABLE_SEND_QUEUE=1 always answers -1.
+ */
+gint64 line_udp_send_queue(int fd);
 /*
  * sendto() with this datagram marked dscp, for voice on a socket whose
  * default class is video. Falls back to an unmarked send if refused.

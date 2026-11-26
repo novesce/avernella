@@ -6,6 +6,7 @@
 #include "call_vp8.h"
 #include "call_vp8_encode.h"
 #include "screencast.h"
+#include <poll.h>
 #include <string.h>
 #include <vpx/vp8cx.h>
 #include <vpx/vpx_encoder.h>
@@ -2351,9 +2352,145 @@ static void encode_720p(void)
 	call_video_close(video);
 }
 
+/* Waits for the encoder thread and sends what it finished. */
+static void collect_encoded(struct loop *loop)
+{
+	struct pollfd fd = { .fd = call_video_encoder_fd(loop->tx),
+			     .events = POLLIN };
+
+	g_assert_cmpint(fd.fd, >=, 0);
+	g_assert_cmpint(poll(&fd, 1, 10000), ==, 1);
+	g_assert_true(call_video_encoded(loop->tx, g_get_monotonic_time(),
+					 collect, loop));
+}
+
+/*
+ * On its own thread the encoder hands the picture back through an
+ * eventfd: nothing is sent during call_video_encode(), the result decodes
+ * as before, a frame offered while it is busy is skipped, and closing a
+ * stream with a picture in flight waits for it.
+ */
+static void encoder_thread(void)
+{
+	struct loop loop = { 0 };
+
+	prepare(&loop);
+	g_assert_cmpint(call_video_encoder_fd(loop.tx), ==, -1);
+	g_assert_true(call_video_encode_async(loop.tx));
+	/* A receive-only stream has nothing to encode. */
+	struct call_video *rx_only = call_video_open_rx(key_b, 97, 101, NULL);
+
+	g_assert_nonnull(rx_only);
+	g_assert_false(call_video_encode_async(rx_only));
+	call_video_close(rx_only);
+	encode(&loop, 1000000);
+	g_assert_cmpuint(loop.packets->len, ==, 0);
+	/* Still busy, or just finished: either way nothing new is queued. */
+	encode(&loop, 1100000);
+	collect_encoded(&loop);
+	g_assert_cmpuint(loop.packets->len, >, 2);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_true(deliver(&loop, i));
+	g_assert_cmpuint(loop.count, ==, 1);
+	/* The next picture is a delta that decodes on top of the first. */
+	g_ptr_array_set_size(loop.packets, 0);
+	encode(&loop, 1300000);
+	collect_encoded(&loop);
+	g_assert_cmpuint(loop.packets->len, >, 0);
+	for (guint i = 0; i < loop.packets->len; i++)
+		g_assert_true(deliver(&loop, i));
+	g_assert_cmpuint(loop.count, ==, 2);
+	/* A keyframe request made while encoding applies to the next one. */
+	encode(&loop, 1500000);
+	call_video_keyframe(loop.tx);
+	collect_encoded(&loop);
+	g_ptr_array_set_size(loop.packets, 0);
+	encode(&loop, 1700000);
+	collect_encoded(&loop);
+	g_assert_cmpuint(loop.packets->len, >, 2);
+	/* Closed with a picture in flight. */
+	encode(&loop, 1900000);
+	done(&loop);
+}
+
+static int compare_time(gconstpointer a, gconstpointer b)
+{
+	gint64 x = *(const gint64 *)a, y = *(const gint64 *)b;
+
+	return (x > y) - (x < y);
+}
+
+/*
+ * How long a 720p camera frame holds up the call thread, inline and with
+ * the encoder thread. The thread only copies the frame.
+ */
+static void encoder_thread_blocking(void)
+{
+	enum {
+		EW = 1280,
+		EH = 720,
+		FRAMES = 24
+	};
+	g_autofree guint8 *pixels = g_malloc(EW * EH * 3 / 2);
+	struct line_camera_frame frame;
+	gint64 held[2][FRAMES], opening[2];
+
+	line_camera_i420_frame(&frame, pixels, EW, EH);
+	for (int threaded = 0; threaded < 2; threaded++) {
+		struct call_video *video =
+			call_video_open(key_a, key_b, 96, 1, 2, 1500, 30, NULL);
+		guint packets = 0;
+
+		g_assert_nonnull(video);
+		if (threaded)
+			g_assert_true(call_video_encode_async(video));
+		for (int i = 0; i < FRAMES; i++) {
+			for (unsigned int y = 0; y < EH; y++)
+				for (unsigned int x = 0; x < EW; x++)
+					pixels[y * EW + x] =
+						(x + 3 * y + 7 * i) ^
+						(x * y >> 6);
+			memset(pixels + EW * EH, 128 + i % 32, EW * EH / 2);
+			gint64 start = g_get_monotonic_time();
+
+			g_assert_true(call_video_encode(
+				video, &frame, (gint64)i * G_USEC_PER_SEC / 30,
+				discard, &packets, NULL));
+			held[threaded][i] = g_get_monotonic_time() - start;
+			if (threaded) {
+				struct pollfd fd = {
+					.fd = call_video_encoder_fd(video),
+					.events = POLLIN
+				};
+
+				g_assert_cmpint(poll(&fd, 1, 10000), ==, 1);
+				g_assert_true(call_video_encoded(
+					video, g_get_monotonic_time(), discard,
+					&packets));
+			}
+		}
+		g_assert_cmpuint(packets, >=, FRAMES);
+		call_video_close(video);
+		/* The first frame also opens the encoder, on the call thread. */
+		opening[threaded] = held[threaded][0];
+		qsort(held[threaded] + 1, FRAMES - 1, sizeof(gint64),
+		      compare_time);
+	}
+	g_test_message(
+		"720p frame holds the call thread: inline median %.2f ms, max %.2f ms; encoder thread median %.2f ms, max %.2f ms; first frame with the encoder opening %.2f ms and %.2f ms",
+		held[0][FRAMES / 2] / 1000.0, held[0][FRAMES - 1] / 1000.0,
+		held[1][FRAMES / 2] / 1000.0, held[1][FRAMES - 1] / 1000.0,
+		opening[0] / 1000.0, opening[1] / 1000.0);
+	g_assert_cmpint(held[1][FRAMES / 2], <, 5000);
+	g_assert_cmpint(held[1][FRAMES / 2] * 2, <, held[0][FRAMES / 2]);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
+	g_test_add_func("/video/encoder-thread", encoder_thread);
+	g_test_add_func("/video/encoder-thread/blocking",
+			encoder_thread_blocking);
 	g_test_add_func("/video/evs3-vp8-srtp-reordering", roundtrip);
 	g_test_add_func("/video/conference-independent-stream-directions",
 			conference_directions);
