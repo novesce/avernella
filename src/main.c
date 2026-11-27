@@ -2621,13 +2621,66 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 
 		if (!seq)
 			return NULL;
-		if (line_is_square_chat(chat))
-			return line_square_send_sticker(
-				s, w->stickers, chat,
-				my_square_member_id(w, chat), pack, sticker,
-				reply_to, seq, error);
-		return line_send_sticker(s, w->stickers, chat, pack, sticker,
-					 reply_to, seq, error);
+		J *ack;
+
+		if (line_is_square_chat(chat)) {
+			const char *my_mid = my_square_member_id(w, chat);
+
+			ack = line_square_send_sticker(s, w->stickers, chat,
+						       my_mid, pack, sticker,
+						       reply_to, seq, error);
+			if (ack) {
+				g_hash_table_remove(w->history_cache, chat);
+				const char *sent_id = strfield(ack, "id");
+
+				if (w->messages &&
+				    !g_strcmp0(chat, w->history_chat) &&
+				    sent_id && *sent_id && my_mid &&
+				    !field(w->messages, sent_id)) {
+					J *stub = obj();
+
+					json_object_object_add(
+						stub, "1",
+						json_object_new_string(my_mid));
+					json_object_object_add(
+						stub, "4",
+						json_object_new_string(
+							sent_id));
+					json_object_object_add(w->messages,
+							       sent_id, stub);
+					w->publish_reads = TRUE;
+					w->need_ranges = TRUE;
+				}
+				if (w->square_poll_due)
+					w->square_poll_due =
+						g_get_monotonic_time() +
+						1 * G_USEC_PER_SEC;
+			}
+			return ack;
+		}
+		ack = line_send_sticker(s, w->stickers, chat, pack, sticker,
+					reply_to, seq, error);
+		if (ack) {
+			g_hash_table_remove(w->history_cache, chat);
+			const char *sent_id = strfield(ack, "id");
+
+			if (w->messages && !g_strcmp0(chat, w->history_chat) &&
+			    sent_id && *sent_id && s->mid &&
+			    !field(w->messages, sent_id)) {
+				J *stub = obj();
+
+				json_object_object_add(
+					stub, "1",
+					json_object_new_string(s->mid));
+				json_object_object_add(
+					stub, "4",
+					json_object_new_string(sent_id));
+				json_object_object_add(w->messages, sent_id,
+						       stub);
+				w->publish_reads = TRUE;
+			}
+		}
+		return ack;
 	}
 	if (!strcmp(method, "markRead")) {
 		if (!msg || !w->latest_history ||

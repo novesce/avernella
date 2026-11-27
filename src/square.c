@@ -1537,8 +1537,10 @@ J *line_square_peer_ranges(Line *s, const char *chat, const char *my_member_id,
 	return g_steal_pointer(&ranges);
 }
 
-static J *build_emoji_replace(const char *text, J *emojis)
+static J *build_emoji_replace(const char *text, J *emojis, J **ownership_out)
 {
+	if (ownership_out)
+		*ownership_out = NULL;
 	if (!length(emojis) || length(emojis) > 1024)
 		return NULL;
 	g_autoptr(J) resources = array(), packs = array(), seen = obj();
@@ -1577,12 +1579,12 @@ static J *build_emoji_replace(const char *text, J *emojis)
 			json_object_array_add(packs, string(pack));
 		}
 	}
-	J *replace = obj(), *sticon = obj(), *own = obj();
+	J *replace = obj(), *sticon = obj();
 
 	put(sticon, "resources", g_steal_pointer(&resources));
 	put(replace, "sticon", sticon);
-	put(own, "productIds", g_steal_pointer(&packs));
-	put(replace, "sticonOwnership", own);
+	if (ownership_out)
+		*ownership_out = g_steal_pointer(&packs);
 	return replace;
 }
 
@@ -1684,12 +1686,20 @@ J *line_square_send_text(Line *s, const char *chat, const char *my_member_id,
 	put_str(msg, "10:str", text);
 	put_num(msg, "15:i32", 0);
 	if (length(emojis)) {
-		g_autoptr(J) rep = build_emoji_replace(text, emojis);
+		g_autoptr(J) ownership = NULL;
+		g_autoptr(J) rep =
+			build_emoji_replace(text, emojis, &ownership);
 
-		if (rep)
+		if (rep) {
 			put_str(meta, "REPLACE",
 				json_object_to_json_string_ext(
 					rep, JSON_C_TO_STRING_PLAIN));
+			if (ownership && length(ownership))
+				put_str(meta, "STICON_OWNERSHIP",
+					json_object_to_json_string_ext(
+						ownership,
+						JSON_C_TO_STRING_PLAIN));
+		}
 	}
 	if (length(mentions)) {
 		g_autoptr(J) ment = build_mentions_meta(text, mentions);
@@ -1720,6 +1730,10 @@ J *line_square_send_sticker(Line *s, LineStickers *stickers, const char *chat,
 						  sticker_id, error);
 	if (!meta)
 		return NULL;
+	/* Match LINE Android Square sticker metadata: always set STKOPT, omit STKTXT. */
+	json_object_object_del(meta, "STKTXT");
+	if (!field(meta, "STKOPT"))
+		put_str(meta, "STKOPT", "");
 	g_autoptr(J) msg = obj();
 
 	put_num(msg, "15:i32", 7); /* STICKER */
