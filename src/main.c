@@ -2883,7 +2883,7 @@ static void update_peer_reads(struct line_worker *w)
 		return;
 	json_object_object_foreach(w->messages, id, msg) {
 		if (g_strcmp0(strfield(msg, "1"), self_id) ||
-		    json_object_get_int(field(counts, id)) > 0)
+		    (!square && json_object_get_int(field(counts, id)) > 0))
 			continue;
 		w->need_ranges = FALSE;
 		if (!background_ready(w, NULL))

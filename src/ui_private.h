@@ -253,6 +253,7 @@ static inline gboolean ui_read_finish(UiReadCursor *cursor, guint64 target,
 }
 
 void ui_conversation_presented(gboolean covered);
+int ui_message_read_count(Json *message);
 gboolean ui_message_is_read(Json *message);
 void ui_message_reads(Json *packet);
 Json *ui_field(Json *obj, const char *key);

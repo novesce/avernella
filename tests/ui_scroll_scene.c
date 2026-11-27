@@ -214,6 +214,16 @@ static void check_message_receipts(void)
 	g_assert_false(changed[0]);
 	g_assert_true(changed[1]);
 	g_assert_true(changed[2]);
+	/* A higher reader count dirties the view so "Read N" redraws. */
+	json_object_object_add(packet, "counts",
+			       json_tokener_parse("{\"101\":5}"));
+	ui.dirty = FALSE;
+	ui_message_reads(packet);
+	g_assert_true(ui.dirty);
+	g_assert_cmpint(
+		ui_message_read_count(json_object_array_get_idx(ui.history, 1)),
+		==, 5);
+	ui_draw();
 	/* A stale count or a duplicate receipt must not undo a confirmed read. */
 	json_object_object_add(packet, "counts",
 			       json_tokener_parse("{\"101\":0,\"102\":1}"));

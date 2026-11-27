@@ -576,9 +576,14 @@ static int reader_count(Json *value)
 		       0;
 }
 
+int ui_message_read_count(Json *message)
+{
+	return reader_count(ui_field(message, "readCount"));
+}
+
 gboolean ui_message_is_read(Json *message)
 {
-	return reader_count(ui_field(message, "readCount")) > 0;
+	return ui_message_read_count(message) > 0;
 }
 
 static gboolean merge_message_reads(Json *rows, Json *counts)
@@ -601,7 +606,7 @@ static gboolean merge_message_reads(Json *rows, Json *counts)
 			continue;
 		json_object_object_add(row, "readCount",
 				       json_object_get(count));
-		changed |= !old;
+		changed = TRUE;
 	}
 	return changed;
 }

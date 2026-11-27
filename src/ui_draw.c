@@ -1967,6 +1967,7 @@ struct message_layout {
 static struct {
 	GArray *rows;
 	PangoLayout *sent, *read;
+	GHashTable *read_counts;
 	int receipt_height;
 	int width, height;
 	double scale_x, scale_y;
@@ -1993,6 +1994,7 @@ void ui_forget_history(void)
 	g_clear_pointer(&cache.rows, g_array_unref);
 	g_clear_object(&cache.sent);
 	g_clear_object(&cache.read);
+	g_clear_pointer(&cache.read_counts, g_hash_table_destroy);
 	cache.source = NULL;
 	cache.height = 0;
 }
@@ -2915,6 +2917,33 @@ static void text_bubble(const struct message_layout *r, Rect body)
 	      r->mine ? UI_BUBBLE_OUT_INK : UI_BUBBLE_IN_INK);
 }
 
+static PangoLayout *read_status_layout(int count)
+{
+	if (count <= 0)
+		return cache.sent;
+	gboolean multi = ui.selected &&
+			 (ui.selected[0] == 'c' || ui.selected[0] == 'r' ||
+			  ui.selected[0] == 'm');
+
+	if (count == 1 && !multi)
+		return cache.read;
+	if (!cache.read_counts)
+		cache.read_counts = g_hash_table_new_full(
+			g_direct_hash, g_direct_equal, NULL, g_object_unref);
+	PangoLayout *l =
+		g_hash_table_lookup(cache.read_counts, GINT_TO_POINTER(count));
+
+	if (!l) {
+		g_autofree char *text =
+			g_strdup_printf("%s %d", _("Read"), count);
+
+		l = layout(text, 11, 500, -1, FALSE);
+		g_hash_table_insert(cache.read_counts, GINT_TO_POINTER(count),
+				    l);
+	}
+	return l;
+}
+
 static void message_status(const struct message_layout *r, Rect body)
 {
 	int bottom = body.y + body.h - 1;
@@ -2931,8 +2960,8 @@ static void message_status(const struct message_layout *r, Rect body)
 	if (!r->receipt)
 		return;
 	/* Live receipts update the label without reflowing the history. */
-	PangoLayout *status = ui_message_is_read(r->message) ? cache.read :
-							       cache.sent;
+	PangoLayout *status =
+		read_status_layout(ui_message_read_count(r->message));
 	int x = body.x, y = body.y + body.h + (r->reactions ? 30 : 0) + 2;
 
 	if (cache.line_style) {
