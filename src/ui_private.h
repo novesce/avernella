@@ -291,6 +291,8 @@ void ui_restore_input(void);
 void ui_edit_key(Editor *edit, SDL_KeyboardEvent key);
 void ui_insert(Editor *edit, const char *text);
 void ui_mention_member(const char *id, const char *name);
+/* Byte range of the composer's i-th committed @mention, in order. */
+gboolean ui_mention_span(guint i, int *start, int *end);
 void ui_media_login(Json *result);
 void ui_media_refresh(void);
 void ui_media_reset(void);

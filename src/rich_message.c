@@ -274,3 +274,79 @@ J *line_rich_parse(J *metadata, char **alt)
 	}
 	return g_steal_pointer(&out);
 }
+
+/* A UTF-16 offset as a JSON number or LINE's decimal string. */
+static gboolean mention_bound(J *item, const char *key, guint64 *out)
+{
+	J *v = field(item, key);
+
+	if (json_object_is_type(v, json_type_int)) {
+		gint64 n = json_object_get_int64(v);
+
+		if (n < 0 || n > G_MAXINT32)
+			return FALSE;
+		*out = (guint64)n;
+		return TRUE;
+	}
+	const char *p = text(item, key, 10);
+
+	return p && !p[strspn(p, "0123456789")] &&
+	       g_ascii_string_to_unsigned(p, 10, 0, G_MAXINT32, out, NULL);
+}
+
+/* Advance to a UTF-16 offset without splitting a surrogate pair. */
+static gboolean utf16_to(const char **cursor, guint64 *position, guint64 target)
+{
+	while (*position < target && **cursor) {
+		*position += g_utf8_get_char(*cursor) > 0xffff ? 2u : 1u;
+		*cursor = g_utf8_next_char(*cursor);
+	}
+	return *position == target;
+}
+
+J *line_mention_spans(const char *body, J *meta, const char *self,
+		      gboolean *mentions_me)
+{
+	const char *encoded = text(meta, "MENTION", MARKUP_LIMIT);
+
+	if (mentions_me)
+		*mentions_me = FALSE;
+	if (!body || !encoded || !g_utf8_validate(body, -1, NULL))
+		return NULL;
+	g_autoptr(J) doc = json_tokener_parse(encoded);
+	J *people = field(doc, "MENTIONEES");
+	size_t count = json_object_is_type(people, json_type_array) ?
+			       json_object_array_length(people) :
+			       0;
+
+	if (!count || count > 100)
+		return NULL;
+	g_autoptr(J) out = json_object_new_array();
+
+	for (size_t i = 0; i < count; i++) {
+		J *item = json_object_array_get_idx(people, i);
+		const char *id = text(item, "M", 64);
+		gboolean all = !g_strcmp0(text(item, "A", 8), "1");
+		const char *cursor = body;
+		guint64 start, end, position = 0;
+
+		if ((!all && !id) || !mention_bound(item, "S", &start) ||
+		    !mention_bound(item, "E", &end) || end <= start ||
+		    !utf16_to(&cursor, &position, start) ||
+		    !utf16_to(&cursor, &position, end))
+			continue;
+		J *span = json_object_new_object();
+
+		put_int(span, "start", (int)start);
+		put_int(span, "length", (int)(end - start));
+		if (id)
+			put_str(span, "id", id);
+		if (all)
+			json_object_object_add(span, "all",
+					       json_object_new_boolean(TRUE));
+		json_object_array_add(out, span);
+		if (mentions_me && (all || (self && !g_strcmp0(id, self))))
+			*mentions_me = TRUE;
+	}
+	return json_object_array_length(out) ? g_steal_pointer(&out) : NULL;
+}

@@ -19,6 +19,8 @@
 #include <string.h>
 #include <time.h>
 
+static gboolean decorate_draft_mentions(PangoLayout *item, const char *draft);
+
 #define WHITE 0xffffff
 
 static cairo_t *cr;
@@ -1002,6 +1004,8 @@ int ui_edit_hit(Editor *edit, Rect r, int x)
 		layout(edit->value->str, 15, 400, -1, FALSE);
 	if (edit == &ui.message)
 		ui_emoji_shape_editor(item, 0, 0, 0);
+	if (edit == &ui.message)
+		decorate_draft_mentions(item, edit->value->str);
 	int index = 0, trailing = 0;
 
 	pango_layout_xy_to_index(item,
@@ -1055,7 +1059,10 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 		display = preedit->str;
 		caret = from + (int)strlen(ui.composition);
 	}
-	gboolean rich = edit == &ui.message && ui_emoji_has_tokens();
+	int start, end;
+	gboolean rich =
+		edit == &ui.message &&
+		(ui_emoji_has_tokens() || ui_mention_span(0, &start, &end));
 
 	g_autoptr(PangoLayout) item =
 		rich ? layout(display, 15, 400, -1, FALSE) :
@@ -1064,6 +1071,8 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 		ui_emoji_shape_editor(
 			item, composing ? from : 0, composing ? to : 0,
 			composing ? (int)strlen(ui.composition) : 0);
+	if (rich)
+		decorate_draft_mentions(item, edit->value->str);
 	int pos = caret_x(item, caret), width = r.w - pad - 12, ox = r.x + pad;
 
 	if (pos - edit->scroll > width - 2)
@@ -2144,6 +2153,108 @@ static gboolean decorate_message_links(PangoLayout *item, size_t skip,
 	return TRUE;
 }
 
+/*
+ * Embolden and tint the first copy of needle at or after *from. Emoji
+ * shaping replaces some text first, so spans are found by their own text.
+ */
+static void mark_mention(PangoLayout *item, PangoAttrList **attrs, size_t *from,
+			 const char *needle, size_t n, gboolean on_accent)
+{
+	const char *full = pango_layout_get_text(item);
+	size_t size = strlen(full);
+	guint rgb = on_accent ? UI_BUBBLE_OUT_INK : UI_ACCENT_HOVER;
+
+	if (!n || *from > size)
+		return;
+	const char *hit = memmem(full + *from, size - *from, needle, n);
+
+	if (!hit)
+		return;
+	guint begin = (guint)(hit - full), end = begin + (guint)n;
+
+	if (!*attrs) {
+		PangoAttrList *prev = pango_layout_get_attributes(item);
+
+		*attrs = prev ? pango_attr_list_copy(prev) :
+				pango_attr_list_new();
+	}
+	PangoAttribute *bold = pango_attr_weight_new(PANGO_WEIGHT_BOLD);
+
+	bold->start_index = begin;
+	bold->end_index = end;
+	pango_attr_list_insert(*attrs, bold);
+	PangoAttribute *fg =
+		pango_attr_foreground_new((guint16)(((rgb >> 16) & 255) * 257u),
+					  (guint16)(((rgb >> 8) & 255) * 257u),
+					  (guint16)((rgb & 255) * 257u));
+
+	fg->start_index = begin;
+	fg->end_index = end;
+	pango_attr_list_insert(*attrs, fg);
+	*from = end;
+}
+
+static void finish_mentions(PangoLayout *item, PangoAttrList *attrs)
+{
+	if (!attrs)
+		return;
+	pango_layout_set_attributes(item, attrs);
+	pango_attr_list_unref(attrs);
+}
+
+/* Advance a count of UTF-16 code units, as LINE measures text. */
+static const char *utf16_units_skip(const char *p, gint64 units)
+{
+	while (units > 0 && *p) {
+		units -= g_utf8_get_char(p) > 0xffff ? 2 : 1;
+		p = g_utf8_next_char(p);
+	}
+	return units ? NULL : p;
+}
+
+/* The @name spans LINE listed in a received message's MENTION metadata. */
+static void decorate_mentions(PangoLayout *item, const char *body, size_t skip,
+			      Json *spans, gboolean on_accent)
+{
+	size_t count = json_object_is_type(spans, json_type_array) ?
+			       MIN(json_object_array_length(spans), 100u) :
+			       0;
+	PangoAttrList *attrs = NULL;
+
+	for (size_t i = 0; i < count; i++) {
+		Json *r = json_object_array_get_idx(spans, i);
+		gint64 start = json_object_get_int64(ui_field(r, "start")),
+		       n = json_object_get_int64(ui_field(r, "length"));
+		const char *a = start >= 0 && start <= G_MAXINT32 ?
+					utf16_units_skip(body, start) :
+					NULL;
+		const char *b = a && n > 0 && n <= G_MAXINT32 ?
+					utf16_units_skip(a, n) :
+					NULL;
+
+		if (b)
+			mark_mention(item, &attrs, &skip, a, (size_t)(b - a),
+				     on_accent);
+	}
+	finish_mentions(item, attrs);
+}
+
+/* Committed @mentions in the composer, so they read as mentions. */
+static gboolean decorate_draft_mentions(PangoLayout *item, const char *draft)
+{
+	PangoAttrList *attrs = NULL;
+	size_t from = 0;
+	int start, end;
+
+	for (guint i = 0; ui_mention_span(i, &start, &end); i++)
+		mark_mention(item, &attrs, &from, draft + start,
+			     (size_t)(end - start), FALSE);
+	if (!attrs)
+		return FALSE;
+	finish_mentions(item, attrs);
+	return TRUE;
+}
+
 /* Whether a rich message's first scene draws anything from LINE's CDN. */
 static gboolean rich_loadable(Json *rich)
 {
@@ -2335,6 +2446,10 @@ static void prepare_bubbles(Rect area)
 			ui_emoji_shape_history(row.body, body,
 					       with_reply ? "↪ Reply\n" : "",
 					       ui_field(msg, "emojis"));
+			decorate_mentions(row.body, body,
+					  with_reply ? strlen("↪ Reply\n") : 0,
+					  ui_field(msg, "mentions"),
+					  line_style && row.mine);
 			row.has_links = decorate_message_links(
 				row.body, with_reply ? strlen("↪ Reply\n") : 0,
 				line_style && row.mine);

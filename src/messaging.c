@@ -1251,6 +1251,17 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 						 FALSE, NULL);
 			if (emojis)
 				put(row, "emojis", emojis);
+			gboolean me = FALSE;
+			J *spans = field(row, "unreadable") ?
+					   NULL :
+					   line_mention_spans(text,
+							      field(msg, "18"),
+							      s->mid, &me);
+
+			if (spans)
+				put(row, "mentions", spans);
+			if (me)
+				boolean(row, "mentionsMe", TRUE);
 		}
 		static const char *const kinds[] = {
 			"text",	    "photo",	     "video",	   "audio",

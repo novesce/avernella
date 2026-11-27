@@ -325,6 +325,13 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 
 		g_assert_cmpstr(strfield(req, "2:str"), ==, CHAT_MID);
 		g_assert_cmpstr(strfield(msg, "2:str"), ==, CHAT_MID);
+		if (!g_strcmp0(strfield(msg, "10:str"), "@Alice hi"))
+			g_assert_cmpstr(
+				strfield(field(msg, "18:map:str:str"),
+					 "MENTION"),
+				==,
+				"{\"MENTIONEES\":[{\"S\":\"0\",\"E\":\"6\",\"M\":\"" PEER_MEM
+				"\"}]}");
 		return json_tokener_parse(
 			"{\"1\":{\"1\":{\"4\":\"1009\",\"5\":1700000009000}}}");
 	}

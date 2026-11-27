@@ -2410,9 +2410,54 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "mentionCandidates")) {
 		const char *q = strfield(params, "query");
 
-		if (line_is_square_chat(chat))
-			return line_square_search_mentionables(s, chat, q,
-							       error);
+		if (line_is_square_chat(chat)) {
+			g_autoptr(GError) err = NULL;
+			J *rows = line_square_search_mentionables(s, chat, q,
+								  &err);
+
+			if (rows && json_object_array_length(rows))
+				return rows;
+			json_object_put(rows);
+			const char *sq =
+				w->square_chat_to_square ?
+					strfield(w->square_chat_to_square,
+						 chat) :
+					NULL;
+			if (!sq) {
+				if (err) {
+					g_propagate_error(
+						error, g_steal_pointer(&err));
+					return NULL;
+				}
+				return json_object_new_array();
+			}
+			g_autoptr(J) detail = line_square_members(
+				s, sq, NULL, q, FALSE, error);
+			if (!detail)
+				return NULL;
+			const char *my_mid = my_square_member_id(w, chat);
+			J *members = field(detail, "members");
+			J *out = json_object_new_array();
+
+			for (size_t i = 0;
+			     json_object_is_type(members, json_type_array) &&
+			     i < json_object_array_length(members);
+			     i++) {
+				J *m = json_object_array_get_idx(members, i);
+				const char *mid = strfield(m, "id");
+				const char *name = strfield(m, "name");
+
+				if (!mid || !g_strcmp0(mid, my_mid) || !name)
+					continue;
+				if (q && *q &&
+				    !g_str_match_string(q, name, TRUE))
+					continue;
+				json_object_array_add(out, json_object_get(m));
+				if (json_object_array_length(out) >= 20)
+					break;
+			}
+			return out;
+		}
 		if (*chat != 'c')
 			return json_object_new_array();
 		g_autoptr(J) detail = line_group_members(s, chat, error);

@@ -937,9 +937,15 @@ static J *format_square_message(Line *s, J *sq_msg, const char *sender_name,
 
 	if (type == 0) {
 		J *emojis = parse_sticon_emojis(text, meta);
+		gboolean me = FALSE;
+		J *spans = line_mention_spans(text, meta, my_member_id, &me);
 
 		if (emojis)
 			put(row, "emojis", emojis);
+		if (spans)
+			put(row, "mentions", spans);
+		if (me)
+			put_bool(row, "mentionsMe", TRUE);
 	}
 	static const char *const kinds[] = {
 		"text",	    "photo",	     "video",	"audio",      "html",
@@ -1580,18 +1586,20 @@ static J *build_mentions_meta(const char *text, J *mentions)
 		gint64 start = json_object_get_int64(field(it, "start"));
 		gint64 len = json_object_get_int64(field(it, "length"));
 
-		if (!line_square_id(mid, 'p') || start < 0 || len <= 0 ||
+		/* LINE clients read S..E like group mentions, not a length. */
+		if (!line_square_id(mid, 'p') || start < 0 || len < 2 ||
 		    !utf16_step(&cursor, &pos, (guint64)start) ||
+		    *cursor != '@' ||
 		    !utf16_step(&cursor, &pos, (guint64)(start + len)))
 			return NULL;
 		g_autofree char *s_str =
 			g_strdup_printf("%" G_GINT64_FORMAT, start);
-		g_autofree char *l_str =
-			g_strdup_printf("%" G_GINT64_FORMAT, len);
+		g_autofree char *e_str =
+			g_strdup_printf("%" G_GINT64_FORMAT, start + len);
 		J *m = obj();
 
 		put_str(m, "S", s_str);
-		put_str(m, "L", l_str);
+		put_str(m, "E", e_str);
 		put_str(m, "M", mid);
 		json_object_array_add(list, m);
 	}
@@ -3091,8 +3099,13 @@ J *line_square_search_mentionables(Line *s, const char *chat_mid,
 	for (size_t i = 0; i < length(list); i++) {
 		J *m = at(list, i);
 		const char *mid = nonempty(m, "1");
-		const char *name = nonempty(m, "2");
-		const char *hash = nonempty(m, "3");
+		const char *f2 = nonempty(m, "2");
+		/* Handle both SquareMentionable (1=mid,2=name,3=hash) and
+		 * SquareMember (1=mid,2=squareMid,3=name,4=hash). */
+		gboolean is_member = line_square_id(f2, 's');
+		const char *name = is_member ? nonempty(m, "3") : f2;
+		const char *hash = is_member ? nonempty(m, "4") :
+					       nonempty(m, "3");
 
 		if (!line_square_id(mid, 'p') || !name)
 			continue;

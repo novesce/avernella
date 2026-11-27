@@ -29,3 +29,12 @@ J *line_rich_parse(J *metadata, char **alt);
 
 /* The base-image width the window asks for: one of LINE's sizes. */
 #define LINE_RICH_IMAGE_WIDTH 700
+
+/*
+ * Text messages carry MENTION metadata listing S..E spans in UTF-16 units
+ * of the visible text, each naming a member (M) or everyone (A: "1").
+ * Returns the spans that fit the text as [{start, length, id?, all?}], or
+ * NULL, and sets *mentions_me when one names self or everyone.
+ */
+J *line_mention_spans(const char *text, J *meta, const char *self,
+		      gboolean *mentions_me);

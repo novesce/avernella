@@ -236,6 +236,21 @@ static GArray *mention_list(const char *chat)
 	return mentions && chat ? g_hash_table_lookup(mentions, chat) : NULL;
 }
 
+gboolean ui_mention_span(guint i, int *start, int *end)
+{
+	GArray *list = mention_list(ui.selected);
+	int size = ui.message.value ? (int)ui.message.value->len : 0;
+
+	if (!list || i >= list->len)
+		return FALSE;
+	const struct draft_mention *m =
+		&g_array_index(list, struct draft_mention, i);
+
+	*start = CLAMP(m->start, 0, size);
+	*end = CLAMP(m->end, *start, size);
+	return TRUE;
+}
+
 static void forget_mentions(const char *chat)
 {
 	if (mentions && chat)
@@ -1993,6 +2008,7 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 	Json *row = json_object_new_object();
 	gint64 sent = json_object_get_int64(ui_field(receipt, "sentAt"));
 	Json *emojis = ui_field(saved->params, "emojis");
+	Json *mentions_sent = ui_field(saved->params, "mentions");
 	Json *reply = ui_field(saved->params, "replyTo");
 
 	json_object_object_add(row, "id", json_object_new_string(id));
@@ -2009,6 +2025,9 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 				       json_object_new_string(ui.self_id));
 	if (emojis)
 		json_object_object_add(row, "emojis", json_object_get(emojis));
+	if (mentions_sent)
+		json_object_object_add(row, "mentions",
+				       json_object_get(mentions_sent));
 	if (reply)
 		json_object_object_add(row, "replyTo", json_object_get(reply));
 	json_object_array_add(ui.history, row);

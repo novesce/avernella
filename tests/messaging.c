@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "messaging.h"
+#include "rich_message.h"
 #include "sealing.h"
 #include <string.h>
 
@@ -607,6 +608,47 @@ static void mention_and_forward(void)
 	expected_body = NULL;
 }
 
+static void received_mentions(void)
+{
+	const char *text = "🎉 @Alice @All hi";
+	g_autoptr(J) meta = json_tokener_parse(
+		"{\"MENTION\":\"{\\\"MENTIONEES\\\":["
+		"{\\\"S\\\":\\\"3\\\",\\\"E\\\":\\\"9\\\",\\\"M\\\":\\\"" ALICE
+		"\\\"},{\\\"S\\\":\\\"10\\\",\\\"E\\\":\\\"14\\\",\\\"A\\\":\\\"1\\\"},"
+		"{\\\"S\\\":\\\"40\\\",\\\"E\\\":\\\"50\\\",\\\"M\\\":\\\"" SELF
+		"\\\"}]}\"}");
+	gboolean me = FALSE;
+	g_autoptr(J) spans = line_mention_spans(text, meta, SELF, &me);
+
+	g_assert_nonnull(spans);
+	g_assert_cmpuint(json_object_array_length(spans), ==, 2);
+	J *first = json_object_array_get_idx(spans, 0);
+
+	g_assert_cmpint(json_object_get_int(field(first, "start")), ==, 3);
+	g_assert_cmpint(json_object_get_int(field(first, "length")), ==, 6);
+	g_assert_cmpstr(strfield(first, "id"), ==, ALICE);
+	g_assert_true(json_object_get_boolean(
+		field(json_object_array_get_idx(spans, 1), "all")));
+	/* @All names everyone, even when the out-of-range span is dropped. */
+	g_assert_true(me);
+
+	g_autoptr(J) only = json_tokener_parse(
+		"{\"MENTION\":\"{\\\"MENTIONEES\\\":[{\\\"S\\\":3,\\\"E\\\":9,"
+		"\\\"M\\\":\\\"" ALICE "\\\"}]}\"}");
+	g_autoptr(J) alice = line_mention_spans(text, only, SELF, &me);
+
+	g_assert_nonnull(alice);
+	g_assert_false(me);
+	g_autoptr(J) mine = line_mention_spans(text, only, ALICE, &me);
+
+	g_assert_true(me);
+	g_assert_null(line_mention_spans(text, NULL, SELF, &me));
+	g_autoptr(J) junk = json_tokener_parse("{\"MENTION\":\"not json\"}");
+
+	g_assert_null(line_mention_spans(text, junk, SELF, &me));
+	g_assert_false(me);
+}
+
 static void announcements(void)
 {
 	Line s = { .mid = SELF, .seq = 42 };
@@ -950,6 +992,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/messaging/profile-reuse", profile_reuse);
 	g_test_add_func("/messaging/mentions-and-forwarding",
 			mention_and_forward);
+	g_test_add_func("/messaging/received-mentions", received_mentions);
 	g_test_add_func("/messaging/announcements", announcements);
 	g_test_add_func("/messaging/cards-sound-and-forward",
 			cards_sound_and_forward);
