@@ -345,6 +345,8 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 		"/lib",
 		"/lib64",
 		"/run/host",
+		"/run/NetworkManager",
+		"/run/resolvconf",
 		"/etc/fonts",
 		"/etc/ld.so.cache",
 		"/etc/ld.so.conf",
@@ -371,8 +373,10 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 		"/proc/self",
 	};
 	static const char *const rw_dev_dirs[] = {
-		"/dev/null", "/dev/zero", "/dev/urandom",   "/dev/random",
-		"/dev/dri",  "/dev/shm",  "/tmp/.X11-unix",
+		"/dev/null",	  "/dev/zero",
+		"/dev/urandom",	  "/dev/random",
+		"/dev/dri",	  "/dev/shm",
+		"/tmp/.X11-unix", "/run/systemd/resolve",
 	};
 	uint64_t ro = AVSB_FS_RO_BASE;
 	uint64_t ro_exec = AVSB_FS_RO_BASE | LANDLOCK_ACCESS_FS_EXECUTE;
