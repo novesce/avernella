@@ -474,17 +474,33 @@ static void submit_primary(void)
 			const char *cid = ui_string(oc.preview, "chatMid", "");
 
 			if (*cid) {
-				Json *row = json_object_new_object();
+				Json *existing = NULL;
 
-				json_object_object_add(
-					row, "id", json_object_new_string(cid));
-				json_object_object_add(
-					row, "name",
-					json_object_new_string(ui_string(
-						oc.preview, "name", cid)));
-				close_openchat();
-				ui_open_conversation(row);
-				json_object_put(row);
+				for (size_t i = 0;
+				     ui.chats &&
+				     i < json_object_array_length(ui.chats);
+				     i++) {
+					Json *c = json_object_array_get_idx(
+						ui.chats, i);
+
+					if (!g_strcmp0(ui_string(c, "id", ""),
+						       cid)) {
+						existing = c;
+						break;
+					}
+				}
+				if (existing) {
+					close_openchat();
+					ui_open_conversation(existing);
+				} else {
+					/* Register/join the room in the worker before opening. */
+					Json *p = json_object_new_object();
+
+					json_object_object_add(
+						p, "chat",
+						json_object_new_string(cid));
+					rpc("squareJoinChat", p);
+				}
 			}
 			return;
 		}
@@ -1130,6 +1146,27 @@ gboolean ui_openchat_event(SDL_Event *e)
 		}
 		if (oc.page == OC_MY_PROFILE && hit(oc.extra[0], x, y)) {
 			ui_media_pick_avatar();
+			return TRUE;
+		}
+		if (oc.page == OC_ROOMS && hit(oc.extra[0], x, y) &&
+		    oc.cursor >= 0) {
+			Json *subs = ui_field(oc.detail, "subchats");
+			Json *row =
+				subs && (size_t)oc.cursor <
+							json_object_array_length(
+								subs) ?
+					json_object_array_get_idx(subs,
+								  oc.cursor) :
+					NULL;
+			const char *cid = ui_string(row, "id", NULL);
+
+			if (cid) {
+				Json *p = json_object_new_object();
+
+				json_object_object_add(
+					p, "chat", json_object_new_string(cid));
+				rpc("squareJoinChat", p);
+			}
 			return TRUE;
 		}
 		if (oc.page == OC_DISCOVER) {
@@ -1969,9 +2006,9 @@ void ui_openchat_draw(void)
 		}
 		oc.secondary = (Rect){ cx, bottom, 110, 36 };
 		ui_draw_button(oc.secondary, _("Back"), FALSE);
-		if (!can_create && oc.cursor >= 0 && (size_t)oc.cursor < n) {
-			oc.primary = (Rect){ x + w - 150, bottom, 130, 36 };
-			ui_draw_button(oc.primary, _("Join room"), TRUE);
+		if (oc.cursor >= 0 && (size_t)oc.cursor < n) {
+			oc.extra[0] = (Rect){ x + w - 150, bottom, 130, 36 };
+			ui_draw_button(oc.extra[0], _("Join room"), TRUE);
 		}
 	} else if (oc.page == OC_CONFIRM) {
 		const char *who = oc.confirm_name ? oc.confirm_name : "";

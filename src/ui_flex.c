@@ -16,10 +16,12 @@ enum {
 struct flex_item {
 	Rect rect, clip;
 	guint32 fill, ink, border;
+	guint32 grad_start, grad_center, grad_end;
+	double grad_angle, grad_center_pos;
 	int radius, stroke, label_x, label_y;
 	PangoLayout *label;
 	char *url, *uri;
-	gboolean cover, card, action;
+	gboolean cover, card, action, has_gradient, has_grad_center;
 };
 
 struct ui_flex_layout {
@@ -395,7 +397,7 @@ static void move_items(struct builder *b, guint first, guint end, int dy,
 }
 
 static int box_contents(struct builder *b, Json *node, Rect slot, Rect clip,
-			guint depth)
+			guint depth, int fixed_h)
 {
 	Json *contents = field(node, "contents");
 	const char *flow = string(node, "layout");
@@ -430,6 +432,7 @@ static int box_contents(struct builder *b, Json *node, Rect slot, Rect clip,
 	int used = 0, height = 0, flexible = MAX(0, slot.w - fixed);
 	guint start[MAX_CHILDREN], end[MAX_CHILDREN];
 	int heights[MAX_CHILDREN];
+	guint flow_start = b->layout->items->len;
 
 	for (size_t i = 0; i < count; i++) {
 		Json *child = json_object_array_get_idx(contents, i);
@@ -494,21 +497,73 @@ static int box_contents(struct builder *b, Json *node, Rect slot, Rect clip,
 		}
 	} else {
 		height = used;
+		if (fixed_h > height) {
+			const char *justify = string(node, "justifyContent");
+			int dy = is(justify, "center") ?
+					 (fixed_h - height) / 2 :
+				 is(justify, "flex-end") ? fixed_h - height :
+							   0;
+
+			if (dy > 0)
+				move_items(b, flow_start, b->layout->items->len,
+					   dy, clip);
+		}
 	}
+	int ref_h = fixed_h >= 0 ? fixed_h : MAX(height, 1);
+
 	for (size_t i = 0; i < count; i++) {
 		if (before[i] >= 0)
 			continue;
 		Json *child = json_object_array_get_idx(contents, i);
-		int top = dimension_for(child, "offsetTop", slot.h, 0);
-		int left = dimension_for(
-			child, b->rtl ? "offsetEnd" : "offsetStart", slot.w, 0);
-		int right = dimension_for(
-			child, b->rtl ? "offsetStart" : "offsetEnd", slot.w, 0);
-		Rect r = { slot.x + left, slot.y + top, slot.w - left - right,
-			   slot.h - top };
-		int h = component(b, child, r, clip, depth + 1, FALSE);
+		const char *top_s = string(child, "offsetTop");
+		const char *bot_s = string(child, "offsetBottom");
+		const char *start_s =
+			string(child, b->rtl ? "offsetEnd" : "offsetStart");
+		const char *end_s =
+			string(child, b->rtl ? "offsetStart" : "offsetEnd");
+		int top = top_s ? size(top_s, ref_h, 0, FALSE) : 0;
+		int bot = bot_s ? size(bot_s, ref_h, 0, FALSE) : 0;
+		int left = start_s ? size(start_s, slot.w, 0, FALSE) : 0;
+		int right = end_s ? size(end_s, slot.w, 0, FALSE) : 0;
+		Rect r = { slot.x + left, slot.y + top,
+			   MAX(0, slot.w - left - right), 0 };
 
-		height = MAX(height, top + h);
+		if (top_s && bot_s) {
+			r.h = MAX(0, ref_h - top - bot);
+		} else if (bot_s) {
+			r.y = slot.y;
+			r.h = MAX(0, ref_h - bot);
+		} else {
+			r.h = MAX(0, (fixed_h >= 0 ? ref_h : slot.h) - top);
+		}
+		guint abs_start = b->layout->items->len;
+		int h = component(b, child, r, clip, depth + 1, FALSE);
+		guint abs_end = b->layout->items->len;
+
+		if (!top_s && bot_s) {
+			int dy = MAX(0, ref_h - bot - h);
+
+			move_items(b, abs_start, abs_end, dy, clip);
+			height = MAX(height, dy + h + bot);
+		} else {
+			height = MAX(height, top + h + (bot_s ? bot : 0));
+		}
+		/* Preserve DOM paint order so early absolute backgrounds stay behind text. */
+		if (abs_end > abs_start && start[i] < abs_start) {
+			guint n = abs_end - abs_start;
+			struct flex_item *arr =
+				(struct flex_item *)b->layout->items->data;
+			g_autofree struct flex_item *tmp = g_memdup2(
+				arr + abs_start, sizeof(struct flex_item) * n);
+
+			memmove(arr + start[i] + n, arr + start[i],
+				sizeof(struct flex_item) *
+					(abs_start - start[i]));
+			memcpy(arr + start[i], tmp,
+			       sizeof(struct flex_item) * n);
+			for (size_t j = i + 1; j < count; j++)
+				start[j] += n;
+		}
 	}
 	return MIN(height, slot.h);
 }
@@ -589,16 +644,54 @@ static int component(struct builder *b, Json *node, Rect slot, Rect clip,
 		item.uri = action_uri(node);
 		item.fill = color(string(node, "backgroundColor"), 0xe4e5eaff);
 		item.cover = is(string(node, "aspectMode"), "cover");
-		item.rect.w = image_width(node, slot.w, icon);
+		gboolean abs = is(string(node, "position"), "absolute");
+		int explicit_w = dimension_for(node, "width", slot.w, -1);
+		int explicit_h = dimension_for(node, "height", slot.h, -1);
+
+		if (explicit_w >= 0)
+			item.rect.w = explicit_w;
+		else if (abs && string(node, "offsetStart") &&
+			 string(node, "offsetEnd") && !string(node, "size"))
+			item.rect.w = slot.w;
+		else
+			item.rect.w = image_width(node, slot.w, icon);
 		const char *align = string(node, "align");
 
 		if (is(align, "center") || (!align && !icon))
 			item.rect.x += (slot.w - item.rect.w) / 2;
 		else if (is(align, b->rtl ? "start" : "end"))
 			item.rect.x += slot.w - item.rect.w;
-		height = MAX(1, (int)(item.rect.w / aspect(node) + .5));
+		if (explicit_h >= 0)
+			height = explicit_h;
+		else if (abs && string(node, "offsetTop") &&
+			 string(node, "offsetBottom"))
+			height = slot.h;
+		else
+			height = MAX(1, (int)(item.rect.w / aspect(node) + .5));
 	} else if (box) {
 		item.fill = color(string(node, "backgroundColor"), 0);
+		Json *bg = field(node, "background");
+
+		if (is(string(bg, "type"), "linearGradient")) {
+			item.has_gradient = TRUE;
+			item.grad_start = color(string(bg, "startColor"), 0);
+			item.grad_end = color(string(bg, "endColor"), 0);
+			const char *mid_c = string(bg, "centerColor");
+
+			if (mid_c) {
+				item.has_grad_center = TRUE;
+				item.grad_center = color(mid_c, 0);
+				int pct = dimension_for(bg, "centerPosition",
+							100, 50);
+
+				item.grad_center_pos =
+					CLAMP(pct / 100., 0., 1.);
+			}
+			const char *ang = string(bg, "angle");
+
+			if (ang)
+				item.grad_angle = g_ascii_strtod(ang, NULL);
+		}
 		item.border = color(string(node, "borderColor"), 0);
 		item.stroke = space(node, "borderWidth", 0);
 		if (is(string(node, "borderWidth"), "light"))
@@ -626,6 +719,10 @@ static int component(struct builder *b, Json *node, Rect slot, Rect clip,
 		int bottom = space(node, "paddingBottom", padding);
 		int max = dimension_for(node, "maxHeight", inner.h, inner.h);
 		int fixed = dimension_for(node, "height", max, -1);
+
+		if (fixed < 0 && is(string(node, "position"), "absolute") &&
+		    string(node, "offsetTop") && string(node, "offsetBottom"))
+			fixed = max;
 		int bound = fixed >= 0 ? fixed : max;
 
 		inner.x += left;
@@ -636,12 +733,15 @@ static int component(struct builder *b, Json *node, Rect slot, Rect clip,
 		guint old_visible = b->visible;
 
 		height = box_contents(b, node, inner,
-				      intersection(clip, item.rect), depth) +
+				      intersection(clip, item.rect), depth,
+				      fixed >= 0 ? inner.h : -1) +
 			 top + bottom;
 		height = fixed >= 0 ? fixed : CLAMP(height, 0, max);
-		if (item.fill && fixed > 0 && b->visible == old_visible)
+		if ((item.fill || item.has_gradient) && fixed > 0 &&
+		    b->visible == old_visible)
 			b->visible++;
-		if (b->visible == old_visible && !item.fill && !item.uri)
+		if (b->visible == old_visible && !item.fill &&
+		    !item.has_gradient && !item.uri)
 			height = 0;
 		g_array_index(b->layout->items, struct flex_item, index).rect.h =
 			height;
@@ -883,21 +983,67 @@ void ui_flex_draw(cairo_t *cr, const struct ui_flex_layout *layout, int x,
 		if (!clip.w || !clip.h || clip.x >= x2 || clip.y >= y2 ||
 		    clip.x + clip.w <= x1 || clip.y + clip.h <= y1)
 			continue;
-		if (!item->fill && !item->stroke && !item->label && !item->url)
+		if (!item->fill && !item->has_gradient && !item->stroke &&
+		    !item->label && !item->url)
 			continue;
 		cairo_save(cr);
 		cairo_rectangle(cr, clip.x, clip.y, clip.w, clip.h);
 		cairo_clip(cr);
-		if (item->fill || item->stroke) {
+		if (item->fill || item->has_gradient || item->stroke) {
 			shape(cr, r, item->radius);
-			source(cr, item->fill);
-			if (item->stroke) {
-				cairo_fill_preserve(cr);
-				source(cr, item->border);
-				cairo_set_line_width(cr, item->stroke);
-				cairo_stroke(cr);
+			if (item->has_gradient) {
+				double rad = item->grad_angle * G_PI / 180.;
+				double dx = sin(rad), dy = -cos(rad);
+				double cx = r.x + r.w * .5, cy = r.y + r.h * .5;
+				double half =
+					(fabs(dx) * r.w + fabs(dy) * r.h) * .5;
+				cairo_pattern_t *pat =
+					cairo_pattern_create_linear(
+						cx - dx * half, cy - dy * half,
+						cx + dx * half, cy + dy * half);
+
+				cairo_pattern_add_color_stop_rgba(
+					pat, 0.,
+					(item->grad_start >> 24) / 255.,
+					((item->grad_start >> 16) & 255) / 255.,
+					((item->grad_start >> 8) & 255) / 255.,
+					(item->grad_start & 255) / 255.);
+				if (item->has_grad_center)
+					cairo_pattern_add_color_stop_rgba(
+						pat, item->grad_center_pos,
+						(item->grad_center >> 24) /
+							255.,
+						((item->grad_center >> 16) &
+						 255) / 255.,
+						((item->grad_center >> 8) &
+						 255) / 255.,
+						(item->grad_center & 255) /
+							255.);
+				cairo_pattern_add_color_stop_rgba(
+					pat, 1., (item->grad_end >> 24) / 255.,
+					((item->grad_end >> 16) & 255) / 255.,
+					((item->grad_end >> 8) & 255) / 255.,
+					(item->grad_end & 255) / 255.);
+				cairo_set_source(cr, pat);
+				if (item->stroke) {
+					cairo_fill_preserve(cr);
+					source(cr, item->border);
+					cairo_set_line_width(cr, item->stroke);
+					cairo_stroke(cr);
+				} else {
+					cairo_fill(cr);
+				}
+				cairo_pattern_destroy(pat);
 			} else {
-				cairo_fill(cr);
+				source(cr, item->fill);
+				if (item->stroke) {
+					cairo_fill_preserve(cr);
+					source(cr, item->border);
+					cairo_set_line_width(cr, item->stroke);
+					cairo_stroke(cr);
+				} else {
+					cairo_fill(cr);
+				}
 			}
 		}
 		if (item->label) {

@@ -2376,6 +2376,7 @@ J *line_square_create(Line *s, const char *name, const char *description,
 	put_num(sq, "7:i32", 1); /* SquareType.OPEN */
 	put_num(sq, "8:i32", category_id > 0 ? category_id : 1);
 	put_bool(sq, "11:bool", TRUE); /* ableToUseInvitationTicket */
+	put_num(sq, "12:i32", 0); /* SquareState.ALIVE */
 	put_num(jm, "1:i32",
 		join_method >= 0 && join_method <= 2 ? join_method : 0);
 	if (join_method == SQ_JOIN_CODE) {
@@ -2395,9 +2396,12 @@ J *line_square_create(Line *s, const char *name, const char *description,
 		put(jm, "2:obj", jv);
 	}
 	put(sq, "14:obj", jm);
+	put_num(sq, "15:i32", 1); /* BooleanState.OFF (adultOnly) */
 
 	put_str(creator, "3:str", clean_nick);
 	put_bool(creator, "5:bool", TRUE);
+	put_num(creator, "7:i32", 1); /* SquareMembershipState.JOINED */
+	put_num(creator, "8:i32", 1); /* SquareMemberRole.ADMIN */
 
 	put_num(req, "1:i32", seq);
 	put(req, "2:obj", sq);
