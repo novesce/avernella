@@ -2779,20 +2779,20 @@ static void click(int x, int y)
 		Json *message = ui_sender_at(x, y, &anchor);
 
 		if (message) {
-			if (*ui.selected == 'm') {
-				if (ui.openchats)
-					ui_openchat_open_info();
-				return;
-			}
 			gboolean mine = json_object_get_boolean(
 				ui_field(message, "own"));
 			const char *id = ui_string(message, "senderId",
 						   mine ? ui.self_id : NULL);
+
+			if (!id || !*id) {
+				if (*ui.selected == 'm' && ui.openchats)
+					ui_openchat_open_info();
+				return;
+			}
 			Json *who = json_object_new_object();
 
 			json_object_object_add(who, "id",
-					       json_object_new_string(id ? id :
-									   ""));
+					       json_object_new_string(id));
 			json_object_object_add(
 				who, "name",
 				json_object_new_string(ui_string(
@@ -2807,6 +2807,11 @@ static void click(int x, int y)
 			return;
 		}
 		if (ui_header_peer_at(x, y, &anchor)) {
+			if (*ui.selected == 'm') {
+				if (ui.openchats)
+					ui_openchat_open_info();
+				return;
+			}
 			Json *chat = ui_selected_chat();
 			Json *who = json_object_new_object();
 

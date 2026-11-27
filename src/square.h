@@ -122,6 +122,7 @@ J *line_square_update_picture(Line *s, J *my_member, const char *path,
 J *line_square_members(Line *s, const char *square_mid,
 		       const char *continuation, const char *query,
 		       gboolean pending_only, GError **error);
+J *line_square_member_card(Line *s, const char *member_mid, GError **error);
 J *line_square_moderate_member(Line *s, const char *square_mid,
 			       const char *member_mid, const char *action,
 			       GError **error);

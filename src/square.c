@@ -565,7 +565,7 @@ static J *square_chats_from_events(Line *s, J *squares, J *members,
 		if (!field(squares, smid)) {
 			g_autoptr(J) sq_req = obj();
 
-			put_str(sq_req, "1:str", smid);
+			put_str(sq_req, "2:str", smid);
 			g_autoptr(GError) sq_err = NULL;
 			g_autoptr(J) sq_rep =
 				square_rpc(s, "getSquare", sq_req, &sq_err);
@@ -590,6 +590,14 @@ static J *square_chats_from_events(Line *s, J *squares, J *members,
 					put(authorities, smid,
 					    json_object_get(auth));
 			}
+		}
+		if (!field(members, smid) && chat_member &&
+		    line_square_id(nonempty(chat_member, "1"), 'p')) {
+			J *stub = obj();
+
+			put_str(stub, "1", nonempty(chat_member, "1"));
+			put_str(stub, "2", smid);
+			put(members, smid, stub);
 		}
 		J *row = make_chat_row(s, chat, field(reply, "3"),
 				       field(squares, smid),
@@ -1085,6 +1093,149 @@ static J *format_square_system_event(gint64 created_time, const char *id,
 	return row;
 }
 
+static void apply_square_member_info(Line *s, J *member, GHashTable *names,
+				     GHashTable *avatars)
+{
+	const char *mid = nonempty(member, "1");
+	const char *name = nonempty(member, "3");
+	const char *hash = nonempty(member, "4");
+
+	if (!line_square_id(mid, 'p'))
+		return;
+	if (name)
+		g_hash_table_replace(names, g_strdup(mid), g_strdup(name));
+	if (hash) {
+		remember_square_avatar(s, mid, hash);
+		const char *pic = strfield(s->pictures, mid);
+
+		if (pic && *pic)
+			g_hash_table_replace(avatars, g_strdup(mid),
+					     g_strdup(pic));
+	}
+}
+
+/*
+ * LINE 26.x fetchSquareChatEvents omits senderDisplayName and avatar hashes.
+ * Resolve all unique p... senders in one batch via getSquareMembersBySquare
+ * (falling back to getSquareMember if squareMid is unavailable).
+ */
+static void resolve_square_senders(Line *s, const char *square_mid, J *rows)
+{
+	if (!length(rows))
+		return;
+	g_autoptr(GHashTable) wanted =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	g_autoptr(J) mids = array();
+
+	for (size_t i = 0; i < length(rows); i++) {
+		J *row = at(rows, i);
+		const char *sid = nonempty(row, "senderId");
+		const char *from = nonempty(row, "from");
+		const char *av = nonempty(row, "avatarKey");
+
+		if (!line_square_id(sid, 'p'))
+			continue;
+		if (g_hash_table_contains(wanted, sid))
+			continue;
+		if (from && strcmp(from, sid) && av && *av)
+			continue;
+		g_hash_table_add(wanted, g_strdup(sid));
+		json_object_array_add(mids, json_object_new_string(sid));
+	}
+	if (!length(mids))
+		return;
+	g_autoptr(GHashTable) names =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	g_autoptr(GHashTable) avatars =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+	gboolean fetched = FALSE;
+
+	if (line_square_id(square_mid, 's')) {
+		g_autoptr(J) req = obj();
+		g_autoptr(GError) ignored = NULL;
+
+		put_str(req, "2:str", square_mid);
+		put(req, "3:set:str", json_object_get(mids));
+		g_autoptr(J) reply = square_rpc(s, "getSquareMembersBySquare",
+						req, &ignored);
+		J *members = field(reply, "1");
+
+		if (json_object_is_type(members, json_type_array)) {
+			fetched = TRUE;
+			for (size_t i = 0; i < length(members); i++)
+				apply_square_member_info(s, at(members, i),
+							 names, avatars);
+		}
+	}
+	if (!fetched) {
+		size_t cap = MIN(length(mids), (size_t)20);
+
+		for (size_t i = 0; i < cap; i++) {
+			const char *sid = json_object_get_string(at(mids, i));
+			g_autoptr(J) req = obj();
+			g_autoptr(GError) ignored = NULL;
+
+			put_str(req, "2:str", sid);
+			g_autoptr(J) reply =
+				square_rpc(s, "getSquareMember", req, &ignored);
+			J *m = field(reply, "1");
+
+			if (m)
+				apply_square_member_info(s, m, names, avatars);
+		}
+	}
+	for (size_t i = 0; i < length(rows); i++) {
+		J *row = at(rows, i);
+		const char *sid = nonempty(row, "senderId");
+
+		if (!sid)
+			continue;
+		const char *name = g_hash_table_lookup(names, sid);
+		const char *av = g_hash_table_lookup(avatars, sid);
+
+		if (name && !json_object_get_boolean(field(row, "own")))
+			put_str(row, "from", name);
+		if (av)
+			put_str(row, "avatarKey", av);
+	}
+}
+
+J *line_square_member_card(Line *s, const char *member_mid, GError **error)
+{
+	if (!line_square_id(member_mid, 'p'))
+		return problem(error, "Choose an OpenChat member.");
+	g_autoptr(J) req = obj();
+
+	put_str(req, "2:str", member_mid);
+	g_autoptr(J) reply = square_rpc(s, "getSquareMember", req, error);
+	if (!reply)
+		return NULL;
+	J *m = field(reply, "1");
+
+	if (!m || !json_object_is_type(m, json_type_object))
+		return problem(error,
+			       "LINE did not return this member's profile.");
+	const char *name = nonempty(m, "3");
+	const char *hash = nonempty(m, "4");
+	const char *bio = nonempty(m, "13");
+	int role = json_object_get_int(field(m, "7"));
+
+	remember_square_avatar(s, member_mid, hash);
+	const char *pic = strfield(s->pictures, member_mid);
+	J *row = obj();
+
+	put_str(row, "id", member_mid);
+	put_str(row, "name", name ? name : member_mid);
+	put_str(row, "avatarKey", pic ? pic : "");
+	put_str(row, "status",
+		bio	  ? bio :
+		role == 1 ? "OpenChat Admin" :
+		role == 2 ? "OpenChat Co-Admin" :
+			    "OpenChat Member");
+	put_bool(row, "squareMember", TRUE);
+	return row;
+}
+
 J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 		       const char *continuation, J **raw_out,
 		       char **next_token_out, gboolean *more_out,
@@ -1120,6 +1271,7 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 	g_autoptr(J) rows = array(), raw = obj();
 	g_autoptr(GHashTable) destroyed =
 		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+	const char *square_mid = NULL;
 
 	/* First pass: collect destroyed message IDs so we hide them. */
 	for (size_t i = 0; i < length(events); i++) {
@@ -1145,6 +1297,8 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 		if (etype == SQ_EVT_RECEIVE_MESSAGE) {
 			J *p = field(payload, "1");
 
+			if (!square_mid)
+				square_mid = nonempty(p, "6");
 			row = format_square_message(s, field(p, "2"),
 						    nonempty(p, "3"),
 						    field(p, "4"), my_member_id,
@@ -1156,6 +1310,11 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 						    nonempty(p, "4"),
 						    field(p, "5"), my_member_id,
 						    &raw_msg);
+			if (row &&
+			    g_strcmp0(strfield(row, "type"), "chat_event")) {
+				put_bool(row, "own", TRUE);
+				put_str(row, "from", "You");
+			}
 		} else if (etype == SQ_EVT_JOIN_CHAT) {
 			J *m = field(field(payload, "3"), "2");
 			const char *who = nonempty(m, "3");
@@ -1205,6 +1364,7 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 			put(raw, mid, json_object_get(raw_msg));
 		json_object_array_add(rows, row);
 	}
+	resolve_square_senders(s, square_mid, rows);
 	json_object_array_sort(rows, message_order);
 	const char *next = nonempty(reply, "3");
 

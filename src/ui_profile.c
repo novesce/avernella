@@ -425,6 +425,11 @@ static int draw_card(Json *row, int x, int y, int w, gboolean actions)
 	if (self) {
 		button((Rect){ bx, by, bw, 32 }, _("Edit Profile"), ACCENT,
 		       UI_ON_ACCENT, A_EDIT_PROFILE, 0);
+	} else if (flag(row, "squareMember") ||
+		   (ui_string(row, "id", "")[0] == 'p' &&
+		    strlen(ui_string(row, "id", "")) == 33)) {
+		/* OpenChat members use per-room identities (no direct DM/add). */
+		h -= 44;
 	} else if (flag(row, "loading")) {
 		button((Rect){ bx, by, bw, 32 }, "Message", ACCENT,
 		       UI_ON_ACCENT, A_MESSAGE, 0);

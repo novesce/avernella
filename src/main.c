@@ -1681,6 +1681,8 @@ static J *profile_card(struct line_worker *w, const char *id, GError **error)
 					       json_object_new_boolean(TRUE));
 		return row;
 	}
+	if (line_square_id(id, 'p'))
+		return line_square_member_card(s, id, error);
 	J *row = line_friend_card(s, id, error);
 
 	if (row)
