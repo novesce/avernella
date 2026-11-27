@@ -250,6 +250,10 @@ static void test_net_worker_landlock_and_fd_hygiene(void)
 	close(canary);
 	close(listener);
 	g_assert_true(WIFEXITED(status));
+	if (WEXITSTATUS(status) == 77) {
+		g_test_skip("Unprivileged mount/userns restricted by host LSM");
+		return;
+	}
 	g_assert_cmpint(WEXITSTATUS(status), ==, 0);
 }
 
@@ -262,7 +266,7 @@ static int empty_root_worker(int ctrl_fd, uint32_t active, void *userdata)
 	(void)ctrl_fd;
 	if (!(active & AVSB_ACTIVE_EMPTY_ROOT) ||
 	    !(active & AVSB_ACTIVE_NET_NS))
-		return 30;
+		return 77;
 
 	/* /etc/passwd must not exist or be accessible in empty RO tmpfs. */
 	fd = open("/etc/passwd", O_RDONLY | O_CLOEXEC);
@@ -320,6 +324,10 @@ static void test_net_worker_empty_root_and_netns(void)
 	avernella_worker_close(&proc);
 	close(listener);
 	g_assert_true(WIFEXITED(status));
+	if (WEXITSTATUS(status) == 77) {
+		g_test_skip("Unprivileged mount/userns restricted by host LSM");
+		return;
+	}
 	g_assert_cmpint(WEXITSTATUS(status), ==, 0);
 }
 
@@ -493,6 +501,10 @@ static void test_media_worker_isolation(void)
 	avernella_worker_close(&proc);
 	close(listener);
 	g_assert_true(WIFEXITED(status));
+	if (WEXITSTATUS(status) == 77) {
+		g_test_skip("Unprivileged mount/userns restricted by host LSM");
+		return;
+	}
 	g_assert_cmpint(WEXITSTATUS(status), ==, 0);
 }
 

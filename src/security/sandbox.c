@@ -119,12 +119,22 @@ static bool probe_userns(void)
 		ssize_t n = read(fd, buf, sizeof(buf) - 1);
 
 		close(fd);
-		if (n > 0) {
-			buf[n] = '\0';
-			return buf[0] == '1';
-		}
+		if (n > 0 && buf[0] != '1')
+			return false;
 	}
-	/* Upstream kernels without the Debian/Arch sysctl allow userns. */
+	/*
+	 * Ubuntu 24.04+ restricts unprivileged userns capabilities (including
+	 * mount/pivot_root) via AppArmor when this sysctl is 1.
+	 */
+	fd = open("/proc/sys/kernel/apparmor_restrict_unprivileged_userns",
+		  O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+
+		close(fd);
+		if (n > 0 && buf[0] == '1')
+			return false;
+	}
 	return true;
 }
 
