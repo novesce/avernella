@@ -383,6 +383,20 @@ GBytes *line_obs_download(const char *token, const char *sid, const char *oid,
 			90L, e);
 }
 
+GBytes *line_obs_download_original(const char *token, const char *sid,
+				   const char *oid, const char *id, GError **e)
+{
+	if (!token || !segment(sid) || !segment(oid) || !digits(id)) {
+		invalid(e);
+		return NULL;
+	}
+	g_autofree char *hdr = download_header(id);
+	g_autofree char *url = g_strdup_printf(
+		"https://obs.line-apps.com/r/talk/%s/%s/original", sid, oid);
+	return transfer(url, token, hdr, NULL, NULL, LINE_MEDIA_LIMIT + 65536,
+			90L, e);
+}
+
 GBytes *line_obs_download_preview(const char *token, const char *sid,
 				  const char *oid, const char *id, GError **e)
 {
@@ -477,9 +491,16 @@ char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 	json_object_object_add(params, "reqseq",
 			       json_object_new_string(seq_str));
 	json_object_object_add(params, "range", json_object_new_string(range));
-	if (!strcmp(media_type, "IMAGE"))
+	const char *ctype = square_content_type(name, media_type);
+
+	if (!strcmp(media_type, "IMAGE")) {
 		json_object_object_add(params, "quality",
 				       json_object_new_string("100"));
+		if (!strcmp(ctype, "Content-Type: image/gif"))
+			json_object_object_add(
+				params, "cat",
+				json_object_new_string("original"));
+	}
 	if (duration_ms &&
 	    (!strcmp(media_type, "VIDEO") || !strcmp(media_type, "AUDIO"))) {
 		g_autofree char *dur =
@@ -493,7 +514,6 @@ char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 	g_autofree char *b64 =
 		g_base64_encode((const guint8 *)json, strlen(json));
 	g_autofree char *hdr = g_strconcat("x-obs-params: ", b64, NULL);
-	const char *ctype = square_content_type(name, media_type);
 	char *oid = NULL;
 
 	g_autoptr(GBytes) reply =
@@ -514,6 +534,20 @@ GBytes *line_obs_download_square(const char *token, const char *message_id,
 	}
 	g_autofree char *url = g_strconcat("https://obs.line-apps.com/r/g2/m/",
 					   message_id, NULL);
+
+	return transfer(url, token, NULL, NULL, NULL, LINE_MEDIA_LIMIT + 65536,
+			90L, e);
+}
+
+GBytes *line_obs_download_square_original(const char *token,
+					  const char *message_id, GError **e)
+{
+	if (!token || !digits(message_id)) {
+		invalid(e);
+		return NULL;
+	}
+	g_autofree char *url = g_strconcat("https://obs.line-apps.com/r/g2/m/",
+					   message_id, "/original", NULL);
 
 	return transfer(url, token, NULL, NULL, NULL, LINE_MEDIA_LIMIT + 65536,
 			90L, e);

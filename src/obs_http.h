@@ -7,6 +7,9 @@ char *line_obs_upload(const char *token, const char *sid, const char *oid,
 		      const char *name, GBytes *encrypted, GError **error);
 GBytes *line_obs_download(const char *token, const char *sid, const char *oid,
 			  const char *message_id, GError **error);
+GBytes *line_obs_download_original(const char *token, const char *sid,
+				   const char *oid, const char *message_id,
+				   GError **error);
 GBytes *line_obs_download_preview(const char *token, const char *sid,
 				  const char *oid, const char *message_id,
 				  GError **error);
@@ -20,6 +23,9 @@ char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 			     GError **error);
 GBytes *line_obs_download_square(const char *token, const char *message_id,
 				 GError **error);
+GBytes *line_obs_download_square_original(const char *token,
+					  const char *message_id,
+					  GError **error);
 GBytes *line_obs_download_square_preview(const char *token,
 					 const char *message_id,
 					 GError **error);

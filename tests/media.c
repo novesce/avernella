@@ -129,6 +129,13 @@ GBytes *line_obs_download(const char *token, const char *sid, const char *oid,
 	return g_bytes_new_take(wrong, size);
 }
 
+GBytes *line_obs_download_original(const char *token, const char *sid,
+				   const char *oid, const char *message_id,
+				   GError **error)
+{
+	return line_obs_download(token, sid, oid, message_id, error);
+}
+
 GBytes *line_obs_download_preview(const char *token, const char *sid,
 				  const char *oid, const char *id,
 				  GError **error)
@@ -176,6 +183,13 @@ GBytes *line_obs_download_square(const char *token, const char *message_id,
 	(void)message_id;
 	g_set_error_literal(error, LINE_ERROR, 1, "Unused square download");
 	return NULL;
+}
+
+GBytes *line_obs_download_square_original(const char *token,
+					  const char *message_id,
+					  GError **error)
+{
+	return line_obs_download_square(token, message_id, error);
 }
 
 GBytes *line_obs_download_square_preview(const char *token,

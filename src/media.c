@@ -623,7 +623,27 @@ static GBytes *download_sealed_object(Line *s, J *message, gboolean preview,
 	return g_steal_pointer(&result);
 }
 
-static GBytes *download_square_object(Line *s, const char *id, gboolean preview,
+static gboolean want_original_image(J *message)
+{
+	if (json_object_get_int(field(message, "15")) != LINE_MEDIA_IMAGE)
+		return FALSE;
+	J *meta = field(message, "18");
+
+	if (!meta)
+		return FALSE;
+	const char *info = strfield(meta, "MEDIA_CONTENT_INFO");
+
+	if (!info)
+		info = strfield(meta, "OBS_CONTENT_INFO");
+	if (info &&
+	    (strstr(info, "\"gif\"") || strstr(info, "\"GIF\"") ||
+	     strstr(info, "\"animated\":true") || strstr(info, "\"original\"")))
+		return TRUE;
+	return !g_strcmp0(strfield(meta, "IS_SEND_ORIGINAL_IMAGE"), "true") ||
+	       strfield(meta, "OBS_POP") != NULL;
+}
+
+static GBytes *download_square_object(Line *s, const char *id, int variant,
 				      GError **error)
 {
 	g_autoptr(GError) failure = NULL;
@@ -634,9 +654,39 @@ static GBytes *download_square_object(Line *s, const char *id, gboolean preview,
 		if (!token)
 			break;
 		GBytes *bytes =
-			preview ? line_obs_download_square_preview(token, id,
-								   &failure) :
-				  line_obs_download_square(token, id, &failure);
+			variant == 1 ?
+				line_obs_download_square_preview(token, id,
+								 &failure) :
+			variant == 2 ?
+				line_obs_download_square_original(token, id,
+								  &failure) :
+				line_obs_download_square(token, id, &failure);
+
+		if (bytes)
+			return bytes;
+		if (i || !g_error_matches(failure, LINE_ERROR,
+					  LINE_OBS_UNAUTHORIZED))
+			break;
+		g_clear_error(&failure);
+		line_secret_set(&s->obs_token, NULL);
+		s->obs_until = 0;
+	}
+	if (failure)
+		g_propagate_error(error, g_steal_pointer(&failure));
+	return NULL;
+}
+
+static GBytes *download_talk_original(Line *s, const char *id, GError **error)
+{
+	g_autoptr(GError) failure = NULL;
+
+	for (int i = 0; i < 2; i++) {
+		g_autoptr(LineSecret) token = line_obs_token(s, &failure);
+
+		if (!token)
+			break;
+		GBytes *bytes = line_obs_download_original(token, "m", id, id,
+							   &failure);
 
 		if (bytes)
 			return bytes;
@@ -659,10 +709,17 @@ GBytes *line_download_attachment(Line *s, J *message, GError **error)
 	const char *id = strfield(message, "4");
 	const char *to = strfield(message, "2");
 	gboolean square = line_is_square_chat(to);
+	g_autoptr(GBytes) bytes = NULL;
 
-	g_autoptr(GBytes) bytes =
-		square ? download_square_object(s, id, FALSE, error) :
-			 download_object(s, "m", id, id, FALSE, error);
+	if (want_original_image(message)) {
+		g_autoptr(GError) ignored = NULL;
+
+		bytes = square ? download_square_object(s, id, 2, &ignored) :
+				 download_talk_original(s, id, &ignored);
+	}
+	if (!bytes)
+		bytes = square ? download_square_object(s, id, 0, error) :
+				 download_object(s, "m", id, id, FALSE, error);
 
 	if (bytes && (!g_bytes_get_size(bytes) ||
 		      g_bytes_get_size(bytes) > LINE_MEDIA_LIMIT)) {

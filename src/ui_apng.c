@@ -614,14 +614,15 @@ cairo_surface_t *ui_gif_decode(const guint8 *d, gsize n, int limit,
 	    (gsize)w * h > MAX_ANIMATION_PIXELS)
 		return NULL;
 	guint out_w = w, out_h = h;
+	int eff_limit = animate && limit > 640 ? 640 : limit;
 
-	if (limit > 0 && MAX(w, h) > (guint)limit) {
+	if (eff_limit > 0 && MAX(w, h) > (guint)eff_limit) {
 		if (w >= h) {
-			out_w = (guint)limit;
-			out_h = MAX(1u, (guint)((guint64)h * limit / w));
+			out_w = (guint)eff_limit;
+			out_h = MAX(1u, (guint)((guint64)h * eff_limit / w));
 		} else {
-			out_h = (guint)limit;
-			out_w = MAX(1u, (guint)((guint64)w * limit / h));
+			out_h = (guint)eff_limit;
+			out_w = MAX(1u, (guint)((guint64)w * eff_limit / h));
 		}
 	}
 	gsize pos = 13;
