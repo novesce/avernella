@@ -27,6 +27,7 @@ enum oc_page {
 enum oc_confirm_kind {
 	CONF_NONE,
 	CONF_LEAVE,
+	CONF_LEAVE_CHAT,
 	CONF_KICK,
 	CONF_BAN,
 	CONF_PROMOTE,
@@ -652,6 +653,10 @@ static void submit_primary(void)
 					p, "chat",
 					json_object_new_string(oc.chat));
 			rpc("squareLeave", p);
+		} else if (oc.confirm == CONF_LEAVE_CHAT && oc.chat) {
+			json_object_object_add(p, "chat",
+					       json_object_new_string(oc.chat));
+			rpc("squareLeaveChat", p);
 		} else if (oc.confirm_member) {
 			const char *act = oc.confirm == CONF_KICK ? "kick" :
 					  oc.confirm == CONF_BAN  ? "ban" :
@@ -898,15 +903,17 @@ gboolean ui_openchat_reply(const char *method, guint tag, Json *result,
 	} else if (!strcmp(method, "squareApproveMember") ||
 		   !strcmp(method, "squareRejectMember")) {
 		load_requests();
-	} else if (!strcmp(method, "squareLeave")) {
+	} else if (!strcmp(method, "squareLeave") ||
+		   !strcmp(method, "squareLeaveChat")) {
 		g_autofree char *left_chat = g_strdup(oc.chat);
+		gboolean room_only = !strcmp(method, "squareLeaveChat");
 
 		close_openchat();
 		if (left_chat)
 			ui_group_left(left_chat);
 		else
 			ui_refresh();
-		ui_status(_("Left OpenChat."));
+		ui_status(room_only ? _("Left room.") : _("Left OpenChat."));
 	}
 	ui.dirty = TRUE;
 	return TRUE;
@@ -1142,6 +1149,11 @@ gboolean ui_openchat_event(SDL_Event *e)
 			else if (hit(oc.extra[6], x, y))
 				start_confirm(CONF_LEAVE, OC_INFO, NULL,
 					      ui_string(oc.detail, "name", ""));
+			else if (oc.chat && hit(oc.extra[7], x, y))
+				start_confirm(CONF_LEAVE_CHAT, OC_INFO, NULL,
+					      ui_string(oc.detail, "chatName",
+							ui_string(oc.detail,
+								  "name", "")));
 			return TRUE;
 		}
 		if (oc.page == OC_MY_PROFILE && hit(oc.extra[0], x, y)) {
@@ -1761,6 +1773,12 @@ void ui_openchat_draw(void)
 			cy += 54;
 			oc.extra[6] = (Rect){ cx, cy, bw, 38 };
 			ui_draw_button(oc.extra[6], _("Leave OpenChat"), FALSE);
+			if (oc.chat) {
+				oc.extra[7] =
+					(Rect){ cx + bw + 12, cy, bw, 38 };
+				ui_draw_button(oc.extra[7], _("Leave room"),
+					       FALSE);
+			}
 		}
 		oc.secondary = (Rect){ cx, bottom, 110, 36 };
 		ui_draw_button(oc.secondary, _("Close"), FALSE);
@@ -2015,6 +2033,8 @@ void ui_openchat_draw(void)
 		g_autofree char *msg =
 			oc.confirm == CONF_LEAVE ?
 				g_strdup_printf(_("Leave %s?"), who) :
+			oc.confirm == CONF_LEAVE_CHAT ?
+				g_strdup_printf(_("Leave room %s?"), who) :
 			oc.confirm == CONF_KICK ?
 				g_strdup_printf(
 					_("Kick %s from this OpenChat?"), who) :
@@ -2037,6 +2057,6 @@ void ui_openchat_draw(void)
 	}
 
 	if (oc.notice && *oc.notice)
-		ui_draw_label(oc.notice, (Rect){ cx, bottom - 32, cw, 28 }, 13,
+		ui_draw_label(oc.notice, (Rect){ cx, bottom - 40, cw, 36 }, 13,
 			      500, UI_MUTED, TRUE);
 }

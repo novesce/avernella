@@ -323,17 +323,75 @@ static int add_net_rule(int ruleset, uint16_t port, uint64_t access)
 #define ARRAY_SIZE(x) (sizeof(x) / sizeof((x)[0]))
 #endif
 
-static void build_xdg_path(char *buf, size_t len, const char *env_var,
-			   const char *home_rel, const char *sub)
+static void build_xdg_base(char *buf, size_t len, const char *env_var,
+			   const char *home_rel)
 {
 	const char *base = getenv(env_var);
 	const char *home = getenv("HOME");
 
 	buf[0] = '\0';
 	if (base && base[0] == '/')
-		snprintf(buf, len, "%s/%s", base, sub);
+		snprintf(buf, len, "%s", base);
 	else if (home && home[0] == '/')
-		snprintf(buf, len, "%s/%s/%s", home, home_rel, sub);
+		snprintf(buf, len, "%s/%s", home, home_rel);
+}
+
+static void build_xdg_path(char *buf, size_t len, const char *env_var,
+			   const char *home_rel, const char *sub)
+{
+	char base[PATH_MAX];
+
+	buf[0] = '\0';
+	build_xdg_base(base, sizeof(base), env_var, home_rel);
+	if (base[0])
+		snprintf(buf, len, "%s/%s", base, sub);
+}
+
+/*
+ * Landlock rules bind to an existing inode via open(O_PATH). On a fresh
+ * Flatpak or native install, Avernella's XDG subdirectories do not exist yet
+ * when the worker/UI enters Landlock, so add_path_rule() would skip them on
+ * ENOENT and later session creation would fail with EACCES. Create missing
+ * directories with 0700 permissions before attaching the rule.
+ */
+static void ensure_dir_0700(const char *path)
+{
+	char tmp[PATH_MAX];
+	size_t len;
+
+	if (!path || path[0] != '/')
+		return;
+	len = strlen(path);
+	if (len >= sizeof(tmp))
+		return;
+	memcpy(tmp, path, len + 1);
+	for (char *p = tmp + 1; *p; p++) {
+		if (*p != '/')
+			continue;
+		*p = '\0';
+		(void)mkdir(tmp, 0700);
+		*p = '/';
+	}
+	(void)mkdir(tmp, 0700);
+}
+
+static bool has_legacy_state_dir(const char *state_base)
+{
+	static const char *const legacy[] = { "kitatide", "line-linux" };
+	char probe[PATH_MAX];
+	struct stat st;
+
+	if (!state_base || state_base[0] != '/')
+		return false;
+	for (size_t i = 0; i < ARRAY_SIZE(legacy); i++) {
+		int n = snprintf(probe, sizeof(probe), "%s/%s", state_base,
+				 legacy[i]);
+
+		if (n > 0 && (size_t)n < sizeof(probe) &&
+		    lstat(probe, &st) == 0)
+			return true;
+	}
+	return false;
 }
 
 static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
@@ -419,6 +477,7 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 	build_xdg_path(path, sizeof(path), "XDG_CONFIG_HOME", ".config",
 		       "avernella");
 	if (path[0]) {
+		ensure_dir_0700(path);
 		err = add_path_rule(ruleset, path, rw, handled_fs);
 		if (err)
 			return err;
@@ -427,6 +486,7 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 	build_xdg_path(path, sizeof(path), "XDG_CACHE_HOME", ".cache",
 		       "avernella");
 	if (path[0]) {
+		ensure_dir_0700(path);
 		err = add_path_rule(ruleset, path, rw, handled_fs);
 		if (err)
 			return err;
@@ -435,21 +495,44 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 	build_xdg_path(path, sizeof(path), "XDG_DATA_HOME", ".local/share",
 		       "avernella");
 	if (path[0]) {
+		ensure_dir_0700(path);
 		err = add_path_rule(ruleset, path, rw, handled_fs);
 		if (err)
 			return err;
 	}
 
-	build_xdg_path(path, sizeof(path), "XDG_STATE_HOME", ".local/state",
-		       "avernella");
-	if (path[0]) {
-		err = add_path_rule(ruleset, path, rw, handled_fs);
-		if (err)
-			return err;
+	{
+		char state_base[PATH_MAX];
+		struct stat st;
+
+		build_xdg_base(state_base, sizeof(state_base), "XDG_STATE_HOME",
+			       ".local/state");
+		if (state_base[0]) {
+			snprintf(path, sizeof(path), "%s/avernella",
+				 state_base);
+			if (lstat(path, &st) == 0) {
+				err = add_path_rule(ruleset, path, rw,
+						    handled_fs);
+			} else if (has_legacy_state_dir(state_base)) {
+				/*
+				 * Preserve one-time migration from kitatide or
+				 * line-linux without pre-creating avernella/.
+				 */
+				err = add_path_rule(ruleset, state_base, rw,
+						    handled_fs);
+			} else {
+				ensure_dir_0700(path);
+				err = add_path_rule(ruleset, path, rw,
+						    handled_fs);
+			}
+			if (err)
+				return err;
+		}
 	}
 
 	if (runtime && runtime[0] == '/') {
 		snprintf(path, sizeof(path), "%s/avernella", runtime);
+		ensure_dir_0700(path);
 		err = add_path_rule(ruleset, path, rw, handled_fs);
 		if (err)
 			return err;

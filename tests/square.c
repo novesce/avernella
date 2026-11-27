@@ -420,6 +420,13 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 						  "\",\"4\":\"Main Room\"}}");
 	}
 	if (!strcmp(method, "createSquare")) {
+		J *sq = field(req, "2:obj");
+		J *creator = field(req, "3:obj");
+
+		g_assert_nonnull(strfield(sq, "4:str"));
+		g_assert_null(field(sq, "12:i32"));
+		g_assert_null(field(creator, "7:i32"));
+		g_assert_null(field(creator, "8:i32"));
 		return json_tokener_parse(
 			"{\"1\":{\"1\":\"" SQ_MID "\",\"2\":\"New Club\"},"
 			"\"2\":{\"1\":\"" ME_MEM "\",\"2\":\"" SQ_MID

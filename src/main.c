@@ -2105,7 +2105,20 @@ static J *square_dispatch(struct line_worker *w, const char *method, J *params,
 				g_hash_table_remove(w->chats, chat);
 				json_object_object_del(w->opened_chats, chat);
 				json_object_object_del(w->unread_heads, chat);
+				g_hash_table_remove(w->history_cache, chat);
 			}
+			clear_global_search(w);
+		}
+		return res;
+	}
+	if (!strcmp(method, "squareLeaveChat")) {
+		J *res = line_square_leave_chat(s, chat, 0, error);
+
+		if (res && chat) {
+			g_hash_table_remove(w->chats, chat);
+			json_object_object_del(w->opened_chats, chat);
+			json_object_object_del(w->unread_heads, chat);
+			g_hash_table_remove(w->history_cache, chat);
 			clear_global_search(w);
 		}
 		return res;

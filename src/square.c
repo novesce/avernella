@@ -2317,6 +2317,18 @@ J *line_square_leave_chat(Line *s, const char *chat_mid, gint64 member_rev,
 {
 	if (!line_square_id(chat_mid, 'm'))
 		return problem(error, "Choose an OpenChat room to leave.");
+	if (member_rev <= 0) {
+		g_autoptr(J) creq = obj();
+		g_autoptr(GError) ignored = NULL;
+
+		put_str(creq, "1:str", chat_mid);
+		g_autoptr(J) creply =
+			square_rpc(s, "getSquareChat", creq, &ignored);
+		J *cmem = field(creply, "2");
+
+		if (cmem)
+			member_rev = json_object_get_int64(field(cmem, "5"));
+	}
 	g_autoptr(J) req = obj();
 
 	put_str(req, "2:str", chat_mid);
@@ -2366,17 +2378,25 @@ J *line_square_create(Line *s, const char *name, const char *description,
 			       "Enter a join code of 4 to 32 characters.");
 	g_autoptr(J) req = obj();
 	J *sq = obj(), *creator = obj(), *jm = obj();
+	/*
+	 * Match LINE Android SquareRemoteDataSourceImpl.createSquare:
+	 * supply a valid default OBS cover hash (SquareDefaultProfileUtil)
+	 * and Thrift primitive defaults (revision=0), without server-assigned
+	 * state/membershipState/role fields.
+	 */
+	static const char *const default_cover =
+		"0h6tJfahRYaVt3H0eLAsAWDFheczgHd3wTCTx2eApNKSoefHNVGRdwfgxbdgUMLi8MSngnPFMeNmpbLi8MSngnPFMeNmpbLi8MSngnPQ";
 
 	put_str(sq, "2:str", clean_name);
 	if (*clean_welcome)
 		put_str(sq, "3:str", clean_welcome);
-	if (*clean_desc)
-		put_str(sq, "5:str", clean_desc);
+	put_str(sq, "4:str", default_cover);
+	put_str(sq, "5:str", clean_desc);
 	put_bool(sq, "6:bool", searchable);
 	put_num(sq, "7:i32", 1); /* SquareType.OPEN */
 	put_num(sq, "8:i32", category_id > 0 ? category_id : 1);
-	put_bool(sq, "11:bool", TRUE); /* ableToUseInvitationTicket */
-	put_num(sq, "12:i32", 0); /* SquareState.ALIVE */
+	put_num(sq, "10:i64", 0); /* revision */
+	put_bool(sq, "11:bool", FALSE); /* ableToUseInvitationTicket */
 	put_num(jm, "1:i32",
 		join_method >= 0 && join_method <= 2 ? join_method : 0);
 	if (join_method == SQ_JOIN_CODE) {
@@ -2399,9 +2419,8 @@ J *line_square_create(Line *s, const char *name, const char *description,
 	put_num(sq, "15:i32", 1); /* BooleanState.OFF (adultOnly) */
 
 	put_str(creator, "3:str", clean_nick);
-	put_bool(creator, "5:bool", TRUE);
-	put_num(creator, "7:i32", 1); /* SquareMembershipState.JOINED */
-	put_num(creator, "8:i32", 1); /* SquareMemberRole.ADMIN */
+	put_bool(creator, "5:bool", FALSE); /* ableToReceiveMessage */
+	put_num(creator, "9:i64", 0); /* revision */
 
 	put_num(req, "1:i32", seq);
 	put(req, "2:obj", sq);

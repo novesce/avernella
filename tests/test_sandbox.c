@@ -817,6 +817,84 @@ static void test_supervisor_respawn_after_sigsys(void)
 	avernella_supervisor_stop(&slot);
 }
 
+static int fresh_state_worker(int ctrl_fd, uint32_t active, void *userdata)
+{
+	const char *session_file = userdata;
+	struct avernella_ipc_hdr hdr;
+	int fd;
+
+	if (!(active & AVSB_ACTIVE_LANDLOCK_FS))
+		return 10;
+
+	/* Fresh install: state dir must be created & writable for login. */
+	fd = open(session_file, O_CREAT | O_WRONLY | O_TRUNC | O_CLOEXEC, 0600);
+	if (fd < 0)
+		return 11;
+	if (write(fd, "{\"access\":\"ok\"}", 15) != 15) {
+		close(fd);
+		return 12;
+	}
+	close(fd);
+
+	/* /etc/passwd remains blocked. */
+	fd = open("/etc/passwd", O_RDONLY | O_CLOEXEC);
+	if (fd >= 0 || errno != EACCES)
+		return 13;
+
+	memset(&hdr, 0, sizeof(hdr));
+	hdr.op = IPC_OP_REPLY_OK;
+	hdr.payload_len = 2;
+	(void)avernella_ipc_send(ctrl_fd, &hdr, "ok", NULL, 0);
+	return 0;
+}
+
+static void test_ui_landlock_fresh_state_dir(void)
+{
+	struct avernella_sandbox_opts opts;
+	struct avernella_worker_proc proc;
+	struct avernella_ipc_hdr hdr;
+	char buf[8];
+	int status = 0;
+
+	/* Point XDG_STATE_HOME at an empty directory (like a fresh Flatpak). */
+	g_autofree char *fresh_root =
+		g_dir_make_tmp("avernella-fresh-state-XXXXXX", NULL);
+	g_assert_nonnull(fresh_root);
+	g_autofree char *session_file =
+		g_build_filename(fresh_root, "avernella", "session.json", NULL);
+
+	g_autofree char *prev_state = g_strdup(g_getenv("XDG_STATE_HOME"));
+
+	g_assert_true(g_setenv("XDG_STATE_HOME", fresh_root, TRUE));
+
+	memset(&opts, 0, sizeof(opts));
+	opts.role = SANDBOX_ROLE_UI;
+	opts.keep_stderr = true;
+
+	g_assert_cmpint(avernella_spawn_worker(&opts, fresh_state_worker,
+					       session_file, &proc),
+			==, 0);
+	g_assert_cmpint(avernella_ipc_recv(proc.ctrl_fd, &hdr, buf, sizeof(buf),
+					   NULL, 0, NULL),
+			==, 0);
+	g_assert_cmpuint(hdr.op, ==, IPC_OP_REPLY_OK);
+	g_assert_cmpint(waitpid(proc.pid, &status, 0), ==, proc.pid);
+	g_assert_true(WIFEXITED(status));
+	g_assert_cmpint(WEXITSTATUS(status), ==, 0);
+	proc.pid = -1;
+	avernella_worker_close(&proc);
+
+	if (prev_state)
+		g_setenv("XDG_STATE_HOME", prev_state, TRUE);
+	else
+		g_unsetenv("XDG_STATE_HOME");
+	unlink(session_file);
+	g_autofree char *av_dir =
+		g_build_filename(fresh_root, "avernella", NULL);
+	rmdir(av_dir);
+	rmdir(fresh_root);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
@@ -831,6 +909,8 @@ int main(int argc, char **argv)
 			test_media_worker_isolation);
 	g_test_add_func("/security/ui-landlock-blocks-secrets",
 			test_ui_landlock_blocks_secrets);
+	g_test_add_func("/security/ui-landlock-fresh-state-dir",
+			test_ui_landlock_fresh_state_dir);
 	g_test_add_func("/security/vault-memfd-secret-and-ipc",
 			test_vault_memfd_secret_and_ipc);
 	g_test_add_func("/security/supervisor-respawn-after-sigsys",
