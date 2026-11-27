@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vk_present.h"
+#include "vk_cache.h"
 #include "vk_frame.h"
+#include "vk_nv12.h"
 #include <SDL.h>
 #include <SDL_vulkan.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-
-#define FRAME_WAIT_NS UINT64_C(8000000)
 
 struct present_image {
 	VkImage image;
@@ -31,11 +31,13 @@ struct swapchain {
 	VkSwapchainKHR handle;
 	struct present_image *images;
 	uint32_t count;
-	bool presented;
+	bool presented, query_timing;
 };
 
 struct vk_present {
 	struct vk_ctx ctx;
+	struct vk_nv12 *nv12;
+	bool imported;
 	struct swapchain *chain, *retired;
 	VkExtent2D extent;
 	VkFormat format;
@@ -49,7 +51,7 @@ struct vk_present {
 	uint32_t acquired_index;
 	VkRect2D damage;
 	struct frame_slot slots[VK_PRESENT_SLOTS];
-	uint64_t submitted;
+	uint64_t submitted, last_import, wait_ns;
 };
 
 static VkResult create_surface(VkInstance instance, void *window,
@@ -299,9 +301,28 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	SDL_Vulkan_GetDrawableSize(window, &w, &h);
 	if (w <= 0 || h <= 0)
 		return VK_NOT_READY;
-	VkSurfaceCapabilitiesKHR caps;
-	VkResult result = vkGetPhysicalDeviceSurfaceCapabilitiesKHR(
-		ctx->gpu, ctx->surface, &caps);
+	bool latest = surface_latest_ready(ctx);
+	VkSurfacePresentModeKHR mode = {
+		.sType = VK_STRUCTURE_TYPE_SURFACE_PRESENT_MODE_KHR,
+		.presentMode = latest ? VK_PRESENT_MODE_FIFO_LATEST_READY_KHR :
+					VK_PRESENT_MODE_FIFO_KHR,
+	};
+	VkPhysicalDeviceSurfaceInfo2KHR surface = {
+		.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SURFACE_INFO_2_KHR,
+		.pNext = &mode,
+		.surface = ctx->surface,
+	};
+	VkPresentTimingSurfaceCapabilitiesEXT timing = {
+		.sType =
+			VK_STRUCTURE_TYPE_PRESENT_TIMING_SURFACE_CAPABILITIES_EXT,
+	};
+	VkSurfaceCapabilities2KHR info2 = {
+		.sType = VK_STRUCTURE_TYPE_SURFACE_CAPABILITIES_2_KHR,
+		.pNext = ctx->present_timing ? &timing : NULL,
+	};
+	VkResult result = vkGetPhysicalDeviceSurfaceCapabilities2KHR(
+		ctx->gpu, &surface, &info2);
+	VkSurfaceCapabilitiesKHR caps = info2.surfaceCapabilities;
 
 	if (result != VK_SUCCESS)
 		return result;
@@ -323,9 +344,18 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	result = vk_surface_format(ctx->gpu, ctx->surface, &format);
 	if (result != VK_SUCCESS)
 		return result;
-	/* FIFO paces presentation without spinning or tearing. */
-	uint32_t count = caps.minImageCount + 1;
+	/* One acquired image at a time. Keep enough images for this
+	 * presentation mode and our two upload/command slots.
+	 */
+	uint32_t count = caps.minImageCount > VK_PRESENT_SLOTS ?
+				 caps.minImageCount :
+				 VK_PRESENT_SLOTS;
 
+	/* Latest-ready needs a spare queued replacement while one image is
+	 * scanned out. Two images repeatedly stall acquisition on NVIDIA.
+	 */
+	if (latest && count < UINT32_MAX)
+		count++;
 	if (caps.maxImageCount && count > caps.maxImageCount)
 		count = caps.maxImageCount;
 	VkCompositeAlphaFlagsKHR alpha = caps.supportedCompositeAlpha;
@@ -347,10 +377,12 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 	bool retain = ctx->incremental_present &&
 		      caps.currentTransform ==
 			      VK_SURFACE_TRANSFORM_IDENTITY_BIT_KHR;
-	bool latest = surface_latest_ready(ctx);
 	VkSwapchainCreateInfoKHR info = {
 		.sType = VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
 		.surface = ctx->surface,
+		.flags = timing.presentTimingSupported ?
+				 VK_SWAPCHAIN_CREATE_PRESENT_TIMING_BIT_EXT :
+				 0,
 		.oldSwapchain = p->chain ? p->chain->handle : VK_NULL_HANDLE,
 		.minImageCount = count,
 		.imageFormat = format.format,
@@ -360,8 +392,7 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		.imageUsage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
 		.preTransform = caps.currentTransform,
 		.compositeAlpha = alpha & (0u - alpha),
-		.presentMode = latest ? VK_PRESENT_MODE_FIFO_LATEST_READY_KHR :
-					VK_PRESENT_MODE_FIFO_KHR,
+		.presentMode = mode.presentMode,
 		/* Reacquired images must also retain previously obscured pixels. */
 		.clipped = !retain,
 	};
@@ -380,6 +411,16 @@ static VkResult rebuild_swapchain(struct vk_present *p, SDL_Window *window)
 		return result;
 	}
 	p->chain = chain;
+	chain->query_timing = timing.presentTimingSupported;
+	SDL_DisplayMode display;
+	int screen = SDL_GetWindowDisplayIndex(window);
+
+	p->wait_ns =
+		screen >= 0 && !SDL_GetCurrentDisplayMode(screen, &display) &&
+				display.refresh_rate > 0 ?
+			UINT64_C(1000000000) / display.refresh_rate /
+				VK_PRESENT_SLOTS :
+			0;
 	result = init_images(p, format.format);
 	if (result != VK_SUCCESS)
 		return result;
@@ -462,6 +503,8 @@ static VkResult stage_primitives(struct vk_present *p, struct frame_slot *slot,
 static VkResult record_frame(struct vk_present *p, VkCommandBuffer cmd,
 			     const struct present_image *image,
 			     VkDeviceAddress address, uint32_t count,
+			     const struct ui_prim *items,
+			     const struct vk_nv12_batch *external,
 			     VkClearColorValue clear, bool discard,
 			     VkRect2D area, uint32_t index,
 			     vk_present_upload_fn upload, void *user)
@@ -474,6 +517,8 @@ static VkResult record_frame(struct vk_present *p, VkCommandBuffer cmd,
 
 	if (result != VK_SUCCESS)
 		return result;
+	if (external)
+		vk_nv12_barriers(external, cmd, p->ctx.family, true);
 	if (upload) {
 		result = upload(user, cmd, index);
 		if (result != VK_SUCCESS)
@@ -492,7 +537,9 @@ static VkResult record_frame(struct vk_present *p, VkCommandBuffer cmd,
 			     VK_IMAGE_LAYOUT_UNDEFINED,
 		   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 	vk_ui_draw_mode(&p->ctx, cmd, p->pipeline, image->view, p->extent, area,
-			&push, count, clear, discard);
+			&push, count, clear, discard, external, items);
+	if (external)
+		vk_nv12_barriers(external, cmd, p->ctx.family, false);
 	transition(cmd, image->image, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		   VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 	return vkEndCommandBuffer(cmd);
@@ -557,9 +604,17 @@ static VkRect2D include_damage(VkRect2D old, VkRect2D delta)
 	return delta;
 }
 
-VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
-			 uint32_t count, VkClearColorValue clear,
-			 vk_present_upload_fn upload, void *user)
+bool vk_present_dmabuf_supported(const struct vk_present *p)
+{
+	return p->nv12 != NULL;
+}
+
+VkResult vk_present_draw_dmabuf(struct vk_present *p,
+				const struct ui_prim *prims, uint32_t count,
+				VkClearColorValue clear,
+				vk_present_upload_fn upload, void *user,
+				const struct gpu_dmabuf *const frames[3],
+				unsigned int *rejected)
 {
 	VkDevice device = p->ctx.device;
 	uint32_t slot_index = p->submitted % VK_PRESENT_SLOTS;
@@ -592,18 +647,40 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 				return result;
 		}
 	}
-	result = wait_for(p, slot->done, FRAME_WAIT_NS);
+	/* A busy upload slot leaves the UI free to service input. Give
+	 * only the WSI acquisition half a display period to make progress.
+	 */
+	result = wait_for(p, slot->done, 0);
 	if (result != VK_SUCCESS)
 		return result;
-	result = stage_primitives(p, slot, prims, count, &address);
-	if (result != VK_SUCCESS)
-		return result;
+	struct vk_nv12_batch batch = { 0 };
+	bool active = frames && (frames[0] || frames[1] || frames[2]);
+
+	if (active || p->imported) {
+		if (!p->nv12) {
+			for (unsigned int i = 0; i < 3; i++)
+				if (frames && frames[i])
+					*rejected |= 1u << i;
+			return VK_NOT_READY;
+		}
+		uint64_t completed = 0;
+
+		result = vkGetSemaphoreCounterValue(device, p->timeline,
+						    &completed);
+		if (result != VK_SUCCESS)
+			return result;
+		p->imported = active || completed < p->last_import;
+		result = vk_nv12_prepare(p->nv12, p->format, frames, completed,
+					 &batch, rejected);
+		if (result != VK_SUCCESS)
+			return result;
+	}
 	/* Retain the acquisition across a slow present fence. The acquire
 	 * semaphore is already signalled and must only be consumed once.
 	 */
 	if (!p->acquired) {
 		result = vkAcquireNextImageKHR(device, p->chain->handle,
-					       FRAME_WAIT_NS, slot->acquire,
+					       p->wait_ns, slot->acquire,
 					       VK_NULL_HANDLE,
 					       &p->acquired_index);
 		if (result == VK_ERROR_OUT_OF_DATE_KHR)
@@ -646,13 +723,14 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 		area = image->repair;
 		image->repair = (VkRect2D){ 0 };
 	}
-	bool full_canvas =
-		p->opaque && count && prims[0].prim_type == UI_PRIM_CANVAS &&
-		prims[0].clip_rect_idx == UI_NO_CLIP && prims[0].pos[0] == 0 &&
-		prims[0].pos[1] == 0 && prims[0].size[0] == p->extent.width &&
-		prims[0].size[1] == p->extent.height;
-	result = record_frame(p, slot->cmd, image, address, count, clear,
-			      full_canvas, area, slot_index, upload, user);
+	bool covered = p->opaque && vk_visible_layers(&prims, &count, area);
+
+	result = stage_primitives(p, slot, prims, count, &address);
+	if (result != VK_SUCCESS)
+		return result;
+	result = record_frame(p, slot->cmd, image, address, count, prims,
+			      active ? &batch : NULL, clear, covered, area,
+			      slot_index, upload, user);
 	if (result != VK_SUCCESS)
 		return result;
 	VkCommandBufferSubmitInfo command = {
@@ -687,6 +765,10 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	if (result != VK_SUCCESS)
 		return result;
 	slot->done = ++p->submitted;
+	if (active) {
+		p->last_import = slot->done;
+		vk_nv12_submitted(&batch, slot->done);
+	}
 	p->acquired = false;
 	/* Damage is relative to the previous present on the swapchain, even
 	 * when a different swapchain image was just acquired and redrawn. A
@@ -724,6 +806,18 @@ VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
 	image->pending = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR ||
 			 result == VK_ERROR_OUT_OF_DATE_KHR ||
 			 result == VK_ERROR_SURFACE_LOST_KHR;
+	if (p->previous_present && p->chain->query_timing) {
+		VkSwapchainTimingPropertiesEXT props = {
+			.sType =
+				VK_STRUCTURE_TYPE_SWAPCHAIN_TIMING_PROPERTIES_EXT,
+		};
+		if (vkGetSwapchainTimingPropertiesEXT(device, p->chain->handle,
+						      &props,
+						      NULL) == VK_SUCCESS &&
+		    props.refreshDuration)
+			p->wait_ns = props.refreshDuration / VK_PRESENT_SLOTS;
+		p->chain->query_timing = false;
+	}
 	p->chain->presented |= image->pending;
 	p->rebuild = p->suboptimal || result == VK_SUBOPTIMAL_KHR ||
 		     result == VK_ERROR_OUT_OF_DATE_KHR;
@@ -740,8 +834,13 @@ struct vk_present *vk_present_open(SDL_Window *window, uint32_t vendor,
 	p->log = log;
 	p->opaque = opaque;
 	VkResult result = init_context(p, window, vendor);
-	if (result == VK_SUCCESS)
+
+	if (result == VK_SUCCESS) {
+		p->ctx.log_pipeline = log;
+		vk_cache_open(&p->ctx);
+		p->nv12 = vk_nv12_open(&p->ctx);
 		result = init_frames(p);
+	}
 	if (result == VK_SUCCESS)
 		result = rebuild_swapchain(p, window);
 	if (result == VK_NOT_READY) {
@@ -775,6 +874,8 @@ void vk_present_close(struct vk_present *p)
 		}
 		vkDestroySemaphore(p->ctx.device, p->timeline, NULL);
 		vkDestroyCommandPool(p->ctx.device, p->pool, NULL);
+		vk_nv12_close(p->nv12);
+		vk_cache_save(&p->ctx);
 		vk_ctx_destroy(&p->ctx);
 	}
 	free(p);

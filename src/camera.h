@@ -5,11 +5,35 @@
 
 struct line_camera;
 
+/* NV12, one DRM object and two explicit plane layouts. The GBytes which
+ * owns this record also holds the producer buffer until the codec is done.
+ */
+struct line_capture_dma {
+	int fd;
+	guint32 offset[2], stride[2];
+	guint64 size, modifier;
+	void (*reject)(gpointer owner);
+	gpointer owner;
+};
+
+/* Tiled layouts are validated by the importing driver. A linear plane's
+ * last visible row must also fit, with overflow-safe offset arithmetic.
+ */
+static inline gboolean line_capture_plane_valid(guint64 size, guint64 offset,
+						guint32 pitch, guint width,
+						guint rows, guint64 modifier)
+{
+	if (offset >= size || pitch < width || !rows)
+		return FALSE;
+	return modifier || (guint64)(rows - 1) * pitch + width <= size - offset;
+}
+
 struct line_camera_frame {
 	const guint8 *plane[3];
 	int stride[3];
 	unsigned int width, height;
 	unsigned int rotation;
+	GBytes *capture_dma; /* optional retained PipeWire NV12 frame */
 };
 
 static inline gboolean line_camera_frame_size_valid(unsigned int width,
@@ -53,6 +77,27 @@ static inline void line_camera_i420_frame(struct line_camera_frame *frame,
 		.width = width,
 		.height = height,
 	};
+}
+
+static inline void line_capture_frame(struct line_camera_frame *frame,
+				      GBytes *storage, gboolean dma, guint w,
+				      guint h)
+{
+	if (dma)
+		*frame = (struct line_camera_frame){ .width = w,
+						     .height = h,
+						     .capture_dma = storage };
+	else
+		line_camera_i420_frame(frame, g_bytes_get_data(storage, NULL),
+				       w, h);
+}
+
+static inline void line_capture_reject(GBytes *storage)
+{
+	const struct line_capture_dma *dma = g_bytes_get_data(storage, NULL);
+
+	if (g_bytes_get_size(storage) == sizeof(*dma) && dma->reject)
+		dma->reject(dma->owner);
 }
 
 static inline void line_camera_pack_i420(guint8 *out,

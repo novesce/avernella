@@ -3,6 +3,21 @@
 #include "camera.h"
 
 struct call_vp8_encoder;
+struct AVFrame;
+struct AVBufferRef;
+
+/* FFmpeg VA-API path only. dst retains the producer lease until its last
+ * reference is released. No pixel memory is mapped into the CPU.
+ */
+gboolean call_capture_import_nv12(struct AVFrame *dst,
+				  struct AVBufferRef *frames_ctx,
+				  const struct line_camera_frame *frame);
+
+/* Verify VP8 encode and direct import on the selected encoder before
+ * offering this exact size and DRM modifier to the compositor.
+ */
+gboolean call_vp8_capture_probe(guint width, guint height, guint fps,
+				guint kbps, guint64 *modifier);
 
 /* Returns NULL when no GPU can encode the requested VP8 stream. */
 struct call_vp8_encoder *call_vp8_encoder_open(guint width, guint height,

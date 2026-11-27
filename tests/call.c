@@ -281,9 +281,10 @@ struct line_screencast {
 	gboolean ready, picker;
 };
 
-struct line_screencast *line_screencast_start(unsigned int width,
-					      unsigned int height,
-					      unsigned int fps, GError **error)
+struct line_screencast *
+line_screencast_start(unsigned int width, unsigned int height, unsigned int fps,
+		      guint kbps G_GNUC_UNUSED,
+		      line_cast_probe_fn probe G_GNUC_UNUSED, GError **error)
 {
 	(void)error;
 	g_assert_true(share_fixture);
@@ -355,8 +356,9 @@ static GBytes *fixture_screen_pixels(void)
 }
 
 GBytes *line_screencast_take(struct line_screencast *cast, unsigned int *width,
-			     unsigned int *height, guint64 *time)
+			     unsigned int *height, guint64 *time, gboolean *dma)
 {
+	*dma = FALSE;
 	if (!cast->ready)
 		return NULL;
 	cast->ready = FALSE;
@@ -374,12 +376,38 @@ void __real_SDL_CloseAudioDevice(SDL_AudioDeviceID dev);
 int __real_SDL_QueueAudio(SDL_AudioDeviceID dev, const void *data, Uint32 len);
 Uint32 __real_SDL_DequeueAudio(SDL_AudioDeviceID dev, void *data, Uint32 len);
 
+static SDL_AudioCallback real_mic_callback;
+static void *real_mic_data;
+static void fixture_mic_callback(void *unused, Uint8 *stream, int len)
+{
+	static guint phase;
+	gint16 *pcm = (gint16 *)stream;
+
+	(void)unused;
+	if (group_fixture) {
+		for (guint i = microphone_channels - 1; i < len / sizeof(*pcm);
+		     i += microphone_channels) {
+			pcm[i] = 24 * (MIN((int)phase, 240 - (int)phase) - 60);
+			phase = (phase + 1) % 240;
+		}
+	}
+	real_mic_callback(real_mic_data, stream, len);
+}
+
 SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(const char *name, int input,
 					     const SDL_AudioSpec *want,
 					     SDL_AudioSpec *got, int flags)
 {
+	SDL_AudioSpec requested = *want;
+
+	if (input && want->callback) {
+		real_mic_callback = want->callback;
+		real_mic_data = want->userdata;
+		requested.callback = fixture_mic_callback;
+		requested.userdata = NULL;
+	}
 	SDL_AudioDeviceID device =
-		__real_SDL_OpenAudioDevice(name, input, want, got, flags);
+		__real_SDL_OpenAudioDevice(name, input, &requested, got, flags);
 	if (device && input)
 		microphone_channels = got ? got->channels : want->channels;
 	if (device)

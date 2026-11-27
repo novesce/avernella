@@ -9,10 +9,19 @@
 #include <poll.h>
 #include <string.h>
 #include <vpx/vp8cx.h>
+#include <vpx/vp8dx.h>
+#include <vpx/vpx_decoder.h>
 #include <vpx/vpx_encoder.h>
 #if CALL_HWDECODE
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
+#include <fcntl.h>
+/* SPA headers use GNU statement expressions. */
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#include "screencast_dma.h"
+#pragma GCC diagnostic pop
 
 static guint hardware_transfers;
 static gboolean fail_transfer;
@@ -81,8 +90,9 @@ static const guint8 gray_delta[] = {
 };
 
 static struct encoder_fixture {
-	guint opens, frames, closes, kbps, fps;
-	gboolean enabled, fail, force_key;
+	const vpx_codec_cx_pkt_t *packet;
+	guint opens, frames, closes, kbps, fps, dma_frames;
+	gboolean enabled, fail, force_key, last_key;
 } encoder;
 
 struct call_vp8_encoder *__wrap_call_vp8_encoder_open(guint w, guint h,
@@ -111,8 +121,19 @@ gboolean __wrap_call_vp8_encoder_frame(struct call_vp8_encoder *enc,
 	g_assert_cmpuint(frame->width, ==, 16);
 	g_assert_cmpuint(frame->height, ==, 16);
 	encoder.frames++;
+	if (frame->capture_dma) {
+		g_assert_null(frame->plane[0]);
+		encoder.dma_frames++;
+	}
 	if (encoder.fail)
 		return FALSE;
+	encoder.last_key = force_key;
+	if (encoder.packet) {
+		*key = encoder.packet->data.frame.flags & VPX_FRAME_IS_KEY;
+		*data = encoder.packet->data.frame.buf;
+		*size = encoder.packet->data.frame.sz;
+		return TRUE;
+	}
 	*key = force_key || encoder.force_key;
 	*data = *key ? gray_key : gray_delta;
 	*size = *key ? sizeof(gray_key) : sizeof(gray_delta);
@@ -551,6 +572,402 @@ static gboolean source_fragment(struct source_view *view, srtp_t sender,
 	g_assert_cmpint(srtp_protect(sender, packet, &n), ==,
 			srtp_err_status_ok);
 	return call_video_receive(view->rx, packet, n, source_display, view);
+}
+
+static void receiver_report_wrap(void)
+{
+	/* Start high enough to exercise both the first report and wrap.
+	 * A late packet from the previous reporting interval repairs its
+	 * cumulative loss without inventing another sequence-number cycle.
+	 */
+	static const guint16 sequences[] = { 65533, 65535, 65534, 0 };
+	static const guint32 expected_high[] = { 65533, 65535, 65535, 65536 };
+	static const guint fraction[] = { 0, 128, 0, 0 };
+	static const guint total[] = { 0, 1, 0, 0 };
+	struct loop loop = { 0 };
+	struct source_view view = { 0 };
+	srtp_t sender, observer;
+	gint64 now = g_get_monotonic_time();
+	guint32 ts = G_MAXUINT32 - 2 * 90000;
+
+	prepare(&loop);
+	view.rx = loop.rx;
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	g_assert_true(call_srtp_open(&observer, key_b, ssrc_specific, 102));
+	for (guint i = 0; i < G_N_ELEMENTS(sequences); i++) {
+		guint8 packet[128] = { 0x80, 0x80 | 97, 0, 0, 0,   0,	0,
+				       0,    0,		0, 0, 101, 0x10 };
+		guint16 seq = GUINT16_TO_BE(sequences[i]);
+		guint32 ticks = GUINT32_TO_BE(
+			ts + (guint16)(sequences[i] - sequences[0]) * 90000u);
+		int size = 13 + sizeof(gray_key);
+
+		memcpy(packet + 2, &seq, 2);
+		memcpy(packet + 4, &ticks, 4);
+		memcpy(packet + 13, gray_key, sizeof(gray_key));
+		g_assert_cmpint(srtp_protect(sender, packet, &size), ==,
+				srtp_err_status_ok);
+		(void)call_video_receive_at(loop.rx, packet, size, now,
+					    source_display, &view);
+		g_ptr_array_set_size(loop.packets, 0);
+		call_video_poll(loop.rx, loop.rx, now, FALSE, collect, &loop,
+				source_display, &view);
+		gboolean found = FALSE;
+
+		for (guint j = 0; j < loop.packets->len; j++) {
+			gsize len;
+			const guint8 *wire =
+				g_bytes_get_data(loop.packets->pdata[j], &len);
+
+			if (wire[1] != 201)
+				continue;
+			g_assert_cmpuint(len, <=, sizeof(packet));
+			memcpy(packet, wire, len);
+			size = len;
+			g_assert_cmpint(srtp_unprotect_rtcp(observer, packet,
+							    &size),
+					==, srtp_err_status_ok);
+			g_assert_cmpuint(packet[12], ==, fraction[i]);
+			g_assert_cmpuint((packet[13] << 16) |
+						 (packet[14] << 8) | packet[15],
+					 ==, total[i]);
+			guint32 high;
+
+			memcpy(&high, packet + 16, sizeof(high));
+			g_assert_cmpuint(GUINT32_FROM_BE(high), ==,
+					 expected_high[i]);
+			found = TRUE;
+		}
+		g_assert_true(found);
+		now += G_USEC_PER_SEC;
+	}
+	srtp_dealloc(sender);
+	srtp_dealloc(observer);
+	done(&loop);
+}
+
+static void discardable_picture(gconstpointer mode)
+{
+	gboolean disposable = GPOINTER_TO_INT(mode);
+	struct source_view view = { 0 };
+	struct loop loop = { 0 };
+	srtp_t sender;
+	gint64 now = g_get_monotonic_time();
+
+	prepare(&loop);
+	view.rx = loop.rx;
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < 5; i++) {
+		if (i == 2)
+			continue; /* An interior fragment of picture 1. */
+		gboolean fragment = i == 1 || i == 3;
+		guint8 buf[128] = { 0x80, 97, 0, i,
+				    0,	  0,  0, fragment ? 1 : i,
+				    0,	  0,  0, 101,
+				    0x10 };
+		int n = 13;
+
+		if (i != 1)
+			buf[1] |= 0x80;
+		if (fragment) {
+			buf[12] = (disposable ? 0x20 : 0) | (i == 1 ? 0x10 : 0);
+			buf[n++] = 1;
+		} else {
+			gsize len = i ? sizeof(gray_delta) : sizeof(gray_key);
+
+			memcpy(buf + n, i ? gray_delta : gray_key, len);
+			n += len;
+		}
+		g_assert_cmpint(srtp_protect(sender, buf, &n), ==,
+				srtp_err_status_ok);
+		call_video_receive_at(loop.rx, buf, n, now, source_display,
+				      &view);
+	}
+	call_video_poll(loop.rx, loop.rx, now + G_USEC_PER_SEC, FALSE, collect,
+			&loop, source_display, &view);
+	g_assert_cmpuint(view.frames, ==, disposable ? 2 : 1);
+	g_assert_cmpint(call_video_needs_keyframe(loop.rx), ==, !disposable);
+	srtp_dealloc(sender);
+	done(&loop);
+}
+
+/*
+ * A VP8 frame may be disposable at the codec and still be part of a
+ * referenceable EVS3 stream. Exercise the distinction with the same bytes.
+ */
+static void evs3_temporal_recovery(void)
+{
+	const int discard = VP8_EFLAG_NO_UPD_LAST | VP8_EFLAG_NO_UPD_GF |
+			    VP8_EFLAG_NO_UPD_ARF | VP8_EFLAG_NO_UPD_ENTROPY;
+	vpx_codec_ctx_t enc = { 0 }, dec[2] = { 0 };
+	vpx_codec_enc_cfg_t cfg;
+	struct loop loop = { 0 };
+	struct source_view view = { 0 };
+	guint8 pixels[16 * 16 * 3 / 2];
+	vpx_image_t image;
+	gint64 now = g_get_monotonic_time();
+
+	g_assert_cmpint(vpx_codec_enc_config_default(vpx_codec_vp8_cx(), &cfg,
+						     0),
+			==, VPX_CODEC_OK);
+	cfg.g_w = cfg.g_h = 16;
+	cfg.g_lag_in_frames = cfg.rc_dropframe_thresh = 0;
+	cfg.kf_mode = VPX_KF_DISABLED;
+	g_assert_cmpint(vpx_codec_enc_init(&enc, vpx_codec_vp8_cx(), &cfg, 0),
+			==, VPX_CODEC_OK);
+	for (guint j = 0; j < G_N_ELEMENTS(dec); j++)
+		g_assert_cmpint(vpx_codec_dec_init(&dec[j], vpx_codec_vp8_dx(),
+						   NULL, 0),
+				==, VPX_CODEC_OK);
+
+	g_assert_nonnull(
+		vpx_img_wrap(&image, VPX_IMG_FMT_I420, 16, 16, 1, pixels));
+	line_camera_i420_frame(&loop.frame, pixels, 16, 16);
+	loop.packets =
+		g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+	loop.tx = call_video_open_group_tx(key_a, 97, 101, 400, 10, NULL);
+	loop.rx = call_video_open_group_rx(key_a, 97, 101, NULL);
+	g_assert_nonnull(loop.tx);
+	g_assert_nonnull(loop.rx);
+	call_video_set_group_format(loop.tx, CALL_VIDEO_RTP_EXT_VED, TRUE);
+	view.rx = loop.rx;
+	encoder = (struct encoder_fixture){ .enabled = TRUE };
+	memset(pixels + 256, 128, sizeof(pixels) - 256);
+	for (guint i = 0; i < 4; i++) {
+		vpx_codec_iter_t iter = NULL;
+		vpx_codec_flags_t flags = i == 1 ? discard :
+					  i == 3 ? VPX_EFLAG_FORCE_KF :
+						   0;
+		vpx_image_t *decoded[2] = { NULL, NULL };
+		const vpx_codec_cx_pkt_t *p;
+
+		for (guint j = 0; j < 256; j++)
+			pixels[j] = 32 + (j + i * 17) % 192;
+		g_assert_cmpint(vpx_codec_encode(&enc, &image, i, 1, flags,
+						 VPX_DL_REALTIME),
+				==, VPX_CODEC_OK);
+		p = vpx_codec_get_cx_data(&enc, &iter);
+		g_assert_nonnull(p);
+		g_assert_cmpint(p->kind, ==, VPX_CODEC_CX_FRAME_PKT);
+		g_assert_cmpint(!!(p->data.frame.flags & VPX_FRAME_IS_KEY), ==,
+				i == 0 || i == 3);
+		if (i == 1)
+			g_assert_true(p->data.frame.flags &
+				      VPX_FRAME_IS_DROPPABLE);
+
+		for (guint j = 0; j < G_N_ELEMENTS(dec); j++) {
+			vpx_codec_iter_t frame = NULL;
+
+			if (j == 1 && i == 1)
+				continue;
+			g_assert_cmpint(
+				vpx_codec_decode(&dec[j], p->data.frame.buf,
+						 p->data.frame.sz, NULL, 0),
+				==, VPX_CODEC_OK);
+			decoded[j] = vpx_codec_get_frame(&dec[j], &frame);
+			g_assert_nonnull(decoded[j]);
+		}
+		/*
+		 * Compare all visible bytes after dropping the non-reference
+		 * picture from just one of the two independent decoders.
+		 */
+		if (i == 2)
+			for (guint c = 0; c < 3; c++) {
+				guint w = 16 >> !!c;
+
+				for (guint y = 0; y < w; y++)
+					g_assert_cmpmem(
+						decoded[0]->planes[c] +
+							y * decoded[0]->stride[c],
+						w,
+						decoded[1]->planes[c] +
+							y * decoded[1]->stride[c],
+						w);
+			}
+		encoder.packet = p;
+		encode(&loop, now + i * 100000);
+		g_assert_cmpuint(loop.packets->len, ==, 1);
+		if (i != 1) {
+			gsize len;
+			const guint8 *pkt =
+				g_bytes_get_data(loop.packets->pdata[0], &len);
+			call_video_receive_at(loop.rx, pkt, len,
+					      now + i * 100000, source_display,
+					      &view);
+			call_video_poll(loop.rx, loop.rx,
+					now + i * 100000 + 90000, FALSE,
+					collect, &loop, source_display, &view);
+		}
+		g_assert_cmpuint(view.frames, ==, i == 3 ? 2 : 1);
+		if (i == 2)
+			g_assert_true(call_video_needs_keyframe(loop.rx));
+	}
+	g_assert_false(call_video_needs_keyframe(loop.rx));
+	done(&loop);
+	encoder = (struct encoder_fixture){ 0 };
+	for (guint j = 0; j < G_N_ELEMENTS(dec); j++)
+		vpx_codec_destroy(&dec[j]);
+	vpx_codec_destroy(&enc);
+}
+
+static void wait_decode(struct call_vp8_decoder *d)
+{
+	struct pollfd fd = { .fd = call_vp8_worker_fd(d), .events = POLLIN };
+
+	g_assert_cmpint(fd.fd, >=, 0);
+	g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+	g_assert_cmpint(fd.revents, ==, POLLIN);
+}
+
+/* Hold both slots, interrupt their chain, replace the pending picture by
+ * a keyframe, and close with a final outstanding job. No clock races.
+ */
+static void bounded_decode(void)
+{
+	struct call_vp8_decoder *d;
+	struct source_view view = { 0 };
+	struct call_vp8_output out;
+
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 10 * G_USEC_PER_SEC, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_setenv("LINE_DISABLE_GPU", "1", TRUE);
+	g_unsetenv("LINE_CALL_DECODER_THREAD");
+	d = call_vp8_open(1, FALSE);
+	g_assert_nonnull(d);
+	call_vp8_enable_worker(d);
+	g_assert_cmpint(call_vp8_decode(d, gray_key, sizeof(gray_key), TRUE, 0,
+					source_display, &view),
+			==, 1);
+	for (guint i = 0; i < 3; i++)
+		g_assert_cmpint(call_vp8_submit(d, gray_delta,
+						sizeof(gray_delta), FALSE, 0,
+						i),
+				==, i == 2 ? CALL_VP8_FULL : CALL_VP8_QUEUED);
+	call_vp8_discontinuity(d);
+	g_assert_cmpint(call_vp8_submit(d, gray_key, sizeof(gray_key), TRUE, 90,
+					9),
+			==, CALL_VP8_QUEUED);
+	wait_decode(d);
+	g_assert_false(call_vp8_take(d, &out));
+	wait_decode(d);
+	g_assert_true(call_vp8_take(d, &out));
+	g_assert_cmpint(out.shown, ==, 1);
+	g_assert_cmpuint(out.tag, ==, 9);
+	g_assert_cmpuint(out.image.rotation, ==, 90);
+	g_assert_cmpuint(out.image.width, ==, 16);
+	call_vp8_release(d);
+	for (guint i = 0; i < 2; i++)
+		g_assert_cmpint(call_vp8_submit(d, gray_key, sizeof(gray_key),
+						TRUE, 0, i),
+				==, CALL_VP8_QUEUED);
+	for (guint i = 0; i < 2; i++) {
+		wait_decode(d);
+		g_assert_true(call_vp8_take(d, &out));
+		g_assert_cmpint(out.shown, ==, 1);
+		g_assert_cmpuint(out.tag, ==, i);
+		call_vp8_release(d);
+	}
+	const guint8 bad[] = { 0xff, 0xff, 0xff };
+
+	g_assert_cmpint(call_vp8_submit(d, bad, sizeof(bad), FALSE, 0, 5), ==,
+			CALL_VP8_QUEUED);
+	g_assert_cmpint(call_vp8_submit(d, gray_key, sizeof(gray_key), TRUE, 0,
+					6),
+			==, CALL_VP8_QUEUED);
+	wait_decode(d);
+	g_assert_false(call_vp8_take(d, &out));
+	wait_decode(d);
+	g_assert_true(call_vp8_take(d, &out));
+	g_assert_cmpuint(out.tag, ==, 6);
+	g_assert_cmpint(out.shown, ==, 1);
+	call_vp8_release(d);
+	g_assert_cmpint(call_vp8_submit(d, gray_delta, sizeof(gray_delta),
+					FALSE, 0, 10),
+			==, CALL_VP8_QUEUED);
+	call_vp8_close(d);
+}
+
+static void decode_recovers(gconstpointer mode)
+{
+	gboolean share = GPOINTER_TO_INT(mode);
+	struct source_view view = { 0 };
+	struct loop loop = { 0 };
+	struct call_share_decoder *screen = NULL;
+	struct call_vp8_decoder *d;
+	const guint8 bad[] = { 0xff, 0xff, 0xff };
+	srtp_t sender = NULL;
+
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 15 * G_USEC_PER_SEC, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_setenv("LINE_DISABLE_GPU", "1", TRUE);
+	g_unsetenv("LINE_CALL_DECODER_THREAD");
+	if (share) {
+		screen = call_share_decoder_new();
+		d = call_share_video_decoder(screen);
+	} else {
+		prepare(&loop);
+		view.rx = loop.rx;
+		d = call_video_decoder(loop.rx);
+		g_assert_true(
+			call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	}
+	call_vp8_enable_worker(d);
+	for (guint i = 0; i < 5; i++) {
+		gboolean key = i == 0 || i == 4;
+		const guint8 *picture = key    ? gray_key :
+					i == 2 ? bad :
+						 gray_delta;
+		gsize len = key	   ? sizeof(gray_key) :
+			    i == 2 ? sizeof(bad) :
+				     sizeof(gray_delta);
+		guint8 packet[256] = { 0x80, 0xe1, 0, i, 0, 0,
+				       0,    i,	   0, 0, 0, 101 };
+		/* PDTP EVS3 without an optional size, or plain RFC 7741. */
+		if (share) {
+			guint8 frag[128] = { 0x8c, 0, i };
+
+			memcpy(frag + 3, picture, len);
+			g_assert_true(call_share_decode(screen, frag, len + 3,
+							source_display, &view));
+		} else {
+			int size = 13 + len;
+
+			packet[12] = 0x10;
+			memcpy(packet + 13, picture, len);
+			g_assert_cmpint(srtp_protect(sender, packet, &size), ==,
+					srtp_err_status_ok);
+			g_assert_true(call_video_receive(
+				loop.rx, packet, size, source_display, &view));
+		}
+		if (i && i != 3) {
+			wait_decode(d);
+			/* The callback only runs on the consuming call thread. */
+			g_assert_cmpuint(view.frames, ==, i == 1 ? 1 : 2);
+			if (share)
+				call_share_decoded(screen, source_display,
+						   &view);
+			else
+				call_video_decoded(loop.rx, source_display,
+						   &view);
+		}
+		g_assert_cmpint(
+			share ? call_share_decoder_keyframe_needed(screen) :
+				call_video_needs_keyframe(loop.rx),
+			==, i == 2 || i == 3);
+	}
+	g_assert_cmpuint(view.frames, ==, 3);
+	if (share)
+		call_share_decoder_free(screen);
+	else {
+		srtp_dealloc(sender);
+		done(&loop);
+	}
 }
 
 static void group_source_visibility(void)
@@ -1923,6 +2340,279 @@ static void vaapi_encoder_selection(gconstpointer vendor)
 #endif
 }
 
+static void capture_counter(gpointer address)
+{
+	++*(guint *)address;
+}
+
+/*
+ * Both transports must keep the PipeWire buffer alive through encode, and
+ * recover in the same call on the first I420 frame after import fails.
+ */
+static void capture_transport(gconstpointer data)
+{
+	gboolean pdtp = GPOINTER_TO_INT(data);
+	guint rejections = 0, released = 0;
+	struct line_capture_dma capture = { .owner = &rejections,
+					    .reject = capture_counter };
+	GBytes *dma = g_bytes_new_with_free_func(&capture, sizeof(capture),
+						 capture_counter, &released);
+	struct loop loop = { 0 };
+	struct share_loop share = { 0 };
+	struct call_share_encoder *s = NULL;
+	guint64 capture_ns = 0;
+	guint8 pixels[16 * 16 * 3 / 2];
+
+	memset(pixels, 128, sizeof(pixels));
+	g_autoptr(GBytes) cpu = g_bytes_new_static(pixels, sizeof(pixels));
+
+	encoder = (struct encoder_fixture){ .enabled = TRUE };
+	prepare(&loop);
+	if (pdtp) {
+		s = call_share_encoder_new(900, 20);
+		call_share_encode_async(s);
+		share.fragments = g_ptr_array_new_with_free_func(
+			(GDestroyNotify)g_bytes_unref);
+	} else {
+		call_video_screen(loop.tx, 900, 20);
+		g_assert_true(call_video_encode_async(loop.tx));
+	}
+	struct pollfd fd = { .fd = pdtp ? call_share_encoder_fd(s) :
+					  call_video_encoder_fd(loop.tx),
+			     .events = POLLIN };
+	g_assert_cmpint(fd.fd, >=, 0);
+	for (guint i = 0; i < 3; i++) {
+		GBytes *input = i == 2 ? cpu : dma;
+		gint64 now = g_get_monotonic_time() + i * 100000;
+
+		encoder.fail = i == 1;
+		if (pdtp) {
+			g_ptr_array_set_size(share.fragments, 0);
+			g_assert_true(call_share_queue(
+				s, input, i != 2, 16, 16, (guint64)now * 1000,
+				&capture_ns, share_collect, &share));
+		} else {
+			line_capture_frame(&loop.frame, input, i != 2, 16, 16);
+			encode(&loop, now);
+		}
+		if (i == 1)
+			g_clear_pointer(&dma, g_bytes_unref);
+		g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+		if (pdtp)
+			g_assert_true(call_share_encoded(
+				s, TRUE, &capture_ns, share_collect, &share));
+		else
+			g_assert_true(call_video_encoded(loop.tx, now, collect,
+							 &loop));
+		g_assert_cmpuint((pdtp ? share.fragments : loop.packets)->len,
+				 ==, i == 1 ? 0 : 1);
+		g_assert_cmpuint(encoder.dma_frames, ==, MIN(i + 1, 2u));
+		g_assert_cmpuint(rejections, ==, i > 0);
+		g_assert_cmpuint(released, ==, i > 0);
+		if (i == 2)
+			g_assert_true(encoder.last_key);
+	}
+	g_clear_pointer(&share.fragments, g_ptr_array_unref);
+	call_share_encoder_free(s);
+	done(&loop);
+	encoder = (struct encoder_fixture){ 0 };
+}
+
+static int compare_time(gconstpointer a, gconstpointer b);
+
+#if CALL_HWDECODE
+static void unexpected_capture_fallback(void *user, uint64_t value)
+{
+	(void)user;
+	(void)value;
+	g_assert_not_reached();
+}
+#endif
+
+static void vaapi_capture_import(void)
+{
+#if CALL_HWDECODE
+	const char *node = g_getenv("AVERNELLA_TEST_VAAPI_NODE");
+
+	if (!node || !*node) {
+		g_test_skip(
+			"Set AVERNELLA_TEST_VAAPI_NODE to a VA-API render node for the DMA import fixture");
+		return;
+	}
+	enum {
+		CW = 1280,
+		CH = 720
+	};
+	AVBufferRef *dev = NULL;
+
+	g_assert_cmpint(av_hwdevice_ctx_create(&dev, AV_HWDEVICE_TYPE_VAAPI,
+					       node, NULL, 0),
+			>=, 0);
+	AVBufferRef *frames = av_hwframe_ctx_alloc(dev);
+
+	g_assert_nonnull(frames);
+	AVHWFramesContext *ctx = (void *)frames->data;
+
+	ctx->format = AV_PIX_FMT_VAAPI;
+	ctx->sw_format = AV_PIX_FMT_NV12;
+	ctx->width = CW;
+	ctx->height = CH;
+	g_assert_cmpint(av_hwframe_ctx_init(frames), >=, 0);
+	AVFrame *raw = av_frame_alloc(), *gpu = av_frame_alloc(),
+		*exported = av_frame_alloc(), *imported = av_frame_alloc(),
+		*download = av_frame_alloc();
+	g_assert_cmpint(av_hwframe_get_buffer(frames, gpu, 0), ==, 0);
+	raw->width = CW;
+	raw->height = CH;
+	raw->format = AV_PIX_FMT_NV12;
+	g_assert_cmpint(av_frame_get_buffer(raw, 32), ==, 0);
+	for (int i = 0; i < 2; i++)
+		for (int y = 0; y < (CH >> i); y++)
+			for (int x = 0; x < CW; x++)
+				raw->data[i][y * raw->linesize[i] + x] =
+					(17 * x + 31 * y + 63 * i) & 255;
+	g_assert_cmpint(av_hwframe_transfer_data(gpu, raw, 0), ==, 0);
+	exported->format = AV_PIX_FMT_DRM_PRIME;
+	g_assert_cmpint(av_hwframe_map(exported, gpu,
+				       AV_HWFRAME_MAP_DIRECT |
+					       AV_HWFRAME_MAP_READ),
+			==, 0);
+	const AVDRMFrameDescriptor *desc = (const void *)exported->data[0];
+
+	if (desc->nb_objects != 1 ||
+	    (desc->nb_layers != 1 && desc->nb_layers != 2)) {
+		g_test_skip("Driver exports a different NV12 memory layout");
+		goto out;
+	}
+	struct line_capture_dma dma = {
+		.fd = desc->objects[0].fd,
+		.size = desc->objects[0].size,
+		.modifier = desc->objects[0].format_modifier
+	};
+	for (int i = 0; i < 2; i++) {
+		const AVDRMPlaneDescriptor *plane =
+			desc->nb_layers == 1 ? &desc->layers[0].planes[i] :
+					       &desc->layers[i].planes[0];
+		dma.offset[i] = plane->offset;
+		dma.stride[i] = plane->pitch;
+	}
+	/*
+	 * Supply the real exported planes through the same ownership and fd
+	 * checks as PipeWire. Remove the buffer while the encoder still reads.
+	 */
+	struct spa_chunk chunks[2];
+	struct spa_data planes[2];
+
+	for (guint i = 0; i < 2; i++) {
+		chunks[i] = (struct spa_chunk){ .stride = dma.stride[i],
+						.offset = dma.offset[i] };
+		planes[i] = (struct spa_data){ .type = SPA_DATA_DmaBuf,
+					       .fd = dma.fd,
+					       .chunk = &chunks[i] };
+	}
+	struct spa_buffer bytes = { .n_datas = 2, .datas = planes };
+	struct pw_buffer buffer = { .buffer = &bytes };
+	struct spa_video_info_raw fmt = {
+		.format = SPA_VIDEO_FORMAT_NV12,
+		.size = { CW, CH },
+		.flags = SPA_VIDEO_FLAG_MODIFIER,
+		.modifier = dma.modifier,
+		.color_matrix = SPA_VIDEO_COLOR_MATRIX_BT601,
+		.color_range = SPA_VIDEO_COLOR_RANGE_16_235
+	};
+	pw_init(NULL, NULL);
+	struct pw_loop *pw = pw_loop_new(NULL);
+
+	g_assert_nonnull(pw);
+	struct cast_dma_pool *pool =
+		cast_dma_pool_new((struct pw_stream *)&buffer, pw,
+				  unexpected_capture_fallback, NULL);
+	g_assert_nonnull(pool);
+	GBytes *owner =
+		cast_dma_take(pool, &buffer, &fmt, CW, CH, dma.modifier);
+	g_assert_nonnull(owner);
+	const struct line_capture_dma *held = g_bytes_get_data(owner, NULL);
+	int lease_fd = held->fd;
+
+	g_assert_cmpint(lease_fd, !=, dma.fd);
+	cast_dma_remove(pool, &buffer);
+	cast_dma_pool_stop(pool);
+	pw_loop_destroy(pw);
+	struct line_camera_frame frame = { .capture_dma = owner,
+					   .width = CW,
+					   .height = CH };
+	if (g_test_perf()) {
+		/* Measure frame preparation only, alternating test order. */
+		enum {
+			SAMPLES = 300,
+			WARMUP = 16
+		};
+		gint64 times[2][SAMPLES];
+
+		for (int n = -WARMUP; n < SAMPLES; n++)
+			for (int j = 0; j < 2; j++) {
+				gboolean direct = (n + j) & 1;
+				gint64 t0 = g_get_monotonic_time();
+
+				if (direct) {
+					g_assert_true(call_capture_import_nv12(
+						imported, frames, &frame));
+					av_frame_unref(imported);
+				} else {
+					g_assert_cmpint(
+						av_hwframe_transfer_data(
+							gpu, raw, 0),
+						==, 0);
+				}
+				if (n >= 0)
+					times[direct][n] =
+						g_get_monotonic_time() - t0;
+			}
+		for (int i = 0; i < 2; i++) {
+			qsort(times[i], SAMPLES, sizeof(gint64), compare_time);
+			g_test_message("%s 720p p50/p95/p99 = %" G_GINT64_FORMAT
+				       "/%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT
+				       " us",
+				       i ? "Capture DMA import/release" :
+					   "NV12 CPU upload",
+				       times[i][149], times[i][284],
+				       times[i][296]);
+		}
+	}
+	guint previous = hardware_transfers;
+
+	g_assert_true(call_capture_import_nv12(imported, frames, &frame));
+	g_assert_cmpuint(hardware_transfers, ==, previous);
+	g_bytes_unref(owner);
+	g_assert_cmpint(fcntl(lease_fd, F_GETFD), ==, FD_CLOEXEC);
+	download->format = AV_PIX_FMT_NV12;
+	g_assert_cmpint(av_hwframe_transfer_data(download, imported, 0), ==, 0);
+	for (int i = 0; i < 2; i++)
+		for (int y = 0; y < (CH >> i); y++)
+			g_assert_cmpmem(raw->data[i] + y * raw->linesize[i], CW,
+					download->data[i] +
+						y * download->linesize[i],
+					CW);
+	av_frame_unref(imported);
+	g_assert_cmpint(fcntl(lease_fd, F_GETFD), ==, -1);
+	g_assert_cmpint(errno, ==, EBADF);
+	g_test_message(
+		"Independent 720p NV12 import and readback matched all %d bytes with modifier 0x%" G_GINT64_MODIFIER
+		"x",
+		CW * CH * 3 / 2, dma.modifier);
+out:
+	av_frame_free(&exported);
+	av_frame_free(&raw);
+	av_frame_free(&gpu);
+	av_frame_free(&imported);
+	av_frame_free(&download);
+	av_buffer_unref(&frames);
+	av_buffer_unref(&dev);
+#else
+	g_test_skip("Built without FFmpeg acceleration");
+#endif
+}
+
 static void native_hardware_vp8(void)
 {
 	struct call_vp8_encoder *enc =
@@ -2420,6 +3110,121 @@ static int compare_time(gconstpointer a, gconstpointer b)
 	return (x > y) - (x < y);
 }
 
+struct decode_sample {
+	guint frames, signature;
+	GThread *caller;
+};
+
+static void sample_hd(const struct line_camera_frame *image, gpointer data)
+{
+	struct decode_sample *sample = data;
+
+	g_assert_true(sample->caller == g_thread_self());
+	g_assert_cmpuint(image->width, ==, 1280);
+	g_assert_cmpuint(image->height, ==, 720);
+	sample->frames++;
+	sample->signature = 0;
+	for (guint p = 0; p < 3; p++) {
+		guint w = image->width >> !!p, h = image->height >> !!p;
+
+		for (guint y = p; y < h; y += 31)
+			for (guint x = y % 17; x < w; x += 37)
+				sample->signature =
+					33 * sample->signature +
+					image->plane[p]
+						    [y * image->stride[p] + x];
+	}
+}
+
+/* Same SRTP datagrams, alternating which receiver is measured first.
+ * Service time includes calling the display callback. Worker wake and
+ * scheduling are counted separately in the time to an available frame.
+ */
+static void receive_blocking(void)
+{
+	enum {
+		N = 101,
+		WIDTH = 1280,
+		HEIGHT = 720
+	};
+	gint64 held[2][N], ready[2][N], now = G_USEC_PER_SEC;
+	struct loop loop = { 0 };
+	struct call_video *rx[2];
+	struct decode_sample sample[2];
+	g_autofree guint8 *pixels = g_malloc(WIDTH * HEIGHT * 3 / 2);
+
+	if (!g_test_perf() && !g_test_subprocess()) {
+		g_test_skip("Run with -m perf to measure.");
+		return;
+	}
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 90 * G_USEC_PER_SEC,
+				       G_TEST_SUBPROCESS_INHERIT_STDOUT);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_setenv("LINE_DISABLE_GPU", "1", TRUE);
+	g_unsetenv("LINE_CALL_DECODER_THREAD");
+	loop.tx = call_video_open_tx(key_a, 97, 101, 1500, 30, NULL);
+	loop.packets =
+		g_ptr_array_new_with_free_func((GDestroyNotify)g_bytes_unref);
+	line_camera_i420_frame(&loop.frame, pixels, WIDTH, HEIGHT);
+	for (guint j = 0; j < G_N_ELEMENTS(rx); j++) {
+		rx[j] = call_video_open_rx(key_a, 97, 101, NULL);
+		g_assert_nonnull(rx[j]);
+		sample[j] = (struct decode_sample){ .caller = g_thread_self() };
+	}
+	call_vp8_enable_worker(call_video_decoder(rx[1]));
+	for (guint i = 0; i < N + 2; i++) {
+		screen_picture(pixels, WIDTH, HEIGHT, i % 30);
+		encode(&loop, now + i * 33334);
+		g_assert_cmpuint(loop.packets->len, >, 0);
+		for (guint order = 0; order < 2; order++) {
+			guint j = (order + i) % 2;
+			gint64 begin = g_get_monotonic_time();
+
+			for (guint k = 0; k < loop.packets->len; k++) {
+				gsize size;
+				const guint8 *packet = g_bytes_get_data(
+					loop.packets->pdata[k], &size);
+				g_assert_true(call_video_receive(
+					rx[j], packet, size, sample_hd,
+					&sample[j]));
+			}
+			gint64 before_wait = g_get_monotonic_time();
+			gint64 after_wait = before_wait;
+
+			if (j && i) {
+				wait_decode(call_video_decoder(rx[j]));
+				after_wait = g_get_monotonic_time();
+				call_video_decoded(rx[j], sample_hd,
+						   &sample[j]);
+			}
+			gint64 end = g_get_monotonic_time();
+
+			if (i >= 2) {
+				held[j][i - 2] =
+					before_wait - begin + end - after_wait;
+				ready[j][i - 2] = end - begin;
+			}
+			g_assert_cmpuint(sample[j].frames, ==, i + 1);
+		}
+		g_assert_cmpuint(sample[0].signature, ==, sample[1].signature);
+	}
+	for (guint j = 0; j < G_N_ELEMENTS(rx); j++) {
+		qsort(held[j], N, sizeof(gint64), compare_time);
+		qsort(ready[j], N, sizeof(gint64), compare_time);
+		g_print("# 720p receive %s p50/p95/p99 us: call thread %" G_GINT64_FORMAT
+			"/%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT
+			", first packet to display %" G_GINT64_FORMAT
+			"/%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT "\n",
+			j ? "worker" : "inline", held[j][50], held[j][95],
+			held[j][99], ready[j][50], ready[j][95], ready[j][99]);
+		call_video_close(rx[j]);
+	}
+	done(&loop);
+}
+
 /*
  * How long a 720p camera frame holds up the call thread, inline and with
  * the encoder thread. The thread only copies the frame.
@@ -2485,9 +3290,158 @@ static void encoder_thread_blocking(void)
 	g_assert_cmpint(held[1][FRAMES / 2] * 2, <, held[0][FRAMES / 2]);
 }
 
+static void presentation_worker(void)
+{
+	enum {
+		W = 1280,
+		H = 720
+	};
+	g_autoptr(GBytes) frame =
+		g_bytes_new_take(g_malloc0(W * H * 3 / 2), W * H * 3 / 2);
+	struct call_share_encoder *s = call_share_encoder_new(3500, 30);
+	struct share_loop loop = { .fragments = g_ptr_array_new_with_free_func(
+					   (GDestroyNotify)g_bytes_unref) };
+	guint64 time = 0;
+	guint64 period = G_GUINT64_CONSTANT(1000000000) / 30;
+	guint64 start = 1000 * (guint64)g_get_monotonic_time() - 10 * period;
+
+	call_share_encode_async(s);
+	struct pollfd fd = { call_share_encoder_fd(s), POLLIN, 0 };
+
+	g_assert_cmpint(fd.fd, >=, 0);
+	/* One active picture, then two queued before its completion is read. */
+	for (guint i = 0; i < 3; i++)
+		g_assert_true(call_share_queue(s, frame, FALSE, W, H,
+					       start + i * period, &time,
+					       share_collect, &loop));
+	/* Repeated enable while the encoder is running must be idempotent. */
+	call_share_encode_async(s);
+	g_assert_cmpint(fd.fd, ==, call_share_encoder_fd(s));
+	g_assert_cmpuint(loop.fragments->len, ==, 0);
+	g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+	g_assert_true(call_share_encoded(s, TRUE, &time, share_collect, &loop));
+	g_assert_cmpuint(time, ==, start);
+	g_assert_cmpuint(loop.fragments->len, >, 0);
+	g_ptr_array_set_size(loop.fragments, 0);
+	g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+	g_assert_true(
+		call_share_encoded(s, FALSE, &time, share_collect, &loop));
+	g_assert_cmpuint(time, ==, start + 2 * period);
+	g_assert_cmpuint(loop.fragments->len, ==, 0);
+	/* Resume after a suppressed picture must start on a fresh keyframe. */
+	g_assert_true(call_share_queue(s, frame, FALSE, W, H,
+				       start + 3 * period, &time, share_collect,
+				       &loop));
+	g_clear_pointer(&frame, g_bytes_unref);
+	g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+	g_assert_true(call_share_encoded(s, TRUE, &time, share_collect, &loop));
+	g_assert_cmpuint(loop.fragments->len, >, 0);
+	const guint8 *p = g_bytes_get_data(loop.fragments->pdata[0], NULL);
+
+	g_assert_cmphex(p[0] & ~4, ==, 0xba);
+	/*
+	 * A resize starts a new keyframe. Duplicate capture timestamps do
+	 * not overrun the configured frame rate.
+	 */
+	enum {
+		SW = 320,
+		SH = 180
+	};
+	g_autoptr(GBytes) small =
+		g_bytes_new_take(g_malloc0(SW * SH * 3 / 2), SW * SH * 3 / 2);
+	g_ptr_array_set_size(loop.fragments, 0);
+	g_assert_true(call_share_queue(s, small, FALSE, SW, SH,
+				       start + 3 * period, &time, share_collect,
+				       &loop));
+	g_assert_cmpint(poll(&fd, 1, 0), ==, 0);
+	g_assert_true(call_share_queue(s, small, FALSE, SW, SH,
+				       start + 4 * period, &time, share_collect,
+				       &loop));
+	g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+	g_assert_true(call_share_encoded(s, TRUE, &time, share_collect, &loop));
+	g_assert_cmpuint(loop.fragments->len, >, 0);
+	p = g_bytes_get_data(loop.fragments->pdata[0], NULL);
+	g_assert_cmphex(p[0] & ~4, ==, 0xba);
+
+	/* Release both queued capture references on shutdown while busy. */
+	for (guint i = 5; i < 7; i++)
+		g_assert_true(call_share_queue(s, small, FALSE, SW, SH,
+					       start + i * period, &time,
+					       share_collect, &loop));
+	g_clear_pointer(&small, g_bytes_unref);
+	call_share_encoder_free(s);
+	g_ptr_array_unref(loop.fragments);
+}
+
+static void presentation_blocking(void)
+{
+	enum {
+		W = 1280,
+		H = 720,
+		N = 101
+	};
+	gint64 held[N];
+
+	if (!g_test_perf()) {
+		g_test_skip("Run with -m perf to measure.");
+		return;
+	}
+	for (guint mode = 0; mode < 2; mode++) {
+		struct call_share_encoder *s = call_share_encoder_new(3500, 30);
+		struct share_loop loop = {
+			.fragments = g_ptr_array_new_with_free_func(
+				(GDestroyNotify)g_bytes_unref)
+		};
+		guint64 time = 0;
+		guint64 epoch = (guint64)g_get_monotonic_time() * 1000;
+
+		if (mode)
+			call_share_encode_async(s);
+		struct pollfd fd = { call_share_encoder_fd(s), POLLIN, 0 };
+
+		for (int i = 0; i <= N; i++) {
+			guint8 *pixels = g_malloc(W * H * 3 / 2);
+
+			g_autoptr(GBytes) frame =
+				g_bytes_new_take(pixels, W * H * 3 / 2);
+
+			screen_picture(pixels, W, H, i);
+			gint64 us = g_get_monotonic_time();
+
+			g_assert_true(call_share_queue(
+				s, frame, FALSE, W, H,
+				epoch + i * G_GUINT64_CONSTANT(33333333), &time,
+				share_collect, &loop));
+			gint64 submit = g_get_monotonic_time() - us;
+
+			if (mode) {
+				g_assert_cmpint(poll(&fd, 1, 5000), ==, 1);
+				us = g_get_monotonic_time();
+				g_assert_true(call_share_encoded(
+					s, TRUE, &time, share_collect, &loop));
+				submit += g_get_monotonic_time() - us;
+			}
+			g_assert_cmpuint(loop.fragments->len, >, 0);
+			g_ptr_array_set_size(loop.fragments, 0);
+			if (i)
+				held[i - 1] = submit;
+		}
+		qsort(held, N, sizeof(*held), compare_time);
+		g_test_message(
+			"720p presentation call-thread time, %s: p50/p95/p99 %" G_GINT64_FORMAT
+			"/%" G_GINT64_FORMAT "/%" G_GINT64_FORMAT " us",
+			mode ? "worker" : "inline", held[50], held[95],
+			held[99]);
+		g_ptr_array_unref(loop.fragments);
+		call_share_encoder_free(s);
+	}
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
+	g_test_add_func("/video/presentation-worker", presentation_worker);
+	g_test_add_func("/video/presentation-blocking", presentation_blocking);
 	g_test_add_func("/video/encoder-thread", encoder_thread);
 	g_test_add_func("/video/encoder-thread/blocking",
 			encoder_thread_blocking);
@@ -2495,11 +3449,25 @@ int main(int argc, char **argv)
 	g_test_add_func("/video/conference-independent-stream-directions",
 			conference_directions);
 	g_test_add_func("/video/evs3-picture-metadata", evs3_picture_metadata);
+	g_test_add_func("/video/evs3-temporal-recovery",
+			evs3_temporal_recovery);
+	g_test_add_func("/video/async-decode/bounded", bounded_decode);
+	g_test_add_func("/video/receive-blocking", receive_blocking);
+	g_test_add_data_func("/video/async-decode/rtp", GINT_TO_POINTER(0),
+			     decode_recovers);
+	g_test_add_data_func("/video/async-decode/pdtp", GINT_TO_POINTER(1),
+			     decode_recovers);
 	g_test_add_func("/video/group-source-visibility",
 			group_source_visibility);
 	g_test_add_func("/video/authentication-loss-and-keyframe-recovery",
 			recovery);
 	g_test_add_func("/video/standard-vp8-reordering", standard_vp8);
+	g_test_add_data_func("/video/incomplete-nonreference-picture",
+			     GINT_TO_POINTER(1), discardable_picture);
+	g_test_add_data_func("/video/incomplete-reference-picture", NULL,
+			     discardable_picture);
+	g_test_add_func("/video/receiver-report-repair-and-wrap",
+			receiver_report_wrap);
 	g_test_add_data_func("/video/single-packet/evs3", GINT_TO_POINTER(0),
 			     single_packet);
 	g_test_add_data_func("/video/single-packet/rfc7741", GINT_TO_POINTER(1),
@@ -2543,6 +3511,11 @@ int main(int argc, char **argv)
 	g_test_add_func("/video/profile-negotiation", negotiation);
 	g_test_add_func("/video/negotiated-stream-reports", negotiated_streams);
 	g_test_add_func("/video/hardware-encode/native", native_hardware_vp8);
+	g_test_add_func("/video/vaapi-capture-import", vaapi_capture_import);
+	g_test_add_data_func("/video/dma-capture/rtp", GINT_TO_POINTER(FALSE),
+			     capture_transport);
+	g_test_add_data_func("/video/dma-capture/pdtp", GINT_TO_POINTER(TRUE),
+			     capture_transport);
 	g_test_add_data_func("/video/hardware-encode/amd-selection", "0x1002",
 			     vaapi_encoder_selection);
 	g_test_add_data_func("/video/hardware-encode/intel-selection", "0x8086",

@@ -319,11 +319,14 @@ int ui_media_stage_height(void);
 void ui_media_chat_shown(void);
 int ui_media_dock_hover(int x, int y);
 void ui_media_draw_call_dock(void);
+struct gpu_scene;
 struct line_preview_frame;
+void ui_media_dmabuf_frame(const struct line_preview_frame *frame, int fd,
+			   int release_fd);
+int ui_media_draw_scene(const struct gpu_scene *scene);
 void ui_media_preview_frame(const struct line_preview_frame *frame, int fd);
 void ui_media_overlay(void);
 void ui_media_present_video(double y_offset);
-struct gpu_scene;
 void ui_media_gpu_video(struct gpu_scene *scene, double y_offset);
 void ui_media_reset_renderer(void);
 void ui_media_thumb(Json *row, Rect area);

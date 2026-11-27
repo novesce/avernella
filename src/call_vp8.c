@@ -1,22 +1,59 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call_vp8.h"
+#include "codec_affinity.h"
+#include "line.h"
+#include <sys/eventfd.h>
+#include <unistd.h>
 #include "call_hwdecode_config.h"
 #include <vpx/vp8dx.h>
 #include <vpx/vpx_decoder.h>
 #include <vpx/vpx_encoder.h>
 #if CALL_HWDECODE
 #include "call_vp8_device.h"
+#include "call_vp8_dma.h"
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
 #endif
 
+/* Two slots cover the picture being decoded/displayed and one arrival
+ * during that service interval. More only adds queued latency.
+ */
+struct decode_job {
+	guint8 *bytes;
+	gsize size, capacity;
+	guint rotation, tag;
+	guint64 generation;
+	gboolean key;
+};
+
+struct decode_worker {
+	struct decode_job job[2];
+	struct call_vp8_output out;
+	GThread *thread;
+	GMutex lock;
+	GCond cond;
+	guint head, count;
+	gboolean done, stop;
+	int wake;
+};
+
 struct call_vp8_decoder {
+	struct decode_worker *worker;
+	gboolean allow_worker;
+	guint64 generation;
 	vpx_codec_ctx_t software;
 	guint8 *converted;
 	gsize capacity;
 	const char *backend;
 	gboolean presentation;
 #if CALL_HWDECODE
+	gboolean (*visible)(gpointer);
+	call_dma_send_fn send;
+	gpointer sink;
+	struct call_dma_pool *leases;
+	call_video_display_fn display;
+	gpointer display_data;
+	gboolean disable_export;
 	struct AVCodecContext *codec;
 	AVBufferRef *device;
 	AVFrame *surface, *download;
@@ -32,7 +69,13 @@ struct call_vp8_decoder *call_vp8_open(guint threads, gboolean presentation)
 	struct call_vp8_decoder *d = g_new0(struct call_vp8_decoder, 1);
 	vpx_codec_dec_cfg_t config = { .threads = threads };
 
-	if (vpx_codec_dec_init(&d->software, vpx_codec_vp8_dx(), &config, 0)) {
+	cpu_set_t saved;
+	gboolean local = line_codec_local_cpus(&saved, threads);
+	vpx_codec_err_t result = vpx_codec_dec_init(
+		&d->software, vpx_codec_vp8_dx(), &config, 0);
+	if (local)
+		(void)sched_setaffinity(0, sizeof(saved), &saved);
+	if (result != VPX_CODEC_OK) {
 		g_free(d);
 		return NULL;
 	}
@@ -138,6 +181,8 @@ static enum AVPixelFormat hardware_format(AVCodecContext *ctx,
 
 static void close_hardware(struct call_vp8_decoder *d)
 {
+	call_dma_retire(&d->leases);
+	d->disable_export = FALSE;
 	av_packet_free(&d->packet);
 	av_frame_free(&d->download);
 	av_frame_free(&d->surface);
@@ -211,6 +256,9 @@ static void open_hardware(struct call_vp8_decoder *d, guint width, guint height)
 	d->codec->thread_count = 1;
 	d->codec->thread_type = 0;
 	d->codec->apply_cropping = 0;
+	/* UI may hold three mapped surfaces and a static fallback. */
+	if (d->send && d->format == AV_PIX_FMT_VAAPI)
+		d->codec->extra_hw_frames = 4;
 	/* Drivers can align a presentation surface beyond its visible edges. */
 	d->codec->max_pixels =
 		d->presentation ?
@@ -231,10 +279,11 @@ static void open_hardware(struct call_vp8_decoder *d, guint width, guint height)
 	}
 }
 
-static gboolean display_surface(struct call_vp8_decoder *d, guint rotation,
-				call_video_display_fn display, gpointer data)
+static gboolean display_surface(struct call_vp8_decoder *d, AVFrame *hw,
+				guint rotation, call_video_display_fn display,
+				gpointer data)
 {
-	AVFrame *hw = d->surface, *cpu = d->download;
+	AVFrame *cpu = d->download;
 	struct line_camera_frame frame = { .width = d->width,
 					   .height = d->height,
 					   .rotation = rotation };
@@ -265,6 +314,25 @@ static gboolean display_surface(struct call_vp8_decoder *d, guint rotation,
 	    hw->crop_bottom > spare_h - hw->crop_top ||
 	    ((hw->crop_left | hw->crop_top) & 1))
 		return FALSE;
+	if (d->visible && !d->visible(d->sink)) {
+		/* Do update reception state, without exporting or reading back. */
+		display(&frame, data);
+		call_dma_forget_latest(d->leases);
+		return TRUE;
+	}
+	if (d->format == AV_PIX_FMT_VAAPI && d->send && !d->disable_export &&
+	    !call_dma_rejected(d->leases)) {
+		int result = call_dma_submit(&d->leases, hw, &frame,
+					     d->presentation, d->send, d->sink);
+
+		if (result > 0) {
+			d->display = display;
+			d->display_data = data;
+			display(&frame, data);
+			return TRUE;
+		}
+		d->disable_export = result < 0;
+	}
 	if (cpu->width != hw->width || cpu->height != hw->height)
 		av_frame_unref(cpu);
 	if (av_hwframe_transfer_data(cpu, hw, 0) < 0 ||
@@ -305,7 +373,10 @@ static int decode_hardware(struct call_vp8_decoder *d, const guint8 *packet,
 	if (result < 0)
 		return -1;
 	while ((result = avcodec_receive_frame(d->codec, d->surface)) >= 0) {
-		gboolean valid = display_surface(d, rotation, display, data);
+		/* A newer picture supersedes any rejected static preview. */
+		call_dma_forget_latest(d->leases);
+		gboolean valid =
+			display_surface(d, d->surface, rotation, display, data);
 
 		av_frame_unref(d->surface);
 		if (!valid)
@@ -319,14 +390,269 @@ static int decode_hardware(struct call_vp8_decoder *d, const guint8 *packet,
 }
 #endif
 
-int call_vp8_decode(struct call_vp8_decoder *d, const guint8 *packet,
-		    gsize size, gboolean key, guint rotation,
-		    call_video_display_fn display, gpointer data)
+void call_vp8_set_sink(struct call_vp8_decoder *d,
+		       gboolean (*visible)(gpointer), call_dma_send_fn send,
+		       gpointer data)
+{
+#if CALL_HWDECODE
+	if (d && !g_strcmp0(g_getenv("AVERNELLA_MEDIA_DMABUF"), "1")) {
+		d->visible = visible;
+		d->send = send;
+		d->sink = data;
+	}
+#else
+	(void)d;
+	(void)visible;
+	(void)send;
+	(void)data;
+#endif
+}
+
+int call_vp8_release_fd(struct call_vp8_decoder *d)
+{
+#if CALL_HWDECODE
+	return d && !d->disable_export ? call_dma_reject_fd(d->leases) : -1;
+#else
+	(void)d;
+	return -1;
+#endif
+}
+
+void call_vp8_handle_rejection(struct call_vp8_decoder *d)
+{
+#if CALL_HWDECODE
+	if (!d || !call_dma_rejected(d->leases) || d->disable_export)
+		return;
+	d->disable_export = TRUE;
+	guint rotation;
+	AVFrame *latest = call_dma_take_latest(d->leases, &rotation);
+
+	if (latest) {
+		display_surface(d, latest, rotation, d->display,
+				d->display_data);
+		av_frame_free(&latest);
+	}
+#else
+	(void)d;
+#endif
+}
+
+static int decode_software(struct call_vp8_decoder *d, const guint8 *packet,
+			   gsize size, guint rotation,
+			   call_video_display_fn display, gpointer data)
 {
 	vpx_codec_iter_t iter = NULL;
 	vpx_image_t *image;
 	int shown = 0;
 
+	if (vpx_codec_decode(&d->software, packet, size, NULL, VPX_DL_REALTIME))
+		return -1;
+	while ((image = vpx_codec_get_frame(&d->software, &iter))) {
+		struct line_camera_frame frame = { .width = image->d_w,
+						   .height = image->d_h,
+						   .rotation = rotation };
+
+		for (int i = 0; i < 3; i++) {
+			frame.plane[i] = image->planes[i];
+			frame.stride[i] = image->stride[i];
+		}
+		if (image->fmt != VPX_IMG_FMT_I420 ||
+		    !display_frame(d, frame, FALSE,
+				   image->range == VPX_CR_FULL_RANGE, display,
+				   data))
+			return -1;
+		shown++;
+	}
+	return shown;
+}
+
+static void save_output(const struct line_camera_frame *image, gpointer data)
+{
+	struct call_vp8_output *out = data;
+
+	out->image = *image;
+}
+
+static gpointer decode_main(gpointer data)
+{
+	struct call_vp8_decoder *d = data;
+	struct decode_worker *t = d->worker;
+	gboolean need_key = FALSE;
+
+	line_tune_thread(LINE_THREAD_MEDIA);
+	g_mutex_lock(&t->lock);
+	while (!t->stop) {
+		if (t->done || !t->count) {
+			g_cond_wait(&t->cond, &t->lock);
+			continue;
+		}
+		const struct decode_job *job = &t->job[t->head];
+
+		g_mutex_unlock(&t->lock);
+
+		t->out.tag = job->tag;
+		t->out.shown = need_key && !job->key ?
+				       -1 :
+				       decode_software(d, job->bytes, job->size,
+						       job->rotation,
+						       save_output, &t->out);
+		need_key = t->out.shown < 0;
+		g_mutex_lock(&t->lock);
+		t->done = TRUE;
+		while (eventfd_write(t->wake, 1) < 0 && errno == EINTR)
+			;
+	}
+	g_mutex_unlock(&t->lock);
+	return NULL;
+}
+
+void call_vp8_enable_worker(struct call_vp8_decoder *d)
+{
+	if (d)
+		d->allow_worker =
+			g_strcmp0(g_getenv("LINE_CALL_DECODER_THREAD"), "0") !=
+			0;
+}
+
+static void start_worker(struct call_vp8_decoder *d)
+{
+	struct decode_worker *t = g_new0(struct decode_worker, 1);
+
+	d->allow_worker = FALSE;
+	t->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+	if (t->wake >= 0) {
+		g_mutex_init(&t->lock);
+		g_cond_init(&t->cond);
+		d->worker = t;
+		t->thread =
+			g_thread_try_new("line-decode", decode_main, d, NULL);
+		if (t->thread)
+			return;
+		d->worker = NULL;
+		g_mutex_clear(&t->lock);
+		g_cond_clear(&t->cond);
+		close(t->wake);
+	}
+	g_free(t);
+}
+
+int call_vp8_worker_fd(struct call_vp8_decoder *d)
+{
+	return d && d->worker ? d->worker->wake : -1;
+}
+
+void call_vp8_discontinuity(struct call_vp8_decoder *d)
+{
+	if (d)
+		d->generation++;
+}
+
+enum call_vp8_submit call_vp8_submit(struct call_vp8_decoder *d,
+				     const guint8 *p, gsize n, gboolean key,
+				     guint rotation, guint tag)
+{
+	if (!d->worker) {
+		if (!d->allow_worker || g_strcmp0(d->backend, "libvpx"))
+			return CALL_VP8_INLINE;
+#if CALL_HWDECODE
+		/* A later keyframe may reopen hardware for another size. */
+		if (d->codec || !d->tried || d->retry_resize)
+			return CALL_VP8_INLINE;
+#endif
+		start_worker(d);
+		if (!d->worker)
+			return CALL_VP8_INLINE;
+	}
+	struct decode_worker *t = d->worker;
+
+	g_mutex_lock(&t->lock);
+	if (t->count == G_N_ELEMENTS(t->job)) {
+		if (!key) {
+			g_mutex_unlock(&t->lock);
+			return CALL_VP8_FULL;
+		}
+		/* A fresh key can replace the pending delta or an older key. */
+		t->count--;
+	}
+	struct decode_job *job = &t->job[(t->head + t->count) % 2];
+
+	if (n > job->capacity) {
+		job->bytes = g_realloc(job->bytes, n);
+		job->capacity = n;
+	}
+	memcpy(job->bytes, p, n);
+	job->size = n;
+	job->key = key;
+	job->tag = tag;
+	job->rotation = rotation;
+	job->generation = d->generation;
+	t->count++;
+	g_cond_signal(&t->cond);
+	g_mutex_unlock(&t->lock);
+	return CALL_VP8_QUEUED;
+}
+
+void call_vp8_release(struct call_vp8_decoder *d)
+{
+	struct decode_worker *t = d->worker;
+	eventfd_t count;
+
+	g_mutex_lock(&t->lock);
+	while (eventfd_read(t->wake, &count) < 0 && errno == EINTR)
+		;
+	t->done = FALSE;
+	t->head ^= 1;
+	t->count--;
+	g_cond_signal(&t->cond);
+	g_mutex_unlock(&t->lock);
+}
+
+gboolean call_vp8_take(struct call_vp8_decoder *d, struct call_vp8_output *out)
+{
+	struct decode_worker *t = d ? d->worker : NULL;
+
+	if (!t)
+		return FALSE;
+	g_mutex_lock(&t->lock);
+	gboolean done = t->done;
+	gboolean current = done && t->job[t->head].generation == d->generation;
+
+	/*
+	 * A ready key restores references even if the preceding delta failed.
+	 * Keep successful output in sequence, including consecutive keys.
+	 */
+	if (current && t->out.shown < 0 && t->count == 2 &&
+	    t->job[t->head ^ 1].key)
+		current = FALSE;
+	if (current)
+		*out = t->out;
+	g_mutex_unlock(&t->lock);
+	if (done && !current)
+		call_vp8_release(d);
+	return current;
+}
+
+static void stop_worker(struct decode_worker *t)
+{
+	if (!t)
+		return;
+	g_mutex_lock(&t->lock);
+	t->stop = TRUE;
+	g_cond_signal(&t->cond);
+	g_mutex_unlock(&t->lock);
+	g_thread_join(t->thread);
+	for (guint i = 0; i < G_N_ELEMENTS(t->job); i++)
+		g_free(t->job[i].bytes);
+	close(t->wake);
+	g_mutex_clear(&t->lock);
+	g_cond_clear(&t->cond);
+	g_free(t);
+}
+
+int call_vp8_decode(struct call_vp8_decoder *d, const guint8 *packet,
+		    gsize size, gboolean key, guint rotation,
+		    call_video_display_fn display, gpointer data)
+{
 #if CALL_HWDECODE
 	if (key && size >= 10 && (!d->tried || d->codec || d->retry_resize)) {
 		guint width = (packet[6] | packet[7] << 8) & 0x3fff;
@@ -355,25 +681,9 @@ int call_vp8_decode(struct call_vp8_decoder *d, const guint8 *packet,
 #else
 	(void)key;
 #endif
-	if (vpx_codec_decode(&d->software, packet, size, NULL, VPX_DL_REALTIME))
-		return -1;
-	while ((image = vpx_codec_get_frame(&d->software, &iter))) {
-		struct line_camera_frame frame = { .width = image->d_w,
-						   .height = image->d_h,
-						   .rotation = rotation };
+	int shown = decode_software(d, packet, size, rotation, display, data);
 
-		for (int i = 0; i < 3; i++) {
-			frame.plane[i] = image->planes[i];
-			frame.stride[i] = image->stride[i];
-		}
-		if (image->fmt != VPX_IMG_FMT_I420 ||
-		    !display_frame(d, frame, FALSE,
-				   image->range == VPX_CR_FULL_RANGE, display,
-				   data))
-			return -1;
-		shown++;
-	}
-	if (shown)
+	if (shown > 0)
 		decoded_with(d, "libvpx");
 	return shown;
 }
@@ -382,6 +692,7 @@ void call_vp8_close(struct call_vp8_decoder *d)
 {
 	if (!d)
 		return;
+	stop_worker(d->worker);
 #if CALL_HWDECODE
 	close_hardware(d);
 	av_buffer_unref(&d->device);

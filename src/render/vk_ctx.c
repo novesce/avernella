@@ -52,6 +52,8 @@ static void feature_chain(struct vk_features *f, bool v14, bool heap,
 
 struct device_caps {
 	bool heap, buffer, drm, swapchain, incremental;
+	bool timing, id2, calibrated;
+	bool modifier, dmabuf, fd, foreign;
 	unsigned maintenance, latest_ready;
 };
 
@@ -145,6 +147,24 @@ static bool read_extensions(VkPhysicalDevice gpu, struct device_caps *caps)
 			caps->drm |= !strcmp(
 				name,
 				VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME);
+			caps->modifier |= !strcmp(
+				name,
+				VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME);
+			caps->dmabuf |= !strcmp(
+				name,
+				VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME);
+			caps->fd |= !strcmp(
+				name, VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME);
+			caps->foreign |= !strcmp(
+				name,
+				VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME);
+			caps->timing |= !strcmp(
+				name, VK_EXT_PRESENT_TIMING_EXTENSION_NAME);
+			caps->id2 |= !strcmp(
+				name, VK_KHR_PRESENT_ID_2_EXTENSION_NAME);
+			caps->calibrated |= !strcmp(
+				name,
+				VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME);
 			caps->swapchain |=
 				!strcmp(name, VK_KHR_SWAPCHAIN_EXTENSION_NAME);
 			caps->incremental |= !strcmp(
@@ -269,17 +289,30 @@ static void inspect_adapter(struct vk_adapter *adapter, VkPhysicalDevice gpu,
 	    !vk_drm_matches(gpu, render_node, caps.drm, &render_minor) ||
 	    (surface && (!caps.swapchain || !(caps.maintenance & maintenance))))
 		return;
+	bool timing = caps.timing && caps.id2 && caps.calibrated;
+	VkPhysicalDevicePresentTimingFeaturesEXT timings = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+	};
 	VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latest = {
 		.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+		.pNext = timing ? &timings : NULL,
 	};
 	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR present = {
 		.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
-		.pNext = caps.latest_ready ? &latest : NULL,
+		.pNext = caps.latest_ready ? (void *)&latest :
+					     (timing ? &timings : NULL),
 	};
 	feature_chain(&f, v14, caps.heap, caps.buffer,
 		      surface ? &present : NULL);
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext = f.core.pNext,
+	};
+	f.core.pNext = &ycbcr;
 	vkGetPhysicalDeviceFeatures2(gpu, &f.core);
 	bool heap = v14 && caps.heap && f.heap.descriptorHeap && !force_buffer;
 	VkPhysicalDeviceLimits *limits = &properties.limits;
@@ -322,6 +355,9 @@ static void inspect_adapter(struct vk_adapter *adapter, VkPhysicalDevice gpu,
 				   MAINTENANCE_KHR,
 		.incremental = surface && caps.incremental,
 		.host_copy = v14 && f.v14.hostImageCopy,
+		.present_timing = surface && timings.presentTiming,
+		.nv12 = ycbcr.samplerYcbcrConversion && caps.modifier &&
+			caps.dmabuf && caps.fd && caps.foreign,
 		.latest_ready =
 			surface && latest.presentModeFifoLatestReady &&
 					want_latest_ready(properties.vendorID) ?
@@ -658,22 +694,39 @@ static VkResult open_device(struct vk_ctx *ctx,
 	ctx->incremental_present = adapter->incremental;
 	ctx->host_image_copy = adapter->host_copy;
 	ctx->fifo_latest_ready = adapter->latest_ready;
+	ctx->present_timing = adapter->present_timing;
+	ctx->nv12 = adapter->nv12;
+	VkPhysicalDevicePresentTimingFeaturesEXT timings = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_TIMING_FEATURES_EXT,
+		.presentTiming = VK_TRUE,
+	};
 	struct vk_features features;
 
 	VkPhysicalDevicePresentModeFifoLatestReadyFeaturesKHR latest = {
 		.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PRESENT_MODE_FIFO_LATEST_READY_FEATURES_KHR,
+		.pNext = ctx->present_timing ? &timings : NULL,
 		.presentModeFifoLatestReady = VK_TRUE,
 	};
 	VkPhysicalDeviceSwapchainMaintenance1FeaturesKHR maintenance = {
 		.sType =
 			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SWAPCHAIN_MAINTENANCE_1_FEATURES_KHR,
-		.pNext = ctx->fifo_latest_ready ? &latest : NULL,
+		.pNext = ctx->fifo_latest_ready ?
+				 (void *)&latest :
+				 (ctx->present_timing ? &timings : NULL),
 		.swapchainMaintenance1 = VK_TRUE,
 	};
 	feature_chain(&features, ctx->host_image_copy || ctx->descriptor_heap,
 		      ctx->descriptor_heap, !ctx->descriptor_heap,
 		      ctx->surface ? &maintenance : NULL);
+	VkPhysicalDeviceSamplerYcbcrConversionFeatures ycbcr = {
+		.sType =
+			VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SAMPLER_YCBCR_CONVERSION_FEATURES,
+		.pNext = features.core.pNext,
+		.samplerYcbcrConversion = ctx->nv12,
+	};
+	features.core.pNext = &ycbcr;
 	features.v12.bufferDeviceAddress = VK_TRUE;
 	features.v12.scalarBlockLayout = VK_TRUE;
 	features.v12.shaderSampledImageArrayNonUniformIndexing = VK_TRUE;
@@ -691,7 +744,7 @@ static VkResult open_device(struct vk_ctx *ctx,
 		.queueCount = 1,
 		.pQueuePriorities = &priority,
 	};
-	const char *extensions[5] = {
+	const char *extensions[12] = {
 		ctx->descriptor_heap ? VK_EXT_DESCRIPTOR_HEAP_EXTENSION_NAME :
 				       VK_EXT_DESCRIPTOR_BUFFER_EXTENSION_NAME,
 	};
@@ -703,6 +756,21 @@ static VkResult open_device(struct vk_ctx *ctx,
 			adapter->maintenance_khr ?
 				VK_KHR_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME :
 				VK_EXT_SWAPCHAIN_MAINTENANCE_1_EXTENSION_NAME;
+	}
+	if (ctx->nv12) {
+		extensions[count++] =
+			VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME;
+		extensions[count++] =
+			VK_EXT_EXTERNAL_MEMORY_DMA_BUF_EXTENSION_NAME;
+		extensions[count++] = VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME;
+		extensions[count++] =
+			VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME;
+	}
+	if (ctx->present_timing) {
+		extensions[count++] = VK_KHR_PRESENT_ID_2_EXTENSION_NAME;
+		extensions[count++] =
+			VK_KHR_CALIBRATED_TIMESTAMPS_EXTENSION_NAME;
+		extensions[count++] = VK_EXT_PRESENT_TIMING_EXTENSION_NAME;
 	}
 	if (ctx->incremental_present)
 		extensions[count++] = VK_KHR_INCREMENTAL_PRESENT_EXTENSION_NAME;

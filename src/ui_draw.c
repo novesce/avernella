@@ -4126,8 +4126,16 @@ static gboolean present_native(SDL_Rect dirty)
 
 	native_scroll_scene(&scene);
 	ui_media_gpu_video(&scene, video_offset);
-	int result = ui_gpu_draw(&scene);
+	int result = ui_media_draw_scene(&scene);
 
+	/* No Cairo pixels changed on a video-only retry. The presenter
+	 * retains its canvas texture even when it has to rebuild a swapchain.
+	 */
+	if (!result && !native_repaint && !dirty.w && !dirty.h &&
+	    !scene.upload_count) {
+		ui.video_dirty = TRUE;
+		return FALSE;
+	}
 	native_repaint = result <= 0;
 	if (!native_repaint)
 		return TRUE;

@@ -508,13 +508,13 @@ static struct {
 /* A pending event owns the latest frame for its stream. */
 static GMutex preview_lock;
 struct pending_preview {
-	int fd;
+	int fd, release_fd;
 	struct line_preview_frame frame;
 };
 static struct pending_preview previews[LINE_PREVIEW_COUNT] = {
-	[LINE_PREVIEW_SCREEN] = { .fd = -1 },
-	[LINE_PREVIEW_REMOTE] = { .fd = -1 },
-	[LINE_PREVIEW_SELF] = { .fd = -1 },
+	[LINE_PREVIEW_SCREEN] = { .fd = -1, .release_fd = -1 },
+	[LINE_PREVIEW_REMOTE] = { .fd = -1, .release_fd = -1 },
+	[LINE_PREVIEW_SELF] = { .fd = -1, .release_fd = -1 },
 };
 
 static void set_string(char **dest, const char *s);
@@ -735,7 +735,8 @@ enum {
 static void pump_preview(guint generation)
 {
 	struct line_preview_frame frame;
-	int fd = line_media_recv_frame(wire.preview, &frame);
+	int release_fd;
+	int fd = line_media_recv_preview(wire.preview, &frame, &release_fd);
 
 	if (fd < 0)
 		return;
@@ -746,6 +747,9 @@ static void pump_preview(guint generation)
 
 	if (!notify)
 		close(preview->fd);
+	if (preview->release_fd >= 0)
+		close(preview->release_fd);
+	preview->release_fd = release_fd;
 	preview->fd = fd;
 	preview->frame = frame;
 	if (notify) {
@@ -756,7 +760,9 @@ static void pump_preview(guint generation)
 		e.user.data1 = GUINT_TO_POINTER((guint)frame.source);
 		if (SDL_PushEvent(&e) != 1) {
 			close(preview->fd);
-			preview->fd = -1;
+			if (preview->release_fd >= 0)
+				close(preview->release_fd);
+			preview->release_fd = preview->fd = -1;
 		}
 	}
 	g_mutex_unlock(&preview_lock);
@@ -941,7 +947,9 @@ static void stop_worker(gboolean orderly)
 		for (size_t i = 0; i < G_N_ELEMENTS(previews); i++) {
 			if (previews[i].fd >= 0)
 				close(previews[i].fd);
-			previews[i].fd = -1;
+			if (previews[i].release_fd >= 0)
+				close(previews[i].release_fd);
+			previews[i].release_fd = previews[i].fd = -1;
 		}
 		g_async_queue_unref(wire.writes);
 		wire.pid = 0;
@@ -966,6 +974,8 @@ static char **worker_environment(void)
 
 	/* The audio worker has no SDL event loop to consume SDL_QUIT. */
 	env = g_environ_setenv(env, SDL_HINT_NO_SIGNAL_HANDLERS, "1", TRUE);
+	env = g_environ_setenv(env, "AVERNELLA_MEDIA_DMABUF",
+			       ui_gpu_dmabuf_supported() ? "1" : "0", TRUE);
 	env = g_environ_unsetenv(env, "AVERNELLA_MEDIA_RENDER_NODE");
 	env = g_environ_unsetenv(env, "AVERNELLA_MEDIA_GPU_VENDOR");
 	if (minor >= 0) {
@@ -3193,12 +3203,14 @@ static void event(SDL_Event *e)
 		struct pending_preview *preview = &previews[source];
 
 		g_mutex_lock(&preview_lock);
-		int fd = preview->fd;
+		int fd = preview->fd, release_fd = preview->release_fd;
 		struct line_preview_frame frame = preview->frame;
 
-		preview->fd = -1;
+		preview->release_fd = preview->fd = -1;
 		g_mutex_unlock(&preview_lock);
-		if (fd >= 0) {
+		if (release_fd >= 0) {
+			ui_media_dmabuf_frame(&frame, fd, release_fd);
+		} else if (fd >= 0) {
 			ui_media_preview_frame(&frame, fd);
 			close(fd);
 		}

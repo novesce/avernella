@@ -8,7 +8,8 @@ struct vk_adapter {
 	VkPhysicalDeviceType type;
 	uint32_t family, vendor;
 	int render_minor;
-	bool heap, maintenance_khr, incremental, host_copy;
+	bool heap, maintenance_khr, incremental, host_copy, present_timing,
+		nv12;
 	unsigned int latest_ready; /* 1: KHR extension name, 2: EXT */
 };
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call_video.h"
+#include "codec_affinity.h"
 #include "call_vp8.h"
 #include "call_vp8_encode.h"
 #include "call_srtp.h"
@@ -78,6 +79,7 @@ struct tx_packet {
 	gint64 sent, resent;
 	guint16 seq, size;
 	guint8 resends;
+	gboolean requested;
 	guint8 data[VIDEO_MTU + SRTP_MAX_TRAILER_LEN];
 };
 
@@ -90,7 +92,9 @@ struct rate_control {
 	guint target, remb;
 	gint64 window_start, remb_at, scaled_at, last_fir, decreased_at;
 	guint sent, lost, firs;
-	double report_loss;
+	double report_loss, repair_share, request_fraction;
+	guint repair_kbps;
+	guint64 original_bytes, repair_bytes;
 	gboolean feedback; /* the peer sends more than keyframe requests */
 	guint scale; /* 0 full size, then 3/4, 1/2, 3/8, 1/4 */
 };
@@ -113,10 +117,10 @@ struct local_queue {
 struct remb_estimate {
 	gint64 base_us, min_delay, min_next, min_reset, sent_at, decreased_at;
 	gint64 window_start, updated;
-	guint32 base_ts, last_ts;
-	guint64 window_bytes, picture_bytes;
+	guint32 last_ts;
+	guint64 media_ticks, window_bytes, picture_bytes;
 	double queue_ms, calm_ms, rate_kbps, estimate;
-	gboolean started, send_now, have_ts;
+	gboolean started, send_now, have_ts, timed_picture;
 };
 
 enum video_format {
@@ -285,7 +289,13 @@ static gboolean sender_open_software(struct vp8_sender *s)
 		threshold = 100;
 		partitions = VP8_FOUR_TOKENPARTITION;
 	}
-	if (vpx_codec_enc_init(&s->sw, codec, &cfg, 0))
+	cpu_set_t saved;
+	gboolean local = line_codec_local_cpus(&saved, cfg.g_threads);
+	vpx_codec_err_t result = vpx_codec_enc_init(&s->sw, codec, &cfg, 0);
+
+	if (local)
+		(void)sched_setaffinity(0, sizeof(saved), &saved);
+	if (result != VPX_CODEC_OK)
 		return FALSE;
 	pace_start(&s->pace, speed);
 	if (vpx_codec_control(&s->sw, VP8E_SET_CPUUSED, speed) ||
@@ -349,7 +359,11 @@ static gboolean sender_image(vpx_image_t *img,
 			      .w = frame->width,
 			      .d_w = frame->width,
 			      .h = frame->height,
-			      .d_h = frame->height };
+			      .d_h = frame->height,
+			      .user_priv = frame->capture_dma };
+	if (frame->capture_dma)
+		return g_bytes_get_size(frame->capture_dma) ==
+		       sizeof(struct line_capture_dma);
 	for (int i = 0; i < 3; i++) {
 		guint w = i ? (img->w + 1) / 2 : img->w;
 
@@ -386,6 +400,7 @@ static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
 		const struct line_camera_frame frame = {
 			.width = img->d_w,
 			.height = img->d_h,
+			.capture_dma = img->user_priv,
 			.plane = { img->planes[0], img->planes[1],
 				   img->planes[2] },
 			.stride = { img->stride[0], img->stride[1],
@@ -402,6 +417,13 @@ static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
 			sender_emitted(s);
 			return TRUE;
 		}
+		if (img->user_priv) {
+			/* The next shared-memory capture opens a fresh encoder. */
+			sender_close(s);
+			line_capture_reject(img->user_priv);
+			picture->size = 0;
+			return TRUE;
+		}
 		/* A fresh software keyframe can replace this very picture. No
 		 * packet or sequence number has gone to the peer yet. */
 		if (!g_strcmp0(g_getenv("LINE_RENDER_LOG"), "1"))
@@ -413,6 +435,11 @@ static gboolean sender_encode(struct vp8_sender *s, const vpx_image_t *img,
 		if (!sender_open_software(s))
 			return FALSE;
 		force = TRUE;
+	}
+	if (img->user_priv) {
+		line_capture_reject(img->user_priv);
+		picture->size = 0;
+		return TRUE;
 	}
 	if (vpx_codec_encode(&s->sw, img, pts, 90000 / s->fps,
 			     force ? VPX_EFLAG_FORCE_KF : 0, VPX_DL_REALTIME))
@@ -461,6 +488,9 @@ struct encode_thread {
 	int wake;
 	enum encode_state state;
 	struct vp8_sender *sender;
+	/* Nonzero for an immutable PipeWire presentation handed to this worker. */
+	guint screen_kbps, screen_fps;
+	GBytes *capture;
 	/* The picture to encode: a private copy of the frame's planes. */
 	vpx_image_t img;
 	guint8 *pixels;
@@ -490,8 +520,20 @@ static gpointer encode_main(gpointer data)
 		g_mutex_unlock(&t->lock);
 
 		struct vp8_picture picture = { 0 };
-		gboolean ok = sender_encode(t->sender, &t->img, t->pts,
-					    t->force, &picture);
+		gboolean force = t->force, ok = TRUE;
+
+		if (t->screen_kbps &&
+		    (!t->sender->ready || t->sender->width != t->img.w ||
+		     t->sender->height != t->img.h)) {
+			ok = sender_open(t->sender, t->img.w, t->img.h,
+					 t->screen_kbps, t->screen_fps,
+					 VP8_SCREEN_PDTP);
+			force = TRUE;
+		}
+		if (ok)
+			ok = sender_encode(t->sender, &t->img, t->pts, force,
+					   &picture);
+		g_clear_pointer(&t->capture, g_bytes_unref);
 
 		if (ok && picture.size > t->out_capacity) {
 			t->out_capacity = picture.size;
@@ -504,14 +546,14 @@ static gpointer encode_main(gpointer data)
 		t->key = picture.key;
 		t->out_size = ok ? picture.size : 0;
 		/* From capture, including any wait behind the last picture. */
-		t->delay_ms = MIN((g_get_monotonic_time() - t->captured) / 1000,
-				  G_MAXUINT16);
+		t->delay_ms =
+			CLAMP((g_get_monotonic_time() - t->captured) / 1000, 0,
+			      G_MAXUINT16);
 		if (t->state == ENCODE_RUNNING)
 			t->state = ENCODE_DONE;
+		while (eventfd_write(t->wake, 1) < 0 && errno == EINTR)
+			;
 		g_cond_broadcast(&t->cond);
-		g_mutex_unlock(&t->lock);
-		(void)eventfd_write(t->wake, 1);
-		g_mutex_lock(&t->lock);
 	}
 	g_mutex_unlock(&t->lock);
 	return NULL;
@@ -573,6 +615,18 @@ static void encoder_stop(struct encode_thread *t)
 	g_free(t);
 }
 
+static void encoder_queue(struct encode_thread *t, guint64 pts, gint64 captured,
+			  gboolean force)
+{
+	g_mutex_lock(&t->lock);
+	t->pts = pts;
+	t->captured = captured;
+	t->force = force;
+	t->state = ENCODE_QUEUED;
+	g_cond_signal(&t->cond);
+	g_mutex_unlock(&t->lock);
+}
+
 /* Copies the planes, so the camera may reuse its buffer at once. */
 static void encoder_submit(struct encode_thread *t, const vpx_image_t *img,
 			   guint64 pts, gint64 captured, gboolean force)
@@ -581,6 +635,12 @@ static void encoder_submit(struct encode_thread *t, const vpx_image_t *img,
 	gsize luma = (gsize)img->d_w * img->d_h, chroma = (gsize)cw * ch;
 	gsize need = luma + 2 * chroma;
 
+	if (img->user_priv) {
+		t->capture = g_bytes_ref(img->user_priv);
+		t->img = *img;
+		encoder_queue(t, pts, captured, force);
+		return;
+	}
 	if (need > t->pixels_size) {
 		t->pixels = g_realloc(t->pixels, need);
 		t->pixels_size = need;
@@ -601,13 +661,7 @@ static void encoder_submit(struct encode_thread *t, const vpx_image_t *img,
 			memcpy(t->img.planes[p] + (gsize)y * t->img.stride[p],
 			       img->planes[p] + (gsize)y * img->stride[p], w);
 	}
-	g_mutex_lock(&t->lock);
-	t->pts = pts;
-	t->captured = captured;
-	t->force = force;
-	t->state = ENCODE_QUEUED;
-	g_cond_signal(&t->cond);
-	g_mutex_unlock(&t->lock);
+	encoder_queue(t, pts, captured, force);
 }
 
 struct call_video {
@@ -632,7 +686,7 @@ struct call_video {
 	enum video_format framing, rx_format;
 	enum video_source picture_source, displayed_source;
 	gboolean have_ts, have_last, have_previous_end, finished, group_rx;
-	gboolean group_rx_trace;
+	gboolean group_rx_trace, picture_disposable;
 	gsize received, expected;
 	guint32 extended_size;
 	unsigned int fragments, authenticated;
@@ -642,7 +696,7 @@ struct call_video {
 	guint16 rx_next, rx_high;
 	guint rx_held;
 	gboolean rx_started, rtx_answered;
-	gint64 reorder_us, rtx_rtt_us, next_fir, fir_interval, now;
+	gint64 reorder_us, min_rtt_us, rtx_rtt_us, next_fir, fir_interval, now;
 	/* Kernel receive time of the packet being handled, or 0 for now. */
 	gint64 rx_arrival;
 	gint64 last_key_at, key_due, rtx_window;
@@ -654,12 +708,7 @@ struct call_video {
 	gboolean rr_seen;
 	struct remb_estimate remb;
 	/* Receiver report: losses after repair, from this receiver's view. */
-	struct {
-		gint64 sent_at;
-		guint32 cycles, lost_total, expected_prior, lost_prior;
-		guint16 first, last_high;
-		guint lost;
-	} rr;
+	struct call_reception_report rr;
 	struct {
 		guint requests, requested, retransmitted, gave_up, late;
 		guint firs, rembs, rate_changes, scaled;
@@ -718,6 +767,7 @@ static void clear_picture(struct call_video *v)
 	}
 	v->received = v->expected = 0;
 	v->framing = VIDEO_UNKNOWN;
+	v->picture_disposable = FALSE;
 	v->picture_source = VIDEO_SOURCE_UNKNOWN;
 	v->have_last = FALSE;
 }
@@ -886,6 +936,17 @@ static gboolean configure_encoder(struct call_video *v, guint w, guint h)
 	 */
 	if (v->rc.target && !(v->group_tx && screen))
 		kbps = MAX(MIN(kbps, v->rc.target), (guint)MIN_KBPS);
+	/* C = new VP8 bytes + repair bytes. Allocate C(1 - alpha) to
+	 * the encoder, with alpha measured on this uplink. Reliable PDTP
+	 * uses a different transport and accounts for its own repairs.
+	 */
+	if (v->rc.request_fraction >= 0.02 && !(v->group_tx && screen)) {
+		kbps = MAX((guint)(kbps * (1.0 - v->rc.repair_share)),
+			   (guint)MIN_KBPS);
+		if (v->rc.repair_kbps)
+			kbps = MAX(MIN(kbps, v->rc.repair_kbps),
+				   (guint)MIN_KBPS);
+	}
 	if (!screen && !v->group_tx)
 		fps = MIN(fps, kbps < 120 ? 10u : kbps < 250 ? 15u : fps);
 	if (s->ready && w == s->width && h == s->height && kbps == s->kbps &&
@@ -1005,6 +1066,8 @@ static gboolean encoder_image(struct call_video *v, vpx_image_t *img)
 		return TRUE;
 	}
 
+	if (img->user_priv)
+		return FALSE;
 	if (!v->scaled || v->scaled->d_w != w || v->scaled->d_h != h) {
 		g_clear_pointer(&v->scaled, vpx_img_free);
 		v->scaled = vpx_img_alloc(NULL, VPX_IMG_FMT_I420, w, h, 16);
@@ -1242,9 +1305,11 @@ static gboolean send_picture(struct call_video *v, guint32 timestamp,
 			h->sent = v->now;
 			h->resent = 0;
 			h->resends = 0;
+			h->requested = FALSE;
 			memcpy(h->data, packet, n);
 		}
 		v->rc.sent++;
+		v->rc.original_bytes += n;
 		v->lq.sent += n;
 		if (!send(packet, n, data))
 			return FALSE;
@@ -1366,6 +1431,34 @@ static void rate_update(struct call_video *v, gint64 now)
 		next = MIN(next, rc->remb);
 	if (next != current)
 		rate_set(v, next, now);
+	if (rc->original_bytes) {
+		guint64 wire_bytes = rc->original_bytes + rc->repair_bytes;
+
+		rc->repair_share = (double)rc->repair_bytes / wire_bytes;
+	}
+	/* Keep the expected unrepaired-picture rate below 1% if retries
+	 * are independent. The receiver holds gaps for a request
+	 * and one repeat. After three attempts a fragment is missing with
+	 * probability p^3. For n fragments
+	 * per picture the delivery probability is (1-p^3)^n. Reports
+	 * retain one hundred prior observations (one per percentage point)
+	 * to prevent individual NACKs from reconfiguring the encoder.
+	 */
+	if (rc->sent) {
+		rc->request_fraction =
+			(100 * rc->request_fraction + MIN(rc->lost, rc->sent)) /
+			(100 + rc->sent);
+		double p2 = rc->request_fraction * rc->request_fraction;
+		double max_packets =
+			p2 ? MAX(1.0, log(0.99) / log1p(-p2 *
+							rc->request_fraction)) :
+			     G_MAXUINT;
+		double limit = max_packets * (VIDEO_MTU - RTP_HEADER) * 8 *
+			       v->fps / 1000;
+
+		rc->repair_kbps = limit < rate_ceiling(v) ? (guint)limit : 0;
+	}
+	rc->original_bytes = rc->repair_bytes = 0;
 	rc->window_start = now;
 	rc->sent = rc->lost = rc->firs = 0;
 	rc->report_loss = 0;
@@ -1544,8 +1637,13 @@ gboolean call_video_encode(struct call_video *v,
 		}
 	}
 	if (!sender_image(&img, frame) || !encoder_image(v, &img) ||
-	    !configure_encoder(v, img.d_w, img.d_h))
+	    !configure_encoder(v, img.d_w, img.d_h)) {
+		if (frame->capture_dma) {
+			line_capture_reject(frame->capture_dma);
+			return TRUE;
+		}
 		goto failed;
+	}
 	if (v->epoch < 0)
 		v->epoch = now;
 	pts = ((guint64)(now - v->epoch) / 100) * 9 +
@@ -1582,12 +1680,51 @@ failed:
 	return FALSE;
 }
 
+static void need_video_key(struct call_video *v)
+{
+	v->need_key = TRUE;
+	call_vp8_discontinuity(v->dec);
+}
+
+static gboolean video_decode_result(struct call_video *v, int shown)
+{
+	if (shown < 0) {
+		v->stats.decode++;
+		need_video_key(v);
+		return FALSE;
+	}
+	v->need_key = FALSE;
+	v->next_fir = 0;
+	v->fir_interval =
+		v->group_rx ? G_USEC_PER_SEC :
+			      MAX((gint64)KEY_SPACING_US, 2 * v->rtx_rtt_us);
+	v->stats.hidden += !shown;
+	return TRUE;
+}
+
+void call_video_decoded(struct call_video *v, call_video_display_fn display,
+			gpointer data)
+{
+	struct call_vp8_output out;
+
+	if (!v || !call_vp8_take(v->dec, &out))
+		return;
+	if (out.shown > 0) {
+		if (v->group_rx && out.tag != VIDEO_SOURCE_UNKNOWN)
+			v->displayed_source = out.tag;
+		display(&out.image, data);
+	}
+	video_decode_result(v, out.shown);
+	call_vp8_release(v->dec);
+}
+
 static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 			       call_video_display_fn display, gpointer data)
 {
 	int shown;
 	gboolean key = !(p[0] & 1);
 
+	call_video_decoded(v, display, data);
 	v->stats.pictures++;
 	if (key) {
 		vpx_codec_stream_info_t info = { .sz = sizeof(info) };
@@ -1607,6 +1744,18 @@ static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 		v->stats.deltas++;
 		return TRUE;
 	}
+	switch (call_vp8_submit(v->dec, p, n, key, v->rx_rotation,
+				v->picture_source)) {
+	case CALL_VP8_QUEUED:
+		/* Keep subsequent deltas in order behind the queued key. */
+		v->need_key = FALSE;
+		return TRUE;
+	case CALL_VP8_FULL:
+		need_video_key(v);
+		return FALSE;
+	case CALL_VP8_INLINE:
+		break;
+	}
 	enum video_source previous = v->displayed_source;
 
 	if (v->group_rx && v->picture_source != VIDEO_SOURCE_UNKNOWN)
@@ -1615,18 +1764,7 @@ static gboolean decode_picture(struct call_video *v, const guint8 *p, gsize n,
 				data);
 	if (shown <= 0)
 		v->displayed_source = previous;
-	if (shown < 0) {
-		v->stats.decode++;
-		v->need_key = TRUE;
-		return FALSE;
-	}
-	v->need_key = FALSE;
-	v->next_fir = 0;
-	v->fir_interval =
-		v->group_rx ? G_USEC_PER_SEC :
-			      MAX((gint64)KEY_SPACING_US, 2 * v->rtx_rtt_us);
-	v->stats.hidden += !shown;
-	return TRUE;
+	return video_decode_result(v, shown);
 }
 
 gboolean call_video_frame_is_screen(const struct call_video *v)
@@ -1923,7 +2061,7 @@ static gboolean finish_picture(struct call_video *v, const guint8 *picture,
 		return FALSE;
 	}
 	if (v->have_previous_end && (guint16)(v->first - v->previous_end) != 1)
-		v->need_key = TRUE;
+		need_video_key(v);
 	v->previous_end = v->last;
 	v->have_previous_end = TRUE;
 	if (!v->group_rx) {
@@ -1990,6 +2128,8 @@ static gboolean find_early_end(struct call_video *v)
 		checked++;
 		const guint8 *p = g_bytes_get_data(part->bytes, &size);
 
+		if (v->framing == VIDEO_RFC7741 && !(p[0] & 0x20))
+			v->picture_disposable = FALSE;
 		if (!describe(v->framing, p, size, part->marker, &payload) ||
 		    payload.start || (payload.end && !mark_end(v, part->seq)))
 			return FALSE;
@@ -2019,7 +2159,17 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 	if (!v->have_ts || (gint32)(ts - v->rx_ts) > 0) {
 		if (v->have_ts && !v->finished) {
 			v->stats.incomplete++;
-			v->need_key = TRUE;
+			/* RFC 7741 N: every missing packet lies strictly
+			 * inside one non-reference picture with known ends.
+			 * The decoder still holds the preceding reference.
+			 */
+			if (v->picture_disposable && v->have_previous_end &&
+			    v->have_last && rfc && vp8.start && !evs3.start &&
+			    (guint16)(v->first - v->previous_end) == 1 &&
+			    (guint16)(seq - v->last) == 1)
+				v->previous_end = v->last;
+			else
+				need_video_key(v);
 		}
 		clear_picture(v);
 		v->have_ts = TRUE;
@@ -2031,6 +2181,7 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 		return FALSE;
 	if (v->framing == VIDEO_UNKNOWN && (evs3.start || vp8.start)) {
 		v->framing = evs3.start ? evs : VIDEO_RFC7741;
+		v->picture_disposable = !evs3.start && (p[0] & 0x20);
 		payload = evs3.start ? evs3 : vp8;
 		v->rx_picture = evs3.start ? read16(p + 1) : 0;
 		v->expected = payload.expected;
@@ -2046,6 +2197,8 @@ static gboolean accept_fragment(struct call_video *v, const guint8 *p, gsize n,
 		    (!payload.offset || payload.start))
 			return FALSE;
 	}
+	if (v->framing == VIDEO_RFC7741 && !(p[0] & 0x20))
+		v->picture_disposable = FALSE;
 	if (v->framing != VIDEO_UNKNOWN && v->framing != VIDEO_RFC7741 &&
 	    read16(p + 1) != v->rx_picture)
 		return FALSE;
@@ -2079,7 +2232,8 @@ complete:
 	return TRUE;
 invalid:
 	v->stats.assembly++;
-	v->need_key = v->finished = TRUE;
+	need_video_key(v);
+	v->finished = TRUE;
 	clear_picture(v);
 	return FALSE;
 }
@@ -2136,8 +2290,15 @@ static gint64 rx_hold(const struct call_video *v)
 	return hold;
 }
 
+gint64 call_video_min_rtt(const struct call_video *v)
+{
+	return v ? v->min_rtt_us : 0;
+}
+
 static void rtx_sample(struct call_video *v, gint64 sample)
 {
+	if (sample > 0 && (!v->min_rtt_us || sample < v->min_rtt_us))
+		v->min_rtt_us = sample;
 	sample = CLAMP(sample, 1000, (gint64)G_USEC_PER_SEC);
 	v->rtx_answered = TRUE;
 	v->recovery.retransmitted++;
@@ -2183,7 +2344,6 @@ static gboolean rx_release(struct call_video *v, gint64 now, gboolean flush,
 		    now - r->missing_since < rx_hold(v))
 			break;
 		v->recovery.gave_up++;
-		v->rr.lost++;
 		v->rx_next++;
 	}
 	return ok;
@@ -2203,7 +2363,6 @@ static void remb_packet(struct call_video *v, guint32 ts, gsize size,
 	if (!e->started) {
 		*e = (struct remb_estimate){ .started = TRUE,
 					     .base_us = now,
-					     .base_ts = ts,
 					     .min_delay = G_MAXINT64,
 					     .min_next = G_MAXINT64,
 					     .min_reset =
@@ -2220,15 +2379,26 @@ static void remb_packet(struct call_video *v, guint32 ts, gsize size,
 		e->window_bytes = 0;
 		e->window_start = now;
 	}
+	/* Bytes from late repairs still traversed the bottleneck. Their old
+	 * capture timestamp must not enter the one-way delay gradient.
+	 * Extend the 90 kHz clock a frame at a time so the transit estimate
+	 * also stays continuous beyond half an RTP timestamp cycle.
+	 */
+	if (e->have_ts && (gint32)(ts - e->last_ts) < 0)
+		return;
 	if (!e->have_ts || ts != e->last_ts) {
+		if (e->have_ts)
+			e->media_ticks += (guint32)(ts - e->last_ts);
 		e->have_ts = TRUE;
 		e->last_ts = ts;
 		e->picture_bytes = 0;
+		e->timed_picture = FALSE;
 	}
 	e->picture_bytes += size;
-	if (!marker)
+	if (!marker || e->timed_picture)
 		return;
-	gint64 media = (gint64)(gint32)(ts - e->base_ts) * 1000 / 90;
+	e->timed_picture = TRUE;
+	gint64 media = (gint64)(e->media_ticks * 1000 / 90);
 	/* Time each picture by its last packet. */
 	gint64 own = e->rate_kbps ? e->picture_bytes * 8000.0 / e->rate_kbps :
 				    0;
@@ -2356,8 +2526,8 @@ static gboolean reorder(struct call_video *v, const guint8 *p, gsize n,
 		v->rx_started = TRUE;
 		v->rx_next = seq;
 		v->rx_high = seq - 1;
-		v->rr.first = seq;
 	}
+	call_rtcp_arrival(&v->rr, seq, ts, 90000, now);
 	gint16 ahead = seq - v->rx_next;
 
 	/* Far behind is a restarted sequence, not a late packet. */
@@ -2400,7 +2570,6 @@ static gboolean reorder(struct call_video *v, const guint8 *p, gsize n,
 		if (r->requested_at &&
 		    now - r->requested_at >= v->rtx_rtt_us / 2) {
 			rtx_sample(v, now - r->requested_at);
-			v->rr.lost++;
 		} else {
 			reorder_sample(v, now - r->missing_since);
 		}
@@ -2436,7 +2605,6 @@ static gboolean reorder(struct call_video *v, const guint8 *p, gsize n,
 				g_bytes_unref(payload);
 			} else {
 				v->recovery.gave_up++;
-				v->rr.lost++;
 			}
 			v->rx_next++;
 		}
@@ -2685,35 +2853,14 @@ static gboolean send_remb(struct call_video *tx, const struct call_video *rx,
 static gboolean send_rr(struct call_video *tx, struct call_video *rx,
 			call_video_send_fn send, gpointer data)
 {
-	guint8 packet[32 + SRTP_MAX_TRAILER_LEN] = { 0 };
-	int n = 32;
+	guint8 packet[32 + SRTP_MAX_TRAILER_LEN + 4];
+	gsize size;
 
-	if (!tx || !tx->tx || !rx->rx_started)
+	if (!tx || !tx->tx)
 		return FALSE;
-	if ((guint16)(rx->rx_high - rx->rr.last_high) > 0x8000)
-		rx->rr.cycles += 1u << 16;
-	if (rx->rx_high < rx->rr.last_high)
-		rx->rr.cycles += 1u << 16;
-	rx->rr.last_high = rx->rx_high;
-	guint32 extended = rx->rr.cycles | rx->rx_high;
-	guint32 expected = (guint32)(extended - rx->rr.first) + 1;
-	guint32 interval = expected - rx->rr.expected_prior;
-	guint32 lost = MIN(rx->rr.lost, interval);
-
-	rx->rr.lost_total += lost;
-	rx->rr.expected_prior = expected;
-	rx->rr.lost = 0;
-	packet[0] = 0x81;
-	packet[1] = RTCP_RR;
-	write16(packet + 2, 7);
-	write32(packet + 4, tx->tx_ssrc);
-	write32(packet + 8, rx->rx_ssrc);
-	packet[12] = interval ? MIN(255u, lost * 256 / interval) : 0;
-	packet[13] = MIN(rx->rr.lost_total, 0x7fffffu) >> 16;
-	write16(packet + 14, MIN(rx->rr.lost_total, 0x7fffffu));
-	write32(packet + 16, extended);
-	return srtp_protect_rtcp(tx->tx, packet, &n) == srtp_err_status_ok &&
-	       send(packet, n, data);
+	size = call_rtcp_report(&rx->rr, tx->tx, tx->tx_ssrc, rx->rx_ssrc,
+				packet, sizeof(packet));
+	return size && send(packet, size, data);
 }
 
 gint64 call_video_poll(struct call_video *rx, struct call_video *feedback,
@@ -2823,8 +2970,10 @@ guint call_video_retransmit(struct call_video *v, const guint16 *list,
 
 		if (h->seq != list[i] || !h->size || now - h->sent > RTX_AGE_US)
 			continue;
-		if (!h->resends && !h->resent)
+		if (!h->requested) {
+			h->requested = TRUE;
 			v->rc.lost++;
+		}
 		if (h->resends >= 3 || (h->resent && now - h->resent < 20000) ||
 		    v->rtx_bytes + h->size > budget)
 			continue;
@@ -2833,6 +2982,8 @@ guint call_video_retransmit(struct call_video *v, const guint16 *list,
 		if (!send(h->data, h->size, data))
 			break;
 		v->rtx_bytes += h->size;
+		v->rc.repair_bytes += h->size;
+		v->lq.sent += h->size;
 		v->recovery.retransmitted++;
 		sent++;
 	}
@@ -3083,6 +3234,16 @@ struct call_share_decoder {
 	guint frames, errors;
 };
 
+struct call_vp8_decoder *call_video_decoder(struct call_video *v)
+{
+	return v ? v->dec : NULL;
+}
+
+struct call_vp8_decoder *call_share_video_decoder(struct call_share_decoder *s)
+{
+	return s ? s->dec : NULL;
+}
+
 struct call_share_decoder *call_share_decoder_new(void)
 {
 	struct call_share_decoder *s = g_new0(struct call_share_decoder, 1);
@@ -3111,6 +3272,29 @@ gboolean call_share_decoder_keyframe_needed(const struct call_share_decoder *s)
 	return !s || s->need_key;
 }
 
+static void need_share_key(struct call_share_decoder *s)
+{
+	s->need_key = TRUE;
+	call_vp8_discontinuity(s->dec);
+}
+
+void call_share_decoded(struct call_share_decoder *s,
+			call_video_display_fn display, gpointer data)
+{
+	struct call_vp8_output out;
+
+	if (!s || !call_vp8_take(s->dec, &out))
+		return;
+	if (out.shown < 0) {
+		need_share_key(s);
+		s->errors++;
+	} else if (out.shown > 0) {
+		display(&out.image, data);
+		s->frames += out.shown;
+	}
+	call_vp8_release(s->dec);
+}
+
 static gboolean share_decode_frame(struct call_share_decoder *s,
 				   const guint8 *vp8, gsize n,
 				   call_video_display_fn display, gpointer data)
@@ -3118,6 +3302,7 @@ static gboolean share_decode_frame(struct call_share_decoder *s,
 	gboolean key = n >= 3 && !(vp8[0] & 1);
 	int shown;
 
+	call_share_decoded(s, display, data);
 	if (!key && s->need_key)
 		return TRUE;
 	if (key) {
@@ -3128,6 +3313,15 @@ static gboolean share_decode_frame(struct call_share_decoder *s,
 		    !info.is_kf ||
 		    !line_preview_size_valid(info.w, info.h, TRUE))
 			return FALSE;
+	}
+	switch (call_vp8_submit(s->dec, vp8, n, key, s->rotation, 0)) {
+	case CALL_VP8_QUEUED:
+		s->need_key = FALSE;
+		return TRUE;
+	case CALL_VP8_FULL:
+		return FALSE;
+	case CALL_VP8_INLINE:
+		break;
 	}
 	shown = call_vp8_decode(s->dec, vp8, n, key, s->rotation, display,
 				data);
@@ -3151,7 +3345,7 @@ gboolean call_share_decode(struct call_share_decoder *s, const guint8 *frag,
 
 	if (payload.start) {
 		if (s->assembling)
-			s->need_key = TRUE;
+			need_share_key(s);
 		g_byte_array_set_size(s->frame, 0);
 		s->assembling = TRUE;
 		s->picture = picture;
@@ -3181,7 +3375,7 @@ gboolean call_share_decode(struct call_share_decoder *s, const guint8 *frag,
 failed:
 	if (s) {
 		s->errors++;
-		s->need_key = TRUE;
+		need_share_key(s);
 		s->assembling = FALSE;
 	}
 	return FALSE;
@@ -3194,6 +3388,13 @@ failed:
  */
 struct call_share_encoder {
 	struct vp8_sender sender;
+	struct encode_thread *worker;
+	/* The latest capture replaces any waiting behind the active job. */
+	GBytes *pending;
+	gboolean pending_dma;
+	guint pending_width, pending_height;
+	guint64 pending_ns, active_ns;
+	gboolean request_key;
 	guint kbps, fps;
 	guint16 picture;
 	gint64 last_encoded;
@@ -3215,6 +3416,8 @@ void call_share_encoder_free(struct call_share_encoder *s)
 {
 	if (!s)
 		return;
+	encoder_stop(s->worker);
+	g_clear_pointer(&s->pending, g_bytes_unref);
 	sender_close(&s->sender);
 	g_free(s);
 }
@@ -3222,7 +3425,7 @@ void call_share_encoder_free(struct call_share_encoder *s)
 void call_share_encoder_keyframe(struct call_share_encoder *s)
 {
 	if (s)
-		s->sender.force_key = TRUE;
+		s->request_key = TRUE;
 }
 
 /*
@@ -3259,6 +3462,32 @@ gsize call_share_descriptor(guint8 *p, guint16 picture, gboolean first,
 	return pos + 4;
 }
 
+static gboolean share_emit(struct call_share_encoder *s,
+			   struct vp8_picture picture, guint res,
+			   call_share_fragment_fn emit, gpointer data)
+{
+	guint16 id = s->picture++;
+
+	if (picture.size > FRAME_LIMIT) {
+		s->request_key = TRUE;
+		return TRUE;
+	}
+	/* The official app sends about 900 bytes of VP8 per fragment. */
+	for (gsize pos = 0; pos < picture.size;) {
+		guint8 frag[1024 + 32];
+		gsize len = MIN(1000, picture.size - pos);
+		gsize header = call_share_descriptor(
+			frag, id, !pos, pos + len == picture.size, picture.key,
+			res, picture.delay_ms, picture.size);
+
+		memcpy(frag + header, picture.data + pos, len);
+		if (!emit(frag, header + len, picture.key, data))
+			return FALSE;
+		pos += len;
+	}
+	return TRUE;
+}
+
 gboolean call_share_encode(struct call_share_encoder *s,
 			   const struct line_camera_frame *frame, gint64 now,
 			   call_share_fragment_fn emit, gpointer data,
@@ -3267,7 +3496,7 @@ gboolean call_share_encode(struct call_share_encoder *s,
 	vpx_image_t img;
 	struct vp8_picture picture = { 0 };
 
-	if (!s || !emit || !frame || now < 0 ||
+	if (!s || s->worker || !emit || !frame || now < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		goto failed;
 	if (s->last_encoded >= 0 &&
@@ -3281,36 +3510,129 @@ gboolean call_share_encode(struct call_share_encoder *s,
 			 VP8_SCREEN_PDTP))
 		goto failed;
 	if (!sender_encode(&s->sender, &img, (guint64)now * 9 / 100,
-			   s->sender.force_key, &picture))
+			   s->sender.force_key || s->request_key, &picture))
 		goto failed;
 	s->last_encoded = now;
 	if (!picture.size)
 		return TRUE;
 	s->sender.force_key = FALSE;
 
-	guint16 id = s->picture++;
-	guint res = resolution_class(img.w * img.h);
-
-	if (picture.size > FRAME_LIMIT) {
-		s->sender.force_key = TRUE;
+	s->request_key = FALSE;
+	if (share_emit(s, picture, resolution_class(img.w * img.h), emit, data))
 		return TRUE;
-	}
-	/* The official app sends about 900 bytes of VP8 per fragment. */
-	for (gsize pos = 0; pos < picture.size;) {
-		guint8 frag[1024 + 32];
-		gsize len = MIN(1000, picture.size - pos);
-		gsize header = call_share_descriptor(
-			frag, id, !pos, pos + len == picture.size, picture.key,
-			res, picture.delay_ms, picture.size);
-
-		memcpy(frag + header, picture.data + pos, len);
-		if (!emit(frag, header + len, picture.key, data))
-			goto failed;
-		pos += len;
-	}
-	return TRUE;
 failed:
 	g_set_error_literal(e, LINE_ERROR, 1,
 			    "Could not encode the shared screen.");
 	return FALSE;
+}
+
+void call_share_encode_async(struct call_share_encoder *s)
+{
+	if (!s || s->worker)
+		return;
+	s->worker = encoder_start(&s->sender);
+	if (s->worker) {
+		s->worker->screen_kbps = s->kbps;
+		s->worker->screen_fps = s->fps;
+	}
+}
+
+int call_share_encoder_fd(const struct call_share_encoder *s)
+{
+	return s && s->worker ? s->worker->wake : -1;
+}
+
+static void share_submit_pending(struct call_share_encoder *s)
+{
+	struct encode_thread *t = s->worker;
+	struct line_camera_frame frame;
+
+	if (!s->pending || encoder_busy(t))
+		return;
+	gint64 now = s->pending_ns / 1000;
+
+	if (s->last_encoded >= 0 &&
+	    now - s->last_encoded < G_USEC_PER_SEC / s->fps * 3 / 4) {
+		g_clear_pointer(&s->pending, g_bytes_unref);
+		return;
+	}
+	s->last_encoded = now;
+	t->capture = g_steal_pointer(&s->pending);
+	line_capture_frame(&frame, t->capture, s->pending_dma, s->pending_width,
+			   s->pending_height);
+	sender_image(&t->img, &frame);
+	s->active_ns = s->pending_ns;
+	encoder_queue(t,
+		      s->active_ns / 100000 * 9 +
+			      s->active_ns % 100000 * 9 / 100000,
+		      s->active_ns / 1000, s->request_key);
+	s->request_key = FALSE;
+}
+
+gboolean call_share_queue(struct call_share_encoder *s, GBytes *pixels,
+			  gboolean dma, guint width, guint height,
+			  guint64 capture_ns, guint64 *stream_time,
+			  call_share_fragment_fn emit, gpointer data)
+{
+	struct line_camera_frame frame;
+
+	if (!s || !pixels || !emit || !stream_time ||
+	    !line_camera_frame_size_valid(width, height) ||
+	    g_bytes_get_size(pixels) !=
+		    (dma ? sizeof(struct line_capture_dma) :
+			   line_camera_i420_size(width, height)))
+		return FALSE;
+	if (!s->worker) {
+		*stream_time = capture_ns;
+		line_capture_frame(&frame, pixels, dma, width, height);
+		return call_share_encode(s, &frame, capture_ns / 1000, emit,
+					 data, NULL);
+	}
+	g_clear_pointer(&s->pending, g_bytes_unref);
+	s->pending = g_bytes_ref(pixels);
+	s->pending_dma = dma;
+	s->pending_width = width;
+	s->pending_height = height;
+	s->pending_ns = capture_ns;
+	share_submit_pending(s);
+	return TRUE;
+}
+
+gboolean call_share_encoded(struct call_share_encoder *s, gboolean transmit,
+			    guint64 *stream_time, call_share_fragment_fn emit,
+			    gpointer data)
+{
+	struct vp8_picture picture;
+	eventfd_t n;
+	gboolean ok;
+
+	if (!s || !s->worker || !emit || !stream_time)
+		return FALSE;
+	struct encode_thread *t = s->worker;
+
+	(void)eventfd_read(t->wake, &n);
+	g_mutex_lock(&t->lock);
+	if (t->state != ENCODE_DONE) {
+		g_mutex_unlock(&t->lock);
+		return TRUE;
+	}
+	*stream_time = s->active_ns;
+	ok = t->ok;
+	picture = (struct vp8_picture){ t->out, t->out_size, t->key,
+					t->delay_ms };
+	t->state = ENCODE_IDLE;
+	g_mutex_unlock(&t->lock);
+	if (!transmit) {
+		g_clear_pointer(&s->pending, g_bytes_unref);
+		s->request_key = TRUE;
+	} else if (ok && picture.size) {
+		ok = share_emit(s, picture,
+				resolution_class(t->img.w * t->img.h), emit,
+				data);
+	} else if (t->force) {
+		s->request_key = TRUE;
+	}
+	if (ok)
+		share_submit_pending(s);
+	return ok;
 }

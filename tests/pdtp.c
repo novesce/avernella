@@ -515,7 +515,9 @@ static void ack_ranges(void)
 	ack_peer_open(&a, 3);
 	/* 3, then a gap of one and a range of one: 1. Packet 2 is missing. */
 	n = ack_body(ack, 3, 1, (const guint64[]){ 1, 1 }, 2);
+	a.now += 17000;
 	ack_peer_send(&a, ack, n);
+	g_assert_cmpint(call_pdtp_min_rtt(a.d), ==, 17000);
 	g_assert_cmpuint(call_pdtp_stream_backlog(a.d, 8), ==, 20);
 	/* A duplicate changes nothing; a reordered older ACK covers 2. */
 	ack_peer_send(&a, ack, n);
@@ -523,6 +525,22 @@ static void ack_ranges(void)
 	n = ack_body(ack, 2, 0, NULL, 0);
 	ack_peer_send(&a, ack, n);
 	g_assert_cmpuint(call_pdtp_stream_backlog(a.d, 8), ==, 0);
+	ack_peer_close(&a);
+}
+
+static void stalled_probe_deadline(void)
+{
+	struct ack_peer a;
+
+	ack_peer_open(&a, 4);
+	g_assert_cmpint(call_pdtp_min_rtt(a.d), ==, 0);
+	/* All four expire together. A stalled peer permits one probe. */
+	a.now += G_USEC_PER_SEC;
+	gint64 next = call_pdtp_poll(a.d, a.now, keep_packet, a.sent);
+
+	g_assert_cmpint(next, >, a.now);
+	g_assert_cmpint(call_pdtp_poll(a.d, a.now, keep_packet, a.sent), ==,
+			next);
 	ack_peer_close(&a);
 }
 
@@ -680,6 +698,7 @@ int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/pdtp/varint-limit", varint_limit);
+	g_test_add_func("/pdtp/stalled-probe", stalled_probe_deadline);
 	g_test_add_func("/pdtp/ack-ranges", ack_ranges);
 	g_test_add_func("/pdtp/ack-hostile", ack_hostile);
 	g_test_add_func("/pdtp/group-ack-hostile", group_ack_hostile);

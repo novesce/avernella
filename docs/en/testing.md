@@ -226,7 +226,33 @@ AVERNELLA_VK_DESCRIPTORS=buffer make vulkan-smoke VK_VENDOR=0x1002
 make vulkan-preview VK_PREVIEW_ARGS=--test          # the real presenter: resize, hide, present
 ```
 
-Run them with the validation layer whenever you touch `src/render/`.
+Run them with the validation layer whenever you touch `src/render/`. The smoke test checks known NV12 colors, crop, rotation and lifetime on drivers that import the synthetic linear DMA-BUF. It reports when the kernel fixture allocator or GPU import is unavailable.
+
+```sh
+make build/vulkan-video-bench
+./build/vulkan-video-bench
+./build/vulkan-video-bench --dmabuf
+```
+
+This benchmark displays a synthetic 1080p source at 60 fps. It warms up for 30 frames, then reports 240 samples of GPU command execution, host queue submission and host draw through present, with retries and missed host deadlines. GPU timing uses the queue's timestamp width and period. The DMA-BUF mode uses three immutable NV12 surfaces from `/dev/udmabuf` and requires driver support for their linear modifier. The app itself does not use this allocator. Add `--saturate` to submit back to back. Compare runs on the same driver, viewport and power profile. Display scanout and the remote peer are outside this measurement.
+
+#### Wayland video benchmark results
+
+A 1920×1080 source filled a 1280×720 window. Each cell gives p50 / p95 / p99 in ms, taking the median of each percentile across alternating runs. The baseline was `d4aaebc`. The RTX 5050 Laptop used driver 620.73.04 and FIFO latest-ready (four runs per build). The Radeon 780M used Mesa 26.3.1 and FIFO (three runs per build). Both used descriptor heaps.
+
+| Device and preview path | GPU commands | Host queue submit | Host draw through present |
+| --- | --- | --- | --- |
+| RTX 5050 · I420 · d4aaebc | 0.280 / 0.911 / 0.929 | 0.056 / 0.105 / 0.127 | 0.441 / 1.035 / 1.354 |
+| RTX 5050 · I420 | 0.267 / 0.877 / 0.893 | 0.057 / 0.105 / 0.130 | 0.436 / 0.999 / 1.299 |
+| Radeon 780M · I420 · d4aaebc | 0.479 / 0.865 / 1.315 | 0.050 / 0.097 / 0.127 | 0.367 / 0.773 / 0.940 |
+| Radeon 780M · I420 | 0.366 / 0.742 / 1.160 | 0.045 / 0.101 / 0.129 | 0.377 / 0.584 / 0.783 |
+| Radeon 780M · NV12 DMA-BUF | 0.204 / 0.754 / 1.657 | 0.051 / 0.122 / 0.146 | 0.185 / 0.400 / 0.490 |
+
+All sampled frames met the host 60 fps deadline. The Radeon DMA-BUF path reduced median GPU execution and host draw time, while its GPU p99 varied more than the staged path. NVIDIA accepted the I420 path and declined this synthetic linear DMA-BUF. Current hardware and compositor load affect the tails.
+
+Run `make bench-calls` for the seeded audio and video network profiles, the 720p presentation handoff, UDP batching and the scheduler wakeup comparison. The network tests use synthetic inputs, real codecs and a virtual network clock. The worker and kernel microbenchmarks use the host clock. The Wayland GPU benchmark runs separately so its results can be attributed to a particular driver and presentation mode.
+
+The `/video/receive-blocking` benchmark alternates the order of two receivers for the same 101 measured 1280 × 720 SRTP pictures and checks the decoded samples. On the Ryzen 9 270, call-thread service p50/p95/p99 was 1.533/2.331/3.153 ms inline and 0.043/0.107/0.595 ms with the software decoder worker. First-packet-to-display-callback time was 1.533/2.331/3.153 and 1.579/2.228/3.233 ms respectively. These figures exclude sensor capture and physical scanout.
 
 ## Fuzzing
 

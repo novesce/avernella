@@ -93,6 +93,14 @@ struct sent_packet {
 	struct sent_item item[4];
 };
 
+struct builder {
+	guint8 group[16][PDTP_MTU];
+	gsize len[16];
+	guint count[16];
+	char service[MAX_SERVICE];
+	gsize total;
+};
+
 struct call_pdtp {
 	srtp_t tx, rx;
 	guint8 pt;
@@ -135,8 +143,9 @@ struct call_pdtp {
 	guint32 ts_base;
 	gint64 epoch;
 	struct tx_stream tx_streams[MAX_STREAMS];
+	struct builder *stream_builder;
 	GArray *inflight; /* struct sent_packet */
-	gint64 srtt, rto;
+	gint64 srtt, rto, min_rtt;
 	struct {
 		guint64 pn[GROUP_SETUP_ATTEMPTS];
 		gint64 due;
@@ -366,6 +375,7 @@ void call_pdtp_close(struct call_pdtp *d)
 		srtp_dealloc(d->tx);
 	if (d->rx)
 		srtp_dealloc(d->rx);
+	g_free(d->stream_builder);
 	g_free(d);
 }
 
@@ -507,6 +517,11 @@ void call_pdtp_share_rx_stats(const struct call_pdtp *d,
 			      struct call_pdtp_share_rx *out)
 {
 	*out = d ? d->share_rx : (struct call_pdtp_share_rx){ 0 };
+}
+
+gint64 call_pdtp_min_rtt(const struct call_pdtp *d)
+{
+	return d ? d->min_rtt : 0;
 }
 
 gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *d)
@@ -672,6 +687,8 @@ static void peer_acked(struct call_pdtp *d, guint64 lo, guint64 hi, gint64 now,
 			continue;
 		gint64 rtt = now - sp->sent;
 
+		if (rtt > 0 && (!d->min_rtt || rtt < d->min_rtt))
+			d->min_rtt = rtt;
 		d->srtt = d->srtt ? (7 * d->srtt + rtt) / 8 : rtt;
 		d->rto = CLAMP(2 * d->srtt + 20000, 80000, 2000000);
 		for (guint j = 0; j < sp->count; j++) {
@@ -1244,14 +1261,6 @@ gboolean call_pdtp_receive(struct call_pdtp *d, const guint8 *packet,
 
 /* ---- Sending ---- */
 
-struct builder {
-	guint8 group[16][PDTP_MTU];
-	gsize len[16];
-	guint count[16];
-	char service[MAX_SERVICE];
-	gsize total;
-};
-
 static gsize header_size(const struct builder *b)
 {
 	return 2 + strlen(b->service) + 1 + 2;
@@ -1624,7 +1633,11 @@ static void detect_loss(struct call_pdtp *d, gint64 now)
 	gboolean stalled;
 	guint declared = 0;
 
-	if (d->inflight->len && now - d->last_progress > d->rto)
+	if (!d->inflight->len ||
+	    now - g_array_index(d->inflight, struct sent_packet, 0).sent <
+		    d->rto)
+		return;
+	if (now - d->last_progress > d->rto)
 		d->probing = TRUE;
 	stalled = d->probing;
 	if (stalled && now - d->last_probe < d->rto)
@@ -1736,15 +1749,21 @@ static gboolean send_streams(struct call_pdtp *d, gint64 now,
 	for (guint slot = 0; slot < MAX_STREAMS; slot++) {
 		struct tx_stream *s = &d->tx_streams[slot];
 
-		if (!s->used)
+		if (!s->used ||
+		    (!s->reply_ctrl && !s->open_pending && !s->lost->len &&
+		     (s->paused || s->next >= s->buf_offset + s->buf->len ||
+		      s->next >= s->peer_window)))
 			continue;
+		if (!d->stream_builder)
+			d->stream_builder = g_new0(struct builder, 1);
+		struct builder *b = d->stream_builder;
+
+		g_strlcpy(b->service, s->service, sizeof(b->service));
 		while (d->tokens > 0 && d->inflight->len < MAX_INFLIGHT) {
-			struct builder *b = g_new0(struct builder, 1);
 			struct sent_packet rec = { 0 };
 			guint8 el[PDTP_MTU];
 			gsize n = 0;
 
-			g_strlcpy(b->service, s->service, sizeof(b->service));
 			if (s->reply_ctrl) {
 				n = call_pdtp_varint(el, s->id);
 				el[n++] = 1; /* From the sender. */
@@ -1801,15 +1820,15 @@ static gboolean send_streams(struct call_pdtp *d, gint64 now,
 							    slot, start,
 							    start + len };
 			}
-			if (!rec.count) {
-				g_free(b);
+			if (!rec.count)
 				break;
-			}
-			gboolean ok = emit(d, b, now, send, data, &rec);
-
-			g_free(b);
-			if (!ok)
+			if (!emit(d, b, now, send, data, &rec)) {
+				/* The next invocation starts a fresh datagram. */
+				memset(b->count, 0, sizeof(b->count));
+				memset(b->len, 0, sizeof(b->len));
+				b->total = 0;
 				return FALSE;
+			}
 			d->tokens -= RTP_HEADER + PDTP_MTU;
 		}
 	}
@@ -1837,11 +1856,15 @@ gint64 call_pdtp_poll(struct call_pdtp *d, gint64 now, call_pdtp_send_fn send,
 		next = MIN(next, d->presentation.due);
 	if (d->ack_pending)
 		next = MIN(next, d->ack_due);
-	for (guint i = 0; i < d->inflight->len; i++)
-		next = MIN(
-			next,
-			g_array_index(d->inflight, struct sent_packet, i).sent +
-				d->rto);
+	if (d->inflight->len) {
+		gint64 due =
+			g_array_index(d->inflight, struct sent_packet, 0).sent +
+			d->rto;
+
+		if (d->probing)
+			due = MAX(due, d->last_probe + d->rto);
+		next = MIN(next, due);
+	}
 	for (guint i = 0; i < MAX_STREAMS; i++) {
 		struct tx_stream *s = &d->tx_streams[i];
 

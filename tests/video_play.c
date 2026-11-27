@@ -220,11 +220,14 @@ static void startup_fallback(void)
 		"echo \"$mode\" >> \"$RUN_LOG\"\n"
 		"test \"$mode\" = hw || exit 0\n"
 		"case \"$scenario\" in\n"
-		"recover|short|decode) echo '[error] Failed setup for format cuda' >&2;;\n"
+		"recover|short|decode|prefix) echo '[error] Failed setup for format cuda' >&2;;\n"
+		"audioonly) echo '[error] Vulkan renderer is not available' >&2;;\n"
 		"window) echo '[fatal] Failed to create window' >&2; exit 0;;\n"
 		"early) exit 23;;\n"
 		"esac\n"
 		"case \"$scenario\" in\n"
+		"prefix) printf '[info]   0.1 A-V: 0.0 fd= 0 aq= 0KB vq= 0KB\\r' >&2;;\n"
+		"audioonly) printf '[info]   0.1 M-A: 0.0 fd= 0 aq= 0KB vq= 0KB\\r' >&2;;\n"
 		"recover|late|terminal) printf '  0.02 M-V:  0.000 fd=   0 aq=    0KB vq=    0KB\\r' >&2;;\n"
 		"short) echo '[ffplay_buffer @ 123] [verbose] w:96 h:64 pixfmt:yuv420p' >&2;;\n"
 		"esac\n"
@@ -235,10 +238,15 @@ static void startup_fallback(void)
 		const char *scenario, *attempts;
 		gboolean success;
 	} cases[] = {
-		{ "recover", "hw\n", TRUE },	 { "short", "hw\n", TRUE },
-		{ "early", "hw\nvk\n", TRUE },	 { "decode", "hw\nvk\n", TRUE },
-		{ "window", "hw\nsdl\n", TRUE }, { "late", "hw\n", FALSE },
+		{ "recover", "hw\n", TRUE },
+		{ "short", "hw\n", TRUE },
+		{ "early", "hw\nvk\n", TRUE },
+		{ "decode", "hw\nvk\n", TRUE },
+		{ "window", "hw\nsdl\n", TRUE },
+		{ "late", "hw\n", FALSE },
 		{ "terminal", "hw\n", FALSE },
+		{ "prefix", "hw\n", TRUE },
+		{ "audioonly", "hw\nsdl\n", TRUE },
 	};
 	const struct line_video_gpu gpu = { "Test GPU", 0x10de };
 

@@ -242,6 +242,7 @@ gboolean line_cooldown_check(const char *url, GError **error);
 
 /* Linux and glibc tuning (tune.c). */
 enum line_thread_role {
+	LINE_THREAD_NETWORK, /* event-driven voice and network service */
 	LINE_THREAD_MEDIA, /* call audio and video: tight timers */
 	LINE_THREAD_BACKGROUND, /* image fetch and decode: batch scheduling */
 };

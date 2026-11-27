@@ -35,6 +35,7 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/mman.h>
+#include <sys/socket.h>
 #include <turbojpeg.h>
 #include <unistd.h>
 #include <webp/decode.h>
@@ -114,7 +115,33 @@ struct decode_job {
 	cairo_surface_t *image;
 };
 
+/* A decoder surface can be recycled once both the window and GPU retire it. */
+struct dmabuf_lease {
+	gatomicrefcount refs;
+	int release_fd;
+	struct gpu_dmabuf gpu;
+};
+
+static void hold_surface(void *data)
+{
+	struct dmabuf_lease *surface = data;
+
+	g_atomic_ref_count_inc(&surface->refs);
+}
+
+static void drop_surface(void *data)
+{
+	struct dmabuf_lease *surface = data;
+
+	if (g_atomic_ref_count_dec(&surface->refs)) {
+		close(surface->gpu.fd);
+		close(surface->release_fd);
+		g_free(surface);
+	}
+}
+
 struct call_picture {
+	struct dmabuf_lease *dmabuf;
 	void *pixels;
 	gint64 decoded_at;
 	uint64_t generation;
@@ -184,6 +211,20 @@ static struct {
 	Json *row, *call_participants;
 } m;
 
+static gboolean has_picture(const struct call_picture *picture)
+{
+	return picture && (picture->pixels || picture->dmabuf);
+}
+
+static void reject_surface(struct call_picture *picture)
+{
+	if (picture->dmabuf) {
+		(void)send(picture->dmabuf->release_fd, "R", 1,
+			   MSG_NOSIGNAL | MSG_DONTWAIT);
+		g_clear_pointer(&picture->dmabuf, drop_surface);
+	}
+}
+
 static void reset_picture(struct call_picture *picture)
 {
 	g_clear_pointer(&picture->texture, SDL_DestroyTexture);
@@ -194,6 +235,8 @@ static void reset_picture(struct call_picture *picture)
 
 void ui_media_reset_renderer(void)
 {
+	reject_surface(&m.call_frame);
+	reject_surface(&m.share_frame);
 	reset_picture(&m.call_frame);
 	reset_picture(&m.self_frame);
 	reset_picture(&m.share_frame);
@@ -202,6 +245,7 @@ void ui_media_reset_renderer(void)
 static void clear_picture(struct call_picture *picture)
 {
 	reset_picture(picture);
+	g_clear_pointer(&picture->dmabuf, drop_surface);
 	g_clear_pointer(&picture->surface, cairo_surface_destroy);
 	if (picture->pixels)
 		munmap(picture->pixels, picture->size);
@@ -2574,7 +2618,7 @@ static void stop_picture(struct call_picture *picture, enum stage_tile tile)
 static void request_self_frame(const char *chat)
 {
 	if (!m.camera_enabled || m.share_in_video) {
-		if (m.self_frame.pixels) {
+		if (has_picture(&m.self_frame)) {
 			stop_picture(&m.self_frame, TILE_SELF);
 			ui.dirty = TRUE;
 		}
@@ -2812,12 +2856,12 @@ void ui_media_call_event(Json *p)
 		if (!video_ready && (m.fullscreen_tile == TILE_PEER ||
 				     m.fullscreen_tile == TILE_SELF))
 			ui_media_leave_fullscreen();
-		m.video_call = show_video || m.call_frame.pixels;
+		m.video_call = show_video || has_picture(&m.call_frame);
 		if (camera)
 			m.camera_enabled = json_object_get_boolean(camera);
 		else if (video_changed)
 			m.camera_enabled = video_ready;
-		if (!m.camera_enabled && m.self_frame.pixels)
+		if (!m.camera_enabled && has_picture(&m.self_frame))
 			stop_picture(&m.self_frame, TILE_SELF);
 	}
 	if (!ui_field(p, "name")) {
@@ -2873,7 +2917,7 @@ void ui_media_call_event(Json *p)
 static void update_call_picture(int fd, int width, int height, int rotation,
 				gboolean self, gboolean share,
 				gboolean camera_enabled, gboolean screen,
-				gint64 decoded_at)
+				gint64 decoded_at, struct dmabuf_lease *surface)
 {
 	if (share && (decoded_at < m.call_frames_since ||
 		      decoded_at <= m.share_ended_at ||
@@ -2892,20 +2936,26 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 	if (!line_preview_size_valid(width, height, share))
 		return;
 	size_t size = line_camera_i420_size(width, height);
-	struct stat st;
-	int required = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
-	int seals = fcntl(fd, F_GET_SEALS);
-	void *pixels = MAP_FAILED;
+	void *pixels = NULL;
 
-	if (seals >= 0 && (seals & required) == required && !fstat(fd, &st) &&
-	    (size_t)st.st_size == size)
-		pixels = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (pixels == MAP_FAILED)
-		return;
+	if (!surface) {
+		struct stat st;
+		int required = F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK;
+		int seals = fcntl(fd, F_GET_SEALS);
+
+		pixels = MAP_FAILED;
+
+		if (seals >= 0 && (seals & required) == required &&
+		    !fstat(fd, &st) && (size_t)st.st_size == size)
+			pixels =
+				mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+		if (pixels == MAP_FAILED)
+			return;
+	}
 	struct call_picture *picture = share ? &m.share_frame :
 				       self  ? &m.self_frame :
 					       &m.call_frame;
-	gboolean first = !picture->pixels;
+	gboolean first = !has_picture(picture);
 	gboolean source_changed = picture->screen != screen;
 
 	if (picture->frame.width != (unsigned int)width ||
@@ -2915,6 +2965,11 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 		munmap(picture->pixels, picture->size);
 	if (picture->frame.rotation != (unsigned int)rotation)
 		picture->view.w = 0;
+	g_clear_pointer(&picture->dmabuf, drop_surface);
+	if (surface) {
+		hold_surface(surface);
+		picture->dmabuf = surface;
+	}
 	picture->pixels = pixels;
 	picture->screen = screen;
 	picture->decoded_at = decoded_at;
@@ -2922,7 +2977,11 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 
 	picture->generation = ++generation;
 	picture->size = size;
-	line_camera_i420_frame(&picture->frame, pixels, width, height);
+	if (surface)
+		picture->frame = (struct line_camera_frame){ .width = width,
+							     .height = height };
+	else
+		line_camera_i420_frame(&picture->frame, pixels, width, height);
 	picture->frame.rotation = rotation;
 	picture->upload = picture->convert = TRUE;
 	enum stage_tile tile = share ? TILE_PEER_SCREEN :
@@ -2966,7 +3025,8 @@ static void update_call_picture(int fd, int width, int height, int rotation,
 		ui.dirty = TRUE;
 }
 
-void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
+static void preview_frame(const struct line_preview_frame *frame, int fd,
+			  struct dmabuf_lease *surface)
 {
 	gboolean self = frame->source == LINE_PREVIEW_SELF;
 	gboolean share = frame->source == LINE_PREVIEW_SCREEN;
@@ -2978,7 +3038,41 @@ void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
 	update_call_picture(fd, frame->width, frame->height, frame->rotation,
 			    self, share, frame->camera_enabled,
 			    frame->screen && group_call() && !self && !share,
-			    frame->decoded_at);
+			    frame->decoded_at, surface);
+}
+
+void ui_media_preview_frame(const struct line_preview_frame *frame, int fd)
+{
+	preview_frame(frame, fd, NULL);
+}
+
+void ui_media_dmabuf_frame(const struct line_preview_frame *frame, int fd,
+			   int release_fd)
+{
+	const struct line_dmabuf_layout *d = &frame->layout;
+	struct dmabuf_lease *surface = g_new0(struct dmabuf_lease, 1);
+
+	g_atomic_ref_count_init(&surface->refs);
+	surface->release_fd = release_fd;
+	surface->gpu = (struct gpu_dmabuf){
+		.fd = fd,
+		.width = d->width,
+		.height = d->height,
+		.offset = { d->offset[0], d->offset[1] },
+		.stride = { d->stride[0], d->stride[1] },
+		.crop_x = d->crop_x,
+		.crop_y = d->crop_y,
+		.modifier = d->modifier,
+		.full_range = d->full_range,
+		.lease = surface,
+		.retain = hold_surface,
+		.release = drop_surface,
+	};
+	if (ui_gpu_dmabuf_supported())
+		preview_frame(frame, -1, surface);
+	else
+		(void)send(release_fd, "R", 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+	drop_surface(surface);
 }
 
 static void video_frame(Json *result, gboolean self, gboolean share)
@@ -2999,7 +3093,7 @@ static void video_frame(Json *result, gboolean self, gboolean share)
 		json_object_get_boolean(ui_field(result, "cameraEnabled")),
 		!self && !share && group_call() &&
 			json_object_get_boolean(ui_field(result, "screen")),
-		json_object_get_int64(ui_field(result, "decodedAt")));
+		json_object_get_int64(ui_field(result, "decodedAt")), NULL);
 	close(fd);
 }
 
@@ -3038,7 +3132,9 @@ static gboolean draw_call_frame(struct call_picture *picture, Rect box)
 {
 	const struct line_camera_frame *frame = &picture->frame;
 
-	if (!picture->pixels || box.w <= 0 || box.h <= 0)
+	if (!has_picture(picture) || box.w <= 0 || box.h <= 0)
+		return FALSE;
+	if (picture->dmabuf && !ui_gpu_active())
 		return FALSE;
 	if (ui_gpu_active() || upload_call_frame(picture)) {
 		gboolean sideways = frame->rotation == 90 ||
@@ -3098,7 +3194,7 @@ static gboolean enter_fullscreen(enum stage_tile tile)
 {
 	struct call_picture *picture = tile_picture(tile);
 
-	if (m.mode != CALL || !call_connected() || !picture || !picture->pixels)
+	if (m.mode != CALL || !call_connected() || !has_picture(picture))
 		return FALSE;
 	if (!(SDL_GetWindowFlags(ui.window) & SDL_WINDOW_FULLSCREEN)) {
 		if (SDL_SetWindowFullscreen(
@@ -3149,7 +3245,8 @@ static const char *video_peer_name(char **label)
 	}
 	if (m.call_frame.screen)
 		return _("Shared screen");
-	return m.call_frame.pixels ? _("Video call") : _("Waiting for video…");
+	return has_picture(&m.call_frame) ? _("Video call") :
+					    _("Waiting for video…");
 }
 
 void ui_media_draw_fullscreen(void)
@@ -3540,20 +3637,19 @@ static void draw_group_video(Rect stage, int controls_y, const char *self)
 		weights -= weight;
 		if (tile == TILE_PEER_SCREEN) {
 			call_tile(tile - 1, &m.share_frame, _("Shared screen"),
-				  m.call_chat, m.share_frame.pixels != NULL,
+				  m.call_chat, has_picture(&m.share_frame),
 				  TRUE);
 		} else if (tile == TILE_PEER) {
 			g_autofree char *label = NULL;
 
 			call_tile(0, &m.call_frame, video_peer_name(&label),
-				  m.call_video_peer,
-				  m.call_frame.pixels != NULL,
+				  m.call_video_peer, has_picture(&m.call_frame),
 				  m.call_frame.screen);
 		} else if (tile == TILE_OWN_SCREEN) {
 			draw_own_screen(m.tile_rect[tile - 1]);
 		} else {
 			call_tile(1, &m.self_frame, self, ui.self_id,
-				  m.self_frame.pixels != NULL, FALSE);
+				  has_picture(&m.self_frame), FALSE);
 		}
 	}
 	if (roster_w)
@@ -3677,15 +3773,15 @@ static void draw_call_stage(void)
 						tw, th };
 		}
 		call_tile(0, &m.call_frame, m.call_name, m.call_chat,
-			  m.call_frame.pixels != NULL, FALSE);
+			  has_picture(&m.call_frame), FALSE);
 		if (!m.share_in_video)
 			call_tile(1, &m.self_frame, self, ui.self_id,
-				  m.self_frame.pixels != NULL, FALSE);
+				  has_picture(&m.self_frame), FALSE);
 		if (m.self_sharing)
 			draw_own_screen(m.tile_rect[TILE_OWN_SCREEN - 1]);
 		if (m.peer_sharing)
 			call_tile(3, &m.share_frame, peer_screen, m.call_chat,
-				  m.share_frame.pixels != NULL, TRUE);
+				  has_picture(&m.share_frame), TRUE);
 		else
 			m.share_frame.view = (SDL_FRect){ 0 };
 	} else {
@@ -3815,7 +3911,7 @@ void ui_media_gpu_video(struct gpu_scene *scene, double y_offset)
 		const struct line_camera_frame *f = &pic->frame;
 		SDL_FRect r = pic->view;
 
-		if (!pic->pixels || r.w <= 0 || r.h <= 0)
+		if (!has_picture(pic) || r.w <= 0 || r.h <= 0)
 			continue;
 		gboolean side = f->rotation == 90 || f->rotation == 270;
 		float w = side ? r.h : r.w, h = side ? r.w : r.h;
@@ -3833,6 +3929,33 @@ void ui_media_gpu_video(struct gpu_scene *scene, double y_offset)
 		memcpy(scene->video[i].plane, f->plane, sizeof(f->plane));
 		memcpy(scene->video[i].stride, f->stride, sizeof(f->stride));
 	}
+}
+
+int ui_media_draw_scene(const struct gpu_scene *scene)
+{
+	struct call_picture *pics[] = { &m.call_frame, &m.self_frame,
+					&m.share_frame };
+	const struct gpu_dmabuf *frames[G_N_ELEMENTS(pics)] = { 0 };
+	unsigned int rejected = 0;
+	gboolean any = FALSE;
+
+	for (size_t i = 0; i < G_N_ELEMENTS(pics); i++) {
+		if (!scene->video[i].width || !pics[i]->dmabuf)
+			continue;
+		frames[i] = &pics[i]->dmabuf->gpu;
+		any = TRUE;
+	}
+	if (!any)
+		return ui_gpu_draw(scene);
+	int result = ui_gpu_draw_dmabuf(scene, frames, &rejected);
+
+	for (size_t i = 0; i < G_N_ELEMENTS(pics); i++) {
+		if (rejected & (1u << i)) {
+			reject_surface(pics[i]);
+			ui.dirty = TRUE;
+		}
+	}
+	return result;
 }
 
 void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
@@ -4387,7 +4510,7 @@ static gboolean handle_key(SDL_KeyboardEvent k)
 			const struct call_picture *picture =
 				tile_picture(tiles[i]);
 
-			if (picture && picture->pixels) {
+			if (has_picture(picture)) {
 				enter_fullscreen(tiles[i]);
 				break;
 			}

@@ -34,12 +34,17 @@ struct vk_ctx {
 	VkSurfaceKHR surface;
 	VkPhysicalDevice gpu;
 	VkDevice device;
+	VkPipelineCache pipeline_cache;
+	char *cache_path;
+	char cache_digest[64];
+	bool log_pipeline;
 	VkQueue queue;
 	uint32_t family;
 	int render_minor;
 	VkPhysicalDeviceMemoryProperties memory;
 	VkImageLayout texture_layout;
 	bool descriptor_heap, host_image_copy, incremental_present;
+	bool nv12, present_timing;
 	bool fifo_latest_ready; /* enabled; the surface may still lack it */
 	struct vk_desc_buffer *descriptors;
 	struct vk_heap resources, samplers;

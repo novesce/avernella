@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "gpu_backend.h"
+#include "gpu_dmabuf.h"
 #include "vk_present.h"
 #include "vk_canvas.h"
 #include <stdlib.h>
@@ -45,10 +46,16 @@ static void drawable(void *state, int *w, int *h)
 	*h = size.height;
 }
 
-static int draw(void *state, const struct gpu_scene *scene)
+static int draw_dmabuf(void *state, const struct gpu_scene *scene,
+		       const struct gpu_dmabuf *const frames[3],
+		       unsigned int *rejected)
 {
 	struct backend *b = state;
-	VkResult result = vk_canvas_draw(b->canvas, scene);
+
+	if (rejected)
+		*rejected = 0;
+	VkResult result =
+		vk_canvas_draw_dmabuf(b->canvas, scene, frames, rejected);
 
 	if (result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR)
 		return 1;
@@ -57,6 +64,24 @@ static int draw(void *state, const struct gpu_scene *scene)
 		return 0;
 	return -1;
 }
+
+static int draw(void *state, const struct gpu_scene *scene)
+{
+	return draw_dmabuf(state, scene, NULL, NULL);
+}
+
+static bool dmabuf_supported(void *state)
+{
+	struct backend *b = state;
+
+	return vk_present_dmabuf_supported(b->present);
+}
+
+__attribute__((visibility("default")))
+const struct gpu_dmabuf_backend avernella_gpu_dmabuf_v1 = {
+	.supported = dmabuf_supported,
+	.draw = draw_dmabuf,
+};
 
 static void get_device(void *state, struct gpu_device_info *device)
 {

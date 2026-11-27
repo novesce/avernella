@@ -15,6 +15,7 @@
 #include <spa/pod/builder.h>
 #include <string.h>
 #include <sys/eventfd.h>
+#include "screencast_dma.h"
 #include <unistd.h>
 
 #define PORTAL_NAME "org.freedesktop.portal.Desktop"
@@ -26,7 +27,11 @@ struct line_screencast {
 	GMainContext *context;
 	GCancellable *cancel;
 	int wake;
-	unsigned int max_width, max_height, fps;
+	unsigned int max_width, max_height, fps, kbps;
+	line_cast_probe_fn probe;
+	guint64 modifier;
+	struct cast_dma_pool *pool;
+	gboolean offered_dma, frame_dma;
 
 	GMutex lock;
 	enum line_screencast_state state;
@@ -225,6 +230,35 @@ line_screencast_to_i420(const guint8 *src, unsigned int width,
 
 /* ---- PipeWire ---- */
 
+/* Native I420 avoids converting every pixel of an already planar capture.
+ * Each negotiated plane carries its own origin, valid length and row pitch.
+ */
+GBytes *line_screencast_planar(const struct spa_buffer *buf, guint w, guint h)
+{
+	struct line_camera_frame img = { .width = w & ~1u, .height = h & ~1u };
+
+	if (!buf || buf->n_datas != 3 || w < 2 || h < 2 || w > 3840 || h > 3840)
+		return NULL;
+	for (guint i = 0; i < 3; i++) {
+		const struct spa_data *d = &buf->datas[i];
+		const struct spa_chunk *ch = d->chunk;
+		guint cols = img.width >> !!i, rows = img.height >> !!i;
+
+		if (!d->data || !ch || (ch->flags & SPA_CHUNK_FLAG_CORRUPTED) ||
+		    ch->stride < (gint)cols || ch->offset > d->maxsize ||
+		    ch->size > d->maxsize - ch->offset ||
+		    (guint64)(rows - 1) * ch->stride + cols > ch->size)
+			return NULL;
+		img.plane[i] = (const guint8 *)d->data + ch->offset;
+		img.stride[i] = ch->stride;
+	}
+	gsize size = line_camera_i420_size(img.width, img.height);
+	guint8 *pixels = g_malloc(size);
+
+	line_camera_pack_i420(pixels, &img);
+	return g_bytes_new_take(pixels, size);
+}
+
 static void on_param_changed(void *data, uint32_t id,
 			     const struct spa_pod *param)
 {
@@ -246,13 +280,31 @@ static void on_param_changed(void *data, uint32_t id,
 		g_printerr("group-stats capture format=%u width=%u height=%u\n",
 			   c->format.format, c->format.size.width,
 			   c->format.size.height);
-	/* Shared memory only: DMA-BUF frames would need a GPU readback. */
+	gboolean dma = c->format.format == SPA_VIDEO_FORMAT_NV12 &&
+		       c->offered_dma;
+	if (dma) {
+		const struct spa_pod_prop *p = spa_pod_find_prop(
+			param, NULL, SPA_FORMAT_VIDEO_modifier);
+		if (p && (p->flags & SPA_POD_PROP_FLAG_DONT_FIXATE))
+			return; /* Wait for the producer's chosen modifier. */
+		if (!p || c->format.modifier != c->modifier) {
+			cast_dma_reject(c->pool);
+			return;
+		}
+	}
+	/* Latest, in-flight, queued and producer-held surfaces can coexist. */
+	int blocks = c->format.format == SPA_VIDEO_FORMAT_I420 ? 3 : 1;
+	int types = (1 << SPA_DATA_MemFd) | (1 << SPA_DATA_MemPtr);
+
 	params[0] = spa_pod_builder_add_object(
 		&b, SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+		SPA_PARAM_BUFFERS_buffers,
+		SPA_POD_CHOICE_RANGE_Int(dma ? 4 : 3, dma ? 4 : 1, G_MAXINT),
+		SPA_PARAM_BUFFERS_blocks, SPA_POD_Int(dma ? 2 : blocks),
 		SPA_PARAM_BUFFERS_dataType,
-		SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemFd) |
-					 (1 << SPA_DATA_MemPtr)));
-	pw_stream_update_params(c->stream, params, 1);
+		SPA_POD_CHOICE_FLAGS_Int(dma ? (1 << SPA_DATA_DmaBuf) : types));
+	if (pw_stream_update_params(c->stream, params, 1) < 0 && dma)
+		cast_dma_reject(c->pool);
 }
 
 static void on_state_changed(void *data, enum pw_stream_state old,
@@ -302,52 +354,89 @@ static void on_process(void *data)
 	gboolean bgr = f == SPA_VIDEO_FORMAT_BGRx || f == SPA_VIDEO_FORMAT_BGRA;
 	unsigned int w = c->format.size.width, h = c->format.size.height;
 
-	if (!d->data || !d->chunk || !w || !h ||
-	    (!bgr && f != SPA_VIDEO_FORMAT_RGBx &&
-	     f != SPA_VIDEO_FORMAT_RGBA) ||
-	    (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED) ||
+	if (!w || !h || w > 16384 || h > 16384 ||
 	    now - c->last_frame < G_USEC_PER_SEC / c->fps * 9 / 10)
 		goto done;
-	unsigned int stride =
-		d->chunk->stride ? (unsigned int)d->chunk->stride : w * 4;
-	if ((guint64)stride * h + d->chunk->offset > d->maxsize ||
-	    stride < w * 4)
-		goto done;
 	unsigned int ow, oh;
+	GBytes *frame;
 
 	line_screencast_fit(w, h, c->max_width, c->max_height, &ow, &oh);
-	gsize size = line_camera_i420_size(ow, oh);
-	guint8 *pixels = g_malloc(size);
+	gboolean dma = f == SPA_VIDEO_FORMAT_NV12;
 
-	line_screencast_to_i420((const guint8 *)d->data + d->chunk->offset, w,
-				h, stride, bgr, pixels, ow, oh);
+	if (dma) {
+		for (guint i = 0; i < spa->n_datas; i++)
+			if (spa->datas[i].chunk &&
+			    (spa->datas[i].chunk->flags &
+			     (SPA_CHUNK_FLAG_CORRUPTED | SPA_CHUNK_FLAG_EMPTY)))
+				goto done;
+		frame = cast_dma_take(c->pool, buffer, &c->format, c->max_width,
+				      c->max_height, c->modifier);
+		if (!frame) {
+			if (c->pool)
+				cast_dma_reject(c->pool);
+			goto done;
+		}
+		buffer =
+			NULL; /* release_capture returns the buffer to PipeWire. */
+	} else if (f == SPA_VIDEO_FORMAT_I420) {
+		if (ow != (w & ~1u) || oh != (h & ~1u))
+			goto done;
+		frame = line_screencast_planar(spa, w, h);
+		if (!frame)
+			goto done;
+	} else {
+		if (!d->data || !d->chunk ||
+		    (!bgr && f != SPA_VIDEO_FORMAT_RGBx &&
+		     f != SPA_VIDEO_FORMAT_RGBA) ||
+		    (d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED))
+			goto done;
+		unsigned int stride = d->chunk->stride ?
+					      (unsigned int)d->chunk->stride :
+					      w * 4;
+		if ((guint64)stride * h + d->chunk->offset > d->maxsize ||
+		    stride < w * 4)
+			goto done;
+		gsize size = line_camera_i420_size(ow, oh);
+		guint8 *pixels = g_malloc(size);
+
+		line_screencast_to_i420((const guint8 *)d->data +
+						d->chunk->offset,
+					w, h, stride, bgr, pixels, ow, oh);
+		frame = g_bytes_new_take(pixels, size);
+	}
 	c->last_frame = now;
 	g_mutex_lock(&c->lock);
 	g_clear_pointer(&c->frame, g_bytes_unref);
-	c->frame = g_bytes_new_take(pixels, size);
+	c->frame = frame;
+	c->frame_dma = dma;
 	c->width = ow;
 	c->height = oh;
 	c->time_ns = (guint64)now * 1000;
 	g_mutex_unlock(&c->lock);
 	notify(c);
 done:
-	pw_stream_queue_buffer(c->stream, buffer);
+	if (buffer)
+		pw_stream_queue_buffer(c->stream, buffer);
+}
+
+static void remove_buffer(void *data, struct pw_buffer *buffer)
+{
+	struct line_screencast *c = data;
+
+	cast_dma_remove(c->pool, buffer);
 }
 
 static const struct pw_stream_events stream_events = {
-	PW_VERSION_STREAM_EVENTS,
-	.state_changed = on_state_changed,
-	.param_changed = on_param_changed,
-	.process = on_process,
+	PW_VERSION_STREAM_EVENTS,	   .state_changed = on_state_changed,
+	.param_changed = on_param_changed, .process = on_process,
+	.remove_buffer = remove_buffer,
 };
 
-static gboolean start_pipewire(struct line_screencast *c, int fd, guint32 node,
-			       GError **e)
+static guint capture_formats(struct line_screencast *c,
+			     struct spa_pod_builder *b,
+			     const struct spa_pod **params)
 {
-	static gsize initialized;
-	guint8 buffer[1024];
-	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof buffer);
-	const struct spa_pod *params[1];
+	struct spa_rectangle cap = SPA_RECTANGLE(c->max_width, c->max_height);
 	struct spa_rectangle def = SPA_RECTANGLE(1920, 1080),
 			     min = SPA_RECTANGLE(1, 1),
 			     max = SPA_RECTANGLE(16384, 16384);
@@ -355,6 +444,85 @@ static gboolean start_pipewire(struct line_screencast *c, int fd, guint32 node,
 			    rmin = SPA_FRACTION(0, 1),
 			    rmax = SPA_FRACTION(c->fps, 1);
 
+	guint count = 0;
+
+	if (c->offered_dma && !cast_dma_rejected(c->pool)) {
+		struct spa_pod_frame f, choice;
+
+		spa_pod_builder_push_object(b, &f, SPA_TYPE_OBJECT_Format,
+					    SPA_PARAM_EnumFormat);
+		spa_pod_builder_add(
+			b, SPA_FORMAT_mediaType,
+			SPA_POD_Id(SPA_MEDIA_TYPE_video),
+			SPA_FORMAT_mediaSubtype,
+			SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+			SPA_FORMAT_VIDEO_format,
+			SPA_POD_Id(SPA_VIDEO_FORMAT_NV12),
+			SPA_FORMAT_VIDEO_colorMatrix,
+			SPA_POD_Id(SPA_VIDEO_COLOR_MATRIX_BT601),
+			SPA_FORMAT_VIDEO_colorRange,
+			SPA_POD_Id(SPA_VIDEO_COLOR_RANGE_16_235),
+			SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(&cap),
+			SPA_FORMAT_VIDEO_framerate,
+			SPA_POD_CHOICE_RANGE_Fraction(&rate, &rmin, &rmax), 0);
+		/* The allocating compositor fixates the common modifier. */
+		spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier,
+				     SPA_POD_PROP_FLAG_MANDATORY |
+					     SPA_POD_PROP_FLAG_DONT_FIXATE);
+		spa_pod_builder_push_choice(b, &choice, SPA_CHOICE_Enum, 0);
+		spa_pod_builder_long(b, c->modifier); /* default */
+		spa_pod_builder_long(b, c->modifier);
+		spa_pod_builder_pop(b, &choice);
+		params[count++] = spa_pod_builder_pop(b, &f);
+	}
+	params[count++] = spa_pod_builder_add_object(
+		b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+		SPA_FORMAT_VIDEO_format, SPA_POD_Id(SPA_VIDEO_FORMAT_I420),
+		SPA_FORMAT_VIDEO_colorMatrix,
+		SPA_POD_Id(SPA_VIDEO_COLOR_MATRIX_BT601),
+		SPA_FORMAT_VIDEO_colorRange,
+		SPA_POD_Id(SPA_VIDEO_COLOR_RANGE_16_235), SPA_FORMAT_VIDEO_size,
+		SPA_POD_CHOICE_RANGE_Rectangle(&cap, &min, &cap),
+		SPA_FORMAT_VIDEO_framerate,
+		SPA_POD_CHOICE_RANGE_Fraction(&rate, &rmin, &rmax));
+	params[count++] = spa_pod_builder_add_object(
+		b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+		SPA_FORMAT_VIDEO_format,
+		SPA_POD_CHOICE_ENUM_Id(
+			5, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx,
+			SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx,
+			SPA_VIDEO_FORMAT_RGBA),
+		SPA_FORMAT_VIDEO_size,
+		SPA_POD_CHOICE_RANGE_Rectangle(&def, &min, &max),
+		SPA_FORMAT_VIDEO_framerate,
+		SPA_POD_CHOICE_RANGE_Fraction(&rate, &rmin, &rmax));
+	return count;
+}
+
+static void request_shm(void *data, uint64_t count G_GNUC_UNUSED)
+{
+	struct line_screencast *c = data;
+	guint8 buffer[2048];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+	const struct spa_pod *params[3];
+	guint n = capture_formats(c, &b, params);
+
+	if (pw_stream_update_params(c->stream, params, n) < 0)
+		set_state(c, LINE_SCREENCAST_FAILED,
+			  "Could not renegotiate screen capture.");
+}
+
+static gboolean start_pipewire(struct line_screencast *c, int fd, guint32 node,
+			       GError **e)
+{
+	static gsize initialized;
+	guint8 buffer[2048];
+	struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+	const struct spa_pod *params[3];
 	if (g_once_init_enter(&initialized)) {
 		pw_init(NULL, NULL);
 		g_once_init_leave(&initialized, 1);
@@ -383,26 +551,21 @@ static gboolean start_pipewire(struct line_screencast *c, int fd, guint32 node,
 				  "node.dont-fallback", "true", NULL));
 	if (!c->stream)
 		goto unlock;
+	if (c->probe && c->probe(c->max_width, c->max_height, c->fps, c->kbps,
+				 &c->modifier)) {
+		c->pool = cast_dma_pool_new(c->stream,
+					    pw_thread_loop_get_loop(c->pw_loop),
+					    request_shm, c);
+		c->offered_dma = c->pool != NULL;
+	}
 	pw_stream_add_listener(c->stream, &c->stream_listener, &stream_events,
 			       c);
-	params[0] = spa_pod_builder_add_object(
-		&b, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-		SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-		SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-		SPA_FORMAT_VIDEO_format,
-		SPA_POD_CHOICE_ENUM_Id(
-			5, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRx,
-			SPA_VIDEO_FORMAT_BGRA, SPA_VIDEO_FORMAT_RGBx,
-			SPA_VIDEO_FORMAT_RGBA),
-		SPA_FORMAT_VIDEO_size,
-		SPA_POD_CHOICE_RANGE_Rectangle(&def, &min, &max),
-		SPA_FORMAT_VIDEO_framerate,
-		SPA_POD_CHOICE_RANGE_Fraction(&rate, &rmin, &rmax));
+	guint count = capture_formats(c, &b, params);
 	if (pw_stream_connect(c->stream, PW_DIRECTION_INPUT, node,
 			      PW_STREAM_FLAG_AUTOCONNECT |
 				      PW_STREAM_FLAG_MAP_BUFFERS |
 				      PW_STREAM_FLAG_DONT_RECONNECT,
-			      params, 1) < 0)
+			      params, count) < 0)
 		goto unlock;
 	pw_thread_loop_unlock(c->pw_loop);
 	if (pw_thread_loop_start(c->pw_loop) < 0)
@@ -424,6 +587,7 @@ static void stop_pipewire(struct line_screencast *c)
 	if (!c->pw_loop)
 		return;
 	pw_thread_loop_stop(c->pw_loop);
+	g_clear_pointer(&c->pool, cast_dma_pool_stop);
 	if (c->stream)
 		pw_stream_destroy(c->stream);
 	if (c->pw_core)
@@ -788,7 +952,9 @@ static gpointer worker(gpointer data)
 
 struct line_screencast *line_screencast_start(unsigned int max_width,
 					      unsigned int max_height,
-					      unsigned int fps, GError **e)
+					      unsigned int fps, guint kbps,
+					      line_cast_probe_fn probe,
+					      GError **e)
 {
 	struct line_screencast *c = g_new0(struct line_screencast, 1);
 
@@ -797,6 +963,8 @@ struct line_screencast *line_screencast_start(unsigned int max_width,
 	c->max_width = CLAMP(max_width, 16, 3840);
 	c->max_height = CLAMP(max_height, 16, 2160);
 	c->fps = CLAMP(fps, 1, 60);
+	c->probe = probe;
+	c->kbps = kbps;
 	c->state = LINE_SCREENCAST_STARTING;
 	c->wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	c->context = g_main_context_new();
@@ -853,7 +1021,8 @@ enum line_screencast_state line_screencast_poll(struct line_screencast *c,
 }
 
 GBytes *line_screencast_take(struct line_screencast *c, unsigned int *width,
-			     unsigned int *height, guint64 *time_ns)
+			     unsigned int *height, guint64 *time_ns,
+			     gboolean *dma)
 {
 	g_mutex_lock(&c->lock);
 	GBytes *frame = g_steal_pointer(&c->frame);
@@ -863,6 +1032,7 @@ GBytes *line_screencast_take(struct line_screencast *c, unsigned int *width,
 	*width = c->width;
 	*height = c->height;
 	*time_ns = c->time_ns;
+	*dma = c->frame_dma;
 	g_mutex_unlock(&c->lock);
 	return frame;
 }

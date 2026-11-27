@@ -72,11 +72,8 @@ void main()
 						 filters[0]), uv, 0.0).rgb, 1.0);
 		return;
 	}
-	if (opaque_batch || kind == 5u) {
-		vec2 texels = fwidth(uv) * vec2(textureSize(
-			sampler2D(images[nonuniformEXT(paint.z)], filters[1]), 0));
-		// Bicubic only where the picture is magnified.
-		float y = max(texels.x, texels.y) < 1.0 ?
+	if (opaque_batch || (kind & 255u) == 5u) {
+		float y = (kind & UI_VIDEO_BICUBIC) != 0u ?
 				  luma_bicubic(paint.z, uv) :
 				  textureLod(sampler2D(images[nonuniformEXT(paint.z)],
 						       filters[1]), uv, 0.0).r;

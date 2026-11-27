@@ -9,6 +9,7 @@
 #include "ui_motion.h"
 #include "ui_sounds.h"
 #include <gmodule.h>
+#include <errno.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -41,6 +42,34 @@ char *line_desktop_screenshot(const char *parent, GCancellable *cancel,
 }
 
 /* A deterministic consumer of the production scene's texel-copy commands. */
+static bool accept_dma, reject_dma;
+static const struct gpu_dmabuf *gpu_lease;
+
+bool ui_gpu_dmabuf_supported(void)
+{
+	return accept_dma;
+}
+
+int ui_gpu_draw_dmabuf(const struct gpu_scene *scene,
+		       const struct gpu_dmabuf *const frames[3],
+		       unsigned int *rejected)
+{
+	g_assert_true(accept_dma);
+	g_assert_nonnull(frames[0]);
+	g_assert_null(scene->video[0].plane[0]);
+	g_assert_cmpuint(scene->video[0].width, ==, 2);
+	if (reject_dma) {
+		*rejected = 1;
+		return 0;
+	}
+	if (!gpu_lease) {
+		gpu_lease = frames[0];
+		gpu_lease->retain(gpu_lease->lease);
+	}
+	g_assert_true(gpu_lease == frames[0]);
+	return ui_gpu_draw(scene);
+}
+
 bool ui_gpu_active(void)
 {
 	return true;
@@ -476,6 +505,92 @@ static void group_picture(const char *chat, gint64 decoded, gboolean screen)
 	group_preview(chat, decoded, LINE_PREVIEW_REMOTE, screen);
 }
 
+struct fixture_lease {
+	int pixels, control;
+};
+
+/* The preview socket parser has its own real DMA-BUF test. Here two local
+ * socket peers expose exactly when the window and mock GPU close each FD.
+ */
+static struct fixture_lease offer_surface(const char *chat, gint64 when)
+{
+	struct line_preview_frame frame = {
+		.decoded_at = when,
+		.source = LINE_PREVIEW_REMOTE,
+		.width = 2,
+		.height = 2,
+		.dmabuf = 1,
+		.layout = { .width = 2,
+			    .height = 2,
+			    .stride = { 2, 2 },
+			    .offset = { 0, 4 } },
+	};
+	int data[2], release[2];
+
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+				   data),
+			==, 0);
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0,
+				   release),
+			==, 0);
+	g_strlcpy(frame.chat, chat, sizeof(frame.chat));
+	ui_media_dmabuf_frame(&frame, data[0], release[0]);
+	return (struct fixture_lease){ .pixels = data[1],
+				       .control = release[1] };
+}
+
+static void released(struct fixture_lease lease)
+{
+	char byte;
+
+	g_assert_cmpint(recv(lease.pixels, &byte, 1, MSG_DONTWAIT), ==, 0);
+	g_assert_cmpint(recv(lease.control, &byte, 1, MSG_DONTWAIT), ==, 0);
+	close(lease.pixels);
+	close(lease.control);
+}
+
+static void check_surface_leases(const char *group)
+{
+	accept_dma = true;
+	released(offer_surface("different-chat", scene_time));
+	released(offer_surface(group, scene_time - 1));
+
+	struct fixture_lease first = offer_surface(group, ++scene_time);
+
+	ui_draw();
+	g_assert_nonnull(gpu_lease);
+	/* Replacing it drops the window reference. The GPU is still reading. */
+	group_picture(group, ++scene_time, FALSE);
+
+	char byte;
+
+	g_assert_cmpint(recv(first.control, &byte, 1, MSG_DONTWAIT), ==, -1);
+	g_assert_cmpint(errno, ==, EAGAIN);
+	g_assert_cmpint(recv(first.pixels, &byte, 1, MSG_DONTWAIT), ==, -1);
+	g_assert_cmpint(errno, ==, EAGAIN);
+	gpu_lease->release(gpu_lease->lease);
+	gpu_lease = NULL;
+	released(first);
+
+	reject_dma = true;
+	struct fixture_lease rejected = offer_surface(group, ++scene_time);
+
+	ui_draw();
+	g_assert_cmpint(recv(rejected.control, &byte, 1, MSG_DONTWAIT), ==, 1);
+	g_assert_cmpint(byte, ==, 'R');
+	released(rejected);
+	g_assert_null(gpu_lease);
+	reject_dma = accept_dma = false;
+	/* The worker retries its saved picture at the original timestamp. */
+
+	group_picture(group, scene_time, FALSE);
+	ui_draw();
+	struct gpu_scene scene = { .width = W, .height = H };
+
+	ui_media_gpu_video(&scene, 0);
+	g_assert_nonnull(scene.video[0].plane[0]);
+}
+
 static void group_stage_picture(gboolean present)
 {
 	struct gpu_scene scene = { .width = W, .height = H };
@@ -630,6 +745,7 @@ static void check_group_call_roster(void)
 	ui_media_call_event(focus);
 	group_picture(group, scene_time, FALSE);
 	group_stage_picture(TRUE);
+	check_surface_leases(group);
 	g_assert_false(stage_has_color(live_badge));
 	guint32 caption = peer_caption_checksum(FALSE);
 

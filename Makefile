@@ -76,7 +76,7 @@ CFLAGS += $(FORTIFY) $(STACK_CLASH) $(HARDEN)
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
-SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast live_sync net_route tune http_tune
+SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast screencast_dma live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
 SOURCES += security/ipc security/sandbox security/vault
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
@@ -269,11 +269,13 @@ build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/security/sandbox.o build/security/ipc.o build/udp_batch.o
 build/test-security-sandbox: tests/test_sandbox.c build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/thrift.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
-build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
+build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_dma.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
 # Bad-network harness: a virtual clock and simulated audio devices.
-build/test-call-net: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time,--wrap=SDL_InitSubSystem,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice,--wrap=SDL_ClearQueuedAudio,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
+build/test-call-net: private LDFLAGS += -Wl,--wrap=line_denoise_new,--wrap=g_get_monotonic_time,--wrap=SDL_InitSubSystem,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice,--wrap=SDL_ClearQueuedAudio,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
 build/test-call-net: tests/call_net.c build/call_video.o build/call_srtp.o build/call_audio.o build/call_denoise.o build/camera_pixels.o build/tune.o
-build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/camera_pixels.o
+build/test-screencast-portal: private LDFLAGS += -Wl,--wrap=pw_stream_queue_buffer
+build/test-screencast-portal: private CFLAGS += -Wno-pedantic
+build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/screencast_dma.o build/camera_pixels.o
 ifeq ($(CALL_VP8_JETSON),1)
 build/call_vp8_jetson.o: private CPPFLAGS += $(shell pkg-config --cflags $(JETSON_PKGS))
 avernella build/test-call build/test-call-video build/test-call-net: private LDLIBS += $(shell pkg-config --libs $(JETSON_PKGS))
@@ -289,6 +291,13 @@ CALL_HWDECODE_PKGS = libavcodec libavutil
 CALL_HWDECODE ?= $(shell pkg-config --exists $(CALL_HWDECODE_PKGS) && echo 1 || echo 0)
 CALL_HWCODECS ?= $(CALL_HWDECODE)
 ifeq ($(CALL_HWCODECS),1)
+TESTS += build/test-vp8-dma
+build/test-vp8-dma: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
+build/test-vp8-dma: private LDLIBS += $(shell pkg-config --libs $(CALL_HWDECODE_PKGS))
+build/test-vp8-dma: private LDFLAGS += -Wl,--wrap=av_hwframe_map
+build/test-vp8-dma: tests/call_vp8_dma.c build/call_vp8_dma.o
+avernella build/test-call build/test-call-video build/test-call-net: build/call_vp8_dma.o
+build/call_vp8_dma.o: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
 build/call_vp8.o build/call_vp8_encode.o build/test-call_vp8_encode.o build/test-call-video: private CPPFLAGS += $(shell pkg-config --cflags $(CALL_HWDECODE_PKGS))
 build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwframe_transfer_data
 build/test-call-video: private LDFLAGS += -Wl,--wrap=av_hwdevice_ctx_create,--wrap=g_file_read_link,--wrap=g_file_get_contents
@@ -322,7 +331,7 @@ build/ui_pixels.o: CFLAGS += -O3
 # Per-pixel conversion loops: speed over size, vectorized per CPU.
 build/camera_pixels.o build/screencast.o: CFLAGS += -O3
 # PipeWire's SPA headers use GNU statement expressions.
-build/screencast.o: CFLAGS += -Wno-pedantic
+build/screencast_dma.o build/screencast.o: CFLAGS += -Wno-pedantic
 build/qr_scan.o: CPPFLAGS += $(shell pkg-config --cflags zbar)
 build/test-ui-pixels: tests/ui_pixels.c build/ui_pixels.o build/ui_gpu_scroll.o
 build/test-ui-motion: tests/ui_motion.c build/ui_motion.o
@@ -403,6 +412,18 @@ build/render-bench:
 bench: build/render-bench
 	./build/render-bench
 
+.PHONY: bench-calls
+bench-calls: build/test-call-net build/test-call-video build/test-udp-batch build/test-call-scheduler
+	./build/test-call-net --verbose
+	./build/test-call-net -m perf -r /net/service
+	./build/test-call-video -m perf -p /video/presentation-blocking
+	./build/test-call-video -m perf -p /video/receive-blocking
+	./build/test-udp-batch -m perf -r /udp-batch/perf
+	./build/test-call-scheduler -m perf
+
+build/test-call-scheduler: tests/call_scheduler.c build/tune.o
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
+
 # The main executable loads the native renderer only when opening a window.
 GLSLANG ?= glslangValidator
 SPIRV_VAL ?= spirv-val
@@ -429,32 +450,38 @@ ifeq ($(HAVE_NATIVE_VK),1)
 all: avernella-vulkan.so
 endif
 
-build/ui_uber.%.spv: src/render/ui_uber.% src/render/ui_limits.h Makefile | build
+VK_SHADERS = ui_uber.vert ui_uber.frag ui_nv12.frag
+VK_SPIRV = $(VK_SHADERS:%=build/%.spv)
+$(VK_SPIRV): build/%.spv: src/render/% src/render/ui_limits.h Makefile | build
 	$(GLSLANG) -V -Os --target-env vulkan1.3 $< -o $@
 	$(SPIRV_VAL) --target-env vulkan1.3 $@
 
-build/line_ui_spirv.h: build/ui_uber.vert.spv build/ui_uber.frag.spv
-	@{ for stage in vert frag; do \
-		echo "static const uint32_t ui_$${stage}_spv[] = {"; \
-		od -An -v --endian=little -t x4 build/ui_uber.$$stage.spv | \
+build/line_ui_spirv.h: $(VK_SPIRV)
+	@{ for shader in $(VK_SHADERS); do \
+		symbol=$$(echo "$$shader" | tr . _); \
+		echo "static const uint32_t $${symbol}_spv[] = {"; \
+		od -An -v --endian=little -t x4 build/$$shader.spv | \
 			awk '{ for (i = 1; i <= NF; i++) printf "0x%s,", $$i; print "" }'; \
 		echo '};'; \
 	done; } > $@.tmp
 	mv -f $@.tmp $@
 
-VK_SOURCES = src/render/vk_ctx.c src/render/vk_frame.c src/render/vk_desc_buffer.c
+VK_SOURCES = src/render/vk_nv12.c src/render/vk_ctx.c src/render/vk_frame.c src/render/vk_desc_buffer.c
 VK_PREREQS = $(VK_SOURCES) $(wildcard src/render/*.h) build/line_ui_spirv.h $(filter build/%,$(VOLK_LINK))
-build/vulkan-smoke: tests/vulkan_smoke.c src/render/vk_tex.c src/render/vk_canvas.c $(VK_PREREQS)
+build/vulkan-smoke: tests/vulkan_smoke.c tests/nv12_fixture.h src/render/vk_tex.c src/render/vk_canvas.c $(VK_PREREQS)
 	$(CC) $(CFLAGS) $(VOLK_FLAGS) -Isrc -Ibuild $(LDFLAGS) $(LINK_FLAGS) -o $@ $(filter %.c,$^) $(VOLK_LINK) -ldl
 
-build/vulkan-preview: tests/vulkan_preview.c src/render/vk_present.c $(VK_PREREQS)
-	$(CC) $(CFLAGS) $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2) $(LDFLAGS) $(LINK_FLAGS) -o $@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2) -ldl
+build/vulkan-preview: tests/vulkan_preview.c src/render/vk_cache.c src/render/vk_present.c $(VK_PREREQS)
+	$(CC) $(CFLAGS) $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2 glib-2.0) $(LDFLAGS) $(LINK_FLAGS) -o $@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2 glib-2.0) -ldl
 
-avernella-vulkan.so: src/render/vk_backend.c src/render/vk_backend.map src/render/vk_canvas.c src/render/vk_tex.c src/render/vk_present.c $(VK_PREREQS)
-	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2) \
+build/vulkan-video-bench: tests/vulkan_video_bench.c tests/nv12_fixture.h src/render/vk_canvas.c src/render/vk_tex.c src/render/vk_cache.c src/render/vk_present.c $(VK_PREREQS)
+	$(CC) $(CFLAGS) $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2 glib-2.0) $(LDFLAGS) $(LINK_FLAGS) -o $@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2 glib-2.0) -ldl
+
+avernella-vulkan.so: src/render/vk_backend.c src/render/vk_backend.map src/render/vk_canvas.c src/render/vk_tex.c src/render/vk_cache.c src/render/vk_present.c $(VK_PREREQS)
+	$(CC) $(CFLAGS) -fPIC -fvisibility=hidden $(VOLK_FLAGS) -Isrc -Ibuild $(shell pkg-config --cflags sdl2 glib-2.0) \
 		$(LDFLAGS) -shared -Wl,--exclude-libs,ALL,--gc-sections,-z,defs,-z,relro,-z,now,-z,noexecstack $(STRIP_RELEASE) \
 		-Wl,--version-script=src/render/vk_backend.map \
-		-o build/$@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2) -ldl
+		-o build/$@ $(filter %.c,$^) $(VOLK_LINK) $(shell pkg-config --libs sdl2 glib-2.0) -ldl
 	cp build/$@ $@.tmp
 	mv -f $@.tmp $@
 
@@ -521,7 +548,7 @@ $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_encode.o: $(FUZZ_DIR)/call_h
 
 $(FUZZ_DIR)/fuzz-pdtp: $(FUZZ_DIR)/obj/fuzz-pdtp.o $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o
 $(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/fuzz-video.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/call_srtp.o
-$(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o
+$(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o $(FUZZ_DIR)/obj/tune.o
 $(FUZZ_DIR)/fuzz-pb: $(FUZZ_DIR)/obj/fuzz-pb.o $(FUZZ_DIR)/obj/call_wire.o $(FUZZ_DIR)/obj/call_schema.o
 $(FUZZ_DIR)/fuzz-group: $(FUZZ_DIR)/obj/fuzz-group.o $(FUZZ_DIR)/obj/call_group.o $(FUZZ_DIR)/obj/call_schema.o $(FUZZ_DIR)/obj/call_wire.o
 $(FUZZ_DIR)/fuzz-thrift: $(FUZZ_DIR)/obj/fuzz-thrift.o $(FUZZ_DIR)/obj/thrift.o
@@ -531,7 +558,7 @@ $(FUZZ_BINARIES): $(FUZZ_ENGINE)
 # Seed inputs rebuilt from the synthetic fixtures in tests/.
 $(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/fuzz-seeds.o $(FUZZ_DIR)/obj/call_group.o $(FUZZ_DIR)/obj/call_schema.o $(FUZZ_DIR)/obj/call_wire.o
 $(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/thrift.o
-$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o $(FUZZ_DIR)/obj/fuzz-coverage.o
+$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o $(FUZZ_DIR)/obj/tune.o $(FUZZ_DIR)/obj/fuzz-coverage.o
 	$(CC) $(FUZZ_SANITIZE) $(LDFLAGS) -Wl,--as-needed $^ $(LDLIBS) -o $@
 
 $(FUZZ_DIR)/seeds/.stamp: $(FUZZ_DIR)/fuzz-seeds
@@ -561,12 +588,12 @@ fuzz-clean:
 
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
-	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
+	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/call_vp8_dma.o build/call_vp8_dma.d build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
 	$(RM) build/test-call_vp8_encode.o build/test-call_vp8_encode.d build/call_vp8_jetson.o build/call_vp8_jetson.d build/call_jetson_config.h
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
-	$(RM) build/vulkan-smoke build/vulkan-preview build/volk.o build/line_ui_spirv.h build/ui_uber.vert.spv build/ui_uber.frag.spv
+	$(RM) build/test-call-scheduler build/vulkan-smoke build/vulkan-preview build/vulkan-video-bench build/volk.o build/line_ui_spirv.h $(VK_SPIRV)
 	$(RM) -r $(FUZZ_DIR)/obj $(FUZZ_DIR)/seeds
 	$(RM) $(FUZZ_BINARIES) $(FUZZ_DIR)/fuzz-seeds $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h
 
--include $(OBJECTS:.o=.d) build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
+-include build/call_vp8_dma.d $(OBJECTS:.o=.d) build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
 -include $(wildcard $(FUZZ_DIR)/obj/*.d)

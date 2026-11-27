@@ -295,6 +295,12 @@ static VkResult prepare_video(struct uploads *u, struct video_textures *video,
 		.prim_type = UI_PRIM_I420 |
 			     (v->rotation / 90 << UI_ROTATION_SHIFT),
 	};
+	/* Each tile is affine. Select its luma filter once per frame. */
+	bool rotated = v->rotation == 90 || v->rotation == 270;
+
+	if ((rotated ? v->h : v->w) > v->width &&
+	    (rotated ? v->w : v->h) > v->height)
+		item->prim_type |= UI_VIDEO_BICUBIC;
 	return VK_SUCCESS;
 }
 
@@ -371,7 +377,9 @@ static void present_damage(struct vk_canvas *c, const struct gpu_scene *s,
 			      known && damage.extent.width ? &damage : NULL);
 }
 
-VkResult vk_canvas_draw(struct vk_canvas *c, const struct gpu_scene *s)
+VkResult vk_canvas_draw_dmabuf(struct vk_canvas *c, const struct gpu_scene *s,
+			       const struct gpu_dmabuf *const frames[3],
+			       unsigned int *rejected)
 {
 	struct uploads u = { .canvas = c };
 	struct ui_prim items[8 + VIDEO_COUNT];
@@ -432,22 +440,51 @@ VkResult vk_canvas_draw(struct vk_canvas *c, const struct gpu_scene *s)
 		}
 		if (!v->width || v->w <= 0 || v->h <= 0)
 			continue;
+		if (frames && frames[i]) {
+			const struct gpu_dmabuf *f = frames[i];
+
+			if (!isfinite(v->x) || !isfinite(v->y) ||
+			    !isfinite(v->w) || !isfinite(v->h) || !v->height ||
+			    v->rotation >= 360 || v->rotation % 90 ||
+			    f->crop_x > f->width || f->crop_y > f->height ||
+			    v->width > f->width - f->crop_x ||
+			    v->height > f->height - f->crop_y) {
+				*rejected |= 1u << i;
+				return VK_NOT_READY;
+			}
+			items[count++] = (struct ui_prim){
+				.pos = { v->x, v->y },
+				.size = { v->w, v->h },
+				.uv_min = { (float)f->crop_x / f->width,
+					    (float)f->crop_y / f->height },
+				.uv_max = { (float)(f->crop_x + v->width) /
+						    f->width,
+					    (float)(f->crop_y + v->height) /
+						    f->height },
+				.tex_index = i,
+				.clip_rect_idx = UI_NO_CLIP,
+				.prim_type =
+					UI_PRIM_NV12 |
+					(v->rotation / 90 << UI_ROTATION_SHIFT),
+			};
+			continue;
+		}
 		result = prepare_video(&u, video, v, &items[count++]);
 		if (result != VK_SUCCESS)
 			return result;
 	}
 	present_damage(c, s, next);
-	result = vk_present_draw(
+	result = vk_present_draw_dmabuf(
 		c->present, items, count,
 		(VkClearColorValue){ .float32 = { 0, 0, 0, 1 } },
-		record_uploads, &u);
+		record_uploads, &u, frames, rejected);
 	/* An out-of-date presentation can follow a successful queue submission. */
 	if (u.recorded) {
 		for (uint32_t i = 0; i < u.count; i++)
 			u.copies[i].texture->uploaded = true;
 		for (uint32_t i = 0; i < VIDEO_COUNT; i++)
-			if (s->video[i].width && s->video[i].w > 0 &&
-			    s->video[i].h > 0)
+			if ((!frames || !frames[i]) && s->video[i].width &&
+			    s->video[i].w > 0 && s->video[i].h > 0)
 				c->video[i].generation = s->video[i].generation;
 	}
 	c->presented = result == VK_SUCCESS || result == VK_SUBOPTIMAL_KHR;
@@ -458,6 +495,11 @@ VkResult vk_canvas_draw(struct vk_canvas *c, const struct gpu_scene *s)
 		c->last_count = s->copy_count;
 	}
 	return result;
+}
+
+VkResult vk_canvas_draw(struct vk_canvas *c, const struct gpu_scene *s)
+{
+	return vk_canvas_draw_dmabuf(c, s, NULL, NULL);
 }
 
 struct vk_canvas *vk_canvas_open(struct vk_present *present)

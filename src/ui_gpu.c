@@ -5,6 +5,7 @@
 
 static void *module, *state;
 static const struct gpu_backend *api;
+static const struct gpu_dmabuf_backend *dmabuf;
 static struct gpu_device_info device;
 static int render_minor = -1;
 
@@ -34,6 +35,7 @@ void ui_gpu_close(void)
 		api->close(state);
 	state = NULL;
 	api = NULL;
+	dmabuf = NULL;
 	device = (struct gpu_device_info){ 0 };
 	render_minor = -1;
 	if (module)
@@ -83,6 +85,7 @@ SDL_Window *ui_gpu_window(const char *title, int x, int y, int w, int h,
 			const struct gpu_drm_query *drm =
 				dlsym(module, "avernella_gpu_drm_v1");
 
+			dmabuf = dlsym(module, "avernella_gpu_dmabuf_v1");
 			if (query)
 				query->get(state, &device);
 			if (drm)
@@ -107,4 +110,21 @@ void ui_gpu_size(int *w, int *h)
 int ui_gpu_draw(const struct gpu_scene *scene)
 {
 	return api->draw(state, scene);
+}
+
+bool ui_gpu_dmabuf_supported(void)
+{
+	return state && dmabuf && dmabuf->supported(state);
+}
+
+int ui_gpu_draw_dmabuf(const struct gpu_scene *scene,
+		       const struct gpu_dmabuf *const frames[3],
+		       unsigned int *rejected)
+{
+	if (ui_gpu_dmabuf_supported())
+		return dmabuf->draw(state, scene, frames, rejected);
+	for (unsigned int i = 0; i < 3; i++)
+		if (frames[i])
+			*rejected |= 1u << i;
+	return 0;
 }

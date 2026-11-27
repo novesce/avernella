@@ -79,7 +79,7 @@ static void render(void)
 
 	cairo_t *cr = cairo_create(surface);
 
-	g_autoptr(PangoContext) context = pango_cairo_create_context(cr);
+	PangoContext *context = pango_cairo_create_context(cr);
 	Json *json = json_tokener_parse(coupon);
 	struct ui_flex_layout *layout = ui_flex_new(context, json, 240);
 	struct asset source = { .surface = asset };
@@ -117,11 +117,12 @@ static void render(void)
 	cairo_destroy(cr);
 	cairo_surface_destroy(asset);
 	cairo_surface_destroy(surface);
+	g_object_unref(context);
 }
 
 static void carousel(void)
 {
-	g_autoptr(PangoContext) context = pango_font_map_create_context(
+	PangoContext *context = pango_font_map_create_context(
 		pango_cairo_font_map_get_default());
 	g_autofree char *text = g_strdup_printf(
 		"{\"type\":\"carousel\",\"contents\":[%s,%s]}", simple, simple);
@@ -137,11 +138,12 @@ static void carousel(void)
 	g_assert_cmpint(ui_flex_height(narrow), >, 2 * ui_flex_height(wide));
 	ui_flex_free(narrow);
 	ui_flex_free(wide);
+	g_object_unref(context);
 }
 
 static void fallback(void)
 {
-	g_autoptr(PangoContext) context = pango_font_map_create_context(
+	PangoContext *context = pango_font_map_create_context(
 		pango_cairo_font_map_get_default());
 	const char *const inputs[] = {
 		"{\"type\":\"bubble\",\"body\":{\"type\":\"box\",\"contents\":[{}]}}",
@@ -158,11 +160,12 @@ static void fallback(void)
 		g_assert_null(ui_flex_new(context, json, 280));
 		json_object_put(json);
 	}
+	g_object_unref(context);
 }
 
 static void actions(void)
 {
-	g_autoptr(PangoContext) context = pango_font_map_create_context(
+	PangoContext *context = pango_font_map_create_context(
 		pango_cairo_font_map_get_default());
 	static const char *const uris[] = { "http://example.org/",
 					    "https://name@example.org/",
@@ -183,6 +186,7 @@ static void actions(void)
 		g_assert_false(has_link(layout, NULL));
 		ui_flex_free(layout);
 	}
+	g_object_unref(context);
 }
 
 /* LIFF apps open from line://app/ buttons; other line:// links do not. */
@@ -199,7 +203,7 @@ static void liff_links(void)
 		cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 10, 10);
 	cairo_t *cr = cairo_create(surface);
 
-	g_autoptr(PangoContext) context = pango_cairo_create_context(cr);
+	PangoContext *context = pango_cairo_create_context(cr);
 	Json *json = json_tokener_parse(card);
 	struct ui_flex_layout *layout = ui_flex_new(context, json, 240);
 
@@ -210,6 +214,7 @@ static void liff_links(void)
 	ui_flex_free(layout);
 	cairo_destroy(cr);
 	cairo_surface_destroy(surface);
+	g_object_unref(context);
 }
 
 int main(int argc, char **argv)

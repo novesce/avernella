@@ -9,6 +9,7 @@
 #include "call_vp8_device.h"
 #include <libavcodec/avcodec.h>
 #include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_drm.h>
 #include <libavutil/log.h>
 #include <libavutil/opt.h>
 #endif
@@ -254,6 +255,74 @@ static void copy_nv12(AVFrame *dst, const struct line_camera_frame *src)
 	}
 }
 
+/* FFmpeg retains the capture owner on any reference held by the VA driver. */
+static void release_nv12(void *capture, guint8 *descriptor)
+{
+	g_bytes_unref(capture);
+	av_free(descriptor);
+}
+
+gboolean call_capture_import_nv12(AVFrame *dst, AVBufferRef *frames_ctx,
+				  const struct line_camera_frame *frame)
+{
+	GBytes *storage = frame->capture_dma;
+	const struct line_capture_dma *d = g_bytes_get_data(storage, NULL);
+
+	if (g_bytes_get_size(storage) != sizeof(*d) || d->fd < 0 || !d->size ||
+	    d->size > G_MAXSIZE ||
+	    !line_camera_frame_size_valid(frame->width, frame->height) ||
+	    ((frame->width | frame->height) & 1) ||
+	    d->modifier == (UINT64_MAX >> 8) || d->offset[0] == d->offset[1])
+		return FALSE;
+	AVDRMFrameDescriptor *desc = av_mallocz(sizeof(*desc));
+	AVFrame *src = av_frame_alloc();
+	gboolean ok = FALSE;
+
+	if (!src || !desc) {
+		av_free(desc);
+		goto out;
+	}
+	src->buf[0] = av_buffer_create((guint8 *)desc, sizeof(*desc),
+				       release_nv12, storage,
+				       AV_BUFFER_FLAG_READONLY);
+	if (!src->buf[0]) {
+		av_free(desc);
+		goto out;
+	}
+	g_bytes_ref(storage);
+	desc->nb_objects = desc->nb_layers = 1;
+	desc->objects[0] = (AVDRMObjectDescriptor){
+		.fd = d->fd, .size = d->size, .format_modifier = d->modifier
+	};
+	AVDRMLayerDescriptor *layer = &desc->layers[0];
+
+	layer->format = MKTAG('N', 'V', '1', '2');
+	layer->nb_planes = 2;
+	for (int i = 0; i < 2; i++) {
+		if (!line_capture_plane_valid(d->size, d->offset[i],
+					      d->stride[i], frame->width,
+					      frame->height >> i, d->modifier))
+			goto out;
+		layer->planes[i] =
+			(AVDRMPlaneDescriptor){ .object_index = 0,
+						.offset = d->offset[i],
+						.pitch = d->stride[i] };
+	}
+	src->width = frame->width;
+	src->height = frame->height;
+	src->format = AV_PIX_FMT_DRM_PRIME;
+	src->data[0] = src->buf[0]->data;
+	av_frame_unref(dst);
+	dst->hw_frames_ctx = av_buffer_ref(frames_ctx);
+	dst->format = AV_PIX_FMT_VAAPI;
+	ok = dst->hw_frames_ctx &&
+	     av_hwframe_map(dst, src,
+			    AV_HWFRAME_MAP_READ | AV_HWFRAME_MAP_DIRECT) >= 0;
+out:
+	av_frame_free(&src);
+	return ok;
+}
+
 static gboolean upload_frame(struct call_vp8_encoder *e,
 			     const struct line_camera_frame *src)
 {
@@ -335,7 +404,7 @@ gboolean call_vp8_encoder_frame(struct call_vp8_encoder *e,
 	if (!e || !frame || !picture || !size || !key || pts90k < 0 ||
 	    !line_camera_frame_size_valid(frame->width, frame->height))
 		return FALSE;
-	for (guint i = 0; i < 3; i++) {
+	for (guint i = 0; !frame->capture_dma && i < 3; i++) {
 		guint w = i ? (frame->width + 1) / 2 : frame->width;
 
 		if (!frame->plane[i] || frame->stride[i] < (int)w)
@@ -343,7 +412,8 @@ gboolean call_vp8_encoder_frame(struct call_vp8_encoder *e,
 	}
 #if CALL_VP8_JETSON
 	if (e->jetson) {
-		if (!call_vp8_jetson_frame(e->jetson, frame, pts90k, force_key,
+		if (frame->capture_dma ||
+		    !call_vp8_jetson_frame(e->jetson, frame, pts90k, force_key,
 					   picture, size, key))
 			return FALSE;
 		return check_picture(frame, *picture, *size, force_key, key);
@@ -353,8 +423,14 @@ gboolean call_vp8_encoder_frame(struct call_vp8_encoder *e,
 	if (frame->width != (guint)e->codec->width ||
 	    frame->height != (guint)e->codec->height)
 		return FALSE;
-	if (!upload_frame(e, frame))
+	if (frame->capture_dma) {
+		if (e->codec->pix_fmt != AV_PIX_FMT_VAAPI ||
+		    !call_capture_import_nv12(e->surface,
+					      e->codec->hw_frames_ctx, frame))
+			return FALSE;
+	} else if (!upload_frame(e, frame)) {
 		return FALSE;
+	}
 	e->surface->pts = pts90k;
 	e->surface->pict_type = force_key ? AV_PICTURE_TYPE_I :
 					    AV_PICTURE_TYPE_NONE;
@@ -374,6 +450,101 @@ gboolean call_vp8_encoder_frame(struct call_vp8_encoder *e,
 	return TRUE;
 #else
 	(void)force_key;
+	return FALSE;
+#endif
+}
+
+gboolean call_vp8_capture_probe(guint w, guint h, guint fps, guint kbps,
+				guint64 *modifier)
+{
+#if CALL_HWDECODE
+	struct call_vp8_encoder *e =
+		call_vp8_encoder_open(w, h, kbps, fps, fps * 3);
+	AVFrame *owned = NULL, *map = NULL, *black = NULL;
+	gboolean ok = FALSE;
+
+	if (!e || !e->codec || e->codec->pix_fmt != AV_PIX_FMT_VAAPI)
+		goto out;
+	owned = av_frame_alloc();
+	map = av_frame_alloc();
+	black = av_frame_alloc();
+	if (!owned || !map || !black ||
+	    av_hwframe_get_buffer(e->codec->hw_frames_ctx, owned, 0) < 0)
+		goto out;
+	black->width = w;
+	black->height = h;
+	black->format = AV_PIX_FMT_NV12;
+	if (av_frame_get_buffer(black, 32) < 0)
+		goto out;
+	for (guint i = 0; i < 2; i++)
+		for (guint y = 0; y < (h >> i); y++)
+			memset(black->data[i] + y * black->linesize[i],
+			       i ? 128 : 16, w);
+	if (av_hwframe_transfer_data(owned, black, 0) < 0)
+		goto out;
+	map->format = AV_PIX_FMT_DRM_PRIME;
+	if (av_hwframe_map(map, owned,
+			   AV_HWFRAME_MAP_DIRECT | AV_HWFRAME_MAP_READ) < 0)
+		goto out;
+	const AVDRMFrameDescriptor *desc = (const void *)map->data[0];
+
+	if (!desc || desc->nb_objects != 1 ||
+	    desc->objects[0].format_modifier == ((UINT64_C(1) << 56) - 1))
+		goto out;
+	struct line_capture_dma dma = {
+		.fd = desc->objects[0].fd,
+		.size = desc->objects[0].size,
+		.modifier = desc->objects[0].format_modifier
+	};
+	for (int i = 0; i < 2; i++) {
+		const AVDRMPlaneDescriptor *p;
+
+		if (desc->nb_layers == 1 &&
+		    desc->layers[0].format == MKTAG('N', 'V', '1', '2') &&
+		    desc->layers[0].nb_planes == 2)
+			p = &desc->layers[0].planes[i];
+		else if (desc->nb_layers == 2 &&
+			 desc->layers[i].nb_planes == 1 &&
+			 desc->layers[i].format ==
+				 (i ? MKTAG('G', 'R', '8', '8') :
+				      MKTAG('R', '8', ' ', ' ')))
+			p = &desc->layers[i].planes[0];
+		else
+			goto out;
+		if (p->object_index || p->offset < 0 ||
+		    p->offset > G_MAXUINT32 || p->pitch <= 0 ||
+		    (guint64)p->pitch > G_MAXUINT32)
+			goto out;
+		dma.offset[i] = p->offset;
+		dma.stride[i] = p->pitch;
+	}
+	/* The exported surface stays live through the encoder's final unref. */
+	GBytes *capture = g_bytes_new(&dma, sizeof(dma));
+	struct line_camera_frame frame = { .capture_dma = capture,
+					   .width = w,
+					   .height = h };
+	const guint8 *picture;
+	gsize size;
+	gboolean key;
+
+	ok = call_vp8_encoder_frame(e, &frame, 0, TRUE, &picture, &size,
+				    &key) &&
+	     key;
+	g_bytes_unref(capture);
+	if (ok)
+		*modifier = dma.modifier;
+out:
+	call_vp8_encoder_close(e);
+	av_frame_free(&map);
+	av_frame_free(&owned);
+	av_frame_free(&black);
+	return ok;
+#else
+	(void)w;
+	(void)h;
+	(void)fps;
+	(void)kbps;
+	(void)modifier;
 	return FALSE;
 #endif
 }

@@ -205,7 +205,8 @@ struct line_udp_stats line_udp_rx_stats(const struct line_udp_rx *r)
 }
 
 static ssize_t rx_plain(struct line_udp_rx *r, guint8 *data, gsize size,
-			struct sockaddr_storage *from, socklen_t *from_len)
+			struct sockaddr_storage *from, socklen_t *from_len,
+			gboolean need_whole)
 {
 	struct iovec iov = { data, size };
 	struct msghdr m = { .msg_name = from,
@@ -223,19 +224,38 @@ static ssize_t rx_plain(struct line_udp_rx *r, guint8 *data, gsize size,
 	sample_clocks(r);
 	*from_len = m.msg_namelen;
 	r->stats.datagrams += n >= 0;
+	if (n >= 0 && need_whole && (m.msg_flags & MSG_TRUNC)) {
+		r->arrival = 0;
+		r->stats.dropped++;
+		errno = EMSGSIZE;
+		return -1;
+	}
 	r->arrival = n >= 0 ? stamp_of(r, &m) : 0;
 	return n;
 }
 
-ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
-			 struct sockaddr_storage *from, socklen_t *from_len)
+static ssize_t rx_slot(struct line_udp_rx *r, const guint8 **data,
+		       struct sockaddr_storage *from, socklen_t *from_len)
 {
+	ssize_t n =
+		rx_plain(r, r->buf[0], sizeof(r->buf[0]), from, from_len, TRUE);
+
+	if (n >= 0)
+		*data = r->buf[0];
+	return n;
+}
+
+ssize_t line_udp_rx_borrow(struct line_udp_rx *r, const guint8 **data,
+			   struct sockaddr_storage *from, socklen_t *from_len)
+{
+	*data = NULL;
+	r->arrival = 0;
 	if (r->next >= r->count) {
 		int n;
 
 		r->count = r->next = 0;
 		if (r->mode == LINE_UDP_PLAIN)
-			return rx_plain(r, data, size, from, from_len);
+			return rx_slot(r, data, from, from_len);
 		for (guint i = 0; i < LINE_UDP_RX_BATCH; i++) {
 			struct msghdr *h = &r->msgs[i].msg_hdr;
 
@@ -251,7 +271,7 @@ ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
 		sample_clocks(r);
 		if (n < 0 && unsupported(errno)) {
 			r->mode = LINE_UDP_PLAIN;
-			return rx_plain(r, data, size, from, from_len);
+			return rx_slot(r, data, from, from_len);
 		}
 		if (n <= 0) {
 			if (!n)
@@ -261,22 +281,45 @@ ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
 		r->count = (guint)n;
 		r->stats.datagrams += (guint)n;
 	}
-	struct mmsghdr *m = &r->msgs[r->next];
-	gsize len = MIN((gsize)m->msg_len, size);
+	guint slot = r->next++;
+	struct mmsghdr *m = &r->msgs[slot];
+
+	if (m->msg_hdr.msg_flags & MSG_TRUNC) {
+		r->stats.dropped++;
+		errno = EMSGSIZE;
+		return -1;
+	}
 	socklen_t name = MIN(m->msg_hdr.msg_namelen, (socklen_t)sizeof(*from));
 
-	memcpy(data, r->buf[r->next], len);
-	memcpy(from, &r->from[r->next], name);
+	*data = r->buf[slot];
+	memcpy(from, &r->from[slot], name);
 	*from_len = name;
 	r->arrival = stamp_of(r, &m->msg_hdr);
-	r->next++;
-	return (ssize_t)len;
+	return m->msg_len;
+}
+
+ssize_t line_udp_rx_next(struct line_udp_rx *r, guint8 *data, gsize size,
+			 struct sockaddr_storage *from, socklen_t *from_len)
+{
+	const guint8 *packet;
+	ssize_t n;
+
+	if (r->mode == LINE_UDP_PLAIN)
+		return rx_plain(r, data, size, from, from_len, FALSE);
+	n = line_udp_rx_borrow(r, &packet, from, from_len);
+
+	if (n > 0) {
+		n = MIN((gsize)n, size);
+		memcpy(data, packet, n);
+	}
+	return n;
 }
 
 struct line_udp_tx {
 	int fd;
 	enum line_udp_mode mode;
 	guint count;
+	guint64 bytes;
 	struct line_udp_stats stats;
 	struct sockaddr_storage to;
 	socklen_t to_len;
@@ -318,6 +361,19 @@ struct line_udp_stats line_udp_tx_stats(const struct line_udp_tx *t)
 	return t->stats;
 }
 
+guint64 line_udp_tx_take_bytes(struct line_udp_tx *t)
+{
+	guint64 bytes = t->bytes;
+
+	t->bytes = 0;
+	return bytes;
+}
+
+static gboolean backpressure(int error)
+{
+	return error == EAGAIN || error == EWOULDBLOCK || error == ENOBUFS;
+}
+
 static gboolean tx_plain(struct line_udp_tx *t, guint first)
 {
 	for (guint i = first; i < t->count; i++) {
@@ -328,9 +384,12 @@ static gboolean tx_plain(struct line_udp_tx *t, guint first)
 			n = sendto(t->fd, t->buf[i], t->sizes[i], MSG_NOSIGNAL,
 				   (const void *)&t->to, t->to_len);
 		} while (n < 0 && errno == EINTR);
-		if (n != (ssize_t)t->sizes[i])
-			return FALSE;
+		if (n != (ssize_t)t->sizes[i]) {
+			t->stats.dropped += t->count - i;
+			return n < 0 && backpressure(errno);
+		}
 		t->stats.datagrams++;
+		t->bytes += n;
 	}
 	return TRUE;
 }
@@ -412,10 +471,12 @@ gboolean line_udp_tx_flush(struct line_udp_tx *t)
 				t->mode = LINE_UDP_PLAIN;
 				continue;
 			}
-			ok = FALSE;
+			t->stats.dropped += t->count - first;
+			ok = backpressure(err);
 			break;
 		}
 		for (int m = 0; m < sent; m++) {
+			t->bytes += t->msgs[m].msg_len;
 			first += counts[m];
 			t->stats.datagrams += counts[m];
 		}
@@ -479,6 +540,47 @@ guint line_udp_tune(int fd, int family)
 	return LINE_DSCP_VIDEO;
 }
 
+/* One bandwidth-delay product of media, rounded up to entire TX bursts.
+ * A Linux socket accounts SKBs as well as payload and doubles this request.
+ * Keep the original 1 MiB ceiling for both directions.
+ */
+static void resize_buffer(int fd, int opt, guint *last, guint64 bytes,
+			  gint64 elapsed, gint64 rtt)
+{
+	const guint burst = LINE_UDP_TX_BATCH * LINE_UDP_TX_SIZE;
+	const guint limit = 1u << 20;
+	guint size;
+
+	if (!bytes)
+		return;
+	double bdp = (double)bytes * rtt / elapsed;
+
+	size = MIN(bdp, (double)limit);
+	size += size < bdp && size < limit;
+	size = MAX(1u, (size + burst - 1) / burst) * burst;
+	size = MIN(size, limit);
+	if (size != *last &&
+	    !setsockopt(fd, SOL_SOCKET, opt, &size, sizeof(size)))
+		*last = size;
+}
+
+void line_udp_update_window(struct line_udp_window *w, int fd, gint64 now,
+			    gint64 min_rtt)
+{
+	gint64 elapsed = now - w->sample_at;
+
+	if (w->sample_at && elapsed < G_USEC_PER_SEC)
+		return;
+	if (w->sample_at && min_rtt > 0) {
+		resize_buffer(fd, SO_SNDBUF, &w->sndbuf, w->sent, elapsed,
+			      min_rtt);
+		resize_buffer(fd, SO_RCVBUF, &w->rcvbuf, w->received, elapsed,
+			      min_rtt);
+	}
+	w->sample_at = now;
+	w->sent = w->received = 0;
+}
+
 ssize_t line_udp_send_class(int fd, int family, const void *to,
 			    socklen_t to_len, const guint8 *data, gsize size,
 			    guint dscp)
@@ -517,5 +619,5 @@ ssize_t line_udp_send_class(int fd, int family, const void *to,
 			n = sendmsg(fd, &msg, MSG_NOSIGNAL);
 		} while (n < 0 && errno == EINTR);
 	}
-	return n;
+	return n < 0 && backpressure(errno) ? 0 : n;
 }

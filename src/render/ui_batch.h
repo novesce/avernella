@@ -15,6 +15,7 @@ enum ui_prim_kind {
 	UI_PRIM_DMABUF,
 	UI_PRIM_CANVAS,
 	UI_PRIM_I420,
+	UI_PRIM_NV12,
 };
 
 /* For planar video, color/border_color name the U/V descriptors and the

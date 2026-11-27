@@ -1,11 +1,14 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "call.h"
 #include "call_audio.h"
+#include "call_vp8_encode.h"
+#include "call_srtp.h"
 #include "call_group.h"
 #include "call_pdtp.h"
 #include "screencast.h"
 #include "call_schema.h"
 #include "call_video.h"
+#include "call_vp8.h"
 #include "media_io.h"
 #include "camera.h"
 #include "udp_batch.h"
@@ -140,6 +143,7 @@ struct group_video {
 };
 
 struct voice_call {
+	gboolean restore_preview;
 	enum line_media_reception reception;
 	struct call_task *task;
 	CallInfo info;
@@ -167,6 +171,7 @@ struct voice_call {
 	gboolean share_streams, self_sharing;
 	gboolean share_over_video;
 	GBytes *share_video_frame;
+	gboolean share_video_dma;
 	guint share_video_width, share_video_height;
 	gint64 share_video_repeat, share_video_keyframe;
 	/* Learned from the peer's BIG_DATA_REQ: message ID and services. */
@@ -214,6 +219,7 @@ struct voice_call {
 	struct media_route audio_route, video_route, data_route;
 	int fd;
 	/* Batched receive and video bursts on fd (see udp_batch.c). */
+	struct line_udp_window udp_window;
 	struct line_udp_rx *udp_rx;
 	struct line_udp_tx *udp_tx;
 	gint64 deadline, next_ka, next_capture;
@@ -302,19 +308,25 @@ static gboolean send_to(struct voice_call *c, const struct call_endpoint *to,
 		n = sendto(c->fd, pkt.p, pkt.n, MSG_NOSIGNAL,
 			   (const void *)&to->addr, to->len);
 	} while (n < 0 && errno == EINTR);
+	if (n > 0)
+		c->udp_window.sent += n;
 	return n == (ssize_t)pkt.n;
 }
 
 /* Microphone packets carry the voice class; the socket default is video. */
-static gboolean send_voice(struct voice_call *c, Slice pkt)
+static ssize_t send_voice(struct voice_call *c, Slice pkt)
 {
 	const struct call_endpoint *to = &c->audio_route.current;
 
 	if (line_udp_tx_pending(c->udp_tx))
 		line_udp_tx_flush(c->udp_tx);
-	return line_udp_send_class(c->fd, to->addr.ss_family,
-				   (const void *)&to->addr, to->len, pkt.p,
-				   pkt.n, LINE_DSCP_VOICE) == (ssize_t)pkt.n;
+	ssize_t n = line_udp_send_class(c->fd, to->addr.ss_family,
+					(const void *)&to->addr, to->len, pkt.p,
+					pkt.n, LINE_DSCP_VOICE);
+
+	if (n > 0)
+		c->udp_window.sent += n;
+	return n;
 }
 
 static void media_received(struct voice_call *c, struct media_route *route,
@@ -404,9 +416,9 @@ static void free_call(struct voice_call *c)
 	call_share_decoder_free(c->share_rx);
 	if (c->share_message)
 		g_byte_array_free(c->share_message, TRUE);
-	line_screencast_stop(c->cast);
 	call_share_encoder_free(c->share_tx);
 	g_clear_pointer(&c->share_video_frame, g_bytes_unref);
+	line_screencast_stop(c->cast);
 	if (c->udp_tx)
 		line_udp_tx_flush(c->udp_tx);
 	g_clear_pointer(&c->udp_tx, line_udp_tx_free);
@@ -627,14 +639,10 @@ static void peer_share_state(struct voice_call *c, gboolean sharing)
 	emit_share_state(c, "peerSharing", sharing, NULL);
 }
 
-/* Return true when the preview is sent or dropped under backpressure. */
-static gboolean send_preview(struct voice_call *c,
-			     enum line_preview_source source,
-			     const struct line_camera_frame *image, gint64 now,
-			     struct line_preview_frame *saved)
+static struct line_preview_frame
+preview_info(struct voice_call *c, enum line_preview_source source,
+	     const struct line_camera_frame *image, gint64 now)
 {
-	if (frame_socket < 0 && !saved)
-		return FALSE;
 	struct line_preview_frame report = {
 		.decoded_at = now,
 		.width = image->width,
@@ -648,9 +656,50 @@ static gboolean send_preview(struct voice_call *c,
 	if (source == LINE_PREVIEW_REMOTE && c->conference_video)
 		report.screen = call_video_frame_is_screen(
 			c->conference_video->receiver);
+	return report;
+}
+
+static gboolean preview_visible(gpointer user)
+{
+	struct voice_call *c = user;
+
+	return g_atomic_int_get(&c->task->preview_visible);
+}
+
+static gboolean export_preview(gboolean presentation,
+			       const struct line_camera_frame *image,
+			       const struct line_dmabuf_layout *layout,
+			       int dma_fd, int release_fd, gpointer data)
+{
+	struct voice_call *c = data;
+	struct line_preview_frame report = preview_info(
+		c, presentation ? LINE_PREVIEW_SCREEN : LINE_PREVIEW_REMOTE,
+		image, g_get_monotonic_time());
+
+	return line_media_send_dmabuf(frame_socket, &report, layout, dma_fd,
+				      release_fd);
+}
+
+static void configure_video_decoder(struct voice_call *c,
+				    struct call_vp8_decoder *d)
+{
+	call_vp8_enable_worker(d);
+	if (frame_socket >= 0)
+		call_vp8_set_sink(d, preview_visible, export_preview, c);
+}
+
+/* Return true when the preview is sent or dropped under backpressure. */
+static gboolean send_preview(struct voice_call *c,
+			     enum line_preview_source source,
+			     const struct line_camera_frame *image, gint64 now,
+			     struct line_preview_frame *saved)
+{
+	if (frame_socket < 0 && !saved)
+		return FALSE;
+	struct line_preview_frame report = preview_info(c, source, image, now);
 	if (saved)
 		*saved = report;
-	return frame_socket >= 0 &&
+	return !c->restore_preview && frame_socket >= 0 &&
 	       line_media_send_frame(frame_socket, &report, image);
 }
 
@@ -666,7 +715,7 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
 		c->stats.presentation_frames++;
 	group_reception(c, LINE_MEDIA_PLAYABLE);
 	peer_share_state(c, TRUE);
-	if (!g_atomic_int_get(&task->preview_visible))
+	if (!image->plane[0] || !g_atomic_int_get(&task->preview_visible))
 		return;
 	gint64 now = g_get_monotonic_time();
 
@@ -675,7 +724,7 @@ static void display_share(const struct line_camera_frame *image, gpointer user)
 	GBytes *frame = pack_i420(image);
 
 	g_mutex_lock(&task->frame_lock);
-	gboolean notify = !task->share_frame ||
+	gboolean notify = c->restore_preview || !task->share_frame ||
 			  now - task->share_notified >= G_USEC_PER_SEC;
 	GBytes *previous = task->share_frame;
 
@@ -768,8 +817,11 @@ static void data_stream(guint64 stream, const char *service, guint64 offset,
 		return;
 	if (c->stats.next)
 		c->stats.presentation_chunks++;
-	if (!c->share_rx)
+	if (!c->share_rx) {
 		c->share_rx = call_share_decoder_new();
+		configure_video_decoder(c,
+					call_share_video_decoder(c->share_rx));
+	}
 	if ((flags & (PDTP_MESSAGE_START | PDTP_MESSAGE_END)) ==
 	    (PDTP_MESSAGE_START | PDTP_MESSAGE_END)) {
 		/* Most PDTP messages fit in one packet. Borrow its bytes. */
@@ -909,7 +961,6 @@ static void stop_sharing(struct voice_call *c, const char *message)
 	gboolean was = c->self_sharing || c->cast ||
 		       g_atomic_int_get(&c->task->share_wanted);
 
-	g_clear_pointer(&c->cast, line_screencast_stop);
 	g_clear_pointer(&c->share_tx, call_share_encoder_free);
 	g_clear_pointer(&c->share_video_frame, g_bytes_unref);
 	c->share_video_repeat = 0;
@@ -922,6 +973,8 @@ static void stop_sharing(struct voice_call *c, const char *message)
 		message = "";
 	if (c->share_over_video && c->self_sharing)
 		call_video_screen(c->video, 0, 0);
+	/* Both encoders have released any dequeued PipeWire capture. */
+	g_clear_pointer(&c->cast, line_screencast_stop);
 	c->self_sharing = FALSE;
 	c->share_over_video = FALSE;
 	g_atomic_int_set(&c->task->share_wanted, FALSE);
@@ -972,7 +1025,12 @@ static void share_state(struct voice_call *c)
 		}
 		if (c->stats.next)
 			c->stats.cast_requests++;
-		c->cast = line_screencast_start(width, height, fps, &error);
+		guint kbps = c->share_over_video ?
+				     c->screen_kbps :
+				     share_setting("LINE_SHARE_KBPS", 3500, 300,
+						   20000);
+		c->cast = line_screencast_start(width, height, fps, kbps,
+						call_vp8_capture_probe, &error);
 		if (!c->cast) {
 			if (c->stats.next)
 				c->stats.cast_errors++;
@@ -1029,9 +1087,8 @@ static gboolean send_share_video(struct voice_call *c, gint64 now)
 		call_video_keyframe(c->video);
 		c->share_video_keyframe = now + 3 * G_USEC_PER_SEC;
 	}
-	line_camera_i420_frame(&image,
-			       g_bytes_get_data(c->share_video_frame, NULL),
-			       c->share_video_width, c->share_video_height);
+	line_capture_frame(&image, c->share_video_frame, c->share_video_dma,
+			   c->share_video_width, c->share_video_height);
 	sample_send_queue(c, now);
 	if (!call_video_encode(c->video, &image, now, send_video_packet, c,
 			       &error)) {
@@ -1041,6 +1098,13 @@ static gboolean send_share_video(struct voice_call *c, gint64 now)
 	/* A compositor may stop providing frames until the desktop changes. */
 	c->share_video_repeat = now + G_USEC_PER_SEC;
 	return TRUE;
+}
+
+static gboolean share_can_send(const struct voice_call *c)
+{
+	return !call_pdtp_stream_paused(c->data, PDTP_PRESENTATION_VIDEO) &&
+	       call_pdtp_stream_backlog(c->data, PDTP_PRESENTATION_VIDEO) <=
+		       (2u << 20);
 }
 
 static void share_capture(struct voice_call *c, gint64 now)
@@ -1063,8 +1127,9 @@ static void share_capture(struct voice_call *c, gint64 now)
 		return;
 	unsigned int width, height;
 	guint64 time;
+	gboolean dma = FALSE;
 	g_autoptr(GBytes) frame =
-		line_screencast_take(c->cast, &width, &height, &time);
+		line_screencast_take(c->cast, &width, &height, &time, &dma);
 
 	if (!frame)
 		return;
@@ -1082,6 +1147,7 @@ static void share_capture(struct voice_call *c, gint64 now)
 		}
 		g_clear_pointer(&c->share_video_frame, g_bytes_unref);
 		c->share_video_frame = g_steal_pointer(&frame);
+		c->share_video_dma = dma;
 		c->share_video_width = width;
 		c->share_video_height = height;
 		if (send_share_video(c, now) && first)
@@ -1113,6 +1179,8 @@ static void share_capture(struct voice_call *c, gint64 now)
 				share_setting("LINE_SHARE_KBPS", 3500, 300,
 					      20000),
 				share_setting("LINE_SHARE_FPS", 30, 1, 60));
+		if (g_strcmp0(g_getenv("LINE_CALL_ENCODER_THREAD"), "0"))
+			call_share_encode_async(c->share_tx);
 		call_share_encoder_keyframe(c->share_tx);
 		emit_share_state(c, "selfSharing", TRUE, NULL);
 		if (c->video_trace.enabled)
@@ -1122,21 +1190,13 @@ static void share_capture(struct voice_call *c, gint64 now)
 	 * Skip frames while the viewer has paused the stream or the link
 	 * drains, instead of queueing latency.
 	 */
-	if (call_pdtp_stream_paused(c->data, PDTP_PRESENTATION_VIDEO) ||
-	    call_pdtp_stream_backlog(c->data, PDTP_PRESENTATION_VIDEO) >
-		    (2u << 20)) {
+	if (!share_can_send(c)) {
 		call_share_encoder_keyframe(c->share_tx);
 		return;
 	}
-	struct line_camera_frame image;
-	g_autoptr(GError) error = NULL;
-
-	line_camera_i420_frame(&image, g_bytes_get_data(frame, NULL), width,
-			       height);
-	c->share_time = time;
-	if (!call_share_encode(c->share_tx, &image, now, share_fragment, c,
-			       &error))
-		stop_sharing(c, error->message);
+	if (!call_share_queue(c->share_tx, frame, dma, width, height, time,
+			      &c->share_time, share_fragment, c))
+		stop_sharing(c, "Could not encode the shared screen.");
 }
 
 static GBytes *pack_i420(const struct line_camera_frame *image)
@@ -1182,7 +1242,7 @@ static void display_video(const struct line_camera_frame *image, gpointer user)
 		    call_video_frame_is_screen(c->conference_video->receiver))
 			c->stats.screen_video_received++;
 	}
-	if (!g_atomic_int_get(&task->preview_visible))
+	if (!image->plane[0] || !g_atomic_int_get(&task->preview_visible))
 		return;
 	gint64 now = g_get_monotonic_time();
 
@@ -1193,7 +1253,7 @@ static void display_video(const struct line_camera_frame *image, gpointer user)
 	GBytes *frame = pack_i420(image);
 
 	g_mutex_lock(&task->frame_lock);
-	gboolean notify = !task->frame ||
+	gboolean notify = c->restore_preview || !task->frame ||
 			  now - task->frame_notified >= G_USEC_PER_SEC;
 	GBytes *previous = task->frame;
 
@@ -1427,6 +1487,7 @@ static gboolean setup_video(struct voice_call *c, Slice offer, Slice key,
 			    tx, rx))
 		c->video = call_video_open(tx, rx, pt, tx_ssrc, rx_ssrc,
 					   c->send_kbps, c->send_fps, error);
+	configure_video_decoder(c, call_video_decoder(c->video));
 	encode_on_own_thread(c);
 	OPENSSL_cleanse(tx, sizeof(tx));
 	OPENSSL_cleanse(rx, sizeof(rx));
@@ -2088,6 +2149,8 @@ static void group_select_video(struct voice_call *c)
 		v->receiver = call_video_open_group_rx(v->rx_key, c->video_pt,
 						       selected->ssrc, NULL);
 		if (v->receiver) {
+			configure_video_decoder(
+				c, call_video_decoder(v->receiver));
 			v->peer = *selected;
 			v->attempts = 0;
 			v->retry_at = g_get_monotonic_time();
@@ -3150,6 +3213,12 @@ static gboolean run_call(struct voice_call *c, GError **e)
 				{ .fd = c->fd, .events = POLLIN },
 				{ .fd = -1, .events = POLLIN },
 				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
+				{ .fd = -1, .events = POLLIN },
 				{ .fd = -1, .events = POLLIN } };
 	while (!g_atomic_int_get(&c->task->done)) {
 		gint64 now = g_get_monotonic_time();
@@ -3163,7 +3232,11 @@ static gboolean run_call(struct voice_call *c, GError **e)
 					  "LINE's call relay did not respond.");
 			return FALSE;
 		}
-		if (c->ka_seconds && now >= c->next_ka && !keepalive(c))
+		/* Media refreshes the live deadline. A missed periodic UDP
+		 * keepalive must not end a healthy call during a queue burst.
+		 */
+		if (c->ka_seconds && now >= c->next_ka && !keepalive(c) &&
+		    !c->audio)
 			return FALSE;
 		gint64 next = c->ka_seconds ? MIN(c->deadline, c->next_ka) :
 					      c->deadline;
@@ -3175,16 +3248,27 @@ static gboolean run_call(struct voice_call *c, GError **e)
 				c->muted = mute;
 				c->next_capture = now;
 			}
-			if (!mute && now >= c->next_capture) {
+			int mic_fd = line_audio_capture_fd(c->audio);
+			gboolean take =
+				mic_fd >= 0 ?
+					(line_audio_capture_ready(c->audio) ||
+					 (fds[8].revents & POLLIN)) :
+					now >= c->next_capture;
+			fds[8].fd = mute ? -1 : mic_fd;
+			fds[8].revents = 0;
+			if (!mute && take) {
 				guint8 data[2048];
 				int size = line_audio_capture(c->audio, data,
 							      sizeof(data), e);
-				if (size < 0 ||
-				    (size > 0 &&
-				     !send_voice(c,
-						 (Slice){ data, (gsize)size })))
+				ssize_t sent =
+					size > 0 ?
+						send_voice(c, (Slice){ data,
+								       size }) :
+						size;
+
+				if (sent < 0)
 					return FALSE;
-				if (c->stats.next && size > 0) {
+				if (c->stats.next && sent > 0) {
 					c->stats.audio_sent++;
 					/* Clear RTP extension has the capture level in -dBov. */
 					c->stats.audio_active += size > 20 &&
@@ -3198,8 +3282,10 @@ static gboolean run_call(struct voice_call *c, GError **e)
 								       20000)) :
 					       now + 4000;
 			}
-			if (!mute)
+			if (!mute && mic_fd < 0)
 				next = MIN(next, c->next_capture);
+			else if (!mute && line_audio_capture_ready(c->audio))
+				next = now;
 			gint64 playout = line_audio_playout(c->audio, now);
 
 			if (c->group && c->reception != LINE_MEDIA_PLAYABLE)
@@ -3271,6 +3357,7 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			next = MIN(next, c->share_video_repeat);
 		fds[3].fd = line_screencast_fd(c->cast);
 		fds[4].fd = call_video_encoder_fd(c->video);
+		fds[5].fd = call_share_encoder_fd(c->share_tx);
 		fds[2].fd = -1;
 		if (c->camera) {
 			if (now >= c->next_video)
@@ -3295,6 +3382,15 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		}
 		struct call_video *rx_video =
 			group_video ? group_video->receiver : c->video;
+		if (now - c->udp_window.sample_at >= G_USEC_PER_SEC) {
+			gint64 rtt = call_video_min_rtt(rx_video);
+			gint64 data_rtt = call_pdtp_min_rtt(c->data);
+
+			if (data_rtt && (!rtt || data_rtt < rtt))
+				rtt = data_rtt;
+			c->udp_window.sent += line_udp_tx_take_bytes(c->udp_tx);
+			line_udp_update_window(&c->udp_window, c->fd, now, rtt);
+		}
 		gboolean receiving =
 			group_video ? group_video->last_rtp &&
 					      now - group_video->last_rtp <
@@ -3308,6 +3404,8 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		 * Held packets, retransmission and keyframe requests and
 		 * REMB for the incoming video (see call_video_poll()).
 		 */
+		call_video_decoded(rx_video, display_video, c);
+		call_share_decoded(c->share_rx, display_share, c);
 		if (rx_video)
 			next = MIN(next,
 				   call_video_poll(rx_video, c->video, now,
@@ -3331,6 +3429,13 @@ static gboolean run_call(struct voice_call *c, GError **e)
 		if (c->data)
 			next = MIN(next, call_pdtp_poll(c->data, now,
 							send_data_packet, c));
+		struct call_vp8_decoder *remote = call_video_decoder(rx_video);
+		struct call_vp8_decoder *screen =
+			call_share_video_decoder(c->share_rx);
+		fds[6].fd = call_vp8_release_fd(remote);
+		fds[7].fd = call_vp8_release_fd(screen);
+		fds[9].fd = call_vp8_worker_fd(remote);
+		fds[10].fd = call_vp8_worker_fd(screen);
 		int timeout = (int)CLAMP((next - now + 999) / 1000, 0, 60000);
 
 		if (line_udp_tx_pending(c->udp_tx))
@@ -3350,6 +3455,15 @@ static gboolean run_call(struct voice_call *c, GError **e)
 				continue;
 			return FALSE;
 		}
+		if (fds[6].revents || fds[7].revents) {
+			/* Retry a static image through the durable I420 mailbox.
+			 * The nonblocking preview socket can drop under pressure.
+			 */
+			c->restore_preview = TRUE;
+			call_vp8_handle_rejection(remote);
+			call_vp8_handle_rejection(screen);
+			c->restore_preview = FALSE;
+		}
 		if (fds[0].revents) {
 			eventfd_t n;
 			(void)eventfd_read(c->task->wake, &n);
@@ -3368,7 +3482,11 @@ static gboolean run_call(struct voice_call *c, GError **e)
 				"Could not encode or send the call video frame.");
 			camera_state(c);
 		}
-		if (fds[3].revents & POLLIN)
+		if ((fds[5].revents & POLLIN) && c->share_tx &&
+		    !call_share_encoded(c->share_tx, share_can_send(c),
+					&c->share_time, share_fragment, c))
+			stop_sharing(c, "Could not encode the shared screen.");
+		if (c->cast && (fds[3].revents & POLLIN))
 			share_capture(c, g_get_monotonic_time());
 		if (c->camera && fds[2].revents) {
 			g_autoptr(GError) camera_error = NULL;
@@ -3390,12 +3508,13 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			return FALSE;
 		if (!(fds[1].revents & POLLIN))
 			continue;
-		guint8 data[4096];
+		const guint8 *data;
 		struct call_endpoint source = { .len = sizeof(source.addr) };
-		ssize_t n = line_udp_rx_next(c->udp_rx, data, sizeof(data),
-					     &source.addr, &source.len);
+		ssize_t n = line_udp_rx_borrow(c->udp_rx, &data, &source.addr,
+					       &source.len);
 		if (n <= 0)
 			continue;
+		c->udp_window.received += n;
 		Slice pkt = { data, (gsize)n };
 		/* When the kernel received it, not when this thread got here. */
 		gint64 arrival = line_udp_rx_arrival(c->udp_rx);
@@ -3414,7 +3533,10 @@ static gboolean run_call(struct voice_call *c, GError **e)
 					group_rtcp(c, pkt,
 						   g_get_monotonic_time());
 					group_camera_feedback(c, pkt);
-				} else if (!c->group && c->video &&
+				} else if (!c->group &&
+					   !line_audio_receive_report(
+						   c->audio, data, n) &&
+					   c->video &&
 					   call_video_receive_rtcp(
 						   c->video, data, n, arrival,
 						   send_video_packet, c))
@@ -3507,6 +3629,19 @@ static gboolean run_call(struct voice_call *c, GError **e)
 						       video ? &c->video_route :
 							       &c->audio_route,
 						       &source);
+				if (!c->group && !video) {
+					guint8 packet[32 +
+						      SRTP_MAX_TRAILER_LEN + 4];
+					gsize len = line_audio_receiver_report(
+						c->audio,
+						g_get_monotonic_time(), packet,
+						sizeof(packet));
+
+					if (len)
+						send_to(c,
+							&c->audio_route.current,
+							(Slice){ packet, len });
+				}
 			}
 			continue;
 		}
@@ -3633,7 +3768,7 @@ static gpointer voice_thread(gpointer data)
 	struct voice_call *c = data;
 	struct call_task *task = c->task;
 
-	line_tune_thread(LINE_THREAD_MEDIA);
+	line_tune_thread(LINE_THREAD_NETWORK);
 
 	g_autoptr(GError) e = NULL;
 	gboolean ok = run_call(c, &e);

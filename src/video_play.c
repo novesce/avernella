@@ -23,7 +23,6 @@ struct line_video_playback {
 	const char *hwaccel;
 	int fd;
 	enum playback_mode mode;
-	gboolean sdl_accelerated;
 	LineVideoDone done;
 	gpointer data;
 };
@@ -87,7 +86,7 @@ static GSubprocess *spawn_player(LineVideoPlayback *play, GError **error)
 	args[i] = NULL;
 	g_subprocess_launcher_setenv(
 		launcher, "SDL_RENDER_DRIVER",
-		play->sdl_accelerated ? "vulkan,software" : "software", TRUE);
+		play->mode == PLAY_SDL ? "software" : "vulkan", TRUE);
 	g_subprocess_launcher_setenv(launcher, "AV_LOG_FORCE_NOCOLOR", "1",
 				     TRUE);
 	/*
@@ -143,11 +142,17 @@ static void player_line(struct player_status *status, const char *line)
 
 	while (g_ascii_isspace(*line))
 		line++;
+	/* FFplay 7 prefixes progress with [info] at verbose log level. */
+	if (g_str_has_prefix(line, "[info]")) {
+		line += sizeof("[info]") - 1;
+		while (g_ascii_isspace(*line))
+			line++;
+	}
 	if (g_ascii_isdigit(*line) || *line == '-') {
 		g_ascii_strtod(line, &end);
 		if (end != line && strstr(end, " fd=") && strstr(end, " aq=") &&
 		    (strstr(end, "M-V:") || strstr(end, "A-V:") ||
-		     strstr(end, "M-A:"))) {
+		     (strstr(end, "M-A:") && status->mode == status->next))) {
 			status->played = TRUE;
 			return;
 		}
@@ -290,7 +295,6 @@ LineVideoPlayback *line_video_play(int fd, const struct line_video_gpu *gpu,
 
 	play->fd = fd;
 	play->ffplay = g_steal_pointer(&ffplay);
-	play->sdl_accelerated = gpu != NULL;
 	play->mode = PLAY_SDL;
 	if (gpu && gpu->name && *gpu->name) {
 		play->vk_params = vulkan_options(gpu->name);

@@ -4,9 +4,19 @@
 #include <SDL.h>
 #include <arpa/inet.h>
 #include <opus/opus.h>
+#include <math.h>
 #include "call_srtp.h"
 #include <openssl/rand.h>
 #include <string.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <errno.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
+
+/* Available since libopus 1.5. Older runtimes can still decode FEC. */
+#pragma weak opus_packet_has_lbrr
+extern int opus_packet_has_lbrr(const unsigned char *packet, opus_int32 len);
 
 enum {
 	RATE = 48000,
@@ -32,12 +42,12 @@ enum {
 	GROUP_REORDER_US = 80000,
 	GROUP_OUTPUT_GUARD_US = 20000,
 	GROUP_PLAYBACK_PREROLL = FRAME * 5,
-	GROUP_PLAYBACK_TARGET = FRAME * 9,
 	GROUP_PLAYBACK_LIMIT = FRAME * 18,
 	GROUP_CONCEAL_LIMIT = 2 * GROUP_FRAME,
 	/* One-to-one playout: an adaptive jitter buffer (see jb_playout()). */
 	JB_PACKETS = 50,
-	JB_BUCKETS = 50, /* 10 ms each */
+	/* Two observations per one-percent tail bin. */
+	TRANSIT_WINDOW = 200,
 	/* PipeWire can drain SDL's queue 1024 samples at a time. */
 	JB_DEVICE_LOW = FRAME * 2, /* 40 ms waiting at the speaker */
 	JB_DECIDE = 1024, /* 21 ms: a missing packet waits until then */
@@ -63,6 +73,7 @@ struct xrtp_track {
 	guint64 packet;
 	guint32 ssrc, start_stamp, next_stamp;
 	int frame_samples;
+	guint predicted;
 	gboolean played;
 };
 
@@ -78,19 +89,24 @@ struct audio_packet {
 };
 
 /*
- * Packets wait sorted by sequence. The target delay is the 97th
- * percentile of arrival delay relative to the fastest packet of the last
- * 10-20 s, from a histogram that forgets with a 5 s time constant, plus
- * one packet. The speaker's demand drives decoding.
+ * Absolute one-way delay is unknowable without synchronised clocks.
+ * Rank local arrival minus unwrapped sender time in a sliding window.
  */
+struct transit_window {
+	gint64 fifo[TRANSIT_WINDOW], sorted[TRANSIT_WINDOW];
+	gint64 ticks;
+	guint32 stamp;
+	guint count, slot, margin_ms;
+	double mean_us, variance;
+};
+
 struct jitter_buffer {
 	struct audio_packet packet[JB_PACKETS];
 	guint count, expanded;
-	double histogram[JB_BUCKETS];
-	gint64 base_arrival, min_delay, min_next, min_reset, excess_since;
-	guint32 base_stamp, next_stamp;
+	gint64 excess_since;
+	guint32 next_stamp;
 	guint16 next_seq;
-	gboolean have_base, have_seq, playing, restart;
+	gboolean have_seq, playing, restart;
 };
 
 struct audio_interval {
@@ -118,9 +134,32 @@ struct audio_diagnostics {
 	gboolean have_chunk;
 };
 
+/* Four slots cover one scheduling stall of up to 80 ms (160 ms for EAS2).
+ * SDL is the only producer and the call thread is the only consumer. A slot
+ * is never overwritten before the consumer releases it.
+ */
+enum {
+	MIC_SLOTS = 4
+};
+struct mic_ring {
+	_Alignas(64) atomic_uint head;
+	atomic_uint produced;
+	guint offset;
+	gboolean filling;
+
+	_Alignas(64) atomic_uint tail;
+	guint consumed;
+	int wake;
+	struct {
+		guint stamp;
+		opus_int16 pcm[2 * GROUP_FRAME];
+	} slot[MIC_SLOTS];
+};
+
 struct LineAudio {
 	enum line_media_reception reception;
 	SDL_AudioDeviceID capture, playback;
+	struct mic_ring *mic;
 	OpusEncoder *encoder;
 	OpusDecoder *decoder;
 	srtp_t tx, rx;
@@ -138,7 +177,12 @@ struct LineAudio {
 	struct line_denoise *denoise;
 	struct audio_diagnostics *diagnostics;
 	struct line_audio_stats totals;
+	struct call_reception_report rr;
 	struct jitter_buffer *jb;
+	struct transit_window transit;
+	guint trim_credit, group_expanded;
+	guint16 transit_seq;
+	gboolean transit_xrtp;
 	/* Kernel receive time of the packet being handled, or 0 for now. */
 	gint64 rx_arrival;
 	struct xrtp_track *tracks;
@@ -150,9 +194,16 @@ enum line_media_reception line_audio_reception(const LineAudio *a)
 	return a->reception;
 }
 
+static guint target_ms(const LineAudio *a, int samples);
+
 void line_audio_stats(const LineAudio *a, struct line_audio_stats *out)
 {
 	*out = a ? a->totals : (struct line_audio_stats){ 0 };
+	if (a)
+		out->target_ms = target_ms(a, a->group ? GROUP_FRAME :
+					      a->last_samples ?
+							 a->last_samples :
+							 FRAME);
 }
 
 void line_audio_enable_diagnostics(LineAudio *a)
@@ -236,6 +287,11 @@ void line_audio_close(LineAudio *a)
 	g_clear_pointer(&a->jb, jb_free);
 	if (a->capture)
 		SDL_CloseAudioDevice(a->capture);
+	if (a->mic) {
+		close(a->mic->wake);
+		explicit_bzero(a->mic, sizeof(*a->mic));
+		free(a->mic);
+	}
 	line_denoise_free(a->denoise);
 	if (a->playback)
 		SDL_CloseAudioDevice(a->playback);
@@ -258,6 +314,102 @@ void line_audio_close(LineAudio *a)
 	g_free(a);
 }
 
+static void microphone_input(void *data, Uint8 *samples, int length)
+{
+	LineAudio *a = data;
+	struct mic_ring *r = a->mic;
+	guint frames = a->group ? GROUP_FRAME : FRAME;
+	guint bytes = frames * a->capture_channels * sizeof(opus_int16);
+	guint head = atomic_load_explicit(&r->head, memory_order_relaxed);
+
+	guint produced =
+		atomic_load_explicit(&r->produced, memory_order_relaxed);
+	while (length > 0) {
+		guint amount = MIN((guint)length, bytes - r->offset);
+		guint index = head % MIC_SLOTS;
+
+		if (!r->offset)
+			r->filling =
+				head - atomic_load_explicit(
+					       &r->tail, memory_order_acquire) <
+				MIC_SLOTS;
+		if (r->filling)
+			memcpy((guint8 *)r->slot[index].pcm + r->offset,
+			       samples, amount);
+		samples += amount;
+		length -= amount;
+		r->offset += amount;
+		if (r->offset != bytes)
+			continue;
+		/* Publish capture time even when a full ring discarded this slot. */
+		produced += frames;
+		atomic_store_explicit(&r->produced, produced,
+				      memory_order_release);
+		if (r->filling) {
+			r->slot[index].stamp = produced - frames;
+			atomic_store_explicit(&r->head, ++head,
+					      memory_order_release);
+			while (eventfd_write(r->wake, 1) < 0 && errno == EINTR)
+				;
+		}
+		r->offset = 0;
+	}
+}
+
+int line_audio_capture_fd(const LineAudio *a)
+{
+	return a && a->mic ? a->mic->wake : -1;
+}
+
+gboolean line_audio_capture_ready(const LineAudio *a)
+{
+	const struct mic_ring *r = a ? a->mic : NULL;
+
+	return r &&
+	       atomic_load_explicit(&r->head, memory_order_acquire) !=
+		       atomic_load_explicit(&r->tail, memory_order_relaxed);
+}
+
+static gboolean take_microphone(LineAudio *a, opus_int16 *pcm, guint bytes,
+				guint samples)
+{
+	struct mic_ring *r = a->mic;
+	eventfd_t count;
+
+	(void)eventfd_read(r->wake, &count);
+	guint tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
+	guint head = atomic_load_explicit(&r->head, memory_order_acquire);
+
+	if (tail == head)
+		return FALSE;
+	/* After a stalled consumer, resume with the most recent full frame. */
+	if (head - tail == MIC_SLOTS) {
+		tail = head - 1;
+		guint end = r->slot[tail % MIC_SLOTS].stamp + samples;
+		guint produced = atomic_load_explicit(&r->produced,
+						      memory_order_acquire);
+
+		/* Even the newest retained slot predates a completed, dropped
+		 * frame. Discard backlog and wait for the next fresh capture.
+		 */
+		if (produced != end) {
+			atomic_store_explicit(&r->tail, head,
+					      memory_order_release);
+			return FALSE;
+		}
+	}
+	guint i = tail % MIC_SLOTS;
+	guint skipped = r->slot[i].stamp - r->consumed;
+
+	memcpy(pcm, r->slot[i].pcm, bytes);
+	r->consumed = r->slot[i].stamp + samples;
+	atomic_store_explicit(&r->tail, tail + 1, memory_order_release);
+	a->timestamp += skipped;
+	if (skipped)
+		a->first_tx = TRUE;
+	return TRUE;
+}
+
 static LineAudio *open_audio(const guint8 tx[30], const guint8 rx[30],
 			     guint8 tx_pt, guint8 rx_pt, guint32 tx_ssrc,
 			     guint32 rx_ssrc, gboolean group, GError **e)
@@ -271,6 +423,8 @@ static LineAudio *open_audio(const guint8 tx[30], const guint8 rx[30],
 	a->rx_ssrc = rx_ssrc;
 	a->first_rx = a->first_tx = TRUE;
 	a->capture_gain = CAPTURE_GAIN_ONE;
+	a->totals.expected_loss_pct = 5;
+	a->totals.can_count_lbrr = opus_packet_has_lbrr != NULL;
 	/* EAS2 timestamps each pair at the end of its first 20 ms frame. */
 	a->timestamp = FRAME;
 	int rc;
@@ -302,8 +456,9 @@ static LineAudio *open_audio(const guint8 tx[30], const guint8 rx[30],
 	    opus_encoder_ctl(a->encoder, OPUS_SET_SIGNAL(OPUS_SIGNAL_VOICE)) !=
 		    OPUS_OK ||
 	    opus_encoder_ctl(a->encoder, OPUS_SET_INBAND_FEC(1)) != OPUS_OK ||
-	    opus_encoder_ctl(a->encoder, OPUS_SET_PACKET_LOSS_PERC(5)) !=
-		    OPUS_OK ||
+	    opus_encoder_ctl(a->encoder,
+			     OPUS_SET_PACKET_LOSS_PERC(
+				     a->totals.expected_loss_pct)) != OPUS_OK ||
 	    (group &&
 	     (opus_encoder_ctl(a->encoder, OPUS_SET_DTX(0)) != OPUS_OK ||
 	      opus_encoder_ctl(a->encoder,
@@ -317,9 +472,28 @@ static LineAudio *open_audio(const guint8 tx[30], const guint8 rx[30],
 	SDL_AudioSpec wanted = { .freq = RATE,
 				 .format = AUDIO_S16SYS,
 				 .channels = 1,
-				 .samples = 512 };
+				 .samples = FRAME / 2 };
 	if (a->sdl) {
 		a->playback = SDL_OpenAudioDevice(NULL, 0, &wanted, NULL, 0);
+		if (a->playback &&
+		    g_strcmp0(g_getenv("LINE_CALL_CAPTURE_EVENTS"), "0")) {
+			int fd = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
+
+			if (fd >= 0)
+				a->mic =
+					aligned_alloc(_Alignof(struct mic_ring),
+						      sizeof(*a->mic));
+			if (a->mic) {
+				memset(a->mic, 0, sizeof(*a->mic));
+				a->mic->wake = fd;
+				atomic_init(&a->mic->head, 0);
+				atomic_init(&a->mic->tail, 0);
+				atomic_init(&a->mic->produced, 0);
+				wanted.callback = microphone_input;
+				wanted.userdata = a;
+			} else if (fd >= 0)
+				close(fd);
+		}
 		if (a->playback && group) {
 			wanted.channels = 2;
 			a->capture =
@@ -367,9 +541,22 @@ void line_audio_mute(LineAudio *a, gboolean muted)
 	if (!a || a->muted == muted)
 		return;
 	SDL_PauseAudioDevice(a->capture, 1);
-	SDL_ClearQueuedAudio(a->capture);
+	if (a->mic) {
+		struct mic_ring *r = a->mic;
+		eventfd_t count;
+
+		SDL_LockAudioDevice(a->capture);
+		r->offset = 0;
+		r->consumed = atomic_load(&r->produced);
+		explicit_bzero(r->slot, sizeof(r->slot));
+		atomic_store(&r->tail, atomic_load(&r->head));
+		(void)eventfd_read(r->wake, &count);
+		SDL_UnlockAudioDevice(a->capture);
+	} else {
+		SDL_ClearQueuedAudio(a->capture);
+	}
 	a->muted = muted;
-	if (a->group && muted) {
+	if (muted) {
 		/* Drop the samples still held by the denoiser and encoder. */
 		a->group_active = FALSE;
 		g_clear_pointer(&a->denoise, line_denoise_free);
@@ -378,8 +565,7 @@ void line_audio_mute(LineAudio *a, gboolean muted)
 		a->clean_hold = 0;
 	}
 	if (!muted) {
-		if (a->group)
-			a->denoise = line_denoise_new();
+		a->denoise = line_denoise_new();
 		a->first_tx = TRUE;
 		SDL_PauseAudioDevice(a->capture, 0);
 	}
@@ -634,31 +820,37 @@ int line_audio_capture(LineAudio *a, guint8 *packet, gsize capacity, GError **e)
 	guint samples = a->group ? GROUP_FRAME : FRAME;
 	gsize stride = a->capture_channels * sizeof(*pcm);
 	gsize bytes = samples * stride;
-	const gsize frame_bytes = FRAME * stride;
-	Uint32 available = SDL_GetQueuedAudioSize(a->capture);
-
 	if (a->diagnostics)
 		a->diagnostics->interval.capture_checks++;
-	if (available > frame_bytes * 50) {
-		SDL_ClearQueuedAudio(a->capture);
-		a->timestamp += available / stride;
-		a->first_tx = TRUE;
-		return 0;
-	}
-	if (available > frame_bytes * 6) {
-		/* Keep recent microphone audio after a scheduling stall. */
-		while (available >= frame_bytes * 3) {
-			if (SDL_DequeueAudio(a->capture, pcm, frame_bytes) !=
-			    frame_bytes)
-				return 0;
-			a->timestamp += FRAME;
-			available -= frame_bytes;
+	if (a->mic) {
+		if (!take_microphone(a, pcm, bytes, samples))
+			return 0;
+	} else {
+		const gsize frame_bytes = FRAME * stride;
+		Uint32 available = SDL_GetQueuedAudioSize(a->capture);
+
+		if (available > frame_bytes * 50) {
+			SDL_ClearQueuedAudio(a->capture);
+			a->timestamp += available / stride;
+			a->first_tx = TRUE;
+			return 0;
 		}
-		a->first_tx = TRUE;
+		if (available > frame_bytes * 6) {
+			/* Keep recent microphone audio after a scheduling stall. */
+			while (available >= frame_bytes * 3) {
+				if (SDL_DequeueAudio(a->capture, pcm,
+						     frame_bytes) !=
+				    frame_bytes)
+					return 0;
+				a->timestamp += FRAME;
+				available -= frame_bytes;
+			}
+			a->first_tx = TRUE;
+		}
+		if (available < bytes ||
+		    SDL_DequeueAudio(a->capture, pcm, bytes) != bytes)
+			return 0;
 	}
-	if (available < bytes ||
-	    SDL_DequeueAudio(a->capture, pcm, bytes) != bytes)
-		return 0;
 	int n;
 	gboolean group_active = FALSE;
 	gboolean marker = a->first_tx;
@@ -895,25 +1087,51 @@ static int decode_packet(OpusDecoder *decoder,
 static int decode_xrtp(LineAudio *a, const struct audio_packet *packet,
 		       opus_int16 pcm[MAX_PCM]);
 
-/* Catch up slowly after a burst or sustained clock drift. */
-static int compress_pcm(opus_int16 *pcm, int samples)
+/*
+ * Remove whole pitch periods. Search one 80–500 Hz speech period for
+ * matching waveforms, then overlap-add across one 2.5 ms Opus subframe.
+ * Budget credit over packets so slow drift does not need resampling.
+ */
+static int shorten_pcm(LineAudio *a, opus_int16 *pcm, int n, guint budget)
 {
-	enum {
-		FRACTION = 4096
-	};
-	int count = samples - samples / 50;
-	int step = (samples - 1) * FRACTION / (count - 1);
-	int position = step;
+	const int overlap = MIN_FRAME;
+	const int min_lag = RATE / 500;
+	int limit = MIN(n - overlap, RATE / 80);
 
-	for (int i = 1; i + 1 < count; i++, position += step) {
-		int source = position / FRACTION;
-		int remainder = position % FRACTION;
-		int delta = pcm[source + 1] - pcm[source];
+	a->trim_credit = MIN(a->trim_credit + budget, RATE / 80);
+	if (limit < min_lag || a->trim_credit < min_lag)
+		return n;
+	/* Only search once a full available pitch period can be removed. */
+	if ((int)a->trim_credit < limit)
+		return n;
+	int start = (n - limit - overlap) / 2;
+	guint64 best = G_MAXUINT64;
+	int lag = min_lag;
 
-		pcm[i] = pcm[source] + delta * remainder / FRACTION;
+	for (int k = min_lag; k <= limit; k++) {
+		guint64 error = 0;
+
+		/* Coarse correlation at 12 kHz, sample-accurate lag. */
+		for (int j = 0; j < overlap; j += 4) {
+			gint32 d = pcm[start + j] - pcm[start + k + j];
+
+			error += (gint64)d * d;
+		}
+		if (error < best) {
+			best = error;
+			lag = k;
+		}
 	}
-	pcm[count - 1] = pcm[samples - 1];
-	return count;
+	for (int j = 0; j < overlap; j++) {
+		int x = pcm[start + j], y = pcm[start + lag + j];
+
+		pcm[start + j] = x + (y - x) * j / overlap;
+	}
+	start += overlap;
+	memmove(pcm + start, pcm + start + lag,
+		(n - start - lag) * sizeof(*pcm));
+	a->trim_credit -= lag;
+	return n - lag;
 }
 
 static gboolean queue_pcm(LineAudio *a, opus_int16 *pcm, int samples)
@@ -929,6 +1147,10 @@ static gboolean queue_pcm(LineAudio *a, opus_int16 *pcm, int samples)
 		static opus_int16 silence[GROUP_PLAYBACK_PREROLL];
 		int preroll = a->group ? GROUP_PLAYBACK_PREROLL :
 					 PLAYBACK_PREROLL;
+
+		if (a->group && a->transit.count > 1)
+			preroll = MIN((guint)preroll,
+				      target_ms(a, samples) * (RATE / 1000));
 
 		if (SDL_QueueAudio(a->playback, silence,
 				   preroll * sizeof(*pcm)) < 0)
@@ -946,8 +1168,12 @@ static gboolean queue_pcm(LineAudio *a, opus_int16 *pcm, int samples)
 	}
 
 	int input = samples;
-	if (a->group && queued >= GROUP_PLAYBACK_TARGET && samples >= MIN_FRAME)
-		samples = compress_pcm(pcm, samples);
+
+	if (a->group && queued > target_ms(a, samples) * (RATE / 1000) &&
+	    samples >= MIN_FRAME)
+		samples = shorten_pcm(a, pcm, samples, samples / 50);
+	else
+		a->trim_credit = 0;
 	if (SDL_QueueAudio(a->playback, pcm, samples * sizeof(*pcm)) < 0)
 		return FALSE;
 	a->reception = LINE_MEDIA_PLAYABLE;
@@ -959,6 +1185,17 @@ static gboolean queue_pcm(LineAudio *a, opus_int16 *pcm, int samples)
 	return TRUE;
 }
 
+/* opus_decode(..., decode_fec=1) also succeeds using PLC when a packet
+ * contains no LBRR. Count only redundancy which the packet actually has.
+ */
+static void count_repair(LineAudio *a, const struct audio_packet *next)
+{
+	a->totals.fec_attempts++;
+	if (opus_packet_has_lbrr &&
+	    opus_packet_has_lbrr(next->data, next->len) > 0)
+		a->totals.fec++;
+}
+
 static void conceal_loss(LineAudio *a, const struct audio_packet *next)
 {
 	guint gap = (guint16)(next->seq - a->received - 1);
@@ -968,6 +1205,12 @@ static void conceal_loss(LineAudio *a, const struct audio_packet *next)
 	gint32 ticks = (gint32)(next->stamp - a->next_stamp);
 
 	/* Conceal actual gaps on the audio clock, independent of group sequence. */
+	/*
+	 * Some missing media may already have been concealed at the speaker
+	 * deadline. Do not synthesize that interval twice.
+	 */
+	if (ticks > 0)
+		ticks -= MIN((guint)ticks, a->group_expanded);
 	if (ticks <= 0)
 		return;
 	int limit = a->group ? GROUP_CONCEAL_LIMIT : MAX_PCM;
@@ -1010,7 +1253,8 @@ static void conceal_loss(LineAudio *a, const struct audio_packet *next)
 		if (count <= 0)
 			break;
 		a->totals.concealed += count;
-		a->totals.fec += fec;
+		if (fec && !next->xrtp.count)
+			count_repair(a, next);
 		a->totals.lost++;
 		if (stats)
 			stats->conceal_samples += count;
@@ -1067,6 +1311,7 @@ static gboolean play_packet(LineAudio *a, const struct audio_packet *packet)
 			stats->pcm_square_sum += (gint32)pcm[i] * pcm[i];
 	}
 	a->first_rx = FALSE;
+	a->group_expanded = 0;
 	a->last_xrtp = xrtp;
 	a->received = packet->seq;
 	a->next_stamp = packet->stamp + packet->samples;
@@ -1075,48 +1320,61 @@ static gboolean play_packet(LineAudio *a, const struct audio_packet *packet)
 	return queue_pcm(a, pcm + skip, count - skip);
 }
 
-/* Delay of this arrival above the fastest recent one, into the histogram. */
-static void jb_arrival(struct jitter_buffer *jb, guint32 stamp, gint64 now)
+/*
+ * Fast EWMA variance (one device-delay budget), slow empirical p99 (two
+ * hundred arrivals). Use the normal one-sided 99% quantile only for the
+ * fast attack; the observed tail covers bursty, non-Gaussian arrivals.
+ * Clamp the prediction to the range we actually saw. At 50 packets/s
+ * shifting this short sorted window costs less than 160 KiB/s.
+ */
+static void observe_transit(struct transit_window *w, guint32 stamp, gint64 now,
+			    int samples)
 {
-	if (!jb->have_base) {
-		jb->have_base = TRUE;
-		jb->base_arrival = now;
-		jb->base_stamp = stamp;
-		jb->min_delay = jb->min_next = G_MAXINT64;
-		jb->min_reset = now + 10 * G_USEC_PER_SEC;
-		jb->histogram[0] = 1;
-	}
-	gint64 delay = now - jb->base_arrival -
-		       (gint64)(gint32)(stamp - jb->base_stamp) *
-			       G_USEC_PER_SEC / RATE;
+	gint64 ticks = w->ticks + (gint32)(stamp - w->stamp);
 
-	jb->min_delay = MIN(jb->min_delay, delay);
-	jb->min_next = MIN(jb->min_next, delay);
-	if (now >= jb->min_reset) {
-		jb->min_delay = jb->min_next;
-		jb->min_next = delay;
-		jb->min_reset = now + 10 * G_USEC_PER_SEC;
-	}
-	guint bucket = MIN((delay - jb->min_delay) / 10000, JB_BUCKETS - 1);
+	if (!w->count)
+		ticks = 0;
+	w->stamp = stamp;
+	w->ticks = ticks;
+	gint64 transit = now - ticks * G_USEC_PER_SEC / RATE;
+	guint pos = 0;
 
-	for (guint i = 0; i < JB_BUCKETS; i++)
-		jb->histogram[i] *= 0.996;
-	jb->histogram[bucket] += 0.004;
+	if (w->count == TRANSIT_WINDOW) {
+		while (w->sorted[pos] != w->fifo[w->slot])
+			pos++;
+		memmove(w->sorted + pos, w->sorted + pos + 1,
+			(--w->count - pos) * sizeof(*w->sorted));
+	}
+	pos = w->count;
+	while (pos && w->sorted[pos - 1] > transit) {
+		w->sorted[pos] = w->sorted[pos - 1];
+		pos--;
+	}
+	w->sorted[pos] = transit;
+	w->fifo[w->slot] = transit;
+	w->slot = (w->slot + 1) % TRANSIT_WINDOW;
+	if (!w->count)
+		w->mean_us = transit;
+	w->count++;
+
+	/* Matched first-order low pass: dt / (tau + dt), tau = max delay. */
+	double gain = (double)samples / (JB_MAX_MS * (RATE / 1000) + samples);
+	double error = transit - w->mean_us;
+
+	w->mean_us += gain * error;
+	w->variance = (1 - gain) * (w->variance + gain * error * error);
+	gint64 tail = w->sorted[w->count - 1 - w->count / 100];
+	double predict = w->mean_us + 2.32635 * sqrt(w->variance);
+	double high = MIN(predict, (double)w->sorted[w->count - 1]);
+	double margin = MAX((double)tail, high) - w->sorted[0];
+
+	w->margin_ms = (guint)ceil(MIN(margin / 1000, (double)JB_MAX_MS));
 }
 
-static guint jb_target_ms(const struct jitter_buffer *jb)
+static guint target_ms(const LineAudio *a, int samples)
 {
-	double total = 0, sum = 0;
-
-	for (guint i = 0; i < JB_BUCKETS; i++)
-		total += jb->histogram[i];
-	for (guint i = 0; i < JB_BUCKETS; i++) {
-		sum += jb->histogram[i];
-		if (sum >= 0.97 * total)
-			return CLAMP((i + 1) * 10 + FRAME / 48, JB_MIN_MS,
-				     JB_MAX_MS);
-	}
-	return JB_MAX_MS;
+	return CLAMP(a->transit.margin_ms + (guint)samples / (RATE / 1000),
+		     JB_MIN_MS, JB_MAX_MS);
 }
 
 /* Audio waiting after the next one to play, in milliseconds. */
@@ -1143,7 +1401,11 @@ static gboolean jb_insert(LineAudio *a, struct audio_packet *frame)
 		jb->count = 0;
 		jb->have_seq = jb->playing = FALSE;
 		jb->restart = TRUE;
+		a->transit = (struct transit_window){ 0 };
 	}
+	/* Include late packets so the estimator sees the entire tail. */
+	observe_transit(&a->transit, frame->stamp, frame->arrival,
+			frame->samples);
 	/* Late: its audio has been played or concealed already. */
 	if (jb->have_seq &&
 	    ((gint16)(frame->seq - jb->next_seq) < 0 ||
@@ -1157,7 +1419,6 @@ static gboolean jb_insert(LineAudio *a, struct audio_packet *frame)
 		pos--;
 	if (pos && jb->packet[pos - 1].seq == frame->seq)
 		return FALSE;
-	jb_arrival(jb, frame->stamp, frame->arrival);
 	if (jb->count == JB_PACKETS) {
 		/* Full: the oldest gives way. */
 		a->totals.dropped += jb->packet[0].samples;
@@ -1184,25 +1445,6 @@ static void jb_pop(struct jitter_buffer *jb)
 	memmove(jb->packet, jb->packet + 1, --jb->count * sizeof(*jb->packet));
 }
 
-/* Plays a frame 10% faster by linear resampling, to shed delay. */
-static int jb_compress(opus_int16 *pcm, int samples)
-{
-	int count = samples - samples / 10;
-
-	if (count < 2)
-		return samples;
-	for (int i = 1; i < count; i++) {
-		int position =
-			(int)((gint64)i * (samples - 1) * 4096 / (count - 1));
-		int source = position / 4096, fraction = position % 4096;
-		int next = MIN(source + 1, samples - 1);
-
-		pcm[i] = pcm[source] +
-			 (pcm[next] - pcm[source]) * fraction / 4096;
-	}
-	return count;
-}
-
 /*
  * One-to-one playout, after WebRTC's NetEq: when the speaker runs low,
  * decode the next packet. The RTP clock decides what is missing. A gap
@@ -1218,7 +1460,7 @@ static gint64 jb_playout(LineAudio *a, gint64 now)
 	struct jitter_buffer *jb = a->jb;
 	gboolean drain = now == G_MAXINT64;
 	guint queued = SDL_GetQueuedAudioSize(a->playback) / sizeof(opus_int16);
-	guint target = jb_target_ms(jb);
+	guint target = target_ms(a, a->last_samples ? a->last_samples : FRAME);
 
 	if (!jb->playing) {
 		if (!jb->count)
@@ -1275,9 +1517,10 @@ static gint64 jb_playout(LineAudio *a, gint64 now)
 			level = (queued + n) / 48 + jb_span_ms(jb);
 			a->totals.delay_ms_sum += level;
 			a->totals.delay_count++;
-			if (level <= target + 60)
+			if (level <= target + FRAME / 48) {
 				jb->excess_since = 0;
-			else if (!jb->excess_since)
+				a->trim_credit = 0;
+			} else if (!jb->excess_since)
 				jb->excess_since = now;
 			if (!drain && level > target + 200) {
 				a->totals.dropped += n;
@@ -1285,12 +1528,12 @@ static gint64 jb_playout(LineAudio *a, gint64 now)
 			}
 			if (!drain && jb->excess_since &&
 			    now - jb->excess_since >= G_USEC_PER_SEC / 2) {
-				int shorter = jb_compress(pcm, n);
+				int shorter = shorten_pcm(a, pcm, n, n / 10);
 
 				a->totals.dropped += n - shorter;
 				n = shorter;
 			}
-		} else if (head && !drain && queued >= JB_DECIDE) {
+		} else if (!drain && queued >= JB_DECIDE) {
 			/* The speaker still has audio: decide as late as can be. */
 			break;
 		} else if (head && (drain || level >= target ||
@@ -1305,7 +1548,8 @@ static gint64 jb_playout(LineAudio *a, gint64 now)
 					fec ? head->len : 0, pcm, missing, fec);
 			jb->next_stamp += missing;
 			a->totals.lost++;
-			a->totals.fec += fec && n > 0;
+			if (fec && n > 0)
+				count_repair(a, head);
 			if (n <= 0)
 				continue;
 			a->totals.concealed += n;
@@ -1329,12 +1573,61 @@ static gint64 jb_playout(LineAudio *a, gint64 now)
 	}
 	if (drain || !jb->playing)
 		return drain || !jb->count ? G_MAXINT64 : now + 5000;
-	guint low = jb->count && jb->packet[0].stamp != jb->next_stamp ?
+	guint low = !jb->count || jb->packet[0].stamp != jb->next_stamp ?
 			    JB_DECIDE :
 			    JB_DEVICE_LOW;
 
 	return now + MAX(1000, (gint64)(queued - MIN(queued, low)) *
 				       G_USEC_PER_SEC / RATE);
+}
+
+/*
+ * A lost conference packet used to be concealed only after another
+ * packet arrived, often after a real speaker underrun. Feed Opus PLC at
+ * the device deadline. A silent/muted source stops scheduling after the
+ * same bounded expansion as direct calls. XRTP has one codec per child;
+ * conceal only participants present in the last authenticated mix.
+ */
+static gint64 group_playout_due(LineAudio *a, gint64 now)
+{
+	if (now == G_MAXINT64 || a->first_rx ||
+	    a->group_expanded >= JB_EXPAND_LIMIT * FRAME)
+		return G_MAXINT64;
+	guint queued = SDL_GetQueuedAudioSize(a->playback) / sizeof(opus_int16);
+
+	if (queued < FRAME) {
+		opus_int16 pcm[FRAME];
+
+		if (a->last_xrtp) {
+			gint32 mixed[FRAME] = { 0 };
+
+			for (int i = 0; a->tracks && i < XRTP_TRACKS; i++) {
+				struct xrtp_track *track = &a->tracks[i];
+
+				if (!track->played ||
+				    track->packet != a->xrtp_packet)
+					continue;
+				if (opus_decode(track->decoder, NULL, 0, pcm,
+						FRAME, FALSE) != FRAME)
+					continue;
+				track->predicted += FRAME;
+				for (int j = 0; j < FRAME; j++)
+					mixed[j] += pcm[j];
+			}
+			for (int j = 0; j < FRAME; j++)
+				pcm[j] =
+					CLAMP(mixed[j], G_MININT16, G_MAXINT16);
+		} else if (opus_decode(a->decoder, NULL, 0, pcm, FRAME,
+				       FALSE) != FRAME)
+			return G_MAXINT64;
+		if (SDL_QueueAudio(a->playback, pcm, sizeof(pcm)) < 0)
+			return G_MAXINT64;
+		a->group_expanded += FRAME;
+		a->totals.concealed += FRAME;
+		queued += FRAME;
+	}
+	return now + MAX(G_GINT64_CONSTANT(1000),
+			 (gint64)(queued - FRAME) * G_USEC_PER_SEC / RATE);
 }
 
 gint64 line_audio_playout(LineAudio *a, gint64 now)
@@ -1357,7 +1650,7 @@ gint64 line_audio_playout(LineAudio *a, gint64 now)
 		memmove(a->pending, a->pending + 1,
 			a->pending_count * sizeof(*a->pending));
 	}
-	return G_MAXINT64;
+	return group_playout_due(a, now);
 }
 
 static gint64 group_reorder_time(LineAudio *a)
@@ -1367,7 +1660,11 @@ static gint64 group_reorder_time(LineAudio *a)
 	gint64 available =
 		queued * G_USEC_PER_SEC / RATE - GROUP_OUTPUT_GUARD_US;
 
-	return CLAMP(available, 0, GROUP_REORDER_US);
+	gint64 limit = a->transit.count < 3 ?
+			       GROUP_REORDER_US :
+			       (gint64)target_ms(a, GROUP_FRAME) * 1000;
+
+	return CLAMP(available, 0, limit);
 }
 
 static int nested_rtp_payload(const guint8 *packet, int size)
@@ -1388,6 +1685,85 @@ static guint32 rtp_u32(const guint8 *packet)
 {
 	return ((guint32)packet[0] << 24) | ((guint32)packet[1] << 16) |
 	       ((guint32)packet[2] << 8) | packet[3];
+}
+
+/* Called after receiving audio. A muted peer generates no timer wakeups. */
+gsize line_audio_receiver_report(LineAudio *a, gint64 now, guint8 *packet,
+				 gsize capacity)
+{
+	if (!a || a->group || !a->rr.started ||
+	    now - a->rr.sent_at < G_USEC_PER_SEC)
+		return 0;
+	gsize size = call_rtcp_report(&a->rr, a->tx, a->tx_ssrc, a->rx_ssrc,
+				      packet, capacity);
+
+	if (size)
+		a->rr.sent_at = now;
+	return size;
+}
+
+/* RFC 3550 section 6.4: fraction lost is an unsigned Q0.8 value
+ * for the report interval. Opus wants the nearest integer percentage
+ * and allocates its own LBRR bits within the existing 32 kb/s budget.
+ * EAS2 conference packets require CELT, which has no SILK LBRR.
+ */
+gboolean line_audio_receive_report(LineAudio *a, const guint8 *packet,
+				   gsize size)
+{
+	guint8 plain[MAX_RTP];
+	gsize pos = 0;
+	int length, loss = -1;
+
+	if (!a || a->group || !packet || size < 8 + 14 ||
+	    size > sizeof(plain) || packet[0] >> 6 != 2 ||
+	    (packet[1] != 200 && packet[1] != 201) ||
+	    rtp_u32(packet + 4) != a->rx_ssrc)
+		return FALSE;
+	memcpy(plain, packet, size);
+	length = size;
+	if (srtp_unprotect_rtcp(a->rx, plain, &length) != srtp_err_status_ok)
+		return FALSE;
+	while (pos < (gsize)length) {
+		const guint8 *p = plain + pos;
+		gsize remaining = length - pos;
+
+		if (remaining < 4 || p[0] >> 6 != 2)
+			return FALSE;
+		gsize bytes = 4u * (1u + ((guint)p[2] << 8) + p[3]);
+		gsize payload = bytes;
+
+		if (bytes > remaining)
+			return FALSE;
+		if (p[0] & 0x20) {
+			guint pad = p[bytes - 1];
+
+			if (bytes != remaining || !pad || pad > bytes - 4)
+				return FALSE;
+			payload -= pad;
+		}
+		pos += bytes;
+		if (p[1] != 200 && p[1] != 201)
+			continue;
+		gsize off = p[1] == 200 ? 28 : 8;
+		guint count = p[0] & 31;
+
+		if (off + count * 24u > payload)
+			return FALSE;
+		if (rtp_u32(p + 4) != a->rx_ssrc)
+			continue;
+		for (guint i = 0; i < count; i++, off += 24)
+			if (rtp_u32(p + off) == a->tx_ssrc)
+				loss = (p[off + 4] * 100u + 128) / 256;
+	}
+	if (loss < 0)
+		return FALSE;
+	if ((guint)loss != a->totals.expected_loss_pct) {
+		if (opus_encoder_ctl(a->encoder, OPUS_SET_PACKET_LOSS_PERC(
+							 loss)) != OPUS_OK)
+			return FALSE;
+		a->totals.expected_loss_pct = loss;
+	}
+	return TRUE;
 }
 
 static struct xrtp_track *find_xrtp_track(LineAudio *a, guint32 ssrc)
@@ -1495,8 +1871,8 @@ static int decode_xrtp(LineAudio *a, const struct audio_packet *packet,
 		if (start < 0 || start >= GROUP_FRAME ||
 		    (track->played && gap < 0))
 			continue;
-		if (track->played && gap)
-			xrtp_track_gap(track, gap, pcm);
+		if (track->played && (guint)gap > track->predicted)
+			xrtp_track_gap(track, gap - track->predicted, pcm);
 		int skip = 0;
 		int count = decode_packet(track->decoder, &frame, &skip, pcm);
 		if (count <= 0 || count > GROUP_FRAME)
@@ -1507,6 +1883,7 @@ static int decode_xrtp(LineAudio *a, const struct audio_packet *packet,
 		track->next_stamp = frame.stamp + frame.samples;
 		track->frame_samples = MIN(frame.frame_samples, FRAME);
 		track->played = TRUE;
+		track->predicted = 0;
 		if (packet->xrtp.count == 1) {
 			memset(pcm + count, 0,
 			       (GROUP_FRAME - count) * sizeof(*pcm));
@@ -1734,12 +2111,6 @@ static gboolean receive_packet(LineAudio *a, const guint8 *packet, gsize size)
 	guint16 seq = ((guint16)plain[2] << 8) | plain[3];
 	gint16 delta = (gint16)(seq - a->received);
 
-	if (!a->jb && !a->first_rx && delta <= 0) {
-		a->totals.late++;
-		if (d)
-			d->interval.late++;
-		return FALSE;
-	}
 	struct audio_packet frame = {
 		.data = plain + off,
 		.stamp = rtp_u32(plain + 4),
@@ -1779,10 +2150,36 @@ static gboolean receive_packet(LineAudio *a, const guint8 *packet, gsize size)
 		diagnose_received_audio(d, &frame, n - off - !frame.xrtp.count,
 					plain[0] & 15);
 
-	if (a->jb) {
-		frame.arrival = a->rx_arrival ? a->rx_arrival :
-						g_get_monotonic_time();
+	frame.arrival = a->rx_arrival ? a->rx_arrival : g_get_monotonic_time();
+	if (!a->group) {
+		if (!a->rr.started)
+			a->rr.sent_at = frame.arrival;
+		call_rtcp_arrival(&a->rr, frame.seq, frame.stamp, RATE,
+				  frame.arrival);
+	}
+	if (a->jb)
 		return jb_insert(a, &frame);
+	/*
+	 * The mixer's XRTP children have independent RTP clocks. The outer
+	 * sequence advances one fixed conference slot per packet.
+	 */
+	gboolean xrtp = frame.xrtp.count != 0;
+
+	if (xrtp != a->transit_xrtp)
+		a->transit = (struct transit_window){ 0 };
+	guint32 stamp =
+		xrtp ? a->transit.stamp +
+				(gint16)(seq - a->transit_seq) * GROUP_FRAME :
+		       frame.stamp;
+
+	observe_transit(&a->transit, stamp, frame.arrival, frame.samples);
+	a->transit_xrtp = xrtp;
+	a->transit_seq = seq;
+	if (!a->first_rx && delta <= 0) {
+		a->totals.late++;
+		if (d)
+			d->interval.late++;
+		return FALSE;
 	}
 	if (a->first_rx || delta == 1 || delta > REORDER_PACKETS + 1) {
 		if (!a->first_rx && delta > REORDER_PACKETS + 1)
@@ -1798,7 +2195,7 @@ static gboolean receive_packet(LineAudio *a, const guint8 *packet, gsize size)
 		d->interval.reordered++;
 
 	if (a->group)
-		frame.reorder_until = now + group_reorder_time(a);
+		frame.reorder_until = frame.arrival + group_reorder_time(a);
 	else if (!a->pending_count)
 		a->reorder_until = now + REORDER_US;
 	guint pos = a->pending_count++;

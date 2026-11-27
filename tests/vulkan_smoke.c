@@ -1,8 +1,18 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE
+#endif
 #include "render/vk_canvas.h"
 #include "render/vk_adapter.h"
 #include "render/vk_frame.h"
 #include "render/vk_tex.h"
+#include "render/vk_nv12.h"
+#include "nv12_fixture.h"
+#include <fcntl.h>
+#include <linux/udmabuf.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
@@ -25,6 +35,8 @@ struct render_test {
 	VkCommandPool pool;
 	VkCommandBuffer commands[FRAME_COUNT];
 	VkSemaphore timeline;
+	struct vk_nv12 *nv12;
+	const struct vk_nv12_batch *batch;
 	uint32_t image_slot;
 };
 
@@ -142,6 +154,7 @@ static VkResult draw_readback(struct render_test *test, uint64_t frame,
 {
 	const struct vk_ctx *ctx = &test->ctx;
 	VkCommandBuffer cmd = test->commands[frame % FRAME_COUNT];
+	bool covers = upload && vk_visible_layers(&items, &count, area);
 	size_t prim_bytes = count * sizeof(*items);
 	size_t offset = ((0 - test->primitives.address) & 63) +
 			1024 * (frame % FRAME_COUNT);
@@ -168,6 +181,8 @@ static VkResult draw_readback(struct render_test *test, uint64_t frame,
 	result = vkBeginCommandBuffer(cmd, &begin);
 	if (result != VK_SUCCESS)
 		return result;
+	if (test->batch)
+		vk_nv12_barriers(test->batch, cmd, ctx->family, true);
 	if (upload) {
 		result = upload(user, cmd, frame % VK_PRESENT_SLOTS);
 		if (result != VK_SUCCESS)
@@ -177,15 +192,11 @@ static VkResult draw_readback(struct render_test *test, uint64_t frame,
 		      frame ? VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL :
 			      VK_IMAGE_LAYOUT_UNDEFINED,
 		      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, false);
-	/* The synthetic presenter can discard the clear only for a complete
-	 * canvas. The sparse-copy case deliberately leaves pixels uncovered.
-	 */
-	bool covers = upload && count && items[0].prim_type == UI_PRIM_CANVAS &&
-		      items[0].pos[0] == 0 && items[0].pos[1] == 0 &&
-		      items[0].size[0] == WIDTH && items[0].size[1] == HEIGHT;
 	vk_ui_draw_mode(ctx, cmd, upload ? test->opaque : test->pipeline,
 			test->view, test->target.extent, area, &push, count,
-			clear, covers);
+			clear, covers, test->batch, items);
+	if (test->batch)
+		vk_nv12_barriers(test->batch, cmd, ctx->family, false);
 	image_barrier(cmd, test->target.handle,
 		      VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
 		      VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, true);
@@ -310,16 +321,29 @@ void vk_present_set_damage(struct vk_present *p, const VkRect2D *changed)
 	p->damage = changed ? *changed : (VkRect2D){ 0 };
 }
 
-VkResult vk_present_draw(struct vk_present *p, const struct ui_prim *prims,
-			 uint32_t count, VkClearColorValue clear,
-			 vk_present_upload_fn upload, void *user)
+VkResult vk_present_draw_dmabuf(struct vk_present *p,
+				const struct ui_prim *prims, uint32_t count,
+				VkClearColorValue clear,
+				vk_present_upload_fn upload, void *user,
+				const struct gpu_dmabuf *const frames[3],
+				unsigned int *rejected)
 {
+	struct vk_nv12_batch batch = { 0 };
+
+	if (p->test->nv12) {
+		VkResult r = vk_nv12_prepare(p->test->nv12, RGBA, frames,
+					     UINT64_MAX, &batch, rejected);
+		if (r != VK_SUCCESS)
+			return r;
+	}
+	p->test->batch = frames ? &batch : NULL;
 	VkRect2D area = p->damage.extent.width ?
 				p->damage :
 				(VkRect2D){ .extent = p->test->target.extent };
-
-	return draw_readback(p->test, p->frame++, prims, count, NULL, 0, area,
-			     clear, upload, user);
+	VkResult r = draw_readback(p->test, p->frame++, prims, count, NULL, 0,
+				   area, clear, upload, user);
+	p->test->batch = NULL;
+	return r;
 }
 
 static bool check_color(struct render_test *test, unsigned x, unsigned y,
@@ -543,6 +567,136 @@ static void finish(struct render_test *test)
 	vk_ctx_destroy(ctx);
 }
 
+/* An independent producer exports synthetic linear NV12. No camera,
+ * compositor capture or decoder is needed for the GPU pixel check.
+ */
+static VkResult check_dmabuf(struct render_test *t)
+{
+	struct nv12_fixture fixture = { 0 };
+	bool required = getenv("AVERNELLA_TEST_REQUIRE_DMABUF") &&
+			!strcmp(getenv("AVERNELLA_TEST_REQUIRE_DMABUF"), "1");
+	struct vk_present p = { .test = t, .frame = 128 };
+	uint32_t background[HEIGHT][WIDTH] = { 0 };
+	struct gpu_scene scene = {
+		.pixels = background,
+		.width = WIDTH,
+		.height = HEIGHT,
+		.pitch = 4 * WIDTH,
+	};
+	VkResult result = VK_SUCCESS;
+
+	t->nv12 = vk_nv12_open(&t->ctx);
+	if (!t->nv12) {
+		puts("No compatible two-plane NV12 modifier on this device");
+		return required ? VK_ERROR_FORMAT_NOT_SUPPORTED : VK_SUCCESS;
+	}
+	struct vk_canvas *c = vk_canvas_open(&p);
+	const unsigned int stride = 256, height = 64;
+	bool available = nv12_fixture_open(&fixture, stride, height);
+	struct gpu_dmabuf frame = fixture.frame;
+
+	frame.crop_x = 8;
+	frame.crop_y = 6;
+	frame.fd = -1;
+	const struct gpu_dmabuf *frames[3] = { &frame };
+
+	scene.video[0] = (struct gpu_video){
+		.width = 32,
+		.height = 16,
+		.x = 10,
+		.y = 8,
+		.w = 32,
+		.h = 16,
+		.generation = 1,
+	};
+	unsigned int rejected = 0;
+
+	if (!c ||
+	    vk_canvas_draw_dmabuf(c, &scene, frames, &rejected) !=
+		    VK_NOT_READY ||
+	    rejected != 1 || fixture.refs) {
+		result = VK_ERROR_UNKNOWN;
+		goto done;
+	}
+	if (!available) {
+		puts("No local dma-buf fixture allocator; invalid-handle fallback verified");
+		if (required)
+			goto fail;
+		goto done;
+	}
+	uint8_t *bytes = fixture.pixels;
+
+	memset(bytes, 16, fixture.size);
+	for (unsigned int y = 0; y < 16; y++)
+		memset(bytes + stride * (frame.crop_y + y) + frame.crop_x,
+		       y < 8 ? 82 : 145, 32);
+	for (unsigned int j = stride * height; j < stride * height * 3 / 2;
+	     j += 2) {
+		bytes[j] = 90;
+		bytes[j + 1] = 240;
+	}
+	if (!nv12_fixture_sync(&fixture, DMA_BUF_SYNC_END))
+		goto fail;
+	frame.fd = fixture.frame.fd;
+	/* The chroma start is inside the allocation, but its last row is not. */
+	frame.offset[1] = fixture.size - frame.width;
+	rejected = 0;
+	if (vk_canvas_draw_dmabuf(c, &scene, frames, &rejected) !=
+		    VK_NOT_READY ||
+	    rejected != 1 || fixture.refs)
+		goto fail;
+	frame.offset[1] = fixture.frame.offset[1];
+	rejected = 0;
+	result = vk_canvas_draw_dmabuf(c, &scene, frames, &rejected);
+	if (result == VK_NOT_READY && rejected == 1) {
+		puts("Device declined linear NV12 dma-buf; fallback verified");
+		result = required ? VK_ERROR_FORMAT_NOT_SUPPORTED : VK_SUCCESS;
+		goto done;
+	}
+	if (result != VK_SUCCESS || rejected || fixture.refs != 1 ||
+	    !check_color(t, 18, 9, 255, 1, 0, 3) ||
+	    !check_color(t, 18, 20, 255, 75, 74, 3) ||
+	    !check_color(t, 6, 6, 0, 0, 0, 0))
+		goto fail;
+	scene.video[0].rotation = 180;
+	result = vk_canvas_draw_dmabuf(c, &scene, frames, &rejected);
+	if (result != VK_SUCCESS || fixture.refs != 1 ||
+	    !check_color(t, 18, 9, 255, 75, 74, 3))
+		goto fail;
+	/* Overlay a CPU-decoded tile after the imported one. This exercises
+	 * restoring the heap/buffer pipeline and its push data mid-batch.
+	 */
+	uint8_t y[4] = { 235, 235, 235, 235 }, gray = 128;
+
+	scene.video[1] = (struct gpu_video){
+		.width = 2,
+		.height = 2,
+		.stride = { 2, 1, 1 },
+		.plane = { y, &gray, &gray },
+		.x = 16,
+		.y = 8,
+		.w = 8,
+		.h = 8,
+		.generation = 1,
+	};
+	result = vk_canvas_draw_dmabuf(c, &scene, frames, &rejected);
+	if (result != VK_SUCCESS || !check_color(t, 18, 9, 255, 255, 255, 1))
+		goto fail;
+	memset(scene.video, 0, sizeof(scene.video));
+	if (vk_canvas_draw(c, &scene) != VK_SUCCESS || fixture.refs)
+		goto fail;
+	puts("Read back BT.601 NV12 from imported dma-buf; crop, rotation and lease release verified.");
+	goto done;
+fail:
+	result = VK_ERROR_UNKNOWN;
+done:
+	nv12_fixture_close(&fixture);
+	vk_canvas_close(c);
+	vk_nv12_close(t->nv12);
+	t->nv12 = NULL;
+	return result;
+}
+
 static bool adapter_selection(void)
 {
 	struct vk_adapter list[] = {
@@ -623,6 +777,8 @@ int main(int argc, char **argv)
 	}
 	if (result == VK_SUCCESS)
 		result = check_canvas(&test);
+	if (result == VK_SUCCESS)
+		result = check_dmabuf(&test);
 	finish(&test);
 	if (result != VK_SUCCESS) {
 		fprintf(stderr, "Vulkan offscreen check failed (%d).\n",

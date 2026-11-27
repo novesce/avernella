@@ -1,18 +1,22 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "vk_frame.h"
+#include "vk_nv12.h"
 #include "vk_desc_buffer.h"
 #include "line_ui_spirv.h"
+#include <stdio.h>
 
-VkResult vk_ui_pipeline_mode(const struct vk_ctx *ctx, VkFormat format,
-			     bool opaque, VkPipeline *pipeline)
+static VkResult create_pipeline(const struct vk_ctx *ctx, VkFormat format,
+				bool opaque, VkPipelineLayout nv12,
+				VkPipeline *pipeline)
 {
 	VkShaderModuleCreateInfo code[] = {
 		{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-		  .codeSize = sizeof(ui_vert_spv),
-		  .pCode = ui_vert_spv },
+		  .codeSize = sizeof(ui_uber_vert_spv),
+		  .pCode = ui_uber_vert_spv },
 		{ .sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO,
-		  .codeSize = sizeof(ui_frag_spv),
-		  .pCode = ui_frag_spv },
+		  .codeSize = nv12 ? sizeof(ui_nv12_frag_spv) :
+				     sizeof(ui_uber_frag_spv),
+		  .pCode = nv12 ? ui_nv12_frag_spv : ui_uber_frag_spv },
 	};
 	VkShaderModule modules[2] = { 0 };
 	VkResult result =
@@ -65,10 +69,10 @@ VkResult vk_ui_pipeline_mode(const struct vk_ctx *ctx, VkFormat format,
 		  .pSpecializationInfo = &specialization,
 		  .pName = "main" },
 		{ .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
-		  .pNext = ctx->descriptor_heap ? &mapping : NULL,
+		  .pNext = !nv12 && ctx->descriptor_heap ? &mapping : NULL,
 		  .stage = VK_SHADER_STAGE_FRAGMENT_BIT,
 		  .module = modules[1],
-		  .pSpecializationInfo = &specialization,
+		  .pSpecializationInfo = nv12 ? NULL : &specialization,
 		  .pName = "main" },
 	};
 	VkPipelineVertexInputStateCreateInfo vertex = {
@@ -130,12 +134,13 @@ VkResult vk_ui_pipeline_mode(const struct vk_ctx *ctx, VkFormat format,
 	};
 	VkGraphicsPipelineCreateInfo info = {
 		.sType = VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO,
-		.pNext = ctx->descriptor_heap ? (void *)&flags :
-						(void *)&rendering,
-		.flags = ctx->descriptor_heap ?
+		.pNext = !nv12 && ctx->descriptor_heap ? (void *)&flags :
+							 (void *)&rendering,
+		.flags = nv12 || ctx->descriptor_heap ?
 				 0 :
 				 VK_PIPELINE_CREATE_DESCRIPTOR_BUFFER_BIT_EXT,
-		.layout = ctx->descriptors ? ctx->descriptors->layout :
+		.layout = nv12		   ? nv12 :
+			  ctx->descriptors ? ctx->descriptors->layout :
 					     VK_NULL_HANDLE,
 		.stageCount = 2,
 		.pStages = stages,
@@ -148,18 +153,75 @@ VkResult vk_ui_pipeline_mode(const struct vk_ctx *ctx, VkFormat format,
 		.pDynamicState = &dynamic,
 	};
 
-	result = vkCreateGraphicsPipelines(ctx->device, VK_NULL_HANDLE, 1,
+	VkPipelineCreationFeedback feedback = { 0 };
+	VkPipelineCreationFeedbackCreateInfo report = {
+		.sType =
+			VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO,
+		.pNext = info.pNext,
+		.pPipelineCreationFeedback = &feedback,
+	};
+	if (ctx->log_pipeline)
+		info.pNext = &report;
+	result = vkCreateGraphicsPipelines(ctx->device, ctx->pipeline_cache, 1,
 					   &info, NULL, pipeline);
+	if (result == VK_SUCCESS && ctx->log_pipeline &&
+	    (feedback.flags & VK_PIPELINE_CREATION_FEEDBACK_VALID_BIT))
+		fprintf(stderr,
+			"Vulkan %s pipeline: %.3f ms, application cache %s\n",
+			nv12 ? "NV12" : "UI", feedback.duration / 1000000.,
+			(feedback.flags &
+			 VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT) ?
+				"hit" :
+				"miss");
 finish:
 	vkDestroyShaderModule(ctx->device, modules[1], NULL);
 	vkDestroyShaderModule(ctx->device, modules[0], NULL);
 	return result;
 }
 
+VkResult vk_ui_pipeline_mode(const struct vk_ctx *ctx, VkFormat format,
+			     bool opaque, VkPipeline *pipeline)
+{
+	return create_pipeline(ctx, format, opaque, VK_NULL_HANDLE, pipeline);
+}
+
+VkResult vk_ui_nv12_pipeline(const struct vk_ctx *ctx, VkFormat format,
+			     VkPipelineLayout layout, VkPipeline *pipeline)
+{
+	return create_pipeline(ctx, format, true, layout, pipeline);
+}
+
+/* Called for opaque batches only, with the acquired image's repair area. */
+bool vk_visible_layers(const struct ui_prim **prims, uint32_t *count,
+		       VkRect2D area)
+{
+	for (uint32_t i = *count; *prims && i-- > 0;) {
+		const struct ui_prim *item = &(*prims)[i];
+		uint32_t kind = item->prim_type & 255;
+
+		if ((kind != UI_PRIM_CANVAS && kind != UI_PRIM_I420 &&
+		     kind != UI_PRIM_NV12) ||
+		    item->clip_rect_idx != UI_NO_CLIP ||
+		    item->pos[0] > area.offset.x ||
+		    item->pos[1] > area.offset.y ||
+		    item->pos[0] + item->size[0] <
+			    area.offset.x + area.extent.width ||
+		    item->pos[1] + item->size[1] <
+			    area.offset.y + area.extent.height)
+			continue;
+		*prims += i;
+		*count -= i;
+		return true;
+	}
+	return false;
+}
+
 void vk_ui_draw_mode(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 		     VkPipeline pipeline, VkImageView target, VkExtent2D extent,
 		     VkRect2D area, const struct ui_push *push, uint32_t count,
-		     VkClearColorValue clear, bool discard)
+		     VkClearColorValue clear, bool discard,
+		     const struct vk_nv12_batch *external,
+		     const struct ui_prim *items)
 {
 	VkRenderingAttachmentInfo color = {
 		.sType = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -184,17 +246,34 @@ void vk_ui_draw_mode(const struct vk_ctx *ctx, VkCommandBuffer cmd,
 	};
 	VkViewport viewport = { 0, 0, extent.width, extent.height, 0, 1 };
 
-	if (ctx->descriptor_heap) {
-		vkCmdBindResourceHeapEXT(cmd, &ctx->resources.bind);
-		vkCmdBindSamplerHeapEXT(cmd, &ctx->samplers.bind);
-		vkCmdPushDataEXT(cmd, &data);
-	} else {
-		vk_desc_buffer_bind(ctx, cmd, push);
-	}
 	vkCmdBeginRendering(cmd, &rendering);
-	vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, pipeline);
 	vkCmdSetViewport(cmd, 0, 1, &viewport);
 	vkCmdSetScissor(cmd, 0, 1, &rendering.renderArea);
-	vkCmdDraw(cmd, 4, count, 0, 0);
+	for (uint32_t i = 0; i < count;) {
+		uint32_t first = i++;
+
+		if (external &&
+		    (items[first].prim_type & 255) == UI_PRIM_NV12) {
+			vk_nv12_draw(external->images[items[first].tex_index],
+				     cmd, push, first);
+			continue;
+		}
+		if (external)
+			while (i < count &&
+			       (items[i].prim_type & 255) != UI_PRIM_NV12)
+				i++;
+		else
+			i = count;
+		if (ctx->descriptor_heap) {
+			vkCmdBindResourceHeapEXT(cmd, &ctx->resources.bind);
+			vkCmdBindSamplerHeapEXT(cmd, &ctx->samplers.bind);
+			vkCmdPushDataEXT(cmd, &data);
+		} else {
+			vk_desc_buffer_bind(ctx, cmd, push);
+		}
+		vkCmdBindPipeline(cmd, VK_PIPELINE_BIND_POINT_GRAPHICS,
+				  pipeline);
+		vkCmdDraw(cmd, 4, i - first, 0, first);
+	}
 	vkCmdEndRendering(cmd);
 }

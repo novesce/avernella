@@ -17,6 +17,13 @@ enum line_preview_source {
 	LINE_PREVIEW_COUNT
 };
 
+/* Single DRM object, two NV12 planes, BT.601. No pointers or FDs on wire. */
+struct line_dmabuf_layout {
+	guint32 width, height, offset[2], stride[2], crop_x, crop_y;
+	guint64 modifier;
+	guint8 full_range;
+};
+
 /* Dedicated datagram path between the call worker and the window. */
 struct line_preview_frame {
 	gint64 decoded_at;
@@ -24,11 +31,19 @@ struct line_preview_frame {
 	guint8 source, camera_enabled;
 	guint8 screen; /* The selected remote group video is a virtual display. */
 	char chat[34];
+	guint8 dmabuf;
+	struct line_dmabuf_layout layout;
 };
 
 gboolean line_media_send_frame(int socket,
 			       const struct line_preview_frame *frame,
 			       const struct line_camera_frame *image);
+gboolean line_media_send_dmabuf(int socket,
+				const struct line_preview_frame *report,
+				const struct line_dmabuf_layout *layout,
+				int dma_fd, int release_fd);
+int line_media_recv_preview(int socket, struct line_preview_frame *frame,
+			    int *release_fd);
 int line_media_recv_frame(int socket, struct line_preview_frame *frame);
 
 GHashTable *line_leases_new(void);

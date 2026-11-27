@@ -78,6 +78,7 @@ void call_pdtp_share_rx_stats(const struct call_pdtp *pdtp,
 /* Select or stop the source of the current in-order presentation command. */
 gboolean call_pdtp_watch_presentation(struct call_pdtp *pdtp, gboolean watch);
 gboolean call_pdtp_group_setup_acknowledged(const struct call_pdtp *pdtp);
+gint64 call_pdtp_min_rtt(const struct call_pdtp *pdtp);
 void call_pdtp_close(struct call_pdtp *pdtp);
 void call_pdtp_set_trace(struct call_pdtp *pdtp, gboolean trace);
 void call_pdtp_set_handlers(struct call_pdtp *pdtp, call_pdtp_stream_fn data,

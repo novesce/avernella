@@ -3,14 +3,26 @@
 #include "camera.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/dma-buf.h>
 #include <poll.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/uio.h>
 #include <unistd.h>
+
+/* Linux 6.0 uAPI. An older running kernel selects the I420 fallback. */
+#ifndef DMA_BUF_IOCTL_EXPORT_SYNC_FILE
+struct dma_buf_export_sync_file {
+	__u32 flags;
+	__s32 fd;
+};
+#define DMA_BUF_IOCTL_EXPORT_SYNC_FILE \
+	_IOWR(DMA_BUF_BASE, 2, struct dma_buf_export_sync_file)
+#endif
 
 #ifndef MFD_NOEXEC_SEAL
 #define MFD_NOEXEC_SEAL 0x0008U
@@ -114,6 +126,47 @@ static gboolean write_i420(int fd, const struct line_camera_frame *image)
 	return !count || write_rows(fd, rows, count, bytes, offset);
 }
 
+static ssize_t preview_send(int socket, const struct line_preview_frame *frame,
+			    const int *fds, guint count)
+{
+	union {
+		struct cmsghdr align;
+		char bytes[CMSG_SPACE(2 * sizeof(int))];
+	} control = { 0 };
+	struct iovec payload = { .iov_base = (void *)frame,
+				 .iov_len = sizeof(*frame) };
+	struct msghdr message = { .msg_iov = &payload,
+				  .msg_iovlen = 1,
+				  .msg_control = control.bytes,
+				  .msg_controllen = sizeof(control.bytes) };
+	struct cmsghdr *c = CMSG_FIRSTHDR(&message);
+
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(count * sizeof(int));
+	message.msg_controllen = CMSG_SPACE(count * sizeof(int));
+	memcpy(CMSG_DATA(c), fds, count * sizeof(int));
+	ssize_t n;
+
+	do {
+		n = sendmsg(socket, &message, MSG_DONTWAIT | MSG_NOSIGNAL);
+	} while (n < 0 && errno == EINTR);
+	return n;
+}
+
+gboolean line_media_send_dmabuf(int socket,
+				const struct line_preview_frame *report,
+				const struct line_dmabuf_layout *layout,
+				int dma_fd, int release_fd)
+{
+	struct line_preview_frame frame = *report;
+	const int fds[] = { dma_fd, release_fd };
+
+	frame.dmabuf = 1;
+	frame.layout = *layout;
+	return preview_send(socket, &frame, fds, 2) == (ssize_t)sizeof(frame);
+}
+
 gboolean line_media_send_frame(int socket,
 			       const struct line_preview_frame *frame,
 			       const struct line_camera_frame *image)
@@ -137,29 +190,7 @@ gboolean line_media_send_frame(int socket,
 	gboolean sent = FALSE;
 
 	if (write_i420(fd, image) && seal(fd)) {
-		union {
-			struct cmsghdr align;
-			char bytes[CMSG_SPACE(sizeof(fd))];
-		} control = { 0 };
-		struct iovec payload = { .iov_base = (void *)frame,
-					 .iov_len = sizeof(*frame) };
-		struct msghdr message = { .msg_iov = &payload,
-					  .msg_iovlen = 1,
-					  .msg_control = control.bytes,
-					  .msg_controllen =
-						  sizeof(control.bytes) };
-		struct cmsghdr *c = CMSG_FIRSTHDR(&message);
-
-		c->cmsg_level = SOL_SOCKET;
-		c->cmsg_type = SCM_RIGHTS;
-		c->cmsg_len = CMSG_LEN(sizeof(fd));
-		memcpy(CMSG_DATA(c), &fd, sizeof(fd));
-		ssize_t n;
-
-		do {
-			n = sendmsg(socket, &message,
-				    MSG_DONTWAIT | MSG_NOSIGNAL);
-		} while (n < 0 && errno == EINTR);
+		ssize_t n = preview_send(socket, frame, &fd, 1);
 		/* A full preview queue can drop this picture. */
 		sent = n == (ssize_t)sizeof(*frame) ||
 		       (n < 0 && errno == EAGAIN);
@@ -168,11 +199,27 @@ gboolean line_media_send_frame(int socket,
 	return sent;
 }
 
-int line_media_recv_frame(int socket, struct line_preview_frame *frame)
+static gboolean valid_layout(const struct line_preview_frame *frame)
+{
+	const struct line_dmabuf_layout *d = &frame->layout;
+
+	return line_preview_size_valid(frame->width, frame->height,
+				       frame->source == LINE_PREVIEW_SCREEN) &&
+	       d->width >= frame->width && d->width <= 8192 &&
+	       d->height >= frame->height && d->height <= 8192 &&
+	       d->crop_x <= d->width - frame->width &&
+	       d->crop_y <= d->height - frame->height &&
+	       !((d->crop_x | d->crop_y) & 1) && d->full_range <= 1 &&
+	       d->stride[0] >= d->width &&
+	       d->stride[1] >= ((d->width + 1u) & ~1u);
+}
+
+int line_media_recv_preview(int socket, struct line_preview_frame *frame,
+			    int *release_fd)
 {
 	union {
 		struct cmsghdr align;
-		char bytes[CMSG_SPACE(sizeof(int))];
+		char bytes[CMSG_SPACE(2 * sizeof(int))];
 	} control = { 0 };
 	struct iovec payload = { .iov_base = frame, .iov_len = sizeof(*frame) };
 	struct msghdr message = { .msg_iov = &payload,
@@ -181,10 +228,11 @@ int line_media_recv_frame(int socket, struct line_preview_frame *frame)
 				  .msg_controllen = sizeof(control.bytes) };
 	ssize_t n;
 
+	*release_fd = -1;
 	do {
 		n = recvmsg(socket, &message, MSG_DONTWAIT | MSG_CMSG_CLOEXEC);
 	} while (n < 0 && errno == EINTR);
-	if (n <= 0)
+	if (n < 0)
 		return -1;
 	int fd = -1;
 	guint count = 0;
@@ -199,18 +247,64 @@ int line_media_recv_frame(int socket, struct line_preview_frame *frame)
 			int received;
 
 			memcpy(&received, CMSG_DATA(c) + i, sizeof(received));
-			if (count++ == 0)
+			if (count == 0)
 				fd = received;
+			else if (count == 1)
+				*release_fd = received;
 			else
 				close(received);
+			count++;
 		}
 	}
-	if (n != (ssize_t)sizeof(*frame) || count != 1 ||
+	if (n != (ssize_t)sizeof(*frame) || frame->dmabuf > 1 ||
+	    count != 1u + frame->dmabuf ||
 	    (message.msg_flags & (MSG_TRUNC | MSG_CTRUNC)) ||
 	    frame->source >= LINE_PREVIEW_COUNT ||
 	    frame->chat[sizeof(frame->chat) - 1]) {
 		if (fd >= 0)
 			close(fd);
+		if (*release_fd >= 0)
+			close(*release_fd);
+		*release_fd = -1;
+		return -1;
+	}
+	if (frame->dmabuf) {
+		int type, family;
+		socklen_t len = sizeof(int);
+		struct dma_buf_export_sync_file fence = {
+			.flags = DMA_BUF_SYNC_READ, .fd = -1
+		};
+		gboolean local = !getsockopt(*release_fd, SOL_SOCKET, SO_TYPE,
+					     &type, &len) &&
+				 type == SOCK_STREAM &&
+				 !getsockopt(*release_fd, SOL_SOCKET, SO_DOMAIN,
+					     &family, &len) &&
+				 family == AF_UNIX;
+
+		if (!local || !valid_layout(frame) ||
+		    ioctl(fd, DMA_BUF_IOCTL_EXPORT_SYNC_FILE, &fence)) {
+			if (local)
+				(void)send(*release_fd, "R", 1,
+					   MSG_NOSIGNAL | MSG_DONTWAIT);
+			close(fd);
+			close(*release_fd);
+			*release_fd = -1;
+			return -1;
+		}
+		close(fence.fd);
+	}
+	return fd;
+}
+
+int line_media_recv_frame(int socket, struct line_preview_frame *frame)
+{
+	int release_fd;
+	int fd = line_media_recv_preview(socket, frame, &release_fd);
+
+	if (release_fd >= 0) {
+		(void)send(release_fd, "R", 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+		close(release_fd);
+		close(fd);
 		return -1;
 	}
 	return fd;

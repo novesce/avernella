@@ -126,6 +126,7 @@ void call_video_keyframe(struct call_video *video);
  * 85% of that (70% above 200 ms), again every 300 ms while the queue still
  * grows, and pauses growth until it drains.
  */
+gint64 call_video_min_rtt(const struct call_video *video);
 void call_video_local_queue(struct call_video *video, guint64 held_bytes,
 			    gint64 now_us);
 /* Sets a screen-specific send budget. Zero kbps restores webcam settings. */
@@ -145,6 +146,12 @@ void call_video_close(struct call_video *video);
  * each complete message in order.
  */
 struct call_share_decoder;
+void call_video_decoded(struct call_video *v, call_video_display_fn display,
+			gpointer data);
+void call_share_decoded(struct call_share_decoder *s,
+			call_video_display_fn display, gpointer data);
+struct call_vp8_decoder *call_video_decoder(struct call_video *v);
+struct call_vp8_decoder *call_share_video_decoder(struct call_share_decoder *s);
 struct call_share_decoder *call_share_decoder_new(void);
 void call_share_decoder_free(struct call_share_decoder *decoder);
 gboolean
@@ -160,10 +167,21 @@ typedef gboolean (*call_share_fragment_fn)(const guint8 *fragment, gsize size,
 struct call_share_encoder *call_share_encoder_new(guint kbps, guint fps);
 void call_share_encoder_free(struct call_share_encoder *encoder);
 void call_share_encoder_keyframe(struct call_share_encoder *encoder);
+/* Inline encoder. Use call_share_queue() once its worker is enabled. */
 gboolean call_share_encode(struct call_share_encoder *encoder,
 			   const struct line_camera_frame *frame, gint64 now_us,
 			   call_share_fragment_fn emit, gpointer data,
 			   GError **error);
+/* The call thread owns signalling, packetization and stream_time. */
+void call_share_encode_async(struct call_share_encoder *encoder);
+int call_share_encoder_fd(const struct call_share_encoder *encoder);
+gboolean call_share_queue(struct call_share_encoder *encoder, GBytes *pixels,
+			  gboolean dma, guint width, guint height,
+			  guint64 capture_ns, guint64 *stream_time,
+			  call_share_fragment_fn emit, gpointer data);
+gboolean call_share_encoded(struct call_share_encoder *encoder,
+			    gboolean transmit, guint64 *stream_time,
+			    call_share_fragment_fn emit, gpointer data);
 gsize call_share_descriptor(guint8 *p, guint16 picture, gboolean first,
 			    gboolean last, gboolean key, guint resolution,
 			    guint delay_ms, guint32 size);

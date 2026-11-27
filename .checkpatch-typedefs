@@ -4,6 +4,8 @@
 # into a regular expression and adds a word boundary only after the last
 # one, so every name ends in \b to keep EVP_CIPHER_CTX from matching
 # EVP_CIPHER_CTX_new.
+AVDRMObjectDescriptor\b
+AVDRMPlaneDescriptor\b
 BIGNUM\b
 cairo_surface_t\b
 cairo_t\b
@@ -90,6 +92,9 @@ srtp_t\b
 UiFrameClock\b
 UiReadCursor\b
 UiScroll\b
+VkCommandBufferBeginInfo\b
+VkImageMemoryBarrier2\b
+VkSubmitInfo2\b
 vpx_codec_cx_pkt_t\b
 vpx_codec_iface_t\b
 vpx_image_t\b

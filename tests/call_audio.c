@@ -9,6 +9,9 @@
 static guint frames_20ms, frames_40ms;
 static gboolean hold_playback;
 static guint queued_samples;
+/* Hold group playout above target while measuring actual time scaling. */
+static gboolean measure_trim;
+static guint trimmed_packets, off_pitch;
 static const guint8 *captured_pcm;
 static Uint32 captured_bytes;
 
@@ -17,6 +20,8 @@ Uint32 __real_SDL_DequeueAudio(SDL_AudioDeviceID device, void *pcm, Uint32 len);
 
 Uint32 __wrap_SDL_GetQueuedAudioSize(SDL_AudioDeviceID device)
 {
+	if (measure_trim)
+		return 3 * 1920 * sizeof(opus_int16);
 	return captured_pcm ? captured_bytes :
 			      __real_SDL_GetQueuedAudioSize(device);
 }
@@ -39,6 +44,17 @@ int __real_SDL_QueueAudio(SDL_AudioDeviceID device, const void *pcm,
 
 int __wrap_SDL_QueueAudio(SDL_AudioDeviceID device, const void *pcm, Uint32 len)
 {
+	if (measure_trim && len < 1920 * sizeof(opus_int16)) {
+		/* The test tone repeats every 80 samples. WSOLA may move
+		 * the splice by a sample on a decoded (lossy) waveform.
+		 */
+		guint discarded = 1920 - len / sizeof(opus_int16);
+		guint remainder = discarded % 80;
+
+		if (MIN(remainder, 80 - remainder) > 2)
+			off_pitch++;
+		trimmed_packets++;
+	}
 	if (hold_playback) {
 		SDL_PauseAudioDevice(device, 1);
 		queued_samples += len / sizeof(opus_int16);
@@ -271,6 +287,42 @@ static void rtp_audio_timeline(void)
 	/* A real 20 ms gap still gets one frame of Opus FEC or concealment. */
 	g_assert_cmpuint(frames_20ms - before, ==, 6);
 	line_audio_close(audio);
+}
+
+/* Exercise the estimator and decoder across the 32-bit RTP wrap.
+ * Once the jittery packets age out, the target must approach its floor.
+ */
+static void transit_wrap_and_recovery(void)
+{
+	guint8 key[30] = { 8 }, packet[2048];
+
+	g_autoptr(GError) e = NULL;
+	LineAudio *a = line_audio_open(key, key, 96, 202, 102, &e);
+	struct line_audio_stats stats;
+	gint64 start = G_USEC_PER_SEC;
+
+	g_assert_no_error(e);
+	for (guint i = 0; i < 430; i++) {
+		guint32 stamp = G_MAXUINT32 - 100 * 960u + i * 960u;
+		int n = protect_at(packet, key, 96, 102, i, stamp);
+		/* One ten-packet ramp from 0 to 90 ms and back. */
+		guint phase = i % 20;
+		gint64 delay = i < 220 ? MIN(phase, 19 - phase) * 10000 : 0;
+
+		g_assert_true(line_audio_receive_at(a, packet, n,
+						    start + i * 20000 + delay));
+		line_audio_playout(a, G_MAXINT64);
+		if (i == 219) {
+			line_audio_stats(a, &stats);
+			g_assert_cmpuint(stats.target_ms, >=, 100);
+			g_assert_cmpuint(stats.target_ms, <=, 110);
+		}
+	}
+	line_audio_stats(a, &stats);
+	g_assert_cmpuint(stats.target_ms, ==, 40);
+	g_assert_cmpuint(stats.late, ==, 0);
+	g_assert_cmpuint(stats.played, ==, 430 * 960);
+	line_audio_close(a);
 }
 
 static void eas2(void)
@@ -750,6 +802,32 @@ static int group_fixture(guint8 payload[256])
 	return 4 + 2 * (n - 1);
 }
 
+static void group_pitch(void)
+{
+	guint8 key[30] = { 61 }, packet[2048], payload[256];
+
+	g_autoptr(GError) e = NULL;
+	LineAudio *a = line_audio_open_group(key, key, 98, 98, 202, 102, &e);
+	int len = group_fixture(payload);
+
+	g_assert_no_error(e);
+	trimmed_packets = off_pitch = 0;
+	measure_trim = TRUE;
+	for (guint i = 0; i < 120; i++) {
+		int n = protect_payload_at(packet, key, 98, 102, i, i * 1920,
+					   payload, len);
+
+		g_assert_true(line_audio_receive_at(
+			a, packet, n, G_USEC_PER_SEC + i * 40000));
+	}
+	measure_trim = FALSE;
+	g_test_message("Trimmed %u packets, %u splices off the tone period",
+		       trimmed_packets, off_pitch);
+	g_assert_cmpuint(trimmed_packets, >, 3);
+	g_assert_cmpuint(off_pitch, ==, 0);
+	line_audio_close(a);
+}
+
 static void group_reorder(void)
 {
 	guint8 key[30] = { 42 }, packet[2048], payload[256];
@@ -778,8 +856,8 @@ static void group_reorder(void)
 	n = protect_payload_at(packet, key, 98, 102, 101, 1920, payload, len);
 	g_assert_true(line_audio_receive(a, packet, n));
 	g_assert_cmpint(line_audio_playout(a, G_MAXINT64), ==, G_MAXINT64);
-	/* A reordered burst keeps every packet, with a small drift correction. */
-	g_assert_cmpuint(queued_samples, ==, 4800 + 3 * 1920 - 1920 / 50);
+	/* A reordered burst plays in full before sustained drift correction. */
+	g_assert_cmpuint(queued_samples, ==, 4800 + 3 * 1920);
 	GPrintFunc previous = g_set_printerr_handler(save_audio_report);
 
 	line_audio_report(a);
@@ -934,12 +1012,12 @@ static void group_timeline(void)
 			       len);
 	g_assert_true(line_audio_receive(a, packet, n));
 	g_assert_cmpuint(frames_20ms - short_frames, ==, 2);
-	g_assert_cmpuint(queued_samples - before, ==, 3840 - 1920 / 50);
+	g_assert_cmpuint(queued_samples - before, ==, 3840);
 	before = queued_samples;
 	/* Only the unheard half of an overlapping packet reaches the speaker. */
 	n = protect_payload_at(packet, key, 98, 102, 13, 4800, payload, len);
 	g_assert_true(line_audio_receive(a, packet, n));
-	g_assert_cmpuint(queued_samples - before, ==, 960 - 960 / 50);
+	g_assert_cmpuint(queued_samples - before, ==, 960);
 	hold_playback = FALSE;
 	line_audio_close(a);
 }
@@ -963,7 +1041,7 @@ static void group_sequence_gap(void)
 	/* The skipped sequence number did not leave a hole in decoded audio. */
 	n = protect_payload_at(packet, key, 98, 102, 12, 1920, payload, len);
 	g_assert_true(line_audio_receive(a, packet, n));
-	g_assert_cmpint(line_audio_playout(a, 0), ==, G_MAXINT64);
+	g_assert_cmpint(line_audio_playout(a, 0), >, 0);
 	g_assert_cmpuint(queued_samples - before, ==, 1920);
 	hold_playback = FALSE;
 	line_audio_close(a);
@@ -1050,14 +1128,108 @@ static void group_overlap(gconstpointer data)
 	line_audio_close(a);
 }
 
+static void opus_feedback(void)
+{
+	guint8 tx[30] = { 1 }, rx[30] = { 2 };
+	srtp_policy_t policy = { 0 };
+	srtp_t peer;
+	struct line_audio_stats stats;
+
+	g_autoptr(GError) error = NULL;
+	LineAudio *a = line_audio_open(tx, rx, 96, 201, 101, &error);
+
+	g_assert_no_error(error);
+	srtp_crypto_policy_set_rtcp_default(&policy.rtcp);
+	srtp_crypto_policy_set_rtp_default(&policy.rtp);
+	policy.key = rx;
+	policy.ssrc.type = ssrc_specific;
+	policy.ssrc.value = 101;
+	g_assert_cmpint(srtp_create(&peer, &policy), ==, srtp_err_status_ok);
+	for (int i = 0; i < 4; i++) {
+		/* Reported fractions 64/256 (25%), then 0/256. */
+		guint8 buf[96] = { 0x81, 201, 0, 7, 0,	 0, 0,
+				   101,	 0,   0, 0, 201, 64 };
+		int bytes = 32;
+
+		if (i == 0)
+			buf[11] =
+				202; /* Report about a different microphone. */
+		if (i == 1)
+			buf[0] = 0x82; /* Truncated second report block. */
+		if (i == 3)
+			buf[12] = 0;
+		g_assert_cmpint(srtp_protect_rtcp(peer, buf, &bytes), ==,
+				srtp_err_status_ok);
+		buf[bytes - 1] ^= 1;
+		g_assert_false(line_audio_receive_report(a, buf, bytes));
+		buf[bytes - 1] ^= 1;
+		g_assert_cmpint(line_audio_receive_report(a, buf, bytes), ==,
+				i >= 2);
+		g_assert_false(line_audio_receive_report(a, buf, bytes));
+		line_audio_stats(a, &stats);
+		g_assert_cmpuint(stats.expected_loss_pct, ==,
+				 i < 2	? 5 :
+				 i == 2 ? 25 :
+					  0);
+	}
+	srtp_dealloc(peer);
+	line_audio_close(a);
+}
+
+static void peer_loss_feedback(void)
+{
+	guint8 tx[30] = { 1 }, rx[30] = { 2 }, wire[2048], report[256];
+	struct line_audio_stats stats;
+
+	g_autoptr(GError) error = NULL;
+	LineAudio *a = line_audio_open(tx, rx, 96, 201, 101, &error);
+	gint64 now = g_get_monotonic_time();
+
+	g_assert_no_error(error);
+	/* Of four expected RTP sequences, receive three. This produces an
+	 * actual protected RR from the same receiver used in calls.
+	 */
+	for (int i = 0; i < 4; i++) {
+		if (i == 2)
+			continue;
+		int n = protect(wire, rx, 96, 101, 10 + i);
+
+		g_assert_true(
+			line_audio_receive_at(a, wire, n, now + 20000 * i));
+	}
+	g_assert_cmpuint(line_audio_receiver_report(a, now + 60000, report,
+						    sizeof(report)),
+			 ==, 0);
+	gsize size = line_audio_receiver_report(a, now + G_USEC_PER_SEC, report,
+						sizeof(report));
+	g_assert_cmpuint(size, >, 32);
+	g_assert_cmpuint(line_audio_receiver_report(a, now + G_USEC_PER_SEC + 1,
+						    wire, sizeof(wire)),
+			 ==, 0);
+	line_audio_close(a);
+	a = line_audio_open(rx, tx, 96, 101, 201, &error);
+	g_assert_no_error(error);
+	g_assert_true(line_audio_receive_report(a, report, size));
+	line_audio_stats(a, &stats);
+	g_assert_cmpuint(stats.expected_loss_pct, ==, 25);
+	line_audio_close(a);
+}
+
 int main(int argc, char **argv)
 {
+	/* The sample fixtures below inject PCM at SDL_DequeueAudio. */
+	g_setenv("LINE_CALL_CAPTURE_EVENTS", "0", TRUE);
 	g_setenv("SDL_AUDIODRIVER", "dummy", TRUE);
 	g_test_init(&argc, &argv, NULL);
+	g_test_add_func("/audio/peer-loss-feedback", peer_loss_feedback);
+	g_test_add_func("/audio/opus-authenticated-loss-reports",
+			opus_feedback);
 	g_test_add_func("/audio/device-codec-srtp-loopback", loopback);
 	g_test_add_func("/audio/negotiated-inbound-stream", incoming_stream);
 	g_test_add_func("/audio/reorder-and-loss", reorder_and_loss);
 	g_test_add_func("/audio/rtp-audio-timeline", rtp_audio_timeline);
+	g_test_add_func("/audio/transit-wrap-and-recovery",
+			transit_wrap_and_recovery);
 	g_test_add_func("/audio/native-eas2-celt", eas2);
 	g_test_add_func("/audio/conference-eas2-send-and-receive", group_send);
 	g_test_add_data_func("/audio/conference-microphone", NULL,
@@ -1068,6 +1240,7 @@ int main(int argc, char **argv)
 			group_microphone_clipping);
 	g_test_add_func("/audio/conference-microphone-signals",
 			group_microphone_signals);
+	g_test_add_func("/audio/conference-preserves-pitch", group_pitch);
 	g_test_add_func("/audio/conference-absorbs-reordered-burst",
 			group_reorder);
 	g_test_add_func("/audio/conference-xrtp-mixes-tracks", group_xrtp);

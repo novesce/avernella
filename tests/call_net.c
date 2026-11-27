@@ -6,13 +6,19 @@
  * virtual clock. Run with --verbose to print the quality metrics.
  */
 #include "call_audio.h"
+#include "call_denoise.h"
+#include "call_srtp.h"
 #include "call_video.h"
 #include <SDL.h>
 #include <gmodule.h>
 #include <math.h>
+#include <poll.h>
 #include <string.h>
+#include <stdlib.h>
+#include <time.h>
 
 static gint64 fake_now = 1000000;
+static guint32 channel_seed;
 
 G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
 {
@@ -42,6 +48,8 @@ struct link_profile {
 	guint outage_from_ms, outage_ms;
 	guint spike_every_ms, spike_ms; /* periodic stalls, as Wi-Fi scans */
 	const struct thread_load *load;
+	const struct link_profile *reverse;
+	gboolean hd;
 	/*
 	 * The bottleneck is this machine's Wi-Fi uplink, so the kernel's
 	 * send queue (SIOCOUTQ) shows it to the sender.
@@ -83,7 +91,7 @@ static void link_init(struct link *l, const struct link_profile *p,
 		      guint32 seed)
 {
 	*l = (struct link){ .p = p,
-			    .rand = g_rand_new_with_seed(seed),
+			    .rand = g_rand_new_with_seed(seed ^ channel_seed),
 			    .start = fake_now };
 	g_queue_init(&l->queue);
 }
@@ -210,13 +218,36 @@ enum {
 	VIDEO_SECONDS = 20,
 };
 
+struct video_run {
+	const struct link_profile *profile;
+	struct call_video *tx, *rx;
+	struct link forward, back;
+	guint8 *screen, *source;
+	guint screen_w, screen_h, shown_index, shown;
+	gboolean have_screen;
+	gint64 last_shown, freeze_us;
+	guint freezes, firs, decoded_frames;
+	double decoded_psnr, screen_psnr;
+	guint screen_samples;
+	gint64 measure_from, outage_end, recovered_at;
+	guint index_at_outage_end;
+	guint8 *cache[8];
+	guint cache_index[8];
+	/* Capture time of each picture, for capture-to-screen latency. */
+	gint64 captured[4096];
+	gint64 latency_sum;
+	guint latency_count, latencies[4096];
+	int width, height, fps;
+};
+
 static guint tri(int a)
 {
 	return ABS((a & 511) - 256);
 }
 
 /* Moving gradients and textured boxes, with the frame index in the top band. */
-static void source_frame(guint index, guint8 *y, guint8 *u, guint8 *v)
+static void source_frame(const struct video_run *run, guint index, guint8 *y,
+			 guint8 *u, guint8 *v)
 {
 	static const int box[3][4] = { { 40, 60, 5, 3 },
 				       { 400, 120, -4, 2 },
@@ -224,7 +255,8 @@ static void source_frame(guint index, guint8 *y, guint8 *u, guint8 *v)
 	int bx[3], by[3];
 
 	for (int b = 0; b < 3; b++) {
-		int span_x = VW - 96, span_y = VH - MARK_ROWS - 72;
+		int span_x = run->width - 96,
+		    span_y = run->height - MARK_ROWS - 72;
 		int px = (box[b][0] + box[b][2] * (int)index) % (2 * span_x);
 		int py = (box[b][1] + box[b][3] * (int)index) % (2 * span_y);
 
@@ -233,12 +265,12 @@ static void source_frame(guint index, guint8 *y, guint8 *u, guint8 *v)
 		bx[b] = px < span_x ? px : 2 * span_x - px;
 		by[b] = MARK_ROWS + (py < span_y ? py : 2 * span_y - py);
 	}
-	for (int r = 0; r < VH; r++) {
-		for (int c = 0; c < VW; c++) {
-			guint8 *p = y + r * VW + c;
+	for (int r = 0; r < run->height; r++) {
+		for (int c = 0; c < run->width; c++) {
+			guint8 *p = y + r * run->width + c;
 
 			if (r < MARK_ROWS) {
-				int block = c * MARK_BLOCKS / VW;
+				int block = c * MARK_BLOCKS / run->width;
 				gboolean bit = block < INDEX_BITS ?
 						       (index >> block) & 1 :
 						       !(block & 1);
@@ -265,34 +297,15 @@ static void source_frame(guint index, guint8 *y, guint8 *u, guint8 *v)
 			*p = MIN(value, 255);
 		}
 	}
-	for (int r = 0; r < VH / 2; r++) {
-		for (int c = 0; c < VW / 2; c++) {
-			u[r * VW / 2 + c] = 112 + tri(c * 4 + index * 4) / 8;
-			v[r * VW / 2 + c] = 144 - tri(r * 4 - index * 2) / 8;
+	for (int r = 0; r < run->height / 2; r++) {
+		for (int c = 0; c < run->width / 2; c++) {
+			u[r * run->width / 2 + c] =
+				112 + tri(c * 4 + index * 4) / 8;
+			v[r * run->width / 2 + c] =
+				144 - tri(r * 4 - index * 2) / 8;
 		}
 	}
 }
-
-struct video_run {
-	const struct link_profile *profile;
-	struct call_video *tx, *rx;
-	struct link forward, back;
-	guint8 *screen, *source;
-	guint screen_w, screen_h, shown_index, shown;
-	gboolean have_screen;
-	gint64 last_shown, freeze_us;
-	guint freezes, firs, decoded_frames;
-	double decoded_psnr, screen_psnr;
-	guint screen_samples;
-	gint64 measure_from, outage_end, recovered_at;
-	guint index_at_outage_end;
-	guint8 *cache[8];
-	guint cache_index[8];
-	/* Capture time of each picture, for capture-to-screen latency. */
-	gint64 captured[4096];
-	gint64 latency_sum;
-	guint latency_count, latency_hist[300];
-};
 
 static guint8 sample(const guint8 *p, guint w, guint h, double x, double y)
 {
@@ -308,16 +321,16 @@ static guint8 sample(const guint8 *p, guint w, guint h, double x, double y)
 /* Luma PSNR of the shown picture, scaled to the source size, below the band. */
 static double psnr(const struct video_run *run, const guint8 *source)
 {
-	double sum = 0, sx = (double)run->screen_w / VW,
-	       sy = (double)run->screen_h / VH;
+	double sum = 0, sx = (double)run->screen_w / run->width,
+	       sy = (double)run->screen_h / run->height;
 	guint count = 0;
 
-	for (int r = MARK_ROWS; r < VH; r += 2) {
-		for (int c = 0; c < VW; c += 2) {
+	for (int r = MARK_ROWS; r < run->height; r += 2) {
+		for (int c = 0; c < run->width; c += 2) {
 			int d = sample(run->screen, run->screen_w,
 				       run->screen_h, (c + 0.5) * sx - 0.5,
 				       (r + 0.5) * sy - 0.5) -
-				source[r * VW + c];
+				source[r * run->width + c];
 
 			sum += d * d;
 			count++;
@@ -334,10 +347,12 @@ static const guint8 *source_cached(struct video_run *run, guint index)
 
 	if (!run->cache[slot] || run->cache_index[slot] != index) {
 		if (!run->cache[slot])
-			run->cache[slot] = g_malloc(VW * VH * 3 / 2);
-		source_frame(index, run->cache[slot],
-			     run->cache[slot] + VW * VH,
-			     run->cache[slot] + VW * VH * 5 / 4);
+			run->cache[slot] =
+				g_malloc(run->width * run->height * 3 / 2);
+		source_frame(run, index, run->cache[slot],
+			     run->cache[slot] + run->width * run->height,
+			     run->cache[slot] +
+				     run->width * run->height * 5 / 4);
 		run->cache_index[slot] = index;
 	}
 	return run->cache[slot];
@@ -348,8 +363,9 @@ static gboolean read_index(const struct video_run *run, guint *index)
 	guint bits = 0;
 
 	for (guint b = 0; b < MARK_BLOCKS; b++) {
-		double x = (b + 0.5) * VW / MARK_BLOCKS * run->screen_w / VW;
-		double y = MARK_ROWS / 2.0 * run->screen_h / VH;
+		double x = (b + 0.5) * run->width / MARK_BLOCKS *
+			   run->screen_w / run->width;
+		double y = MARK_ROWS / 2.0 * run->screen_h / run->height;
 		gboolean bit = sample(run->screen, run->screen_w, run->screen_h,
 				      x, y) > 128;
 
@@ -379,21 +395,23 @@ static void video_display(const struct line_camera_frame *frame, gpointer data)
 		return;
 	run->have_screen = TRUE;
 	run->shown_index = index;
-	source_frame(index, run->source, run->source + VW * VH,
-		     run->source + VW * VH * 5 / 4);
+	source_frame(run, index, run->source,
+		     run->source + run->width * run->height,
+		     run->source + run->width * run->height * 5 / 4);
 	if (fake_now < run->measure_from)
 		return;
 	run->shown++;
 	run->decoded_psnr += psnr(run, run->source);
 	gint64 latency = fake_now - run->captured[index & 4095];
 
-	if (latency >= 0 && latency < 3 * G_USEC_PER_SEC) {
+	if (run->captured[index & 4095] && latency >= 0) {
 		run->latency_sum += latency;
-		run->latency_count++;
-		run->latency_hist[MIN(latency / 10000, 299)]++;
+		g_assert_cmpuint(run->latency_count, <,
+				 G_N_ELEMENTS(run->latencies));
+		run->latencies[run->latency_count++] = latency / 1000;
 	}
 	gint64 gap = fake_now - MAX(run->last_shown, run->measure_from);
-	gint64 frame_us = G_USEC_PER_SEC / VFPS;
+	gint64 frame_us = G_USEC_PER_SEC / run->fps;
 
 	if (gap > MAX(3 * frame_us, frame_us + 150000)) {
 		if (g_getenv("NET_TRACE"))
@@ -449,25 +467,24 @@ static void feedback_arrive(const guint8 *packet, gsize size, gint64 arrival,
 				run);
 }
 
-/* Capture to screen, mean and 95th percentile, in milliseconds. */
-static void latency_of(const struct video_run *run, double *mean, guint *p95)
+static int compare_latency(const void *a, const void *b)
 {
-	guint seen = 0, i = 0;
+	const guint *x = a, *y = b;
 
-	*mean = run->latency_count ?
-			(double)run->latency_sum / run->latency_count / 1000 :
-			0;
-	for (; i < G_N_ELEMENTS(run->latency_hist); i++) {
-		seen += run->latency_hist[i];
-		if (seen * 20 >= run->latency_count * 19)
-			break;
-	}
-	*p95 = i * 10 + 10;
+	return (*x > *y) - (*x < *y);
+}
+
+/* Nearest rank; every observed frame, including multi-second stalls. */
+static guint latency_percentile(const struct video_run *run, guint percentile)
+{
+	guint rank = (run->latency_count * percentile + 99) / 100;
+
+	return rank ? run->latencies[rank - 1] : 0;
 }
 
 struct video_result {
 	double fps, decoded_psnr, screen_psnr, kbps, latency_ms;
-	guint latency_p95_ms, local_cuts;
+	guint latency_p50_ms, latency_p95_ms, latency_p99_ms, local_cuts;
 	gint64 freeze_ms, recovery_ms;
 	guint freezes, firs;
 	double loss;
@@ -477,30 +494,35 @@ static const guint8 key_a[30] = { 1, 2, 3 }, key_b[30] = { 4, 5, 6 };
 
 static struct video_result run_video(const struct link_profile *profile)
 {
-	struct video_run run = { .profile = profile };
+	struct video_run run = { .profile = profile,
+				 .width = profile->hd ? 1280 : VW,
+				 .height = profile->hd ? 720 : VH,
+				 .fps = profile->hd ? 30 : VFPS };
+	guint kbps = profile->hd ? 3000 : VKBPS;
 	const gint64 start = fake_now = 10 * G_USEC_PER_SEC;
 	const gint64 end = start + VIDEO_SECONDS * G_USEC_PER_SEC;
-	guint8 *frame = g_malloc(VW * VH * 3 / 2);
+	guint8 *frame = g_malloc(run.width * run.height * 3 / 2);
 	gint64 next_frame = start,
-	       next_tick = start + G_USEC_PER_SEC / VFPS / 2;
+	       next_tick = start + G_USEC_PER_SEC / run.fps / 2;
 	guint index = 0;
 	struct line_camera_frame image = {
-		.plane = { frame, frame + VW * VH, frame + VW * VH * 5 / 4 },
-		.stride = { VW, VW / 2, VW / 2 },
-		.width = VW,
-		.height = VH,
+		.plane = { frame, frame + run.width * run.height,
+			   frame + run.width * run.height * 5 / 4 },
+		.stride = { run.width, run.width / 2, run.width / 2 },
+		.width = run.width,
+		.height = run.height,
 	};
 	g_autoptr(GError) e = NULL;
 
 	run.screen = g_malloc(1920 * 1080);
-	run.source = g_malloc(VW * VH * 3 / 2);
+	run.source = g_malloc(run.width * run.height * 3 / 2);
 	run.measure_from = start + G_USEC_PER_SEC;
-	run.tx = call_video_open(key_a, key_b, 97, 101, 102, VKBPS, VFPS, &e);
+	run.tx = call_video_open(key_a, key_b, 97, 101, 102, kbps, run.fps, &e);
 	g_assert_no_error(e);
-	run.rx = call_video_open(key_b, key_a, 97, 102, 101, VKBPS, VFPS, &e);
+	run.rx = call_video_open(key_b, key_a, 97, 102, 101, kbps, run.fps, &e);
 	g_assert_no_error(e);
 	link_init(&run.forward, profile, 7);
-	link_init(&run.back, profile, 11);
+	link_init(&run.back, profile->reverse ? profile->reverse : profile, 11);
 	if (profile->outage_ms)
 		run.outage_end =
 			start +
@@ -520,8 +542,9 @@ static struct video_result run_video(const struct link_profile *profile)
 				link_rate(&run.forward));
 		}
 		if (fake_now >= next_frame) {
-			source_frame(index, frame, frame + VW * VH,
-				     frame + VW * VH * 5 / 4);
+			source_frame(&run, index, frame,
+				     frame + run.width * run.height,
+				     frame + run.width * run.height * 5 / 4);
 			run.captured[index & 4095] = fake_now;
 			if (profile->local_uplink &&
 			    !profile->ignore_local_queue)
@@ -536,7 +559,7 @@ static struct video_result run_video(const struct link_profile *profile)
 			if (run.outage_end && fake_now <= run.outage_end)
 				run.index_at_outage_end = index;
 			index++;
-			next_frame += G_USEC_PER_SEC / VFPS;
+			next_frame += G_USEC_PER_SEC / run.fps;
 		}
 		/* The call thread's receiver loss recovery. */
 		call_video_poll(run.rx, run.rx, fake_now, TRUE, video_back,
@@ -550,7 +573,7 @@ static struct video_result run_video(const struct link_profile *profile)
 			 */
 			gint64 ideal =
 				(fake_now - profile->delay_ms * 1000 - start) *
-				VFPS / G_USEC_PER_SEC;
+				run.fps / G_USEC_PER_SEC;
 
 			if (fake_now >= run.measure_from && ideal >= 3) {
 				double best = 0;
@@ -564,12 +587,12 @@ static struct video_result run_video(const struct link_profile *profile)
 				run.screen_psnr += best;
 				run.screen_samples++;
 			}
-			next_tick += G_USEC_PER_SEC / VFPS;
+			next_tick += G_USEC_PER_SEC / run.fps;
 		}
 	}
 	gint64 tail = end - MAX(run.last_shown, run.measure_from);
 
-	if (tail > 3 * G_USEC_PER_SEC / VFPS) {
+	if (tail > 3 * G_USEC_PER_SEC / run.fps) {
 		run.freezes++;
 		run.freeze_us += tail;
 	}
@@ -595,7 +618,14 @@ static struct video_result run_video(const struct link_profile *profile)
 						   run.forward.sent :
 					   0,
 	};
-	latency_of(&run, &r.latency_ms, &r.latency_p95_ms);
+	qsort(run.latencies, run.latency_count, sizeof(run.latencies[0]),
+	      compare_latency);
+	r.latency_ms = run.latency_count ?
+			       run.latency_sum / (1000.0 * run.latency_count) :
+			       0;
+	r.latency_p50_ms = latency_percentile(&run, 50);
+	r.latency_p95_ms = latency_percentile(&run, 95);
+	r.latency_p99_ms = latency_percentile(&run, 99);
 	struct call_video_recovery tx, rx;
 
 	call_video_recovery(run.tx, &tx);
@@ -604,10 +634,11 @@ static struct video_result run_video(const struct link_profile *profile)
 	g_test_message(
 		"video %-18s fps=%5.2f freeze-ms=%6" G_GINT64_FORMAT
 		" freezes=%3u psnr-decoded=%5.2f psnr-screen=%5.2f recovery-ms=%5" G_GINT64_FORMAT
-		" sent-kbps=%6.1f path-loss=%4.1f%% keyframe-requests=%u latency-ms=%6.1f latency-p95-ms=%4u",
+		" sent-kbps=%6.1f path-loss=%4.1f%% keyframe-requests=%u latency-ms=%6.1f p50/p95/p99-ms=%u/%u/%u captures=%u decoded=%u",
 		profile->name, r.fps, r.freeze_ms, r.freezes, r.decoded_psnr,
 		r.screen_psnr, r.recovery_ms, r.kbps, r.loss, r.firs,
-		r.latency_ms, r.latency_p95_ms);
+		r.latency_ms, r.latency_p50_ms, r.latency_p95_ms,
+		r.latency_p99_ms, index, run.decoded_frames);
 	g_test_message(
 		"      requests=%u seqs=%u resent=%u answered=%u gave-up=%u late=%u rembs=%u rtt=%ums hold=%ums rate-changes=%u rescales=%u final=%ukbps %ux%u local-cuts=%u",
 		rx.requests, rx.requested, tx.retransmitted, rx.retransmitted,
@@ -630,20 +661,36 @@ static struct video_result run_video(const struct link_profile *profile)
 
 enum {
 	RATE = 48000,
-	DEVICE_CHUNK = 512,
+	PROBE_HZ = 3000,
+	PROBE_LEVEL = 6000,
 	AUDIO_SECONDS = 30,
 	MAX_DEVICES = 8,
 };
 
 struct device {
-	gboolean used, capture;
-	guint64 consumed; /* capture samples handed out */
+	gboolean used, capture, paused;
+	guint64 consumed; /* capture sample frames handed out */
+	guint channels, quantum;
+	SDL_AudioCallback input;
+	void *userdata;
+	GArray *wave; /* synthetic speaker samples on the capture clock */
 	gint64 epoch;
 	guint64 queued; /* playback samples waiting */
 	guint64 underrun, total, queue_sum, queue_checks;
 };
 
 static struct device devices[MAX_DEVICES];
+static gboolean reject_stereo;
+
+/* Quality tests rely on audible pilots. Only host service benchmarks
+ * include the production RNNoise filter in their CPU measurements.
+ */
+static gboolean measure_denoise;
+struct line_denoise *__real_line_denoise_new(void);
+G_MODULE_EXPORT struct line_denoise *__wrap_line_denoise_new(void)
+{
+	return measure_denoise ? __real_line_denoise_new() : NULL;
+}
 
 G_MODULE_EXPORT int __wrap_SDL_InitSubSystem(Uint32 flags)
 {
@@ -656,14 +703,20 @@ G_MODULE_EXPORT SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(
 	SDL_AudioSpec *obtained, int changes)
 {
 	(void)name;
-	(void)desired;
-	(void)obtained;
+	if (obtained)
+		*obtained = *desired;
 	(void)changes;
+	if (capture && reject_stereo && desired->channels > 1)
+		return 0;
 	for (guint i = 1; i < MAX_DEVICES; i++) {
 		if (devices[i].used)
 			continue;
 		devices[i] = (struct device){ .used = TRUE,
 					      .capture = !!capture,
+					      .channels = desired->channels,
+					      .quantum = desired->samples,
+					      .input = desired->callback,
+					      .userdata = desired->userdata,
 					      .epoch = fake_now };
 		return i;
 	}
@@ -672,15 +725,16 @@ G_MODULE_EXPORT SDL_AudioDeviceID __wrap_SDL_OpenAudioDevice(
 
 G_MODULE_EXPORT void __wrap_SDL_CloseAudioDevice(SDL_AudioDeviceID id)
 {
-	if (id < MAX_DEVICES)
+	if (id < MAX_DEVICES) {
+		g_clear_pointer(&devices[id].wave, g_array_unref);
 		devices[id].used = FALSE;
+	}
 }
 
 G_MODULE_EXPORT void __wrap_SDL_PauseAudioDevice(SDL_AudioDeviceID id,
 						 int pause)
 {
-	(void)id;
-	(void)pause;
+	devices[id].paused = pause;
 }
 
 G_MODULE_EXPORT void __wrap_SDL_ClearQueuedAudio(SDL_AudioDeviceID id)
@@ -696,8 +750,14 @@ G_MODULE_EXPORT void __wrap_SDL_ClearQueuedAudio(SDL_AudioDeviceID id)
 G_MODULE_EXPORT int __wrap_SDL_QueueAudio(SDL_AudioDeviceID id, const void *pcm,
 					  Uint32 len)
 {
-	(void)pcm;
-	devices[id].queued += len / 2;
+	struct device *d = &devices[id];
+	guint pos = d->total + d->queued;
+
+	if (d->wave) {
+		g_array_set_size(d->wave, pos + len / 2);
+		memcpy(&g_array_index(d->wave, gint16, pos), pcm, len);
+	}
+	d->queued += len / 2;
 	return 0;
 }
 
@@ -709,7 +769,10 @@ G_MODULE_EXPORT Uint32 __wrap_SDL_GetQueuedAudioSize(SDL_AudioDeviceID id)
 		return d->queued * 2;
 	guint64 produced = (fake_now - d->epoch) * RATE / G_USEC_PER_SEC;
 
-	return (produced - d->consumed) * 2;
+	produced -= produced % d->quantum;
+	return produced > d->consumed ?
+		       (produced - d->consumed) * 2 * d->channels :
+		       0;
 }
 
 /* A voiced, syllable-shaped signal: harmonics under a 4 Hz envelope. */
@@ -719,56 +782,167 @@ G_MODULE_EXPORT Uint32 __wrap_SDL_DequeueAudio(SDL_AudioDeviceID id, void *pcm,
 	struct device *d = &devices[id];
 	gint16 *out = pcm;
 
-	for (Uint32 i = 0; i < len / 2; i++, d->consumed++) {
+	for (Uint32 i = 0; i < len / 2; d->consumed++) {
 		double t = (double)d->consumed / RATE;
 		double envelope = 0.5 + 0.5 * sin(2 * G_PI * 4 * t);
 		double s = 0;
 
 		for (int h = 1; h <= 6; h++)
 			s += sin(2 * G_PI * 140 * h * t) / h;
-		out[i] = 4000 * envelope * s;
+		double sample = 4000 * envelope * s;
+
+		/* One 40 ms pilot each second, distinguishable from speech. */
+		if (d->consumed % RATE < RATE / 25)
+			sample += PROBE_LEVEL * sin(2 * G_PI * PROBE_HZ * t);
+		for (guint ch = 0; ch < d->channels; ch++)
+			out[i++] = sample;
 	}
 	return len;
 }
 
 /* The playback device takes one callback's worth at a time. */
+static void feed_microphones(void)
+{
+	gint16 pcm[2 * 1024];
+
+	for (guint id = 1; id < MAX_DEVICES; id++) {
+		struct device *d = &devices[id];
+
+		if (!d->used || !d->capture || !d->input || d->paused)
+			continue;
+		guint n = d->quantum * d->channels * sizeof(*pcm);
+
+		g_assert_cmpuint(n, <=, sizeof(pcm));
+		while (__wrap_SDL_GetQueuedAudioSize(id) >= n) {
+			__wrap_SDL_DequeueAudio(id, pcm, n);
+			d->input(d->userdata, (Uint8 *)pcm, n);
+		}
+	}
+}
+
 static void device_consume(struct device *d, gint64 *next)
 {
 	while (fake_now >= *next) {
-		d->total += DEVICE_CHUNK;
-		if (d->queued < DEVICE_CHUNK) {
-			d->underrun += DEVICE_CHUNK - d->queued;
+		d->total += d->quantum;
+		if (d->queued < d->quantum) {
+			d->underrun += d->quantum - d->queued;
 			d->queued = 0;
 		} else {
-			d->queued -= DEVICE_CHUNK;
+			d->queued -= d->quantum;
 		}
-		*next += (gint64)DEVICE_CHUNK * G_USEC_PER_SEC / RATE;
+		*next = d->epoch + d->total * G_USEC_PER_SEC / RATE;
 	}
 	d->queue_sum += d->queued;
 	d->queue_checks++;
 }
 
 struct audio_result {
-	double dead_air_ms, concealed_ms, queue_ms, loss, delay_ms;
-	guint64 late, fec;
+	double dead_air_ms, concealed_ms, queue_ms, loss, delay_ms, late_pc;
+	guint p50, p95, p99, probes;
+	guint64 late, fec, fec_attempts;
+	gboolean can_count_lbrr;
+	guint loss_reports, min_loss_pct, max_loss_pct;
+};
+
+/*
+ * Scan the decoded synthetic speaker waveform in 1 ms steps, using 4 ms
+ * of coherent integration to reject speech harmonics. Include actual
+ * packetisation, codec delay, playout and device drain. Mark a missing
+ * probe as lost rather than assigning the next marker to it.
+ */
+static void acoustic_latency(const struct device *d, guint *p50, guint *p95,
+			     guint *p99, guint *received)
+{
+	enum {
+		PERIOD = RATE / PROBE_HZ,
+		WINDOW = 4 * RATE / 1000
+	};
+	double cosine[PERIOD], sine[PERIOD];
+	guint delays[AUDIO_SECONDS];
+	const gint16 *wave = (gint16 *)d->wave->data;
+
+	for (guint i = 0; i < PERIOD; i++) {
+		cosine[i] = cos(2 * G_PI * i / PERIOD);
+		sine[i] = sin(2 * G_PI * i / PERIOD);
+	}
+	for (guint sec = 1; sec < AUDIO_SECONDS; sec++) {
+		guint start = sec * RATE;
+		guint end = MIN((sec + 1) * RATE, d->total);
+
+		for (guint pos = start;
+		     pos + WINDOW <= end && pos + WINDOW <= d->wave->len;
+		     pos += RATE / 1000) {
+			double x = 0, y = 0;
+
+			for (guint j = 0; j < WINDOW; j++) {
+				x += wave[pos + j] * cosine[j % PERIOD];
+				y += wave[pos + j] * sine[j % PERIOD];
+			}
+			/* Magnitude corresponding to 1/4 of the pilot at source. */
+			double threshold = PROBE_LEVEL * WINDOW / 8;
+
+			if (x * x + y * y < threshold * threshold)
+				continue;
+			delays[(*received)++] = (pos - start) / (RATE / 1000);
+			break;
+		}
+	}
+	g_assert_cmpuint(*received, >, 0);
+	qsort(delays, *received, sizeof(*delays), compare_latency);
+	*p50 = delays[(*received * 50 + 99) / 100 - 1];
+	*p95 = delays[(*received * 95 + 99) / 100 - 1];
+	*p99 = delays[(*received * 99 + 99) / 100 - 1];
+}
+
+struct audio_receiver {
+	LineAudio *audio;
+	guint arrived;
 };
 
 static void audio_arrive(const guint8 *packet, gsize size, gint64 arrival,
 			 gpointer data)
 {
-	line_audio_receive_at(data, packet, size, arrival);
+	struct audio_receiver *rx = data;
+
+	rx->arrived++;
+	line_audio_receive_at(rx->audio, packet, size, arrival);
 }
 
-static struct audio_result run_audio(const struct link_profile *profile)
+struct audio_feedback {
+	LineAudio *sender;
+	guint reports, min_loss_pct, max_loss_pct;
+};
+
+static void audio_report_arrive(const guint8 *packet, gsize size,
+				gint64 received G_GNUC_UNUSED, gpointer data)
+{
+	struct audio_feedback *f = data;
+	struct line_audio_stats stats = { 0 };
+
+	g_assert_true(line_audio_receive_report(f->sender, packet, size));
+	line_audio_stats(f->sender, &stats);
+	f->min_loss_pct = MIN(f->min_loss_pct, stats.expected_loss_pct);
+	f->max_loss_pct = MAX(f->max_loss_pct, stats.expected_loss_pct);
+	f->reports++;
+}
+
+static struct audio_result run_audio(const struct link_profile *profile,
+				     gboolean conference, gboolean feedback)
 {
 	g_autoptr(GError) e = NULL;
 	const gint64 start = fake_now = 100 * G_USEC_PER_SEC;
 	const gint64 end = start + AUDIO_SECONDS * G_USEC_PER_SEC;
-	struct link link;
-	LineAudio *a = line_audio_open(key_a, key_b, 96, 201, 202, &e);
+	struct link link, back;
+	LineAudio *a = conference ?
+			       line_audio_open_group(key_a, key_b, 96, 96, 201,
+						     202, &e) :
+			       line_audio_open(key_a, key_b, 96, 201, 202, &e);
 
 	g_assert_no_error(e);
-	LineAudio *b = line_audio_open(key_b, key_a, 96, 202, 201, &e);
+	LineAudio *b = conference ?
+			       line_audio_open_group(key_b, key_a, 96, 96, 202,
+						     201, &e) :
+			       line_audio_open(key_b, key_a, 96, 202, 201, &e);
 
 	g_assert_no_error(e);
 	/* Device 2 is the receiver's speaker: a opens 1 and 2... find it. */
@@ -781,17 +955,24 @@ static struct audio_result run_audio(const struct link_profile *profile)
 		}
 	g_assert_cmpuint(speaker, >, 0);
 	link_init(&link, profile, 23);
+	link_init(&back, profile->reverse ? profile->reverse : profile, 11);
+	struct audio_feedback reports = { .sender = a, .min_loss_pct = 100 };
 	gint64 next_capture = start, next_chunk = start;
 	struct device *d = &devices[speaker];
+
+	d->wave = g_array_new(FALSE, TRUE, sizeof(gint16));
 	guint64 underrun_before = 0, total_before = 0;
 	struct line_audio_stats before = { 0 }, stats;
 	gboolean measuring = FALSE;
+	struct audio_receiver rx = { .audio = b };
 
 	for (; fake_now < end; fake_now += 1000) {
+		feed_microphones();
 		if (!measuring && fake_now >= start + G_USEC_PER_SEC) {
 			measuring = TRUE;
 			underrun_before = d->underrun;
 			total_before = d->total;
+			rx.arrived = 0;
 			line_audio_stats(b, &before);
 			d->queue_sum = d->queue_checks = 0;
 		}
@@ -803,7 +984,10 @@ static struct audio_result run_audio(const struct link_profile *profile)
 		gboolean busy =
 			thread_busy(profile->load, (fake_now - start) / 1000);
 
-		if (!busy && fake_now >= next_capture) {
+		gboolean ready = line_audio_capture_fd(a) >= 0 ?
+					 line_audio_capture_ready(a) :
+					 fake_now >= next_capture;
+		if (!busy && ready) {
 			guint8 packet[2048];
 			int n = line_audio_capture(a, packet, sizeof(packet),
 						   &e);
@@ -812,11 +996,25 @@ static struct audio_result run_audio(const struct link_profile *profile)
 			if (n > 0)
 				link_send(&link, packet, n);
 			next_capture =
-				n ? MAX(fake_now + 4000, next_capture + 20000) :
+				n ? MAX(fake_now + 4000,
+					next_capture +
+						(conference ? 40000 : 20000)) :
 				    fake_now + 4000;
 		}
 		if (!busy) {
-			link_deliver(&link, audio_arrive, b);
+			guint arrived = rx.arrived;
+
+			link_deliver(&link, audio_arrive, &rx);
+			if (feedback && arrived != rx.arrived) {
+				guint8 packet[512];
+				gsize size = line_audio_receiver_report(
+					b, fake_now, packet, sizeof(packet));
+				if (size)
+					link_send(&back, packet, size);
+			}
+			if (feedback)
+				link_deliver(&back, audio_report_arrive,
+					     &reports);
 			line_audio_playout(b, fake_now);
 		}
 		device_consume(d, &next_chunk);
@@ -825,6 +1023,7 @@ static struct audio_result run_audio(const struct link_profile *profile)
 	stats.silence -= before.silence;
 	stats.concealed -= before.concealed;
 	stats.fec -= before.fec;
+	stats.fec_attempts -= before.fec_attempts;
 	stats.late -= before.late;
 	stats.delay_ms_sum -= before.delay_ms_sum;
 	stats.delay_count -= before.delay_count;
@@ -841,17 +1040,38 @@ static struct audio_result run_audio(const struct link_profile *profile)
 					    link.sent :
 				    0,
 		.late = stats.late,
+		.late_pc = 100.0 * stats.late / MAX(1, rx.arrived),
 		.fec = stats.fec,
+		.fec_attempts = stats.fec_attempts,
+		.can_count_lbrr = stats.can_count_lbrr,
+		.loss_reports = reports.reports,
+		.min_loss_pct = reports.min_loss_pct,
+		.max_loss_pct = reports.max_loss_pct,
 		.delay_ms = stats.delay_count ? (double)stats.delay_ms_sum /
 							stats.delay_count :
 						0,
 	};
+	acoustic_latency(d, &r.p50, &r.p95, &r.p99, &r.probes);
+	g_test_message(
+		"synthetic %s microphone-to-speaker p50/p95/p99=%u/%u/%u ms probes=%u/%u late=%.2f%%",
+		conference ? "group" : "direct", r.p50, r.p95, r.p99, r.probes,
+		AUDIO_SECONDS - 1, r.late_pc);
 	g_test_message(
 		"audio %-18s dead-air-ms/min=%7.1f concealed-ms/min=%7.1f fec=%3" G_GUINT64_FORMAT
 		" late=%4" G_GUINT64_FORMAT
 		" playout-delay-ms=%6.1f path-loss=%4.1f%%",
 		profile->name, r.dead_air_ms, r.concealed_ms, r.fec, r.late,
 		r.delay_ms, r.loss);
+	if (!conference)
+		g_test_message(
+			"Protected loss reports=%u encoder loss=%u..%u%% confirmed LBRR=%" G_GUINT64_FORMAT
+			"/%" G_GUINT64_FORMAT " repair attempts (%s)",
+			r.loss_reports, r.loss_reports ? r.min_loss_pct : 5,
+			r.loss_reports ? r.max_loss_pct : 5, r.fec,
+			r.fec_attempts,
+			r.can_count_lbrr ? "packet inspection available" :
+					   "packet inspection unavailable");
+	link_clear(&back);
 	link_clear(&link);
 	line_audio_close(a);
 	line_audio_close(b);
@@ -996,6 +1216,32 @@ static const struct link_profile uplink_blind = {
 	.ignore_local_queue = TRUE,
 };
 
+/* Deterministic GE channel: bad state drops all packets. A mean burst of
+ * 4 gives P(bad -> good)=1/4. P(good -> bad)=1/12 yields a stationary
+ * loss probability of (1/12)/(1/12 + 1/4) = 25%. Keep the receiver's
+ * feedback link independent from the throttled, lossy camera uplink.
+ */
+static const struct link_profile feedback_link = {
+	.delay_ms = 15,
+	.jitter_ms = 5,
+	.kbps = 128,
+	.queue_ms = 50,
+};
+static const struct link_profile asymmetric_burst = {
+	.name = "asymmetric-burst-25%",
+	.max_dead_air_ms = 600, /* one percent of a minute */
+	.max_delay_ms = 150,
+	.burst_enter = 1.0 / 12,
+	.burst_leave = 0.25,
+	.burst_loss = 1.0,
+	.delay_ms = 40,
+	.jitter_ms = 40,
+	.reorder = TRUE,
+	.kbps = 2400,
+	.queue_ms = 200,
+	.reverse = &feedback_link,
+	.hd = TRUE,
+};
 static const struct link_profile *const video_profiles[] = {
 	&clean,	 &lossy,   &wifi,   &capped,	   &fluctuating,
 	&outage, &hotspot, &uplink, &uplink_blind,
@@ -1089,13 +1335,437 @@ static void video_scenario(gconstpointer data)
 	}
 }
 
+static void video_hd_burst(void)
+{
+	struct video_result r = run_video(&asymmetric_burst);
+
+	/* This profile deliberately overloads the path. Check recovery and
+	 * that the observed packet losses agree with the channel model.
+	 */
+	g_assert_cmpfloat(r.loss, >, 20.0);
+	g_assert_cmpfloat(r.loss, <, 35.0);
+	/* Prior controller: 13.68 fps, 26.47 dB on screen, p99 608 ms. */
+	g_assert_cmpfloat(r.fps, >=, 14);
+	g_assert_cmpfloat(r.screen_psnr, >=, 26);
+	g_assert_cmpuint(r.latency_p99_ms, <=, 608);
+}
+
 static void audio_scenario(gconstpointer data)
 {
 	const struct link_profile *p = data;
-	struct audio_result r = run_audio(p);
+	struct audio_result r = run_audio(p, FALSE, TRUE);
 
+	if (p == &asymmetric_burst) {
+		struct audio_result fixed = run_audio(p, FALSE, FALSE);
+
+		g_assert_cmpuint(r.loss_reports, >, 0);
+		g_assert_cmpuint(r.max_loss_pct, >, 5);
+		g_assert_cmpuint(fixed.loss_reports, ==, 0);
+		if (r.can_count_lbrr)
+			g_assert_cmpuint(r.fec, >, 0);
+	}
 	g_assert_cmpfloat(r.dead_air_ms, <=, p->max_dead_air_ms);
-	g_assert_cmpfloat(r.delay_ms, <=, p->max_delay_ms);
+	if (p->max_delay_ms)
+		g_assert_cmpfloat(r.delay_ms, <=, p->max_delay_ms);
+	g_assert_cmpfloat(r.late_pc, <=, 1.0);
+	g_assert_cmpuint(r.probes, >=, (AUDIO_SECONDS - 1) / 2);
+	if (p == &clean)
+		g_assert_cmpuint(r.p95, <=, p->delay_ms + 4 * 20);
+}
+
+static guint32 audio_stamp(const guint8 *rtp)
+{
+	guint32 stamp;
+
+	memcpy(&stamp, rtp + 4, sizeof(stamp));
+	return GUINT32_FROM_BE(stamp);
+}
+
+/* Drive the SDL callback directly, including fragments smaller than a PCM
+ * sample. No physical audio device is opened by this clocked harness.
+ */
+static void capture_ring(gconstpointer mode)
+{
+	guint channels = GPOINTER_TO_UINT(mode);
+	gboolean group = channels != 0;
+
+	reject_stereo = channels == 1;
+	g_autoptr(GError) e = NULL;
+	LineAudio *audio =
+		group ? line_audio_open_group(key_a, key_b, 96, 96, 201, 202,
+					      &e) :
+			line_audio_open(key_a, key_b, 96, 201, 202, &e);
+	g_assert_no_error(e);
+	struct device *dev = NULL;
+
+	for (guint i = 0; i < MAX_DEVICES; i++)
+		if (devices[i].used && devices[i].capture)
+			dev = &devices[i];
+	g_assert_nonnull(dev);
+	g_assert_nonnull(dev->input);
+	g_assert_cmpuint(dev->channels, ==, MAX(1u, channels));
+	guint samples = group ? 1920 : 960;
+	guint bytes = samples * dev->channels * sizeof(gint16);
+	guint8 tone[2 * 1920 * sizeof(gint16)], packet[2048];
+
+	memset(tone, 0x11, bytes);
+	struct pollfd wake = { .fd = line_audio_capture_fd(audio),
+			       .events = POLLIN };
+
+	g_assert_cmpint(wake.fd, >=, 0);
+	dev->input(dev->userdata, tone, bytes - 1);
+	g_assert_false(line_audio_capture_ready(audio));
+	g_assert_cmpint(poll(&wake, 1, 0), ==, 0);
+	dev->input(dev->userdata, tone + bytes - 1, 1);
+	g_assert_cmpint(poll(&wake, 1, 0), ==, 1);
+	g_assert_cmpint(line_audio_capture(audio, packet, sizeof(packet), &e),
+			>, 0);
+	guint32 first = audio_stamp(packet);
+
+	g_assert_cmpint(poll(&wake, 1, 0), ==, 0);
+
+	/* Rotate through the four slots without losing media time. */
+	for (int i = 1; i <= 12; i++) {
+		dev->input(dev->userdata, tone, bytes);
+		g_assert_cmpint(line_audio_capture(audio, packet,
+						   sizeof(packet), &e),
+				>, 0);
+		g_assert_cmpuint(audio_stamp(packet) - first, ==, i * samples);
+	}
+	/* Six additional completed frames cannot fit in four slots. */
+	for (int i = 0; i < 6; i++)
+		dev->input(dev->userdata, tone, bytes);
+	g_assert_cmpint(line_audio_capture(audio, packet, sizeof(packet), &e),
+			==, 0);
+	g_assert_false(line_audio_capture_ready(audio));
+	dev->input(dev->userdata, tone, bytes);
+	g_assert_cmpint(line_audio_capture(audio, packet, sizeof(packet), &e),
+			>, 0);
+	g_assert_cmpuint(audio_stamp(packet) - first, ==, 19 * samples);
+
+	/* Mute purges complete frames, the partially assembled slot and wake. */
+	dev->input(dev->userdata, tone, bytes);
+	dev->input(dev->userdata, tone, bytes / 2);
+	line_audio_mute(audio, TRUE);
+	g_assert_true(dev->paused);
+	g_assert_false(line_audio_capture_ready(audio));
+	g_assert_cmpint(poll(&wake, 1, 0), ==, 0);
+	g_assert_cmpint(line_audio_capture(audio, packet, sizeof(packet), &e),
+			==, 0);
+	line_audio_mute(audio, FALSE);
+	memset(tone, 0, bytes);
+	dev->input(dev->userdata, tone, bytes / 2);
+	g_assert_false(line_audio_capture_ready(audio));
+	dev->input(dev->userdata, tone, bytes / 2);
+	g_assert_cmpint(line_audio_capture(audio, packet, sizeof(packet), &e),
+			>, 0);
+	if (group)
+		g_assert_cmpuint(packet[20], ==, 127);
+	line_audio_close(audio);
+	reject_stereo = FALSE;
+}
+
+/*
+ * Measure synchronous Opus service against one persistent codec worker. The
+ * condition variable transfers ownership of a single slot, without copying
+ * PCM or RTP. The receive side includes due playout and writes decoded PCM
+ * to the virtual speaker. The media clock stays deterministic while these
+ * measurements use the host CPU and elapsed clocks.
+ */
+enum audio_job {
+	JOB_IDLE,
+	JOB_ENCODE,
+	JOB_RECEIVE,
+	JOB_PLAYOUT,
+	JOB_EXIT
+};
+
+struct service_slot {
+	GMutex lock;
+	GCond ready;
+	enum audio_job job;
+	LineAudio *tx, *rx;
+	guint8 packet[4096];
+	int size;
+	gint64 cpu_ns, next_play;
+};
+
+static gint64 service_time(clockid_t clock)
+{
+	struct timespec t;
+
+	clock_gettime(clock, &t);
+	return (gint64)t.tv_sec * 1000000000 + t.tv_nsec;
+}
+
+static void do_audio_job(struct service_slot *s, enum audio_job job)
+{
+	gint64 begin = service_time(CLOCK_THREAD_CPUTIME_ID);
+
+	if (job == JOB_ENCODE)
+		s->size = line_audio_capture(s->tx, s->packet,
+					     sizeof(s->packet), NULL);
+	else {
+		if (job == JOB_RECEIVE)
+			g_assert_true(line_audio_receive_at(s->rx, s->packet,
+							    s->size, fake_now));
+		s->next_play = line_audio_playout(s->rx, fake_now);
+	}
+	s->cpu_ns = service_time(CLOCK_THREAD_CPUTIME_ID) - begin;
+}
+
+static gpointer service_worker(gpointer data)
+{
+	struct service_slot *s = data;
+
+	g_mutex_lock(&s->lock);
+	for (;;) {
+		while (s->job == JOB_IDLE)
+			g_cond_wait(&s->ready, &s->lock);
+		if (s->job == JOB_EXIT)
+			break;
+		do_audio_job(s, s->job);
+		s->job = JOB_IDLE;
+		g_cond_signal(&s->ready);
+	}
+	g_mutex_unlock(&s->lock);
+	return NULL;
+}
+
+static void dispatch_audio_job(struct service_slot *s, enum audio_job job,
+			       gboolean threaded)
+{
+	if (!threaded) {
+		do_audio_job(s, job);
+		return;
+	}
+	g_mutex_lock(&s->lock);
+	s->job = job;
+	g_cond_signal(&s->ready);
+	while (s->job != JOB_IDLE && job != JOB_EXIT)
+		g_cond_wait(&s->ready, &s->lock);
+	g_mutex_unlock(&s->lock);
+}
+
+/* A synthetic conference mixer rewraps the microphone payload with a
+ * distinct SSRC per child. Relay work is outside the client's timings.
+ */
+static void mix_service_packet(struct service_slot *s, srtp_t ingest,
+			       srtp_t relay, guint voices)
+{
+	guint8 child[512];
+	guint8 *p = s->packet;
+
+	g_assert_cmpint(srtp_unprotect(ingest, p, &s->size), ==,
+			srtp_err_status_ok);
+	guint ext = 16 + 4 * ((p[14] << 8) + p[15]);
+
+	g_assert_cmpuint(ext, <, (guint)s->size);
+	guint child_size = 12 + s->size - ext;
+
+	g_assert_cmpuint(child_size, <=, sizeof(child));
+	memcpy(child, p, 12);
+	child[0] = 0x80;
+	memcpy(child + 12, p + ext, child_size - 12);
+	guint words = (2 + 2 * voices + 3) / 4;
+	guint pos = 16 + 4 * words;
+
+	g_assert_cmpuint(pos + voices * child_size + SRTP_MAX_TRAILER_LEN, <=,
+			 sizeof(s->packet));
+	memset(p + 12, 0, pos - 12);
+	p[12] = 2;
+	p[13] = 0x40;
+	p[15] = words;
+	p[16] = 3;
+	p[17] = voices;
+	for (guint n = 0; n < voices; n++) {
+		p[18 + n * 2] = 0x40 | child_size >> 8;
+		p[19 + n * 2] = child_size;
+		child[11] = n + 1;
+		memcpy(p + pos, child, child_size);
+		pos += child_size;
+	}
+	s->size = pos;
+	g_assert_cmpint(srtp_protect(relay, p, &s->size), ==,
+			srtp_err_status_ok);
+}
+
+static void audio_service(gconstpointer data)
+{
+	enum {
+		N = 1000,
+		WARMUP = 30,
+		TX_CPU = 0,
+		RX_CPU,
+		CALLBACK,
+		READY,
+		COMBINED,
+		METRICS
+	};
+	guint voices = GPOINTER_TO_UINT(data);
+	gboolean group = voices != 0;
+	const char *name = voices > 1 ? "XRTP-eight" :
+			   group      ? "group" :
+					"direct";
+	const guint frames = group ? 4 : 2;
+	guint us[METRICS][N];
+
+	if (!g_test_perf()) {
+		g_test_skip("Run with -m perf to time Opus and SRTP service.");
+		return;
+	}
+	/* The network quality fixtures turn RNNoise off for their pilots. */
+	for (guint threaded = 0; threaded <= 1; threaded++) {
+		g_autoptr(GError) e = NULL;
+		struct service_slot s = { 0 };
+		GThread *worker = NULL;
+		srtp_t ingest = NULL, relay = NULL;
+
+		measure_denoise = TRUE;
+		s.tx = group ? line_audio_open_group(key_a, key_b, 96, 96, 201,
+						     202, &e) :
+			       line_audio_open(key_a, key_b, 96, 201, 202, &e);
+		g_assert_no_error(e);
+		s.rx = group ? line_audio_open_group(key_b, key_a, 96, 96, 202,
+						     201, &e) :
+			       line_audio_open(key_b, key_a, 96, 202, 201, &e);
+		g_assert_no_error(e);
+		measure_denoise = FALSE;
+		if (voices > 1) {
+			g_assert_true(call_srtp_open(&ingest, key_a,
+						     ssrc_specific, 201));
+			g_assert_true(call_srtp_open(&relay, key_a,
+						     ssrc_specific, 201));
+		}
+		struct device *mic = NULL, *speaker = NULL;
+
+		for (guint id = 1; id < MAX_DEVICES; id++) {
+			if (!devices[id].used)
+				continue;
+			if (devices[id].capture && !mic)
+				mic = &devices[id];
+			if (!devices[id].capture)
+				speaker = &devices[id];
+		}
+		g_assert_nonnull(mic);
+		g_assert_nonnull(mic->input);
+		g_assert_nonnull(speaker);
+		g_assert_cmpuint(mic->quantum, ==, RATE / 100);
+		g_assert_cmpuint(speaker->quantum, ==, RATE / 100);
+		struct pollfd wake = { .fd = line_audio_capture_fd(s.tx),
+				       .events = POLLIN };
+		g_assert_cmpint(wake.fd, >=, 0);
+		guint bytes = mic->quantum * mic->channels * sizeof(gint16);
+		gint16 pcm[2 * RATE / 100];
+		gint64 next_drain = fake_now + 10000;
+
+		s.next_play = G_MAXINT64;
+		if (threaded) {
+			g_mutex_init(&s.lock);
+			g_cond_init(&s.ready);
+			worker = g_thread_new("bench-opus", service_worker, &s);
+		}
+		for (int i = -WARMUP; i < N; i++) {
+			gint64 rx_cpu = 0, rx_wall = 0, callback = 0;
+
+			for (guint q = 0; q < frames; q++) {
+				fake_now += 10000;
+				device_consume(speaker, &next_drain);
+				__wrap_SDL_DequeueAudio(mic - devices, pcm,
+							bytes);
+				/* Measure the callback that publishes a complete packet. */
+				gint64 at = service_time(CLOCK_MONOTONIC_RAW);
+
+				mic->input(mic->userdata, (Uint8 *)pcm, bytes);
+				if (q + 1 == frames) {
+					callback =
+						service_time(
+							CLOCK_MONOTONIC_RAW) -
+						at;
+					break;
+				}
+				if (fake_now >= s.next_play) {
+					at = service_time(CLOCK_MONOTONIC_RAW);
+					dispatch_audio_job(&s, JOB_PLAYOUT,
+							   threaded);
+					rx_wall +=
+						service_time(
+							CLOCK_MONOTONIC_RAW) -
+						at;
+					rx_cpu += s.cpu_ns;
+				}
+			}
+			gint64 at = service_time(CLOCK_MONOTONIC_RAW);
+
+			g_assert_cmpint(poll(&wake, 1, 0), ==, 1);
+			g_assert_true(line_audio_capture_ready(s.tx));
+			dispatch_audio_job(&s, JOB_ENCODE, threaded);
+			gint64 ready = service_time(CLOCK_MONOTONIC_RAW) - at;
+			gint64 tx_cpu = s.cpu_ns;
+
+			g_assert_cmpint(s.size, >, 0);
+			if (voices > 1)
+				mix_service_packet(&s, ingest, relay, voices);
+			at = service_time(CLOCK_MONOTONIC_RAW);
+			dispatch_audio_job(&s, JOB_RECEIVE, threaded);
+			rx_wall += service_time(CLOCK_MONOTONIC_RAW) - at;
+			rx_cpu += s.cpu_ns;
+			if (i >= 0) {
+				us[TX_CPU][i] = tx_cpu / 1000;
+				us[RX_CPU][i] = rx_cpu / 1000;
+				us[CALLBACK][i] = callback / 1000;
+				us[READY][i] = ready / 1000;
+				us[COMBINED][i] =
+					(callback + ready + rx_wall) / 1000;
+			}
+		}
+		if (worker) {
+			dispatch_audio_job(&s, JOB_EXIT, TRUE);
+			g_thread_join(worker);
+			g_cond_clear(&s.ready);
+			g_mutex_clear(&s.lock);
+		}
+		struct line_audio_stats stats;
+
+		line_audio_stats(s.rx, &stats);
+		g_assert_cmpuint(stats.played, >,
+				 (N - 5) * frames * RATE / 100);
+		static const char *const labels[] = {
+			"encode-cpu", "receive/playout-cpu", "capture-callback",
+			"ready-to-SRTP", "combined-service"
+		};
+		for (guint m = 0; m < G_N_ELEMENTS(labels); m++) {
+			qsort(us[m], N, sizeof(*us[m]), compare_latency);
+			g_test_message("Opus %s %s %s p50/p95/p99=%u/%u/%u us",
+				       name, threaded ? "worker" : "inline",
+				       labels[m], us[m][N / 2 - 1],
+				       us[m][N * 95 / 100 - 1],
+				       us[m][N * 99 / 100 - 1]);
+		}
+		if (ingest)
+			srtp_dealloc(ingest);
+		if (relay)
+			srtp_dealloc(relay);
+		line_audio_close(s.rx);
+		line_audio_close(s.tx);
+	}
+}
+
+static void group_audio_scenario(gconstpointer data)
+{
+	const struct link_profile *p = data;
+	struct audio_result r = run_audio(p, TRUE, FALSE);
+
+	g_assert_cmpfloat(r.late_pc, <=, 1.0);
+	g_assert_cmpuint(r.probes, >=, (AUDIO_SECONDS - 1) / 2);
+	if (p == &clean)
+		g_assert_cmpuint(r.p50, <=, p->delay_ms + 3 * 40);
+	else {
+		/* Before deadline-driven concealment this was 12.2 s/min. */
+		g_assert_cmpfloat(r.dead_air_ms, <, 6100);
+		g_assert_cmpuint(r.p99, <=,
+				 p->delay_ms + p->jitter_ms + 5 * 40);
+	}
 }
 
 /*
@@ -1119,9 +1789,9 @@ static void uplink_compare(void)
 /* The encoder thread and kernel stamps against encoding inline. */
 static void hd_compare(void)
 {
-	struct audio_result before = run_audio(&hd_inline);
-	struct audio_result thread = run_audio(&hd_threaded_clock);
-	struct audio_result after = run_audio(&hd_threaded);
+	struct audio_result before = run_audio(&hd_inline, FALSE, TRUE);
+	struct audio_result thread = run_audio(&hd_threaded_clock, FALSE, TRUE);
+	struct audio_result after = run_audio(&hd_threaded, FALSE, TRUE);
 
 	g_test_message(
 		"720p call audio: playout delay %.1f -> %.1f (thread alone %.1f) ms, dead air %.1f -> %.1f (%.1f) ms/min, concealed %.0f -> %.0f (%.0f) ms/min",
@@ -1134,8 +1804,19 @@ static void hd_compare(void)
 
 int main(int argc, char **argv)
 {
+	const char *seed = g_getenv("AVERNELLA_NET_SEED");
+	guint64 value;
+
+	if (seed && !g_ascii_string_to_unsigned(seed, 10, 0, G_MAXUINT32,
+						&value, NULL)) {
+		g_printerr(
+			"AVERNELLA_NET_SEED must be an unsigned 32-bit decimal integer\n");
+		return EXIT_FAILURE;
+	}
+	if (seed)
+		channel_seed = value;
 	g_setenv("LINE_DISABLE_GPU", "1", TRUE);
-	g_setenv("LINE_NOISE_SUPPRESSION", "0", TRUE);
+	g_setenv("LINE_NOISE_SUPPRESSION", "1", TRUE);
 	g_test_init(&argc, &argv, NULL);
 	for (guint i = 0; i < G_N_ELEMENTS(video_profiles); i++) {
 		g_autofree char *path = g_strdup_printf(
@@ -1149,6 +1830,25 @@ int main(int argc, char **argv)
 
 		g_test_add_data_func(path, audio_profiles[i], audio_scenario);
 	}
+	g_test_add_func("/net/video/asymmetric-burst-25%", video_hd_burst);
+	g_test_add_data_func("/net/service/direct", GUINT_TO_POINTER(0),
+			     audio_service);
+	g_test_add_data_func("/net/service/group", GUINT_TO_POINTER(1),
+			     audio_service);
+	g_test_add_data_func("/net/service/group-eight-voices",
+			     GUINT_TO_POINTER(8), audio_service);
+	g_test_add_data_func("/net/mic/direct", GUINT_TO_POINTER(0),
+			     capture_ring);
+	g_test_add_data_func("/net/mic/group-mono", GUINT_TO_POINTER(1),
+			     capture_ring);
+	g_test_add_data_func("/net/mic/group-stereo", GUINT_TO_POINTER(2),
+			     capture_ring);
+	g_test_add_data_func("/net/audio/direct-25pc", &asymmetric_burst,
+			     audio_scenario);
+	g_test_add_data_func("/net/audio/group-clean", &clean,
+			     group_audio_scenario);
+	g_test_add_data_func("/net/audio/group-25pc", &asymmetric_burst,
+			     group_audio_scenario);
 	g_test_add_func("/net/compare/weak-wifi-uplink", uplink_compare);
 	g_test_add_func("/net/compare/hd-video-audio", hd_compare);
 	return g_test_run();

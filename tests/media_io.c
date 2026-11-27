@@ -3,6 +3,8 @@
 #include "camera.h"
 #include <fcntl.h>
 #include <glib/gstdio.h>
+#include <linux/udmabuf.h>
+#include <sys/ioctl.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
@@ -294,6 +296,66 @@ static void preview_backpressure(void)
 	close(pair[0]);
 }
 
+static void preview_dmabuf(gconstpointer data)
+{
+	gboolean real = GPOINTER_TO_INT(data);
+	struct line_preview_frame frame = { .width = 16,
+					    .height = 16,
+					    .source = LINE_PREVIEW_REMOTE };
+	struct line_dmabuf_layout layout = { .width = 16,
+					     .height = 16,
+					     .offset = { 0, 256 },
+					     .stride = { 16, 16 } };
+	int fd = memfd_create("avernella-test-plane", MFD_ALLOW_SEALING);
+	int pair[2], lease[2], release_fd;
+	char byte;
+
+	g_assert_cmpint(fd, >=, 0);
+	if (real) {
+		int device = open("/dev/udmabuf", O_RDWR | O_CLOEXEC);
+
+		if (device < 0) {
+			close(fd);
+			g_test_skip(
+				"No user-accessible DMA-BUF test allocator");
+			return;
+		}
+		struct udmabuf_create create = { .memfd = fd,
+						 .size = getpagesize() };
+		g_assert_cmpint(ftruncate(fd, create.size), ==, 0);
+		g_assert_cmpint(fcntl(fd, F_ADD_SEALS, F_SEAL_SHRINK), ==, 0);
+		int dma = ioctl(device, UDMABUF_CREATE, &create);
+
+		close(device);
+		close(fd);
+		g_assert_cmpint(dma, >=, 0);
+		fd = dma;
+	}
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_SEQPACKET, 0, pair), ==, 0);
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_STREAM, 0, lease), ==, 0);
+	g_assert_true(
+		line_media_send_dmabuf(pair[0], &frame, &layout, fd, lease[1]));
+	close(lease[1]);
+	close(fd);
+	fd = line_media_recv_preview(pair[1], &frame, &release_fd);
+	if (real) {
+		g_assert_cmpint(fd, >=, 0);
+		g_assert_cmpint(release_fd, >=, 0);
+		g_assert_cmpint(recv(lease[0], &byte, 1, MSG_DONTWAIT), ==, -1);
+		close(fd);
+		close(release_fd);
+	} else {
+		g_assert_cmpint(fd, ==, -1);
+		g_assert_cmpint(release_fd, ==, -1);
+		g_assert_cmpint(read(lease[0], &byte, 1), ==, 1);
+		g_assert_cmpint(byte, ==, 'R');
+	}
+	g_assert_cmpint(read(lease[0], &byte, 1), ==, 0);
+	close(lease[0]);
+	close(pair[0]);
+	close(pair[1]);
+}
+
 static void save_file(void)
 {
 	g_autoptr(GError) e = NULL;
@@ -343,6 +405,10 @@ int main(int argc, char **argv)
 			     preview_descriptor);
 	g_test_add_func("/media-io/preview-rows", preview_rows);
 	g_test_add_func("/media-io/preview-backpressure", preview_backpressure);
+	g_test_add_data_func("/media-io/dma-descriptors", GINT_TO_POINTER(1),
+			     preview_dmabuf);
+	g_test_add_data_func("/media-io/dma-reject-memfd", NULL,
+			     preview_dmabuf);
 	g_test_add_func("/media-io/atomic-save", save_file);
 	return g_test_run();
 }

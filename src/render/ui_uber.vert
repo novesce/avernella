@@ -2,6 +2,8 @@
 #version 460
 #extension GL_EXT_buffer_reference : require
 #extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+#include "ui_limits.h"
 
 struct UiPrim {
 	vec2 pos, size, uv_min, uv_max;
@@ -43,7 +45,7 @@ void main()
 	if (opaque_batch || kind == 4u || kind == 5u) {
 		vec2 pixel = prim.pos + prim.size * corner;
 		gl_Position = vec4(pixel * pc.inv_viewport - 1.0, 0.0, 1.0);
-		uint turns = prim.prim_type >> 8;
+		uint turns = (prim.prim_type >> 8) & 3u;
 		if (turns == 1u)
 			corner = vec2(corner.y, 1.0 - corner.x);
 		else if (turns == 2u)
@@ -51,6 +53,9 @@ void main()
 		else if (turns == 3u)
 			corner = vec2(1.0 - corner.y, corner.x);
 		uv = mix(prim.uv_min, prim.uv_max, corner);
+		if (kind == 6u)
+			uv_bounds = vec4(prim.uv_min, prim.uv_max);
+		kind = prim.prim_type & (255u | UI_VIDEO_BICUBIC);
 		return;
 	}
 	vec2 half_size = prim.size * 0.5;

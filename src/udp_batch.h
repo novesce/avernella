@@ -26,7 +26,7 @@ enum line_udp_mode {
 #define LINE_UDP_TX_SIZE 1536
 
 struct line_udp_stats {
-	guint64 syscalls, datagrams;
+	guint64 syscalls, datagrams, dropped;
 };
 
 struct line_udp_rx;
@@ -40,6 +40,9 @@ enum line_udp_mode line_udp_default_mode(void);
 
 struct line_udp_rx *line_udp_rx_new(int fd, enum line_udp_mode mode);
 void line_udp_rx_free(struct line_udp_rx *r);
+/* The slot belongs to the receiver until its next receive or free. */
+ssize_t line_udp_rx_borrow(struct line_udp_rx *r, const guint8 **data,
+			   struct sockaddr_storage *from, socklen_t *from_len);
 /*
  * Copies the next datagram into data, at most size bytes, and its source
  * into from. Returns the datagram length, or -1 with errno set (EAGAIN
@@ -70,11 +73,15 @@ void line_udp_tx_free(struct line_udp_tx *t);
  */
 gboolean line_udp_tx_queue(struct line_udp_tx *t, const void *to,
 			   socklen_t to_len, const guint8 *data, gsize size);
-/* Sends everything queued, in order. FALSE if any datagram failed. */
+/* Flushes the burst in order. Local backpressure drops unsent RTP packets
+ * and counts them. FALSE denotes a hard socket error.
+ */
 gboolean line_udp_tx_flush(struct line_udp_tx *t);
 gboolean line_udp_tx_pending(const struct line_udp_tx *t);
 enum line_udp_mode line_udp_tx_mode(const struct line_udp_tx *t);
 struct line_udp_stats line_udp_tx_stats(const struct line_udp_tx *t);
+/* Payload bytes actually accepted since the previous sample. */
+guint64 line_udp_tx_take_bytes(struct line_udp_tx *t);
 
 /*
  * DiffServ classes for call media (RFC 4594): Expedited Forwarding for
@@ -90,6 +97,15 @@ struct line_udp_stats line_udp_tx_stats(const struct line_udp_tx *t);
  * LINE_CALL_DSCP=0 leaves packets unmarked. Returns the class in use.
  */
 guint line_udp_tune(int fd, int family);
+/* One feedback interval of accepted bytes in each direction. */
+struct line_udp_window {
+	guint64 sent, received;
+	gint64 sample_at;
+	guint sndbuf, rcvbuf;
+};
+
+void line_udp_update_window(struct line_udp_window *w, int fd, gint64 now,
+			    gint64 min_rtt);
 /*
  * Bytes of datagrams the kernel still holds for this socket: queued in
  * the qdisc, the Wi-Fi stack or the driver and not yet sent (SIOCOUTQ,
@@ -100,6 +116,7 @@ gint64 line_udp_send_queue(int fd);
 /*
  * sendto() with this datagram marked dscp, for voice on a socket whose
  * default class is video. Falls back to an unmarked send if refused.
+ * Returns 0 when a full local queue drops a realtime voice packet.
  */
 ssize_t line_udp_send_class(int fd, int family, const void *to,
 			    socklen_t to_len, const guint8 *data, gsize size,

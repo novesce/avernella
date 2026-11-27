@@ -392,7 +392,9 @@ static void perf_send(gconstpointer data)
 
 static void perf_receive(gconstpointer data)
 {
-	enum line_udp_mode mode = GPOINTER_TO_INT(data);
+	int variant = GPOINTER_TO_INT(data);
+	gboolean borrow = variant == LINE_UDP_GSO;
+	enum line_udp_mode mode = borrow ? LINE_UDP_MMSG : variant;
 	enum {
 		BURST = 48,
 		ROUNDS = 400
@@ -417,17 +419,26 @@ static void perf_receive(gconstpointer data)
 		struct sockaddr_storage from;
 		socklen_t len;
 
-		for (int i = 0; i < BURST; i++)
-			g_assert_cmpint(line_udp_rx_next(r, sink, sizeof(sink),
-							 &from, &len),
-					==, sizeof(packet));
+		for (int i = 0; i < BURST; i++) {
+			const guint8 *p = sink;
+			ssize_t n =
+				borrow ?
+					line_udp_rx_borrow(r, &p, &from, &len) :
+					line_udp_rx_next(r, sink, sizeof(sink),
+							 &from, &len);
+
+			g_assert_cmpint(n, ==, sizeof(packet));
+			g_assert_cmphex(p[n - 1], ==, packet[n - 1]);
+		}
 		spent += cpu_seconds() - start;
 	}
 	gdouble us = spent * 1e6 / (BURST * ROUNDS);
 
-	g_test_minimized_result(
-		us, "receive %s: %.2f us CPU a datagram",
-		mode == LINE_UDP_PLAIN ? "recvfrom" : "recvmmsg", us);
+	g_test_minimized_result(us, "receive %s: %.2f us CPU a datagram",
+				borrow		       ? "borrow slot" :
+				mode == LINE_UDP_PLAIN ? "recvmsg" :
+							 "copy slot",
+				us);
 	line_udp_rx_free(r);
 	close(rx);
 	close(tx);
@@ -485,6 +496,147 @@ static void receive_timestamps(gconstpointer data)
 	close(tx);
 }
 
+static void borrowed_datagrams(gconstpointer data)
+{
+	enum line_udp_mode mode = GPOINTER_TO_INT(data);
+	struct sockaddr_in rx_addr, tx_addr;
+	struct sockaddr_storage from;
+	socklen_t len;
+	int rx = bound_socket(&rx_addr), tx = bound_socket(&tx_addr);
+	struct line_udp_rx *r = line_udp_rx_new(rx, mode);
+	const guint8 *packet;
+
+	queue_datagrams(tx, &rx_addr);
+	for (guint i = 0; i < RX_COUNT; i++) {
+		ssize_t n = line_udp_rx_borrow(r, &packet, &from, &len);
+
+		g_assert_cmpint(n, ==, 100 + 20 * i);
+		g_assert_true(check(packet, n, i));
+		g_assert_cmpmem(&from, len, &tx_addr, sizeof(tx_addr));
+	}
+	g_assert_cmpint(line_udp_rx_borrow(r, &packet, &from, &len), ==, -1);
+	g_assert_null(packet);
+	g_assert_cmpint(line_udp_rx_arrival(r), ==, 0);
+	line_udp_rx_free(r);
+	close(rx);
+	close(tx);
+}
+
+/* A full local datagram queue is recoverable. Linux accepts a prefix of
+ * the batch here, independent of the host network, then returns EAGAIN.
+ */
+static void full_queue(gconstpointer data)
+{
+	int fd[2], size = 4096;
+	struct sockaddr_storage to = { 0 };
+	guint8 packet[1024] = { 0 };
+	enum line_udp_mode mode = GPOINTER_TO_INT(data);
+	guint i;
+
+	g_assert_cmpint(socketpair(AF_UNIX, SOCK_DGRAM | SOCK_NONBLOCK, 0, fd),
+			==, 0);
+	g_assert_cmpint(setsockopt(fd[0], SOL_SOCKET, SO_SNDBUF, &size,
+				   sizeof(size)),
+			==, 0);
+	struct line_udp_tx *t = line_udp_tx_new(fd[0], mode);
+
+	for (i = 0; i < LINE_UDP_TX_BATCH; i++)
+		g_assert_true(
+			line_udp_tx_queue(t, &to, 0, packet, sizeof(packet)));
+	g_assert_true(line_udp_tx_flush(t));
+	struct line_udp_stats stats = line_udp_tx_stats(t);
+
+	g_assert_cmpuint(stats.datagrams, >, 0);
+	g_assert_cmpuint(stats.dropped, >, 0);
+	g_assert_cmpuint(stats.datagrams + stats.dropped, ==,
+			 LINE_UDP_TX_BATCH);
+	g_assert_cmpuint(line_udp_tx_take_bytes(t), ==,
+			 stats.datagrams * sizeof(packet));
+	g_assert_cmpuint(line_udp_tx_take_bytes(t), ==, 0);
+	g_assert_cmpint(line_udp_send_class(fd[0], AF_UNIX, &to, 0, packet,
+					    sizeof(packet), 0),
+			==, 0);
+	for (i = 0; i < stats.datagrams; i++)
+		g_assert_cmpint(recv(fd[1], packet, sizeof(packet), 0), ==,
+				sizeof(packet));
+	g_assert_true(line_udp_tx_queue(t, &to, 0, packet, sizeof(packet)));
+	g_assert_true(line_udp_tx_flush(t));
+	g_assert_cmpint(recv(fd[1], packet, sizeof(packet), 0), ==,
+			sizeof(packet));
+	g_assert_cmpint(line_udp_send_class(fd[0], AF_UNIX, &to, 0, packet,
+					    sizeof(packet), 0),
+			==, sizeof(packet));
+	close(fd[0]);
+	g_assert_true(line_udp_tx_queue(t, &to, 0, packet, sizeof(packet)));
+	g_assert_false(line_udp_tx_flush(t));
+	g_assert_cmpint(line_udp_send_class(fd[0], AF_UNIX, &to, 0, packet,
+					    sizeof(packet), 0),
+			==, -1);
+	line_udp_tx_free(t);
+	close(fd[1]);
+}
+
+static void whole_datagrams(gconstpointer data)
+{
+	enum line_udp_mode mode = GPOINTER_TO_INT(data);
+	guint8 bytes[LINE_UDP_RX_SIZE + 1] = { 0xff };
+	struct sockaddr_in rx_addr, tx_addr;
+	int rx = bound_socket(&rx_addr), tx = bound_socket(&tx_addr);
+	struct line_udp_rx *r = line_udp_rx_new(rx, mode);
+	struct sockaddr_storage from;
+	socklen_t len;
+	const guint8 *pkt;
+	const gsize sizes[] = { LINE_UDP_RX_SIZE, sizeof(bytes), 1 };
+
+	for (guint i = 0; i < G_N_ELEMENTS(sizes); i++)
+		g_assert_cmpint(sendto(tx, bytes, sizes[i], 0, (void *)&rx_addr,
+				       sizeof(rx_addr)),
+				==, (ssize_t)sizes[i]);
+	g_assert_cmpint(line_udp_rx_borrow(r, &pkt, &from, &len), ==,
+			LINE_UDP_RX_SIZE);
+	g_assert_cmpmem(pkt, LINE_UDP_RX_SIZE, bytes, LINE_UDP_RX_SIZE);
+	g_assert_cmpint(line_udp_rx_borrow(r, &pkt, &from, &len), ==, -1);
+	g_assert_cmpint(errno, ==, EMSGSIZE);
+	g_assert_null(pkt);
+	g_assert_cmpint(line_udp_rx_arrival(r), ==, 0);
+	g_assert_cmpint(line_udp_rx_borrow(r, &pkt, &from, &len), ==, 1);
+	g_assert_cmpuint(*pkt, ==, 0xff);
+	g_assert_cmpuint(line_udp_rx_stats(r).dropped, ==, 1);
+	line_udp_rx_free(r);
+	close(tx);
+	close(rx);
+}
+
+static void measured_buffers(void)
+{
+	struct sockaddr_in addr;
+	int fd = bound_socket(&addr);
+	struct line_udp_window w = { 0 };
+	const guint burst = LINE_UDP_TX_BATCH * LINE_UDP_TX_SIZE;
+
+	line_udp_update_window(&w, fd, 1000000, 0);
+	w.sent = 2000000;
+	w.received = 200000;
+	line_udp_update_window(&w, fd, 2000000, 0);
+	g_assert_cmpuint(w.sndbuf, ==, 0);
+	g_assert_cmpuint(w.rcvbuf, ==, 0);
+	w.sent = 2000000;
+	w.received = 200000;
+	line_udp_update_window(&w, fd, 2500000, 100000);
+	g_assert_cmpuint(w.sent, ==, 2000000);
+	line_udp_update_window(&w, fd, 3000000, 100000);
+	g_assert_cmpuint(w.sndbuf, ==, 3 * burst);
+	g_assert_cmpuint(w.rcvbuf, ==, burst);
+	w.sent = G_MAXUINT64;
+	line_udp_update_window(&w, fd, 4000000, G_MAXINT64);
+	g_assert_cmpuint(w.sndbuf, ==, 1u << 20);
+	g_assert_cmpuint(w.rcvbuf, ==, burst);
+	w.sent = 2 * burst + 1;
+	line_udp_update_window(&w, fd, 5000000, 500000);
+	g_assert_cmpuint(w.sndbuf, ==, 2 * burst);
+	close(fd);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -509,6 +661,23 @@ int main(int argc, char **argv)
 			     receive_timestamps);
 	g_test_add_func("/udp-batch/sandbox-fallback", sandbox_fallback);
 	g_test_add_func("/udp-batch/default-mode", default_mode);
+	g_test_add_data_func("/udp-batch/borrow/plain",
+			     GINT_TO_POINTER(LINE_UDP_PLAIN),
+			     borrowed_datagrams);
+	g_test_add_data_func("/udp-batch/borrow/batch",
+			     GINT_TO_POINTER(LINE_UDP_MMSG),
+			     borrowed_datagrams);
+	g_test_add_data_func("/udp-batch/perf/receive/borrow",
+			     GINT_TO_POINTER(LINE_UDP_GSO), perf_receive);
+	g_test_add_func("/udp-batch/measured-buffers", measured_buffers);
+	g_test_add_data_func("/udp-batch/whole/plain",
+			     GINT_TO_POINTER(LINE_UDP_PLAIN), whole_datagrams);
+	g_test_add_data_func("/udp-batch/whole/batch",
+			     GINT_TO_POINTER(LINE_UDP_MMSG), whole_datagrams);
+	g_test_add_data_func("/udp-batch/full-queue/plain",
+			     GINT_TO_POINTER(LINE_UDP_PLAIN), full_queue);
+	g_test_add_data_func("/udp-batch/full-queue/batch",
+			     GINT_TO_POINTER(LINE_UDP_MMSG), full_queue);
 	g_test_add_func("/udp-batch/traffic-class", traffic_class);
 	for (int mode = LINE_UDP_PLAIN; mode <= LINE_UDP_GSO; mode++) {
 		g_autofree char *send = g_strdup_printf(
