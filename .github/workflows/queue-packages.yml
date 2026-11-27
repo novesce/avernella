@@ -45,4 +45,12 @@ jobs:
 
           git init --quiet "$scratch/repo"
           git -C "$scratch/repo" fetch --quiet --depth=1 "$repo" refs/heads/main
-          git -C "$scratch/repo" push "$repo" "FETCH_HEAD:$ref"
+          # GitHub applies skip directives in the tag target's commit message.
+          # Use the packaging tree unchanged with our own queue message.
+          trigger=$(git -C "$scratch/repo" -c user.name=avernella-ci \
+            -c user.email=41898282+github-actions[bot]@users.noreply.github.com \
+            commit-tree 'FETCH_HEAD^{tree}' -p FETCH_HEAD -m "Build Avernella $GITHUB_SHA")
+          if ! git -C "$scratch/repo" push "$repo" "$trigger:$ref"; then
+            # Two delivery attempts for this immutable SHA can race.
+            git ls-remote --exit-code "$repo" "$ref" >/dev/null
+          fi

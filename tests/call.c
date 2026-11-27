@@ -33,7 +33,7 @@ static gint playback_frames;
 static gint audio_devices;
 static guint microphone_channels;
 static gboolean bad_route, video_fixture, voice_fallback, migrate_media;
-static gboolean start_with_camera_off;
+static gboolean start_with_camera_off, layered_video_fixture;
 static gboolean share_fixture, group_fixture, camera_unavailable;
 static gboolean peer_share_fixture;
 static guint fixture_camera_width = 160;
@@ -1389,11 +1389,19 @@ struct video_peer {
 	const struct sockaddr_in *client;
 	guint expected_width;
 	gboolean got_frame;
+	guint8 drop_once_pt;
+	gboolean dropped;
 };
 
 static gboolean send_peer_video(const guint8 *packet, gsize size, gpointer data)
 {
-	const struct video_peer *endpoint = data;
+	struct video_peer *endpoint = data;
+
+	if (endpoint->drop_once_pt && !endpoint->dropped && size >= 12 &&
+	    (packet[1] & 127) == endpoint->drop_once_pt) {
+		endpoint->dropped = TRUE;
+		return TRUE;
+	}
 
 	return sendto(endpoint->fd, packet, size, 0,
 		      (const void *)endpoint->client,
@@ -1962,6 +1970,19 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	 */
 	g_atomic_int_set(&peer_video_ready, TRUE);
 	struct video_peer endpoint = { .fd = fd, .client = &r->remote };
+
+	if (layered_video_fixture) {
+		const struct call_video_options *o = &r->info.video_options;
+
+		g_assert_cmpuint(o->flags, ==, CALL_VIDEO_FEATURES);
+		g_assert_true(call_video_set_fec(
+			video, o->repair_pt,
+			incoming ? o->caller_repair : o->callee_repair,
+			incoming ? o->callee_repair : o->caller_repair, tx,
+			rx));
+		call_video_set_temporal_layers(video, 2);
+		endpoint.drop_once_pt = pt;
+	}
 	g_autofree guint8 *y = g_malloc(WIDTH * HEIGHT);
 	g_autofree guint8 *u = g_malloc(CHROMA * CHROMA_ROWS);
 	g_autofree guint8 *v = g_malloc(CHROMA * CHROMA_ROWS);
@@ -1978,6 +1999,7 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	g_assert_true(call_video_encode(video, &frame, g_get_monotonic_time(),
 					send_peer_video, &endpoint, &error));
 	g_assert_no_error(error);
+	g_assert_cmpint(endpoint.dropped, ==, layered_video_fixture);
 	struct line_preview_frame info = { 0 };
 
 	g_autoptr(GBytes) picture = NULL;
@@ -2021,7 +2043,9 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 	gint64 deadline = g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
 	gint64 next_feedback = 0;
 
-	while (!endpoint.got_frame) {
+	gboolean saw_repair = FALSE;
+
+	while (!endpoint.got_frame || (layered_video_fixture && !saw_repair)) {
 		guint8 message[2048];
 		gint64 now = g_get_monotonic_time();
 
@@ -2037,11 +2061,16 @@ static void video_exchange(int fd, const struct fake_relay *r, EVP_PKEY *key,
 			continue;
 		ssize_t n = recv(fd, message, sizeof(message), 0);
 
-		if (n >= 12 && (message[0] >> 6) == 2 &&
-		    (message[1] & 127) == pt)
+		if (n >= 12 && call_video_is_fec(video, message, n))
+			saw_repair |= call_video_receive(
+				video, message, n, peer_display, &endpoint);
+		else if (n >= 12 && (message[0] >> 6) == 2 &&
+			 (message[1] & 127) == pt)
 			call_video_receive(video, message, n, peer_display,
 					   &endpoint);
 	}
+	if (layered_video_fixture)
+		g_assert_true(saw_repair);
 	if (!endpoint.got_frame) {
 		g_test_message("Authenticated camera packets: %u",
 			       call_video_authenticated_packets(video));
@@ -2828,6 +2857,8 @@ static void outgoing(void)
 	r.info.audio_payload = 110;
 	/* A payload type outside the dynamic range makes video unusable. */
 	r.info.video_payload = voice_fallback ? 90 : 109;
+	if (layered_video_fixture)
+		r.info.video_options = call_video_options_read(offer, NULL);
 	call_answer_offer(&remote_offer, &r.info);
 	pb_msg(&response, 1, &remote_offer);
 	pb_uint(&response, 2, 777);
@@ -3181,6 +3212,8 @@ static void incoming(gconstpointer mode)
 	r.info.video = video_fixture;
 	r.info.audio_payload = 110;
 	r.info.video_payload = 109;
+	if (layered_video_fixture)
+		call_video_propose(&r.info);
 	call_offer(&offer, &r.info);
 	pb_msg(&verified, 6, &offer);
 	pb_uint(&verified, 1, 0);
@@ -3222,6 +3255,13 @@ static void incoming(gconstpointer mode)
 			g_assert_true(started);
 		}
 		Slice local_offer = pb_data(pb_data(pb_data(cc, 2), 5), 1);
+
+		if (layered_video_fixture) {
+			struct call_video_options agreed =
+				call_video_options_read(local_offer,
+							&r.info.video_options);
+			g_assert_cmpuint(agreed.flags, ==, CALL_VIDEO_FEATURES);
+		}
 		Slice keys = pb_data(pb_data(local_offer, 2), 3);
 		guint8 tx[30], rx[30];
 
@@ -3259,6 +3299,57 @@ static void video_incoming(void)
 	}
 	g_test_trap_subprocess(NULL, 8000000, 0);
 	g_test_trap_assert_passed();
+}
+
+static void layered_call(gconstpointer is_incoming)
+{
+	if (g_test_subprocess()) {
+		g_unsetenv("LINE_EXPERIMENTAL_VIDEO");
+		layered_video_fixture = video_fixture = TRUE;
+		if (is_incoming)
+			incoming(GINT_TO_POINTER(FALSE));
+		else
+			outgoing();
+		return;
+	}
+	g_test_trap_subprocess(NULL, 8000000, 0);
+	g_test_trap_assert_passed();
+}
+
+static void video_options(void)
+{
+	CallInfo caller = { .video = TRUE }, callee = { .video = TRUE };
+	Pb offer = { 0 }, answer = { 0 };
+	struct call_video_options o;
+
+	call_video_propose(&caller);
+	call_offer(&offer, &caller);
+	callee.video_options = call_video_options_read(PB_SLICE(offer), NULL);
+	g_assert_cmpuint(callee.video_options.flags, ==, CALL_VIDEO_FEATURES);
+	o = call_video_options_read(PB_SLICE(offer), &caller.video_options);
+	g_assert_cmpuint(o.flags, ==, 0); /* A reflected offer is no answer. */
+
+	callee.video_options.flags = CALL_VIDEO_TEMPORAL;
+	call_answer_offer(&answer, &callee);
+	o = call_video_options_read(PB_SLICE(answer), &caller.video_options);
+	g_assert_cmpuint(o.flags, ==, CALL_VIDEO_TEMPORAL);
+	caller.video_options.caller_repair ^= 2;
+	o = call_video_options_read(PB_SLICE(answer), &caller.video_options);
+	g_assert_cmpuint(o.flags, ==, 0);
+
+	caller.audio_payload = caller.video_options.repair_pt;
+	offer = (Pb){ 0 };
+	call_offer(&offer, &caller);
+	o = call_video_options_read(PB_SLICE(offer), NULL);
+	g_assert_cmpuint(o.flags, ==, CALL_VIDEO_TEMPORAL);
+	pb_bytes(&offer, 1001, pb_data(PB_SLICE(offer), 1001));
+	o = call_video_options_read(PB_SLICE(offer), NULL);
+	g_assert_cmpuint(o.flags, ==, 0);
+	caller.video_options.flags = 0;
+	offer = (Pb){ 0 };
+	call_offer(&offer, &caller);
+	o = call_video_options_read(PB_SLICE(offer), NULL);
+	g_assert_cmpuint(o.flags, ==, 0);
 }
 
 /* ---- PDTP: the data channel that carries screen shares ---- */
@@ -3564,6 +3655,11 @@ int main(int argc, char **argv)
 			     GUINT_TO_POINTER(2), group_call);
 	g_test_add_func("/call/authenticated-media-migration", media_migration);
 	g_test_add_func("/call/video-outgoing", video_outgoing);
+	g_test_add_func("/call/video-options", video_options);
+	g_test_add_data_func("/call/video-options/outgoing", NULL,
+			     layered_call);
+	g_test_add_data_func("/call/video-options/incoming", GINT_TO_POINTER(1),
+			     layered_call);
 	g_test_add_func("/call/voice-then-video", voice_then_video);
 	g_test_add_func("/call/share-from-tablet", share_on_tablet);
 	g_test_add_func("/call/share-to-tablet/video", share_on_tablet);

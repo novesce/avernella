@@ -583,6 +583,13 @@ static void pb_seeds(void)
 	call_answer_offer(&pb, &info);
 	message("pb", "answer-offer", 1, 0, &pb);
 	pb.n = 0;
+	call_video_propose(&info);
+	call_offer(&pb, &info);
+	message("pb", "video-options-offer", 1, 0, &pb);
+	pb.n = 0;
+	call_answer_offer(&pb, &info);
+	message("pb", "video-options-answer", 1, 0, &pb);
+	pb.n = 0;
 	call_setup(&pb, &info);
 	message("pb", "walk-setup", 0, 9, &pb);
 	pb.n = 0;

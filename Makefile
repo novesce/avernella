@@ -76,7 +76,7 @@ CFLAGS += $(FORTIFY) $(STACK_CLASH) $(HARDEN)
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
 SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
-SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_pdtp screencast screencast_dma live_sync net_route tune http_tune
+SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_fec call_pdtp screencast screencast_dma live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
 SOURCES += security/ipc security/sandbox security/vault
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
@@ -132,7 +132,7 @@ TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-p
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
 TESTS += build/test-udp-batch build/test-sandbox build/test-security-sandbox build/test-gpu-health
-TESTS += build/test-call-net
+TESTS += build/test-call-net build/test-call-fec
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
@@ -264,15 +264,17 @@ build/test-media: tests/media.c build/media.o build/media_crypto.o build/media_i
 build/test-call: LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_QueueAudio,--wrap=SDL_DequeueAudio
 build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o build/udp_batch.o
 build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
+build/test-call-fec: tests/call_fec.c build/call_fec.o build/call_srtp.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/security/sandbox.o build/security/ipc.o build/udp_batch.o
 build/test-security-sandbox: tests/test_sandbox.c build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/thrift.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_dma.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
+build/test-call build/test-call-video: build/call_fec.o
 # Bad-network harness: a virtual clock and simulated audio devices.
 build/test-call-net: private LDFLAGS += -Wl,--wrap=line_denoise_new,--wrap=g_get_monotonic_time,--wrap=SDL_InitSubSystem,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice,--wrap=SDL_ClearQueuedAudio,--wrap=SDL_QueueAudio,--wrap=SDL_GetQueuedAudioSize,--wrap=SDL_DequeueAudio
-build/test-call-net: tests/call_net.c build/call_video.o build/call_srtp.o build/call_audio.o build/call_denoise.o build/camera_pixels.o build/tune.o
+build/test-call-net: tests/call_net.c build/call_fec.o build/call_video.o build/call_srtp.o build/call_audio.o build/test-call_denoise.o build/camera_pixels.o build/tune.o
 build/test-screencast-portal: private LDFLAGS += -Wl,--wrap=pw_stream_queue_buffer
 build/test-screencast-portal: private CFLAGS += -Wno-pedantic
 build/test-screencast-portal: tests/screencast_portal.c build/screencast.o build/screencast_dma.o build/camera_pixels.o
@@ -322,6 +324,9 @@ build/call_jetson_config.h: | build
 build/call_vp8.o build/call_vp8_encode.o build/test-call_vp8_encode.o: private CPPFLAGS += -Ibuild
 build/call_vp8.o build/call_vp8_encode.o: build/call_hwdecode_config.h
 build/call_vp8_encode.o: build/call_jetson_config.h
+# Keep the real denoiser behind the test wrapper even under GCC LTO.
+build/test-call_denoise.o: src/call_denoise.c Makefile | build
+	$(CC) $(CPPFLAGS) $(CFLAGS) -fno-lto -MMD -MP -c $< -o $@
 # Keep linker wrappers at the encoder boundary visible in the video tests.
 build/test-call_vp8_encode.o: src/call_vp8_encode.c Makefile build/call_hwdecode_config.h build/call_jetson_config.h | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -fno-lto -MMD -MP -c $< -o $@
@@ -547,7 +552,7 @@ $(FUZZ_DIR)/call_jetson_config.h: | $(FUZZ_DIR)/obj
 $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_encode.o: $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h
 
 $(FUZZ_DIR)/fuzz-pdtp: $(FUZZ_DIR)/obj/fuzz-pdtp.o $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o
-$(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/fuzz-video.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/call_srtp.o
+$(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/fuzz-video.o $(FUZZ_DIR)/obj/call_fec.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/call_srtp.o
 $(FUZZ_DIR)/fuzz-video: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o $(FUZZ_DIR)/obj/tune.o
 $(FUZZ_DIR)/fuzz-pb: $(FUZZ_DIR)/obj/fuzz-pb.o $(FUZZ_DIR)/obj/call_wire.o $(FUZZ_DIR)/obj/call_schema.o
 $(FUZZ_DIR)/fuzz-group: $(FUZZ_DIR)/obj/fuzz-group.o $(FUZZ_DIR)/obj/call_group.o $(FUZZ_DIR)/obj/call_schema.o $(FUZZ_DIR)/obj/call_wire.o
@@ -557,7 +562,7 @@ $(FUZZ_BINARIES): $(FUZZ_ENGINE)
 
 # Seed inputs rebuilt from the synthetic fixtures in tests/.
 $(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/fuzz-seeds.o $(FUZZ_DIR)/obj/call_group.o $(FUZZ_DIR)/obj/call_schema.o $(FUZZ_DIR)/obj/call_wire.o
-$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/thrift.o
+$(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_fec.o $(FUZZ_DIR)/obj/call_pdtp.o $(FUZZ_DIR)/obj/call_srtp.o $(FUZZ_DIR)/obj/call_video.o $(FUZZ_DIR)/obj/thrift.o
 $(FUZZ_DIR)/fuzz-seeds: $(FUZZ_DIR)/obj/call_vp8.o $(FUZZ_DIR)/obj/call_vp8_device.o $(FUZZ_DIR)/obj/call_vp8_encode.o $(FUZZ_DIR)/obj/tune.o $(FUZZ_DIR)/obj/fuzz-coverage.o
 	$(CC) $(FUZZ_SANITIZE) $(LDFLAGS) -Wl,--as-needed $^ $(LDLIBS) -o $@
 
@@ -589,11 +594,12 @@ fuzz-clean:
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/call_vp8_dma.o build/call_vp8_dma.d build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
+	$(RM) build/test-call_denoise.o build/test-call_denoise.d
 	$(RM) build/test-call_vp8_encode.o build/test-call_vp8_encode.d build/call_vp8_jetson.o build/call_vp8_jetson.d build/call_jetson_config.h
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
 	$(RM) build/test-call-scheduler build/vulkan-smoke build/vulkan-preview build/vulkan-video-bench build/volk.o build/line_ui_spirv.h $(VK_SPIRV)
 	$(RM) -r $(FUZZ_DIR)/obj $(FUZZ_DIR)/seeds
 	$(RM) $(FUZZ_BINARIES) $(FUZZ_DIR)/fuzz-seeds $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h
 
--include build/call_vp8_dma.d $(OBJECTS:.o=.d) build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
+-include build/call_vp8_dma.d $(OBJECTS:.o=.d) build/test-call_denoise.d build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
 -include $(wildcard $(FUZZ_DIR)/obj/*.d)

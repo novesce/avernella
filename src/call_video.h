@@ -19,6 +19,14 @@ typedef void (*call_video_display_fn)(const struct line_camera_frame *frame,
 struct call_video *call_video_open(const guint8 tx[30], const guint8 rx[30],
 				   guint8 pt, guint32 tx_ssrc, guint32 rx_ssrc,
 				   guint kbps, guint fps, GError **error);
+/* A distinct SRTP stream for an explicitly negotiated RFC 8627 profile. */
+gboolean call_video_set_fec(struct call_video *video, guint8 pt,
+			    guint32 tx_repair, guint32 rx_repair,
+			    const guint8 tx_key[30], const guint8 rx_key[30]);
+gboolean call_video_is_fec(const struct call_video *video, const guint8 *packet,
+			   gsize size);
+/* Select the negotiated direct-call RFC 7741 profile before media starts. */
+void call_video_set_temporal_layers(struct call_video *video, guint layers);
 /* In a conference the camera and each subscription have their own stream. */
 struct call_video *call_video_open_tx(const guint8 key[30], guint8 pt,
 				      guint32 ssrc, guint kbps, guint fps,
@@ -102,6 +110,7 @@ guint call_video_retransmit(struct call_video *video, const guint16 *seqs,
 			    gpointer data);
 struct call_video_recovery {
 	guint requests, requested, retransmitted, gave_up, late;
+	guint fec_sent, fec_recovered;
 	guint keyframe_requests, rembs, rate_changes, rescales;
 	guint target_kbps, encoder_kbps, rtt_ms, hold_ms;
 	guint width, height;

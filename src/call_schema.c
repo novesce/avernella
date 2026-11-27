@@ -62,6 +62,130 @@ static void offer_stream(Pb *out, const CallInfo *s, guint index,
 	pb_msg(out, 1, &stream);
 }
 
+/*
+ * Private media-description extension for direct Avernella peers. Keep it
+ * outside LINE's codec/FEC maps. A relay can discard the entire extension.
+ * The role and per-call repair IDs bind an answer to this call's offer.
+ */
+enum {
+	VIDEO_OPTIONS_FIELD = 1001
+};
+static const char video_options_name[] = "org.avernella.video/1";
+
+void call_video_propose(CallInfo *s)
+{
+	guint32 ids[2];
+
+	memcpy(ids, s->media_nonce, sizeof(ids));
+	s->video_options = (struct call_video_options){
+		.flags = CALL_VIDEO_FEATURES,
+		.repair_pt = 120,
+		.caller_repair = GUINT32_FROM_BE(ids[0]) | 0x80000000U,
+		.callee_repair = GUINT32_FROM_BE(ids[1]) | 0x80000000U,
+	};
+	if (s->video_options.caller_repair == s->video_options.callee_repair)
+		s->video_options.callee_repair ^= 1;
+}
+
+static void video_options_write(Pb *out, const struct call_video_options *o,
+				gboolean answer)
+{
+	Pb b = { 0 };
+
+	pb_text(&b, 1, video_options_name);
+	pb_uint(&b, 2, answer ? 2 : 1);
+	pb_uint(&b, 3, o->flags);
+	pb_uint(&b, 4, o->repair_pt);
+	pb_uint(&b, 5, o->caller_repair);
+	pb_uint(&b, 6, o->callee_repair);
+	pb_msg(out, VIDEO_OPTIONS_FIELD, &b);
+}
+
+static gboolean repair_id_used(const struct call_video_options *o, guint64 id)
+{
+	return id == o->caller_repair || id == o->callee_repair;
+}
+
+static gboolean repair_transport_used(Slice stream,
+				      const struct call_video_options *o)
+{
+	Slice path = pb_data(stream, 2), channel = pb_data(stream, 3);
+	const guint fields[] = { 11, 61 };
+
+	if (pb_number(path, 1, 0) == o->repair_pt ||
+	    pb_number(channel, 1, 0) == o->repair_pt)
+		return TRUE;
+	for (guint i = 0; i < G_N_ELEMENTS(fields); i++) {
+		guint k = fields[i];
+
+		if (repair_id_used(o, pb_number(path, k, 0)) ||
+		    repair_id_used(o, pb_number(pb_data(path, k + 1), 2, 0)) ||
+		    repair_id_used(o, pb_number(channel, k, 0)))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+struct call_video_options
+call_video_options_read(Slice description,
+			const struct call_video_options *sent)
+{
+	struct call_video_options off = { 0 };
+	Slice records = description, ext = { 0 };
+	PbField f;
+	guint64 val[7] = { 0 };
+	guint seen = 0;
+
+	while (records.n) {
+		if (!pb_next(&records, &f))
+			return off;
+		if (f.field == VIDEO_OPTIONS_FIELD) {
+			if (ext.p || f.type != 2)
+				return off;
+			ext = f.data;
+		}
+	}
+	while (ext.n) {
+		if (!pb_next(&ext, &f))
+			return off;
+		if (f.field >= G_N_ELEMENTS(val))
+			continue;
+		if (seen & (1U << f.field))
+			return off;
+		seen |= 1U << f.field;
+		if (f.field == 1) {
+			if (f.type != 2 ||
+			    f.data.n != sizeof(video_options_name) - 1 ||
+			    memcmp(f.data.p, video_options_name, f.data.n))
+				return off;
+		} else if (f.type == 0)
+			val[f.field] = f.value;
+		else
+			return off;
+	}
+	if (seen != 0x7e || val[2] != (sent ? 2U : 1U) || !val[3] ||
+	    val[3] > 255 || val[4] < 96 || val[4] >= 127 ||
+	    val[5] < 0x80000000U || val[5] > G_MAXUINT32 ||
+	    val[6] < 0x80000000U || val[6] > G_MAXUINT32 || val[5] == val[6])
+		return off;
+	struct call_video_options o = {
+		.flags = val[3] & CALL_VIDEO_FEATURES,
+		.repair_pt = val[4],
+		.caller_repair = val[5],
+		.callee_repair = val[6],
+	};
+	if (sent && ((val[3] & ~((guint64)sent->flags)) ||
+		     sent->repair_pt != o.repair_pt ||
+		     sent->caller_repair != o.caller_repair ||
+		     sent->callee_repair != o.callee_repair))
+		return off;
+	while (description.n && pb_next(&description, &f))
+		if (f.field == 1 && f.type == 2 &&
+		    repair_transport_used(f.data, &o))
+			o.flags &= ~CALL_VIDEO_FLEXFEC;
+	return o;
+}
+
 static void media_offer(Pb *out, const CallInfo *s, gboolean answer)
 {
 	for (guint i = 0; i < 3; i++)
@@ -78,6 +202,8 @@ static void media_offer(Pb *out, const CallInfo *s, gboolean answer)
 	if (!answer)
 		pb_msg(out, 2, &extra);
 	pair(out, 3, 0, 3);
+	if ((s->video_capable || s->video) && s->video_options.flags)
+		video_options_write(out, &s->video_options, answer);
 }
 
 void call_offer(Pb *out, const CallInfo *s)

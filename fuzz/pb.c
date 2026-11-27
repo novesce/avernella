@@ -54,6 +54,23 @@ static void video_profile(Slice description)
 	guint8 pt = 0;
 	guint32 local = 0, remote = 0;
 
+	CallInfo caller = { .video = TRUE };
+
+	call_video_propose(&caller);
+	struct call_video_options offer =
+		call_video_options_read(description, NULL);
+	struct call_video_options answer =
+		call_video_options_read(description, &caller.video_options);
+
+	g_assert_false(offer.flags && answer.flags);
+	if (offer.flags || answer.flags) {
+		const struct call_video_options *o = offer.flags ? &offer :
+								   &answer;
+		g_assert_cmpuint(o->flags & ~CALL_VIDEO_FEATURES, ==, 0);
+		g_assert_cmpuint(o->repair_pt, >=, 96);
+		g_assert_cmpuint(o->repair_pt, <, 127);
+		g_assert_cmpuint(o->caller_repair, !=, o->callee_repair);
+	}
 	if (call_video_offer_profile(description, &pt, &local, &remote)) {
 		g_assert_cmpuint(pt, >=, 96);
 		g_assert_cmpuint(pt, <=, 127);

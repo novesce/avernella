@@ -49,7 +49,7 @@ struct link_profile {
 	guint spike_every_ms, spike_ms; /* periodic stalls, as Wi-Fi scans */
 	const struct thread_load *load;
 	const struct link_profile *reverse;
-	gboolean hd;
+	gboolean hd, layered_fec;
 	/*
 	 * The bottleneck is this machine's Wi-Fi uplink, so the kernel's
 	 * send queue (SIOCOUTQ) shows it to the sender.
@@ -486,7 +486,7 @@ struct video_result {
 	double fps, decoded_psnr, screen_psnr, kbps, latency_ms;
 	guint latency_p50_ms, latency_p95_ms, latency_p99_ms, local_cuts;
 	gint64 freeze_ms, recovery_ms;
-	guint freezes, firs;
+	guint freezes, firs, repairs, recovered_packets;
 	double loss;
 };
 
@@ -521,6 +521,14 @@ static struct video_result run_video(const struct link_profile *profile)
 	g_assert_no_error(e);
 	run.rx = call_video_open(key_b, key_a, 97, 102, 101, kbps, run.fps, &e);
 	g_assert_no_error(e);
+	if (profile->layered_fec) {
+		g_assert_true(call_video_set_fec(run.tx, 120, 301, 302, key_a,
+						 key_b));
+		g_assert_true(call_video_set_fec(run.rx, 120, 302, 301, key_b,
+						 key_a));
+		call_video_set_temporal_layers(run.tx, 2);
+		call_video_set_temporal_layers(run.rx, 2);
+	}
 	link_init(&run.forward, profile, 7);
 	link_init(&run.back, profile->reverse ? profile->reverse : profile, 11);
 	if (profile->outage_ms)
@@ -631,6 +639,11 @@ static struct video_result run_video(const struct link_profile *profile)
 	call_video_recovery(run.tx, &tx);
 	call_video_recovery(run.rx, &rx);
 	r.local_cuts = tx.local_cuts;
+	r.repairs = tx.fec_sent;
+	r.recovered_packets = rx.fec_recovered;
+	if (profile->layered_fec)
+		g_test_message("FlexFEC sent=%u recovered=%u", r.repairs,
+			       r.recovered_packets);
 	g_test_message(
 		"video %-18s fps=%5.2f freeze-ms=%6" G_GINT64_FORMAT
 		" freezes=%3u psnr-decoded=%5.2f psnr-screen=%5.2f recovery-ms=%5" G_GINT64_FORMAT
@@ -1350,6 +1363,23 @@ static void video_hd_burst(void)
 	g_assert_cmpuint(r.latency_p99_ms, <=, 608);
 }
 
+static void video_layered_burst(gconstpointer data)
+{
+	struct link_profile profile = *(const struct link_profile *)data;
+
+	profile.layered_fec = TRUE;
+	struct video_result r = run_video(&profile);
+
+	g_assert_cmpuint(r.repairs, >, 0);
+	g_assert_cmpuint(r.recovered_packets, >, 0);
+	/* One out of every two input pictures belongs to the base layer. */
+	g_assert_cmpfloat(r.fps, >=, (profile.hd ? 30 : VFPS) / 2.0);
+	g_assert_cmpfloat(r.screen_psnr, >=, 24);
+	g_assert_cmpuint(r.latency_p99_ms, <=, 1000);
+	if (profile.kbps)
+		g_assert_cmpfloat(r.kbps, <=, profile.kbps * 1.05);
+}
+
 static void audio_scenario(gconstpointer data)
 {
 	const struct link_profile *p = data;
@@ -1831,6 +1861,12 @@ int main(int argc, char **argv)
 		g_test_add_data_func(path, audio_profiles[i], audio_scenario);
 	}
 	g_test_add_func("/net/video/asymmetric-burst-25%", video_hd_burst);
+	g_test_add_data_func("/net/video/layered-fec-burst-5%", &lossy,
+			     video_layered_burst);
+	g_test_add_data_func("/net/video/layered-fec-burst-15%", &heavy,
+			     video_layered_burst);
+	g_test_add_data_func("/net/video/layered-fec-burst-25%",
+			     &asymmetric_burst, video_layered_burst);
 	g_test_add_data_func("/net/service/direct", GUINT_TO_POINTER(0),
 			     audio_service);
 	g_test_add_data_func("/net/service/group", GUINT_TO_POINTER(1),

@@ -179,7 +179,7 @@ struct voice_call {
 	Pb big_data_services;
 	char share_session[37];
 	guint64 share_time;
-	guint8 video_pt, data_pt;
+	guint8 video_pt, data_pt, repair_pt;
 	guint32 data_rx, data_tx;
 	guint data_traced;
 	guint32 audio_rx, audio_tx, video_rx, video_tx;
@@ -565,7 +565,8 @@ static gboolean send_video_packet(const guint8 *data, gsize size, gpointer user)
 	gboolean sent =
 		line_udp_tx_queue(c->udp_tx, &to->addr, to->len, data, size);
 
-	if (size < 2 || data[1] & 0x80)
+	if (size < 2 || data[1] & 0x80 ||
+	    (c->repair_pt && (data[1] & 127) == c->repair_pt))
 		sent = line_udp_tx_flush(c->udp_tx) && sent;
 	if (sent && c->stats.next && size >= 12 &&
 	    (data[1] & 127) == c->video_pt) {
@@ -1487,6 +1488,21 @@ static gboolean setup_video(struct voice_call *c, Slice offer, Slice key,
 			    tx, rx))
 		c->video = call_video_open(tx, rx, pt, tx_ssrc, rx_ssrc,
 					   c->send_kbps, c->send_fps, error);
+	if (c->video) {
+		struct call_video_options options =
+			call_video_options_read(offer, &c->info.video_options);
+		guint32 tx_repair = c->incoming ? options.callee_repair :
+						  options.caller_repair;
+		guint32 rx_repair = c->incoming ? options.caller_repair :
+						  options.callee_repair;
+
+		if ((options.flags & CALL_VIDEO_FLEXFEC) &&
+		    call_video_set_fec(c->video, options.repair_pt, tx_repair,
+				       rx_repair, tx, rx))
+			c->repair_pt = options.repair_pt;
+		if (options.flags & CALL_VIDEO_TEMPORAL)
+			call_video_set_temporal_layers(c->video, 2);
+	}
 	configure_video_decoder(c, call_video_decoder(c->video));
 	encode_on_own_thread(c);
 	OPENSSL_cleanse(tx, sizeof(tx));
@@ -2811,9 +2827,12 @@ static gboolean handle(struct voice_call *c, const struct call_endpoint *source,
 			if (c->video_trace.enabled)
 				call_video_describe(offer, "offered");
 			if (call_video_offer_profile(offer, &video_pt,
-						     &video_ssrc, &remote_ssrc))
+						     &video_ssrc,
+						     &remote_ssrc)) {
 				c->info.video_payload = video_pt;
-			else if (c->info.video)
+				c->info.video_options =
+					call_video_options_read(offer, NULL);
+			} else if (c->info.video)
 				video_unavailable(c);
 			else
 				c->info.video_capable = FALSE;
@@ -3569,8 +3588,11 @@ static gboolean run_call(struct voice_call *c, GError **e)
 						n);
 				continue;
 			}
+			gboolean repair = c->repair_pt &&
+					  call_video_is_fec(c->video, data, n);
+
 			if (c->video_trace.enabled && c->info.video_capable &&
-			    (data[1] & 127) != c->video_pt &&
+			    !repair && (data[1] & 127) != c->video_pt &&
 			    GUINT32_FROM_BE(ssrc) != c->audio_rx &&
 			    c->data_traced++ < 600)
 				g_printerr(
@@ -3582,9 +3604,10 @@ static gboolean run_call(struct voice_call *c, GError **e)
 			guint32 video_ssrc = group_video ?
 						     group_video->peer.ssrc :
 						     c->video_rx;
-			gboolean video = receiver &&
-					 (data[1] & 127) == c->video_pt &&
-					 GUINT32_FROM_BE(ssrc) == video_ssrc;
+			gboolean video =
+				repair ||
+				(receiver && (data[1] & 127) == c->video_pt &&
+				 GUINT32_FROM_BE(ssrc) == video_ssrc);
 			if (c->video_trace.enabled && c->video &&
 			    (data[1] & 127) == c->video_pt) {
 				c->video_trace.packets += video;
@@ -3624,7 +3647,7 @@ static gboolean run_call(struct voice_call *c, GError **e)
 						group_packet_received(
 							c, data,
 							g_get_monotonic_time());
-				} else
+				} else if (!repair)
 					media_received(c,
 						       video ? &c->video_route :
 							       &c->audio_route,
@@ -4081,6 +4104,8 @@ static gboolean setup_relay(struct voice_call *c, const char *host,
 		return TRUE;
 	}
 	s->local_channel = ids[2];
+	if (!c->incoming && s->video_capable)
+		call_video_propose(s);
 	if (c->incoming || s->video_capable) {
 		s->local_media = ids[4];
 		if (s->local_media == s->local_channel)

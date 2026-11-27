@@ -2,6 +2,17 @@
 #pragma once
 #include "call_wire.h"
 
+enum {
+	CALL_VIDEO_FLEXFEC = 1,
+	CALL_VIDEO_TEMPORAL = 2,
+	CALL_VIDEO_FEATURES = CALL_VIDEO_FLEXFEC | CALL_VIDEO_TEMPORAL
+};
+
+struct call_video_options {
+	guint32 caller_repair, callee_repair;
+	guint8 flags, repair_pt;
+};
+
 typedef struct {
 	char *local, *target, *token, *i_zone, *r_zone, *stid, *cid;
 	guint64 local_channel, local_media, remote_channel, remote_media, nonce,
@@ -11,8 +22,13 @@ typedef struct {
 		device[32];
 	guint8 audio_payload, video_payload, data_payload;
 	gboolean have_session, video, video_capable;
+	struct call_video_options video_options;
 } CallInfo;
 
+void call_video_propose(CallInfo *s);
+struct call_video_options
+call_video_options_read(Slice description,
+			const struct call_video_options *sent);
 void call_offer(Pb *out, const CallInfo *s);
 void call_answer_offer(Pb *out, const CallInfo *s);
 void call_verify(Pb *out, const CallInfo *s);

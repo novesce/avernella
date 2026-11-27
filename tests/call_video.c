@@ -238,12 +238,53 @@ static void encode(struct loop *loop, gint64 time_us)
 	g_assert_no_error(e);
 }
 
+/* Waits for the encoder thread and sends what it finished. */
+static void collect_encoded(struct loop *loop)
+{
+	struct pollfd fd = { .fd = call_video_encoder_fd(loop->tx),
+			     .events = POLLIN };
+
+	g_assert_cmpint(fd.fd, >=, 0);
+	g_assert_cmpint(poll(&fd, 1, 10000), ==, 1);
+	g_assert_true(call_video_encoded(loop->tx, g_get_monotonic_time(),
+					 collect, loop));
+}
+
 static gboolean deliver(struct loop *loop, guint i)
 {
 	gsize size;
 	const guint8 *packet = g_bytes_get_data(loop->packets->pdata[i], &size);
 
 	return call_video_receive(loop->rx, packet, size, display, loop);
+}
+
+/* Exercise the production SRTP, repair, reorder and VP8 decoder together. */
+static void flexfec_picture(gconstpointer data)
+{
+	struct loop loop = { 0 };
+	struct call_video_recovery tx, rx;
+	guint skip = GPOINTER_TO_UINT(data);
+
+	prepare(&loop);
+	g_assert_false(call_video_set_fec(loop.tx, 97, 103, 104, key_a, key_b));
+	g_assert_true(call_video_set_fec(loop.tx, 110, 103, 104, key_a, key_b));
+	g_assert_true(call_video_set_fec(loop.rx, 110, 104, 103, key_b, key_a));
+	encode(&loop, G_USEC_PER_SEC);
+	g_assert_cmpuint(loop.packets->len, >, skip + 1);
+	for (guint i = 0; i < loop.packets->len; i++) {
+		if (i != skip)
+			deliver(&loop, i);
+	}
+	call_video_recovery(loop.tx, &tx);
+	call_video_recovery(loop.rx, &rx);
+	g_assert_cmpuint(tx.fec_sent, >, 0);
+	g_assert_cmpuint(rx.fec_recovered, ==, 1);
+	g_assert_cmpuint(rx.requested, ==, 0);
+	g_assert_cmpuint(loop.count, ==, 1);
+	g_assert_false(call_video_needs_keyframe(loop.rx));
+	g_assert_true(deliver(&loop, skip));
+	g_assert_cmpuint(loop.count, ==, 1);
+	done(&loop);
 }
 
 static void decoder_recovery(void)
@@ -808,6 +849,225 @@ static void evs3_temporal_recovery(void)
 	for (guint j = 0; j < G_N_ELEMENTS(dec); j++)
 		vpx_codec_destroy(&dec[j]);
 	vpx_codec_destroy(&enc);
+}
+
+struct temporal_view {
+	guint count;
+	guint8 image[W * H * 3 / 2];
+};
+
+static void temporal_display(const struct line_camera_frame *frame,
+			     gpointer data)
+{
+	struct temporal_view *view = data;
+
+	g_assert_cmpuint(frame->width, ==, W);
+	g_assert_cmpuint(frame->height, ==, H);
+	line_camera_pack_i420(view->image, frame);
+	view->count++;
+}
+
+/* Compare the actual decoded samples of both subscriptions while dropping
+ * whole and partial enhancement pictures from the base-only receiver.
+ */
+static void temporal_layers(gconstpointer mode)
+{
+	struct temporal_view full = { 0 }, base = { 0 };
+	struct loop loop = { 0 };
+	struct call_video *filtered;
+	srtp_t observer;
+	gboolean screen = GPOINTER_TO_INT(mode);
+	gint64 now = g_get_monotonic_time();
+	guint16 first_id = 0;
+	guint8 first_tl0 = 0;
+
+	prepare(&loop);
+	filtered = call_video_open_rx(key_a, 97, 101, NULL);
+	g_assert_nonnull(filtered);
+	call_video_set_temporal_layers(loop.tx, 2);
+	call_video_set_temporal_layers(loop.rx, 2);
+	call_video_set_temporal_layers(filtered, 2);
+	if (screen) {
+		call_video_screen(loop.tx, 1200, 10);
+		g_assert_true(call_video_encode_async(loop.tx));
+	}
+	g_assert_true(call_srtp_open(&observer, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < 8; i++) {
+		gboolean high = (i & 1) && i != 7;
+
+		if (i == 7)
+			call_video_keyframe(loop.tx);
+		/* Local motion over a stable background keeps scene cuts out. */
+		for (guint j = 0; j < W * H / 4; j++)
+			loop.pixels[j] = 24 + (loop.pixels[j] + 9) % 190;
+		encode(&loop, now);
+		if (screen)
+			collect_encoded(&loop);
+		g_assert_cmpuint(loop.packets->len, >,
+				 i == 3 || i == 5 ? 1 : 0);
+		for (guint j = 0; j < loop.packets->len; j++) {
+			guint8 plain[1200];
+			gsize size;
+			const guint8 *wire =
+				g_bytes_get_data(loop.packets->pdata[j], &size);
+			int n = size;
+
+			memcpy(plain, wire, n);
+			g_assert_cmpint(srtp_unprotect(observer, plain, &n), ==,
+					srtp_err_status_ok);
+			g_assert_cmpint(n, >, 18);
+			g_assert_cmphex(plain[12], ==,
+					0x80 | (!j ? 0x10 : 0) |
+						(high ? 0x20 : 0));
+			g_assert_cmphex(plain[13], ==, 0xe0);
+			g_assert_true(plain[14] & 0x80);
+			guint16 id = ((plain[14] & 0x7f) << 8) | plain[15];
+
+			if (!i && !j) {
+				first_id = id;
+				first_tl0 = plain[16];
+			}
+			g_assert_cmpuint(id, ==, (first_id + i) & 0x7fff);
+			g_assert_cmpuint(
+				plain[16], ==,
+				(guint8)(first_tl0 + i / 2 + (i == 7)));
+			g_assert_cmphex(plain[17], ==, high ? 0x60 : 0);
+			if (!j)
+				g_assert_cmpint(!(plain[18] & 1), ==,
+						!i || i == 7);
+			g_assert_true(
+				call_video_receive_at(loop.rx, wire, size, now,
+						      temporal_display, &full));
+			/* i=1: no fragments. i=3: only start. i=5: only end. */
+			if (high && !(loop.packets->len > 1 &&
+				      ((i == 3 && !j) ||
+				       (i == 5 && j + 1 == loop.packets->len))))
+				continue;
+			g_assert_true(
+				call_video_receive_at(filtered, wire, size, now,
+						      temporal_display, &base));
+		}
+		g_assert_cmpuint(full.count, ==, i + 1);
+		g_assert_cmpuint(base.count, ==, 1 + i / 2 + (i == 7));
+		if (!high)
+			g_assert_cmpmem(base.image, sizeof(base.image),
+					full.image, sizeof(full.image));
+		g_assert_false(call_video_needs_keyframe(filtered));
+		now += 100000;
+	}
+	srtp_dealloc(observer);
+	call_video_close(filtered);
+	done(&loop);
+}
+
+static void temporal_lost_base(void)
+{
+	struct temporal_view view = { 0 };
+	struct loop loop = { 0 };
+	gint64 now = g_get_monotonic_time();
+
+	prepare(&loop);
+	call_video_set_temporal_layers(loop.tx, 2);
+	call_video_set_temporal_layers(loop.rx, 2);
+	for (guint i = 0; i < 6; i++, now += 100000) {
+		if (i == 5)
+			call_video_keyframe(loop.tx);
+		encode(&loop, now);
+		g_assert_cmpuint(loop.packets->len, >, 0);
+		if (i == 2)
+			continue;
+		for (guint j = 0; j < loop.packets->len; j++) {
+			gsize n;
+			const guint8 *p =
+				g_bytes_get_data(loop.packets->pdata[j], &n);
+
+			g_assert_true(call_video_receive_at(
+				loop.rx, p, n, now, temporal_display, &view));
+		}
+		call_video_poll(loop.rx, loop.rx, now + 90000, FALSE, collect,
+				&loop, temporal_display, &view);
+		g_assert_cmpuint(view.count, ==, i == 5 ? 3 : MIN(i + 1, 2u));
+		g_assert_cmpint(call_video_needs_keyframe(loop.rx), ==,
+				i == 3 || i == 4);
+	}
+	done(&loop);
+}
+
+/* If the answer lost its optional capability, one endpoint sends EVS3
+ * and the other RFC 7741. Both decoders must handle the incoming stream.
+ */
+static void temporal_asymmetric(gconstpointer mode)
+{
+	struct loop loop = { 0 };
+
+	prepare(&loop);
+	call_video_set_temporal_layers(
+		GPOINTER_TO_INT(mode) ? loop.tx : loop.rx, 2);
+	for (guint i = 0; i < 4; i++) {
+		encode(&loop, 1000000 + i * 100000);
+		g_assert_cmpuint(loop.packets->len, >, 0);
+		for (guint j = 0; j < loop.packets->len; j++)
+			g_assert_true(deliver(&loop, j));
+		g_assert_cmpuint(loop.count, ==, i + 1);
+		g_assert_false(call_video_needs_keyframe(loop.rx));
+	}
+	done(&loop);
+}
+
+/* A relay can forward a subset using consecutive RTP sequence numbers.
+ * Continuity comes from the base index and picture ID, including wrap.
+ */
+static void temporal_wrap(void)
+{
+	static const struct {
+		guint16 picture;
+		guint8 tl0, tk;
+		gboolean key, valid, needs_key;
+		guint frames;
+	} cases[] = {
+		{ 32766, 255, 0, TRUE, TRUE, FALSE, 1 },
+		{ 0, 0, 0, FALSE, TRUE, FALSE, 2 },
+		/* Two base indices advanced; this delta has lost its reference. */
+		{ 2, 2, 0, FALSE, TRUE, TRUE, 2 },
+		{ 3, 3, 0, TRUE, TRUE, FALSE, 3 },
+		/* No layer sync on purported independent TID 1. */
+		{ 4, 3, 0x40, FALSE, FALSE, FALSE, 3 },
+		{ 5, 4, 0, FALSE, TRUE, FALSE, 4 },
+	};
+	struct loop loop = { 0 };
+	struct source_view view = { 0 };
+	srtp_t sender;
+
+	prepare(&loop);
+	view.rx = loop.rx;
+	call_video_set_temporal_layers(loop.rx, 2);
+	g_assert_true(call_srtp_open(&sender, key_a, ssrc_specific, 101));
+	for (guint i = 0; i < G_N_ELEMENTS(cases); i++) {
+		gboolean key = cases[i].key;
+		const guint8 *picture = key ? gray_key : gray_delta;
+		gsize len = key ? sizeof(gray_key) : sizeof(gray_delta);
+		guint8 buf[128] = { 0x80, 0x80 | 97, [11] = 101, 0x90, 0xe0 };
+		int n = 18 + len;
+
+		buf[3] = buf[7] = i;
+		buf[14] = 0x80 | (cases[i].picture >> 8);
+		buf[15] = cases[i].picture;
+		buf[16] = cases[i].tl0;
+		buf[17] = cases[i].tk;
+		if (cases[i].tk)
+			buf[12] |= 0x20;
+		memcpy(buf + 18, picture, len);
+		g_assert_cmpint(srtp_protect(sender, buf, &n), ==,
+				srtp_err_status_ok);
+		g_assert_cmpint(call_video_receive(loop.rx, buf, n,
+						   source_display, &view),
+				==, cases[i].valid);
+		g_assert_cmpuint(view.frames, ==, cases[i].frames);
+		g_assert_cmpint(call_video_needs_keyframe(loop.rx), ==,
+				cases[i].needs_key);
+	}
+	srtp_dealloc(sender);
+	done(&loop);
 }
 
 static void wait_decode(struct call_vp8_decoder *d)
@@ -3042,18 +3302,6 @@ static void encode_720p(void)
 	call_video_close(video);
 }
 
-/* Waits for the encoder thread and sends what it finished. */
-static void collect_encoded(struct loop *loop)
-{
-	struct pollfd fd = { .fd = call_video_encoder_fd(loop->tx),
-			     .events = POLLIN };
-
-	g_assert_cmpint(fd.fd, >=, 0);
-	g_assert_cmpint(poll(&fd, 1, 10000), ==, 1);
-	g_assert_true(call_video_encoded(loop->tx, g_get_monotonic_time(),
-					 collect, loop));
-}
-
 /*
  * On its own thread the encoder hands the picture back through an
  * eventfd: nothing is sent during call_video_encode(), the result decodes
@@ -3446,9 +3694,21 @@ int main(int argc, char **argv)
 	g_test_add_func("/video/encoder-thread/blocking",
 			encoder_thread_blocking);
 	g_test_add_func("/video/evs3-vp8-srtp-reordering", roundtrip);
+	g_test_add_data_func("/video/flexfec/first", NULL, flexfec_picture);
+	g_test_add_data_func("/video/flexfec/interior", GUINT_TO_POINTER(2),
+			     flexfec_picture);
 	g_test_add_func("/video/conference-independent-stream-directions",
 			conference_directions);
 	g_test_add_func("/video/evs3-picture-metadata", evs3_picture_metadata);
+	g_test_add_data_func("/video/temporal/camera", NULL, temporal_layers);
+	g_test_add_data_func("/video/temporal/rtp-screen", GINT_TO_POINTER(1),
+			     temporal_layers);
+	g_test_add_func("/video/temporal/lost-base", temporal_lost_base);
+	g_test_add_func("/video/temporal/index-wrap", temporal_wrap);
+	g_test_add_data_func("/video/temporal/legacy-send", NULL,
+			     temporal_asymmetric);
+	g_test_add_data_func("/video/temporal/legacy-receive",
+			     GINT_TO_POINTER(1), temporal_asymmetric);
 	g_test_add_func("/video/evs3-temporal-recovery",
 			evs3_temporal_recovery);
 	g_test_add_func("/video/async-decode/bounded", bounded_decode);
