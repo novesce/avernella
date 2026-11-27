@@ -396,6 +396,23 @@ static void peer_read_counts(void)
 	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740992")),
 			==, 2);
 	g_assert_null(field(counts, "9007199254740993"));
+
+	/* OpenChat peer read ranges use p... SquareMember MIDs. */
+	static const char sq_chat[] = "m00000000000000000000000000000001";
+	static const char sq_me[] = "p00000000000000000000000000000001";
+	static const char sq_peer[] = "p00000000000000000000000000000002";
+	g_autoptr(J) sq_raw = json_tokener_parse(
+		"{\"100\":{\"1\":\"p00000000000000000000000000000001\"},"
+		"\"105\":{\"1\":\"p00000000000000000000000000000001\"}}");
+	g_autoptr(J) sq_ranges = json_tokener_parse(
+		"{\"p00000000000000000000000000000001\":{\"1\":0,\"2\":200},"
+		"\"p00000000000000000000000000000002\":{\"1\":0,\"2\":102}}");
+
+	g_clear_pointer(&counts, json_object_put);
+	counts = line_peer_read_counts(sq_me, sq_chat, sq_raw, sq_ranges, NULL);
+	(void)sq_peer;
+	g_assert_cmpint(json_object_get_int(field(counts, "100")), ==, 1);
+	g_assert_cmpint(json_object_get_int(field(counts, "105")), ==, 0);
 }
 
 static void encrypted_send(void)

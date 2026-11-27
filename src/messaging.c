@@ -428,6 +428,9 @@ J *line_peer_ranges(Line *s, const char *chat, GError **error)
 
 static gboolean peer_reader(const char *self, const char *chat, const char *mid)
 {
+	if (chat[0] == 'm')
+		return mid && strlen(mid) == 33 && mid[0] == 'p' &&
+		       strcmp(mid, self);
 	return talk_id(mid) && mid[0] == 'u' && strcmp(mid, self) &&
 	       (chat[0] != 'u' || !strcmp(mid, chat));
 }

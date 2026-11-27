@@ -38,6 +38,16 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 		       char **next_token_out, gboolean *more_out,
 		       GError **error);
 
+/*
+ * Fetches OpenChat read-receipt watermarks (SQ_EVT_MARK_AS_READ) by draining
+ * fetchSquareChatEvents forward from sync_token (or from the initial snapshot
+ * cursor when sync_token is NULL). Returns a map keyed by peer SquareMember
+ * MID ("p...") to {"1": 0, "2": maxReadMsgId}, matching line_peer_ranges().
+ */
+J *line_square_peer_ranges(Line *s, const char *chat, const char *my_member_id,
+			   const char *sync_token, char **next_sync_out,
+			   GError **error);
+
 /* Sending and message actions on SquareService. */
 J *line_square_send_text(Line *s, const char *chat, const char *my_member_id,
 			 const char *text, const char *reply_to, J *emojis,

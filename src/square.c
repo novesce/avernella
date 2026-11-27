@@ -1071,6 +1071,11 @@ static J *format_square_message(Line *s, J *sq_msg, const char *sender_name,
 			      "OpenChat");
 	put_str(row, "text", text ? text : content_label(type));
 	put_bool(row, "own", own && !notice);
+	J *read_count = field(msg, "23");
+
+	if (own && !notice && json_object_is_type(read_count, json_type_int) &&
+	    json_object_get_int(read_count) >= 0)
+		put(row, "readCount", json_object_get(read_count));
 	put_bool(row, "square", TRUE);
 	put_num(row, "time", json_object_get_int64(field(msg, "5")));
 	if (raw_msg_out)
@@ -1314,6 +1319,10 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 			    g_strcmp0(strfield(row, "type"), "chat_event")) {
 				put_bool(row, "own", TRUE);
 				put_str(row, "from", "You");
+				if (raw_msg && my_member_id &&
+				    line_square_id(my_member_id, 'p') &&
+				    !nonempty(raw_msg, "1"))
+					put_str(raw_msg, "1", my_member_id);
 			}
 		} else if (etype == SQ_EVT_JOIN_CHAT) {
 			J *m = field(field(payload, "3"), "2");
@@ -1366,10 +1375,10 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 	}
 	resolve_square_senders(s, square_mid, rows);
 	json_object_array_sort(rows, message_order);
-	const char *next = nonempty(reply, "3");
+	const char *next = nonempty(reply, "4");
 
 	if (!next)
-		next = nonempty(reply, "4");
+		next = nonempty(reply, "3");
 	if (next_token_out)
 		*next_token_out = next ? g_strdup(next) : NULL;
 	if (more_out)
@@ -1377,6 +1386,135 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 	if (raw_out)
 		*raw_out = g_steal_pointer(&raw);
 	return g_steal_pointer(&rows);
+}
+
+static void note_square_read(J *ranges, const char *my_member_id,
+			     const char *reader, const char *mid)
+{
+	guint64 id;
+
+	if (!line_square_id(reader, 'p') || !g_strcmp0(reader, my_member_id) ||
+	    !decimal_id(mid) ||
+	    !g_ascii_string_to_unsigned(mid, 10, 1, G_MAXINT64, &id, NULL))
+		return;
+	J *existing = field(ranges, reader);
+
+	if (existing &&
+	    json_object_get_int64(field(existing, "2")) >= (gint64)id)
+		return;
+	J *entry = obj();
+
+	put_num(entry, "1", 0);
+	put_num(entry, "2", (gint64)id);
+	put(ranges, reader, entry);
+}
+
+J *line_square_peer_ranges(Line *s, const char *chat, const char *my_member_id,
+			   const char *sync_token, char **next_sync_out,
+			   GError **error)
+{
+	if (!line_square_id(chat, 'm'))
+		return problem(error, "Choose an OpenChat conversation.");
+	g_autoptr(J) ranges = obj();
+	g_autofree char *cursor =
+		sync_token && *sync_token ? g_strdup(sync_token) : NULL;
+
+	/*
+	 * An empty syncToken fetch returns the latest messages and a forward
+	 * syncToken positioned right before the room's SQ_EVT_MARK_AS_READ
+	 * watermark snapshot. Subsequent forward fetches drain those read
+	 * watermarks and advance the cursor to the live tip.
+	 */
+	if (!cursor) {
+		g_autoptr(J) req = obj();
+
+		put_num(req, "1:i64", 0);
+		put_str(req, "2:str", chat);
+		put_str(req, "3:str", "");
+		put_num(req, "4:i32", 1);
+		put_num(req, "5:i32", 1); /* FetchDirection.FORWARD */
+		put_num(req, "6:i32", 1); /* BooleanState.OFF */
+		put_num(req, "8:i32", 1); /* FetchType.DEFAULT */
+		g_autoptr(J) reply =
+			square_rpc(s, "fetchSquareChatEvents", req, error);
+		if (!reply)
+			return NULL;
+		J *events = field(reply, "2");
+
+		for (size_t i = 0; i < length(events); i++) {
+			J *ev = at(events, i);
+			int etype = json_object_get_int(field(ev, "3"));
+			J *payload = field(ev, "4");
+
+			if (etype == SQ_EVT_RECEIVE_MESSAGE) {
+				J *msg = field(field(field(payload, "1"), "2"),
+					       "1");
+
+				note_square_read(ranges, my_member_id,
+						 nonempty(msg, "1"),
+						 nonempty(msg, "4"));
+			}
+		}
+		const char *tok = nonempty(reply, "3");
+
+		if (tok)
+			cursor = g_strdup(tok);
+	}
+	for (guint page = 0; cursor && page < 20; page++) {
+		g_autoptr(J) req = obj();
+
+		put_num(req, "1:i64", 0);
+		put_str(req, "2:str", chat);
+		put_str(req, "3:str", cursor);
+		put_num(req, "4:i32", SQUARE_PAGE_LIMIT);
+		put_num(req, "5:i32", 1); /* FetchDirection.FORWARD */
+		put_num(req, "6:i32", 1); /* BooleanState.OFF */
+		put_num(req, "8:i32", 1); /* FetchType.DEFAULT */
+		g_autoptr(J) reply =
+			square_rpc(s, "fetchSquareChatEvents", req, error);
+		if (!reply) {
+			if (page > 0 && json_object_object_length(ranges)) {
+				g_clear_error(error);
+				break;
+			}
+			return NULL;
+		}
+		J *events = field(reply, "2");
+
+		for (size_t i = 0; i < length(events); i++) {
+			J *ev = at(events, i);
+			int etype = json_object_get_int(field(ev, "3"));
+			J *payload = field(ev, "4");
+
+			if (etype == SQ_EVT_MARK_AS_READ) {
+				J *p = field(payload, "7");
+
+				note_square_read(ranges, my_member_id,
+						 nonempty(p, "2"),
+						 nonempty(p, "4"));
+			} else if (etype == SQ_EVT_RECEIVE_MESSAGE) {
+				J *msg = field(field(field(payload, "1"), "2"),
+					       "1");
+
+				note_square_read(ranges, my_member_id,
+						 nonempty(msg, "1"),
+						 nonempty(msg, "4"));
+			}
+		}
+		const char *next = nonempty(reply, "3");
+		gboolean more = length(events) > 0 && next &&
+				strcmp(next, cursor);
+
+		if (next) {
+			g_free(cursor);
+			cursor = g_strdup(next);
+		}
+		if (!more)
+			break;
+	}
+	if (next_sync_out)
+		*next_sync_out = g_steal_pointer(&cursor);
+	return g_steal_pointer(&ranges);
 }
 
 static J *build_emoji_replace(const char *text, J *emojis)

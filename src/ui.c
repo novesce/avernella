@@ -1228,9 +1228,15 @@ void ui_conversation_presented(gboolean covered)
 			     latest, ui_chat_visible()))
 		return;
 	size_t count = json_object_array_length(ui.history);
-	Json *last = count ? json_object_array_get_idx(ui.history, count - 1) :
-			     NULL;
-	const char *id = ui_string(last, "id", NULL);
+	const char *id = NULL;
+
+	for (size_t i = count; i-- > 0;) {
+		id = ui_string(json_object_array_get_idx(ui.history, i), "id",
+			       NULL);
+		if (id && *id)
+			break;
+		id = NULL;
+	}
 
 	if (!id || g_strcmp0(id, ui_string(summary, "lastId", NULL)))
 		return;

@@ -44,7 +44,8 @@ int line_ui(int argc, char **argv);
 
 struct image_job {
 	char *path, *product, *emoji;
-	char *read_chat, *access, *next_access;
+	char *read_chat, *read_self, *read_sync, *read_next_sync;
+	char *access, *next_access;
 	J *ranges;
 	gint64 request_id;
 	GBytes *bytes;
@@ -81,7 +82,7 @@ struct line_worker {
 	J *squares, *square_members, *square_authorities,
 		*square_chat_to_square, *square_chats_raw;
 	GHashTable *square_history_tokens;
-	char *square_find_token, *square_sync_token;
+	char *square_find_token, *square_sync_token, *square_read_sync;
 	gint64 square_sub_id, square_poll_due;
 	gboolean square_disabled;
 	/* Pending group invite link preview. */
@@ -231,6 +232,7 @@ static void clear_view(struct line_worker *w)
 		g_hash_table_remove_all(w->square_history_tokens);
 	g_clear_pointer(&w->square_find_token, g_free);
 	g_clear_pointer(&w->square_sync_token, g_free);
+	g_clear_pointer(&w->square_read_sync, g_free);
 	w->square_sub_id = 0;
 	w->square_poll_due = 0;
 	w->square_disabled = FALSE;
@@ -1420,14 +1422,15 @@ static void show_history(struct line_worker *w, const char *chat, J *raw)
 	json_object_put(w->messages);
 	w->messages = json_object_get(raw);
 	w->latest_history = TRUE;
-	w->publish_reads = !line_is_square_chat(chat);
+	w->publish_reads = TRUE;
 	if (g_strcmp0(w->history_chat, chat)) {
 		g_free(w->history_chat);
 		w->history_chat = g_strdup(chat);
 		g_clear_pointer(&w->peer_ranges, json_object_put);
 		g_clear_pointer(&w->peer_notices, json_object_put);
+		g_clear_pointer(&w->square_read_sync, g_free);
 		w->peer_notices = obj();
-		w->need_ranges = !line_is_square_chat(chat);
+		w->need_ranges = TRUE;
 		w->ranges_retry_at = 0;
 	}
 }
@@ -2778,6 +2781,9 @@ static void image_free(gpointer data)
 	g_clear_pointer(&job->bytes, g_bytes_unref);
 	g_clear_pointer(&job->ranges, json_object_put);
 	g_free(job->read_chat);
+	g_free(job->read_self);
+	g_free(job->read_sync);
+	g_free(job->read_next_sync);
 	line_secret_free(job->access);
 	line_secret_free(job->next_access);
 	g_clear_error(&job->error);
@@ -2800,8 +2806,16 @@ static gpointer fetch_images(gpointer data)
 		if (job->read_chat) {
 			Line session = { .access = g_strdup(job->access) };
 
-			job->ranges = line_peer_ranges(&session, job->read_chat,
-						       &job->error);
+			job->ranges = line_is_square_chat(job->read_chat) ?
+					      line_square_peer_ranges(
+						      &session, job->read_chat,
+						      job->read_self,
+						      job->read_sync,
+						      &job->read_next_sync,
+						      &job->error) :
+					      line_peer_ranges(&session,
+							       job->read_chat,
+							       &job->error);
 			if (session.token_changed)
 				job->next_access =
 					g_steal_pointer(&session.access);
@@ -2846,11 +2860,13 @@ static void update_peer_reads(struct line_worker *w)
 	w->publish_reads = FALSE;
 	Line *s = &w->session;
 	const char *chat = w->history_chat;
+	gboolean square = line_is_square_chat(chat);
+	const char *self_id = square ? my_square_member_id(w, chat) : s->mid;
 
-	if (!chat || !s->mid || !strcmp(chat, s->mid) || !w->messages)
+	if (!chat || !self_id || !strcmp(chat, self_id) || !w->messages)
 		return;
 	g_autoptr(J) counts = line_peer_read_counts(
-		s->mid, chat, w->messages, w->peer_ranges, w->peer_notices);
+		self_id, chat, w->messages, w->peer_ranges, w->peer_notices);
 	if (json_object_object_length(counts)) {
 		g_autoptr(J) event = obj();
 		json_object_object_add(event, "event",
@@ -2866,7 +2882,7 @@ static void update_peer_reads(struct line_worker *w)
 	    (w->ranges_retry_at && g_get_monotonic_time() < w->ranges_retry_at))
 		return;
 	json_object_object_foreach(w->messages, id, msg) {
-		if (g_strcmp0(strfield(msg, "1"), s->mid) ||
+		if (g_strcmp0(strfield(msg, "1"), self_id) ||
 		    json_object_get_int(field(counts, id)) > 0)
 			continue;
 		w->need_ranges = FALSE;
@@ -2875,6 +2891,10 @@ static void update_peer_reads(struct line_worker *w)
 		struct image_job *job = g_new0(struct image_job, 1);
 
 		job->read_chat = g_strdup(chat);
+		if (square) {
+			job->read_self = g_strdup(self_id);
+			job->read_sync = g_strdup(w->square_read_sync);
+		}
 		job->access = g_strdup(s->access);
 		job->generation = w->generation;
 		w->ranges_pending = TRUE;
@@ -2979,9 +2999,37 @@ static void finish_peer_ranges(struct line_worker *w, struct image_job *job)
 		}
 		if (!g_strcmp0(job->read_chat, w->history_chat)) {
 			if (job->ranges) {
-				g_clear_pointer(&w->peer_ranges,
-						json_object_put);
-				w->peer_ranges = g_steal_pointer(&job->ranges);
+				if (job->read_next_sync) {
+					g_free(w->square_read_sync);
+					w->square_read_sync = g_steal_pointer(
+						&job->read_next_sync);
+				}
+				if (job->read_sync && w->peer_ranges) {
+					json_object_object_foreach(
+						job->ranges, reader, entry) {
+						J *prev = field(w->peer_ranges,
+								reader);
+						gint64 cur =
+							json_object_get_int64(
+								field(entry,
+								      "2"));
+
+						if (!prev ||
+						    cur > json_object_get_int64(
+								  field(prev,
+									"2")))
+							json_object_object_add(
+								w->peer_ranges,
+								reader,
+								json_object_get(
+									entry));
+					}
+				} else {
+					g_clear_pointer(&w->peer_ranges,
+							json_object_put);
+					w->peer_ranges =
+						g_steal_pointer(&job->ranges);
+				}
 				w->ranges_retry_at = 0;
 				w->publish_reads = TRUE;
 			} else {
@@ -3323,6 +3371,9 @@ static gint64 maintain_square_sync(struct line_worker *w)
 		const char *chat = strfield(ev, "chat");
 
 		if (!g_strcmp0(kind, "message") && chat) {
+			const char *mid = strfield(ev, "id");
+			gboolean mine =
+				json_object_get_boolean(field(ev, "mine"));
 			struct cached_history *cached =
 				g_hash_table_lookup(w->history_cache, chat);
 
@@ -3331,6 +3382,25 @@ static gint64 maintain_square_sync(struct line_worker *w)
 			if (!g_strcmp0(chat, w->history_chat)) {
 				g_free(open_chat);
 				open_chat = g_strdup(chat);
+			} else {
+				g_hash_table_remove(w->history_cache, chat);
+			}
+			if (mid && *mid) {
+				J *previous = field(w->unread_heads, chat);
+				J *summary =
+					g_hash_table_lookup(w->chats, chat);
+				gint64 known =
+					MAX(json_object_get_int64(previous),
+					    json_object_get_int64(
+						    field(summary, "lastId")));
+				gint64 incoming =
+					g_ascii_strtoll(mid, NULL, 10);
+
+				if (w->unread_heads && (!mine || previous) &&
+				    incoming > known)
+					json_object_object_add(
+						w->unread_heads, chat,
+						json_object_new_string(mid));
 			}
 			g_autoptr(J) pkt = obj();
 
@@ -3339,17 +3409,14 @@ static gint64 maintain_square_sync(struct line_worker *w)
 				json_object_new_string("chat_message"));
 			json_object_object_add(pkt, "chat",
 					       json_object_new_string(chat));
-			if (strfield(ev, "id"))
+			if (mid)
 				json_object_object_add(
-					pkt, "id",
-					json_object_new_string(
-						strfield(ev, "id")));
+					pkt, "id", json_object_new_string(mid));
 			json_object_object_add(
 				pkt, "time",
 				json_object_get(field(ev, "time")));
-			json_object_object_add(
-				pkt, "mine",
-				json_object_get(field(ev, "mine")));
+			json_object_object_add(pkt, "mine",
+					       json_object_new_boolean(mine));
 			line_emit(pkt);
 		} else {
 			reload = TRUE;
@@ -3359,6 +3426,11 @@ static gint64 maintain_square_sync(struct line_worker *w)
 		line_event("changed", NULL, NULL);
 	else if (open_chat)
 		revalidate_history(w, open_chat);
+	if (w->history_chat && line_is_square_chat(w->history_chat) &&
+	    !w->ranges_pending) {
+		w->need_ranges = TRUE;
+		w->publish_reads = TRUE;
+	}
 	if (w->session.token_changed)
 		save_rotated_token(w);
 	w->square_poll_due = g_get_monotonic_time() +

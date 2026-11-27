@@ -274,15 +274,37 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	}
 	if (!strcmp(method, "fetchSquareChatEvents")) {
 		const char *tok = strfield(req, "3:str");
+		int dir = json_object_get_int(field(req, "5:i32"));
+		int limit = json_object_get_int(field(req, "4:i32"));
 
 		g_assert_cmpstr(strfield(req, "2:str"), ==, CHAT_MID);
 		g_assert_nonnull(tok);
 		g_assert_cmpint(json_object_get_int64(field(req, "1:i64")), ==,
 				0);
-		g_assert_cmpint(json_object_get_int(field(req, "5:i32")), ==,
-				*tok ? 2 : 1);
 		g_assert_cmpint(json_object_get_int(field(req, "6:i32")), ==,
 				1);
+		if (dir == 1 && limit == 1 && !*tok)
+			return json_tokener_parse(
+				"{\"2\":[],\"3\":\"read-sync-0\",\"4\":\"read-sync-0\"}");
+		if (dir == 1 && !strcmp(tok, "read-sync-0"))
+			return json_tokener_parse(
+				"{\"2\":[{\"2\":0,\"3\":6,\"4\":{\"7\":{\"1\":\"" CHAT_MID
+				"\",\"2\":\"" ME_MEM
+				"\",\"4\":\"9999\"}}},{\"2\":0,\"3\":6,\"4\":{\"7\":{\"1\":\"" CHAT_MID
+				"\",\"2\":\"" PEER_MEM
+				"\",\"4\":\"1005\"}}}],\"3\":\"read-sync-1\"}");
+		if (dir == 1 && !strcmp(tok, "read-sync-1"))
+			return json_tokener_parse(
+				"{\"2\":[],\"3\":\"read-sync-1\"}");
+		if (dir == 1 && !strcmp(tok, "read-sync-live"))
+			return json_tokener_parse(
+				"{\"2\":[{\"2\":0,\"3\":6,\"4\":{\"7\":{\"1\":\"" CHAT_MID
+				"\",\"2\":\"" PEER_MEM
+				"\",\"4\":\"1010\"}}}],\"3\":\"read-sync-2\"}");
+		if (dir == 1 && !strcmp(tok, "read-sync-2"))
+			return json_tokener_parse(
+				"{\"2\":[],\"3\":\"read-sync-2\"}");
+		g_assert_cmpint(dir, ==, *tok ? 2 : 1);
 		return json_tokener_parse(
 			"{\"2\":[{\"2\":1700000001000,\"3\":0,\"4\":{\"1\":{\"1\":\"" CHAT_MID
 			"\",\"2\":{\"1\":{\"1\":\"" PEER_MEM
@@ -624,7 +646,7 @@ static void test_chats_and_history(void)
 	g_assert_no_error(error);
 	g_assert_nonnull(hist);
 	g_assert_cmpuint(json_object_array_length(hist), ==, 1);
-	g_assert_cmpstr(next_tok, ==, "sync-1");
+	g_assert_cmpstr(next_tok, ==, "next-tok");
 	g_assert_true(more);
 	J *m = json_object_array_get_idx(hist, 0);
 
@@ -980,6 +1002,34 @@ static void test_discover_and_forward(void)
 	g_clear_pointer(&last_method, g_free);
 }
 
+static void test_peer_reads(void)
+{
+	Line s = { .mid = SELF_MID, .pictures = obj() };
+	g_autoptr(GError) error = NULL;
+	g_autofree char *next_sync = NULL;
+	g_autoptr(J) ranges = line_square_peer_ranges(&s, CHAT_MID, ME_MEM,
+						      NULL, &next_sync, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(ranges);
+	g_assert_cmpstr(next_sync, ==, "read-sync-1");
+	g_assert_null(field(ranges, ME_MEM));
+	g_assert_cmpint(
+		json_object_get_int64(field(field(ranges, PEER_MEM), "2")), ==,
+		1005);
+
+	g_autofree char *live_sync = NULL;
+	g_autoptr(J) delta = line_square_peer_ranges(
+		&s, CHAT_MID, ME_MEM, "read-sync-live", &live_sync, &error);
+	g_assert_no_error(error);
+	g_assert_nonnull(delta);
+	g_assert_cmpstr(live_sync, ==, "read-sync-2");
+	g_assert_cmpint(
+		json_object_get_int64(field(field(delta, PEER_MEM), "2")), ==,
+		1010);
+	json_object_put(s.pictures);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -991,5 +1041,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/square/lifecycle-and-sync", test_lifecycle_and_sync);
 	g_test_add_func("/square/discover-and-forward",
 			test_discover_and_forward);
+	g_test_add_func("/square/peer-reads", test_peer_reads);
 	return g_test_run();
 }
