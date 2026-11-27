@@ -1661,6 +1661,55 @@ static void chat_message(Json *packet)
 	json_object_put(rows);
 }
 
+/*
+ * Preserve recently confirmed local sent messages if an immediately following
+ * server history fetch lags behind sendMessage (common on OpenChat).
+ */
+static Json *merge_recent_sent(Json *incoming)
+{
+	if (!ui.history || !json_object_is_type(incoming, json_type_array))
+		return json_object_get(incoming);
+	gint64 cutoff = g_get_real_time() / 1000 - 15000;
+	Json *merged = NULL;
+	size_t old_n = json_object_array_length(ui.history);
+	size_t inc_n = json_object_array_length(incoming);
+
+	for (size_t i = 0; i < old_n; i++) {
+		Json *row = json_object_array_get_idx(ui.history, i);
+
+		if (!json_object_get_boolean(ui_field(row, "localSent")))
+			continue;
+		gint64 t = json_object_get_int64(ui_field(row, "time"));
+		const char *id = ui_string(row, "id", NULL);
+
+		if (!id || !*id || t < cutoff)
+			continue;
+		gboolean found = FALSE;
+
+		for (size_t j = 0; j < inc_n; j++) {
+			if (!g_strcmp0(id, ui_string(json_object_array_get_idx(
+							     incoming, j),
+						     "id", NULL))) {
+				found = TRUE;
+				break;
+			}
+		}
+		if (found)
+			continue;
+		if (!merged) {
+			merged = json_object_new_array();
+			for (size_t j = 0; j < inc_n; j++)
+				json_object_array_add(
+					merged,
+					json_object_get(
+						json_object_array_get_idx(
+							incoming, j)));
+		}
+		json_object_array_add(merged, json_object_get(row));
+	}
+	return merged ? merged : json_object_get(incoming);
+}
+
 /* The worker revalidated the open chat and pushed what changed. */
 static void pushed_history(Json *packet)
 {
@@ -1670,10 +1719,11 @@ static void pushed_history(Json *packet)
 	    !json_object_is_type(rows, json_type_array) || ui.older_page ||
 	    ui.older_pending)
 		return;
-	size_t n = json_object_array_length(rows);
+	g_autoptr(J) merged = merge_recent_sent(rows);
+	size_t n = json_object_array_length(merged);
 
 	if (n && ui.chats) {
-		Json *newest = json_object_array_get_idx(rows, n - 1);
+		Json *newest = json_object_array_get_idx(merged, n - 1);
 		const char *preview = ui_string(newest, "text", NULL);
 		Json *summary = chat_summary(ui.selected);
 
@@ -1684,8 +1734,8 @@ static void pushed_history(Json *packet)
 			ui_forget_rail();
 		}
 	}
-	ui.has_older = n >= 50;
-	set_json(&ui.history, rows);
+	ui.has_older = json_object_array_length(rows) >= 50;
+	set_json(&ui.history, merged);
 	set_string(&ui.notice, "");
 }
 
@@ -2051,7 +2101,15 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 				       json_object_get(mentions_sent));
 	if (reply)
 		json_object_object_add(row, "replyTo", json_object_get(reply));
+	json_object_object_add(row, "localSent", json_object_new_boolean(TRUE));
 	json_object_array_add(ui.history, row);
+	Json *summary = chat_summary(ui.selected);
+
+	if (summary) {
+		json_object_object_add(summary, "preview",
+				       json_object_new_string(text));
+		ui_forget_rail();
+	}
 	ui_forget_history();
 	set_string(&ui.notice, "");
 	ui.dirty = TRUE;
@@ -2129,12 +2187,16 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				error ? error :
 					_("Could not read the conversation."));
 		else {
+			g_autoptr(J) merged = ui.older_page ?
+						      json_object_get(result) :
+						      merge_recent_sent(result);
+
 			wire.rendered_history = id;
 			if (ui.older_page)
 				ui.stick_bottom = TRUE;
 			ui.older_page = FALSE;
 			ui.has_older = json_object_array_length(result) >= 50;
-			set_json(&ui.history, result);
+			set_json(&ui.history, merged);
 			set_string(&ui.notice, "");
 		}
 		if (wire.history_again && !ui.older_page && !ui.logging_out)

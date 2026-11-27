@@ -1417,13 +1417,15 @@ static void note_square_read(J *ranges, const char *my_member_id,
 
 J *line_square_peer_ranges(Line *s, const char *chat, const char *my_member_id,
 			   const char *sync_token, char **next_sync_out,
-			   GError **error)
+			   gboolean *changed_out, GError **error)
 {
+	if (changed_out)
+		*changed_out = FALSE;
 	if (!line_square_id(chat, 'm'))
 		return problem(error, "Choose an OpenChat conversation.");
 	g_autoptr(J) ranges = obj();
-	g_autofree char *cursor =
-		sync_token && *sync_token ? g_strdup(sync_token) : NULL;
+	gboolean incremental = sync_token && *sync_token;
+	g_autofree char *cursor = incremental ? g_strdup(sync_token) : NULL;
 
 	/*
 	 * An empty syncToken fetch returns the latest messages and a forward
@@ -1505,6 +1507,18 @@ J *line_square_peer_ranges(Line *s, const char *chat, const char *my_member_id,
 				note_square_read(ranges, my_member_id,
 						 nonempty(msg, "1"),
 						 nonempty(msg, "4"));
+				if (incremental && changed_out)
+					*changed_out = TRUE;
+			} else if (incremental && changed_out &&
+				   (etype == SQ_EVT_SEND_MESSAGE ||
+				    etype == SQ_EVT_DESTROY_MESSAGE ||
+				    etype == SQ_EVT_MUTATE_MESSAGE ||
+				    etype == SQ_EVT_NOTIF_REACTION ||
+				    etype == SQ_EVT_JOIN_CHAT ||
+				    etype == SQ_EVT_LEAVE_CHAT ||
+				    etype == SQ_EVT_SYSTEM_MESSAGE ||
+				    etype == SQ_EVT_UPDATE_CHAT_NAME)) {
+				*changed_out = TRUE;
 			}
 		}
 		const char *next = nonempty(reply, "3");

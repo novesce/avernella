@@ -264,6 +264,10 @@ static void poll_timeout(void)
 	g_clear_error(&error);
 	g_assert_null(
 		line_call(&s, "/SYNC4", "sync", NULL, "fixture", 50, &error));
+	g_assert_error(error, LINE_ERROR, LINE_TIMEOUT);
+	g_clear_error(&error);
+	g_assert_null(
+		line_call(&s, "/SYNC4", "sync", NULL, "fixture", 0, &error));
 	g_assert_error(error, LINE_ERROR, 1);
 	g_clear_error(&error);
 	g_assert_null(

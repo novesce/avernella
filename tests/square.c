@@ -1014,11 +1014,13 @@ static void test_peer_reads(void)
 	Line s = { .mid = SELF_MID, .pictures = obj() };
 	g_autoptr(GError) error = NULL;
 	g_autofree char *next_sync = NULL;
-	g_autoptr(J) ranges = line_square_peer_ranges(&s, CHAT_MID, ME_MEM,
-						      NULL, &next_sync, &error);
+	gboolean changed = FALSE;
+	g_autoptr(J) ranges = line_square_peer_ranges(
+		&s, CHAT_MID, ME_MEM, NULL, &next_sync, &changed, &error);
 
 	g_assert_no_error(error);
 	g_assert_nonnull(ranges);
+	g_assert_false(changed);
 	g_assert_cmpstr(next_sync, ==, "read-sync-1");
 	g_assert_null(field(ranges, ME_MEM));
 	g_assert_cmpint(
@@ -1026,8 +1028,9 @@ static void test_peer_reads(void)
 		1005);
 
 	g_autofree char *live_sync = NULL;
-	g_autoptr(J) delta = line_square_peer_ranges(
-		&s, CHAT_MID, ME_MEM, "read-sync-live", &live_sync, &error);
+	g_autoptr(J) delta =
+		line_square_peer_ranges(&s, CHAT_MID, ME_MEM, "read-sync-live",
+					&live_sync, &changed, &error);
 	g_assert_no_error(error);
 	g_assert_nonnull(delta);
 	g_assert_cmpstr(live_sync, ==, "read-sync-2");

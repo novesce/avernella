@@ -272,14 +272,15 @@ cleanup:
 	s->http_status = status;
 	if (status < 200 || status >= 300) {
 		/*
-		 * LINE can end an approval poll with 410. Other endpoints
-		 * should keep their HTTP error instead of looking like idle polls.
+		 * LINE ends both approval polls and idle /SYNC4 long polls
+		 * with HTTP 410. Non-polling endpoints keep their HTTP error.
 		 */
-		gboolean approval = protocol == JSON_APPROVAL ||
-				    !strcmp(path, "/acct/lp/lgn/sq/v1");
+		gboolean long_poll = protocol == JSON_APPROVAL ||
+				     !strcmp(path, "/acct/lp/lgn/sq/v1") ||
+				     !strcmp(path, "/SYNC4");
 		gboolean timed_out =
 			status == 408 || status == 504 ||
-			(status == 410 && poll_seconds && approval);
+			(status == 410 && poll_seconds && long_poll);
 		int code = timed_out ? LINE_TIMEOUT : 1;
 
 		if (status == 429 || status == 503)

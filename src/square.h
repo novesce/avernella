@@ -46,7 +46,7 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
  */
 J *line_square_peer_ranges(Line *s, const char *chat, const char *my_member_id,
 			   const char *sync_token, char **next_sync_out,
-			   GError **error);
+			   gboolean *changed_out, GError **error);
 
 /* Sending and message actions on SquareService. */
 J *line_square_send_text(Line *s, const char *chat, const char *my_member_id,

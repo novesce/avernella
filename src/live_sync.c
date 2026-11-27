@@ -91,7 +91,8 @@ static gpointer run(gpointer data)
 					       LONG_POLL_SECONDS, &error);
 		gint64 took = g_get_monotonic_time() - started;
 		gboolean idle_timeout =
-			took >= LONG_POLL_SECONDS * (gint64)G_USEC_PER_SEC &&
+			took >= (LONG_POLL_SECONDS - 5) *
+					(gint64)G_USEC_PER_SEC &&
 			g_error_matches(error, LINE_ERROR, LINE_TIMEOUT);
 		if (session.denied ||
 		    g_error_matches(error, LINE_ERROR, LINE_ACCESS_DENIED)) {
@@ -156,7 +157,13 @@ static gpointer run(gpointer data)
 				news = TRUE;
 			}
 			l->failures = 0;
-		} else if (!idle_timeout) {
+		} else if (idle_timeout) {
+			if (l->failures) {
+				l->recovered_since = l->failed_since;
+				news = TRUE;
+			}
+			l->failures = 0;
+		} else {
 			if (!l->failures)
 				l->failed_since = started + took;
 			l->failures = MIN(l->failures + 1, 6u);

@@ -499,6 +499,40 @@ J *line_peer_read_counts(const char *self, const char *chat, J *messages,
 	if (!self || !chat || !strcmp(self, chat) ||
 	    !json_object_is_type(messages, json_type_object))
 		return counts;
+	/*
+	 * NOTIFIED_READ_MESSAGE carries each reader's high-water mark: reading
+	 * message N also covers earlier messages in the same chat immediately.
+	 */
+	g_autoptr(GHashTable) notice_max = NULL;
+
+	if (json_object_is_type(notices, json_type_object)) {
+		notice_max = g_hash_table_new_full(g_str_hash, g_str_equal,
+						   NULL, g_free);
+		json_object_object_foreach(notices, nkey, readers) {
+			guint64 nid;
+
+			if (!json_object_is_type(readers, json_type_object) ||
+			    !g_ascii_string_to_unsigned(nkey, 10, 1, G_MAXINT64,
+							&nid, NULL))
+				continue;
+			json_object_object_foreach(readers, mid, flag) {
+				(void)flag;
+				if (!peer_reader(self, chat, mid))
+					continue;
+				guint64 *cur =
+					g_hash_table_lookup(notice_max, mid);
+
+				if (!cur) {
+					cur = g_new(guint64, 1);
+					*cur = nid;
+					g_hash_table_insert(notice_max,
+							    (gpointer)mid, cur);
+				} else if (nid > *cur) {
+					*cur = nid;
+				}
+			}
+		}
+	}
 	json_object_object_foreach(messages, key, msg) {
 		guint64 id;
 
@@ -506,12 +540,28 @@ J *line_peer_read_counts(const char *self, const char *chat, J *messages,
 		    !g_ascii_string_to_unsigned(key, 10, 1, G_MAXINT64, &id,
 						NULL))
 			continue;
-		J *seen = field(notices, key);
-		int count = seen ? json_object_object_length(seen) : 0;
+		int count = 0;
 
+		if (notice_max) {
+			GHashTableIter iter;
+			gpointer nmid, nval;
+
+			g_hash_table_iter_init(&iter, notice_max);
+			while (g_hash_table_iter_next(&iter, &nmid, &nval)) {
+				(void)nmid;
+				if (*(guint64 *)nval >= id)
+					count++;
+			}
+		}
 		if (ranges) {
 			json_object_object_foreach(ranges, mid, intervals) {
-				if (!field(seen, mid) &&
+				guint64 *cur =
+					notice_max ?
+						g_hash_table_lookup(notice_max,
+								    mid) :
+						NULL;
+
+				if ((!cur || *cur < id) &&
 				    peer_reader(self, chat, mid) &&
 				    range_covers(intervals, id))
 					count++;

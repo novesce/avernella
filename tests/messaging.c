@@ -396,7 +396,9 @@ static void peer_read_counts(void)
 	counts = line_peer_read_counts(SELF, GROUP, raw, NULL, notices);
 	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740992")),
 			==, 2);
-	g_assert_null(field(counts, "9007199254740993"));
+	/* BOB's later read notice (9007199254740996) covers earlier messages too. */
+	g_assert_cmpint(json_object_get_int(field(counts, "9007199254740993")),
+			==, 1);
 
 	/* OpenChat peer read ranges use p... SquareMember MIDs. */
 	static const char sq_chat[] = "m00000000000000000000000000000001";

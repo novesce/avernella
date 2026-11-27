@@ -45,6 +45,7 @@ int line_ui(int argc, char **argv);
 struct image_job {
 	char *path, *product, *emoji;
 	char *read_chat, *read_self, *read_sync, *read_next_sync;
+	gboolean read_changed;
 	char *access, *next_access;
 	J *ranges;
 	gint64 request_id;
@@ -1209,7 +1210,7 @@ static J *chat_directory(struct line_worker *w, GError **error)
 			if (json_object_object_length(w->squares) &&
 			    !w->square_poll_due)
 				w->square_poll_due = g_get_monotonic_time() +
-						     4 * G_USEC_PER_SEC;
+						     1 * G_USEC_PER_SEC;
 		} else if (g_error_matches(sq_err, LINE_ERROR,
 					   LINE_METHOD_UNAVAILABLE)) {
 			w->square_disabled = TRUE;
@@ -2752,37 +2753,76 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(error, "Choose an attachment.");
 		if (line_is_square_chat(chat)) {
 			const char *my_mid = my_square_member_id(w, chat);
+			J *ack;
 
 			if (unsend)
-				return line_square_unsend(s, chat, id, error);
-			gint32 reserved = reserve_sequence(w, error);
+				ack = line_square_unsend(s, chat, id, error);
+			else {
+				gint32 reserved = reserve_sequence(w, error);
 
-			if (!reserved)
-				return NULL;
-			if (text_send)
-				return line_square_send_text(
-					s, chat, my_mid, text, reply_to,
-					field(params, "emojis"),
-					field(params, "mentions"), reserved,
-					error);
-			if (photo)
-				return line_send_square_attachment(
-					s, chat, my_mid, path, LINE_MEDIA_IMAGE,
-					reserved, error);
-			if (file) {
-				const char *kind = strfield(params, "type");
-				int type = !g_strcmp0(kind, "video") ?
-						   LINE_MEDIA_VIDEO :
-					   !g_strcmp0(kind, "audio") ?
-						   LINE_MEDIA_AUDIO :
-						   LINE_MEDIA_FILE;
+				if (!reserved)
+					return NULL;
+				if (text_send)
+					ack = line_square_send_text(
+						s, chat, my_mid, text, reply_to,
+						field(params, "emojis"),
+						field(params, "mentions"),
+						reserved, error);
+				else if (photo)
+					ack = line_send_square_attachment(
+						s, chat, my_mid, path,
+						LINE_MEDIA_IMAGE, reserved,
+						error);
+				else if (file) {
+					const char *kind =
+						strfield(params, "type");
+					int type = !g_strcmp0(kind, "video") ?
+							   LINE_MEDIA_VIDEO :
+						   !g_strcmp0(kind, "audio") ?
+							   LINE_MEDIA_AUDIO :
+							   LINE_MEDIA_FILE;
 
-				return line_send_square_attachment(
-					s, chat, my_mid, path, type, reserved,
-					error);
+					ack = line_send_square_attachment(
+						s, chat, my_mid, path, type,
+						reserved, error);
+				} else
+					ack = line_square_react(s, chat, id,
+								reaction,
+								reserved,
+								error);
 			}
-			return line_square_react(s, chat, id, reaction,
-						 reserved, error);
+			if (ack) {
+				g_hash_table_remove(w->history_cache, chat);
+				if (!unsend && !react && w->messages &&
+				    !g_strcmp0(chat, w->history_chat)) {
+					const char *sent_id =
+						strfield(ack, "id");
+
+					if (sent_id && *sent_id && my_mid &&
+					    !field(w->messages, sent_id)) {
+						J *stub = obj();
+
+						json_object_object_add(
+							stub, "1",
+							json_object_new_string(
+								my_mid));
+						json_object_object_add(
+							stub, "4",
+							json_object_new_string(
+								sent_id));
+						json_object_object_add(
+							w->messages, sent_id,
+							stub);
+						w->publish_reads = TRUE;
+						w->need_ranges = TRUE;
+					}
+				}
+				if (w->square_poll_due)
+					w->square_poll_due =
+						g_get_monotonic_time() +
+						1 * G_USEC_PER_SEC;
+			}
+			return ack;
 		}
 		gint32 reserved = reserve_sequence(w, error);
 
@@ -2809,6 +2849,29 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			ack = line_message_action(
 				s, id, react ? reaction : NULL, error);
 		s->seq = reserved;
+		if (ack) {
+			g_hash_table_remove(w->history_cache, chat);
+			if (!unsend && !react && w->messages &&
+			    !g_strcmp0(chat, w->history_chat)) {
+				const char *sent_id = strfield(ack, "id");
+
+				if (sent_id && *sent_id && s->mid &&
+				    !field(w->messages, sent_id)) {
+					J *stub = obj();
+
+					json_object_object_add(
+						stub, "1",
+						json_object_new_string(s->mid));
+					json_object_object_add(
+						stub, "4",
+						json_object_new_string(
+							sent_id));
+					json_object_object_add(w->messages,
+							       sent_id, stub);
+					w->publish_reads = TRUE;
+				}
+			}
+		}
 		return ack;
 	}
 	return problem(error, "Unknown request method.");
@@ -2861,6 +2924,7 @@ static gpointer fetch_images(gpointer data)
 						      job->read_self,
 						      job->read_sync,
 						      &job->read_next_sync,
+						      &job->read_changed,
 						      &job->error) :
 					      line_peer_ranges(&session,
 							       job->read_chat,
@@ -2930,26 +2994,35 @@ static void update_peer_reads(struct line_worker *w)
 	    w->image_wake < 0 ||
 	    (w->ranges_retry_at && g_get_monotonic_time() < w->ranges_retry_at))
 		return;
-	json_object_object_foreach(w->messages, id, msg) {
-		if (g_strcmp0(strfield(msg, "1"), self_id) ||
-		    (!square && json_object_get_int(field(counts, id)) > 0))
-			continue;
-		w->need_ranges = FALSE;
-		if (!background_ready(w, NULL))
-			return;
-		struct image_job *job = g_new0(struct image_job, 1);
+	gboolean should_fetch = square;
 
-		job->read_chat = g_strdup(chat);
-		if (square) {
-			job->read_self = g_strdup(self_id);
-			job->read_sync = g_strdup(w->square_read_sync);
+	if (!should_fetch) {
+		json_object_object_foreach(w->messages, id, msg) {
+			if (g_strcmp0(strfield(msg, "1"), self_id) ||
+			    (chat[0] == 'u' &&
+			     json_object_get_int(field(counts, id)) > 0))
+				continue;
+			should_fetch = TRUE;
+			break;
 		}
-		job->access = g_strdup(s->access);
-		job->generation = w->generation;
-		w->ranges_pending = TRUE;
-		g_async_queue_push(w->image_requests, job);
-		return;
 	}
+	if (!should_fetch)
+		return;
+	w->need_ranges = FALSE;
+	if (!background_ready(w, NULL))
+		return;
+	struct image_job *job = g_new0(struct image_job, 1);
+
+	job->read_chat = g_strdup(chat);
+	if (square) {
+		job->read_self = g_strdup(self_id);
+		job->read_sync = g_strdup(w->square_read_sync);
+	}
+	job->access = g_strdup(s->access);
+	job->generation = w->generation;
+	w->ranges_pending = TRUE;
+	/* Jump ahead of avatar/photo downloads so "Read" stays snappy. */
+	g_async_queue_push_front(w->image_requests, job);
 }
 
 static gboolean queue_image(struct line_worker *w, J *request, J *sticker_msg,
@@ -3081,9 +3154,14 @@ static void finish_peer_ranges(struct line_worker *w, struct image_job *job)
 				}
 				w->ranges_retry_at = 0;
 				w->publish_reads = TRUE;
+				if (job->read_changed) {
+					g_hash_table_remove(w->history_cache,
+							    job->read_chat);
+					revalidate_history(w, job->read_chat);
+				}
 			} else {
 				w->ranges_retry_at = g_get_monotonic_time() +
-						     5 * G_USEC_PER_SEC;
+						     2 * G_USEC_PER_SEC;
 				w->need_ranges = TRUE;
 			}
 		}
@@ -3948,6 +4026,9 @@ static int worker(int credentials_fd)
 	for (;;) {
 		int timeout = maintenance_wait(&w);
 
+		/* Dispatch any read-receipt fetches scheduled by maintenance
+		 * before blocking in poll(). */
+		update_peer_reads(&w);
 		fds[3].fd = line_live_sync_fd(w.live);
 		if (poll(fds, G_N_ELEMENTS(fds), timeout) < 0) {
 			if (errno == EINTR)
