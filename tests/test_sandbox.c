@@ -895,6 +895,67 @@ static void test_ui_landlock_fresh_state_dir(void)
 	rmdir(fresh_root);
 }
 
+static int sandboxed_vault_child(int ctrl_fd, uint32_t active, void *userdata)
+{
+	struct avernella_vault vault;
+	int rc;
+
+	(void)active;
+	(void)userdata;
+	if (avernella_vault_init(&vault, -1) < 0)
+		return 1;
+	rc = avernella_vault_run(&vault, ctrl_fd);
+	avernella_vault_destroy(&vault);
+	return rc < 0 ? 1 : 0;
+}
+
+static void test_vault_spawned_child_ecdh(void)
+{
+	struct avernella_sandbox_opts opts;
+	struct avernella_worker_proc proc;
+	g_autoptr(GError) err = NULL;
+	guint8 priv[32], pub[32], got_pub[32], shared[32];
+	size_t priv_len = sizeof(priv), pub_len = sizeof(pub);
+
+	EVP_PKEY *kp = EVP_PKEY_Q_keygen(NULL, NULL, "X25519");
+	g_assert_nonnull(kp);
+	g_assert_cmpint(EVP_PKEY_get_raw_private_key(kp, priv, &priv_len), ==,
+			1);
+	g_assert_cmpint(EVP_PKEY_get_raw_public_key(kp, pub, &pub_len), ==, 1);
+	EVP_PKEY_free(kp);
+
+	g_autofree char *priv_b64 = g_base64_encode(priv, sizeof(priv));
+	J *keys = obj();
+	J *own = obj();
+
+	json_object_object_add(own, "42", json_object_new_string(priv_b64));
+	json_object_object_add(keys, "own", own);
+
+	memset(&opts, 0, sizeof(opts));
+	opts.role = SANDBOX_ROLE_VAULT;
+	opts.keep_stderr = true;
+
+	g_assert_cmpint(avernella_spawn_worker(&opts, sandboxed_vault_child,
+					       NULL, &proc),
+			==, 0);
+	g_assert_cmpint(avernella_vault_client_ping(proc.ctrl_fd), ==, 0);
+	g_assert_true(avernella_vault_client_load_session(
+		proc.ctrl_fd, "u1234", "tok", "ref", keys, 1, -1, &err));
+	g_assert_no_error(err);
+	g_assert_true(avernella_vault_client_own_public(proc.ctrl_fd, 42,
+							got_pub, &err));
+	g_assert_no_error(err);
+	g_assert_cmpmem(got_pub, sizeof(got_pub), pub, sizeof(pub));
+	g_assert_true(avernella_vault_client_ecdh(proc.ctrl_fd, 42, pub, shared,
+						  &err));
+	g_assert_no_error(err);
+	g_assert_true(avernella_vault_client_wipe(proc.ctrl_fd, &err));
+	g_assert_no_error(err);
+
+	json_object_put(keys);
+	avernella_worker_close(&proc);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
@@ -913,6 +974,8 @@ int main(int argc, char **argv)
 			test_ui_landlock_fresh_state_dir);
 	g_test_add_func("/security/vault-memfd-secret-and-ipc",
 			test_vault_memfd_secret_and_ipc);
+	g_test_add_func("/security/vault-spawned-child-ecdh",
+			test_vault_spawned_child_ecdh);
 	g_test_add_func("/security/supervisor-respawn-after-sigsys",
 			test_supervisor_respawn_after_sigsys);
 	return g_test_run();

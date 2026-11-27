@@ -896,6 +896,12 @@ int avernella_seccomp_apply(const struct avernella_sandbox_opts *opts)
 		if (rc < 0)
 			goto out;
 	}
+	/* Allow strictly hardening PR_SET_DUMPABLE(0), never re-enabling dumps. */
+	rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(prctl), 2,
+			      SCMP_A0(SCMP_CMP_EQ, PR_SET_DUMPABLE),
+			      SCMP_A1(SCMP_CMP_EQ, 0));
+	if (rc < 0)
+		goto out;
 
 	/* Restrict socket() domains strictly by role. */
 	rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,

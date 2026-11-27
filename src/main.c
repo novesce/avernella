@@ -4066,8 +4066,12 @@ static int worker(int credentials_fd)
 		.timer = timerfd_create(CLOCK_MONOTONIC,
 					TFD_CLOEXEC | TFD_NONBLOCK)
 	};
-	if (w.vault.ctrl_fd >= 0)
-		line_sealing_set_vault(&worker_vault_ops, &w.vault);
+	if (w.vault.ctrl_fd >= 0) {
+		if (avernella_vault_client_ping(w.vault.ctrl_fd) == 0)
+			line_sealing_set_vault(&worker_vault_ops, &w.vault);
+		else
+			avernella_worker_close(&w.vault);
+	}
 	w.image_wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	w.image_requests = g_async_queue_new_full(image_free);
 	w.image_results = g_async_queue_new_full(image_free);

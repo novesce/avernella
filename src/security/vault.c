@@ -64,7 +64,8 @@ int avernella_secret_alloc(struct avernella_secret_buf *buf, size_t len)
 	}
 
 	/* Fallback: non-dumpable, mlocked anonymous mapping. */
-	(void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+	if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0)
+		(void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 	ptr = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
 		   MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (ptr == MAP_FAILED)
@@ -99,7 +100,8 @@ int avernella_vault_init(struct avernella_vault *vault, int dirfd)
 	memset(vault, 0, sizeof(*vault));
 	vault->dirfd = dirfd;
 	vault->session.service_code = -1;
-	(void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+	if (prctl(PR_GET_DUMPABLE, 0, 0, 0, 0) != 0)
+		(void)prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
 
 	err = avernella_secret_alloc(&vault->mem,
 				     sizeof(struct avernella_vault_secrets));
