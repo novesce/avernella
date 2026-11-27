@@ -2942,6 +2942,14 @@ J *line_square_poll_events(Line *s, gint64 *subscription_id, char **sync_token,
 			put_str(item, "chat", cid);
 			if (mid)
 				put_str(item, "id", mid);
+			const char *text = nonempty(msg, "10");
+
+			if (text)
+				put_str(item, "preview", text);
+			else
+				put_str(item, "preview",
+					content_label(json_object_get_int64(
+						field(msg, "15"))));
 			put_num(item, "time", t);
 			put_bool(item, "mine", mine);
 		} else if (type == SQ_EVT_UPDATE_CHAT_STATUS) {

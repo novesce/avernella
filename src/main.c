@@ -84,6 +84,7 @@ struct line_worker {
 	GHashTable *square_history_tokens;
 	char *square_find_token, *square_sync_token, *square_read_sync;
 	gint64 square_sub_id, square_poll_due;
+	guint square_poll_failures;
 	gboolean square_disabled;
 	/* Pending group invite link preview. */
 	J *group_ticket_chat;
@@ -235,6 +236,7 @@ static void clear_view(struct line_worker *w)
 	g_clear_pointer(&w->square_read_sync, g_free);
 	w->square_sub_id = 0;
 	w->square_poll_due = 0;
+	w->square_poll_failures = 0;
 	w->square_disabled = FALSE;
 	g_clear_pointer(&w->group_ticket_chat, json_object_put);
 	g_clear_pointer(&w->group_ticket_id, g_free);
@@ -2160,6 +2162,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			    timer.it_value.tv_sec >= 1)
 				wake_after(w, 1);
 		}
+		if (active && !w->foreground && w->square_poll_due)
+			w->square_poll_due = g_get_monotonic_time();
 		w->foreground = active;
 		return obj();
 	}
@@ -3404,12 +3408,25 @@ static gint64 maintain_square_sync(struct line_worker *w)
 			w->square_poll_due = 0;
 			return 0;
 		}
-		w->square_poll_due = now + 30 * G_USEC_PER_SEC;
+		w->square_poll_failures = MIN(w->square_poll_failures + 1, 4u);
+		int backoff = MIN(2 << (w->square_poll_failures - 1), 15);
+
+		w->square_poll_due = now + (gint64)backoff * G_USEC_PER_SEC;
 		return w->square_poll_due;
 	}
+	w->square_poll_failures = 0;
 	gboolean reload = FALSE;
 	g_autofree char *open_chat = NULL;
+	g_autoptr(GHashTable) messaged =
+		g_hash_table_new(g_str_hash, g_str_equal);
 
+	for (size_t i = 0; i < json_object_array_length(events); i++) {
+		J *ev = json_object_array_get_idx(events, i);
+		const char *chat = strfield(ev, "chat");
+
+		if (!g_strcmp0(strfield(ev, "kind"), "message") && chat)
+			g_hash_table_add(messaged, (gpointer)chat);
+	}
 	for (size_t i = 0; i < json_object_array_length(events); i++) {
 		J *ev = json_object_array_get_idx(events, i);
 		const char *kind = strfield(ev, "kind");
@@ -3457,20 +3474,33 @@ static gint64 maintain_square_sync(struct line_worker *w)
 			if (mid)
 				json_object_object_add(
 					pkt, "id", json_object_new_string(mid));
+			const char *preview = strfield(ev, "preview");
+
+			if (preview && *preview)
+				json_object_object_add(
+					pkt, "preview",
+					json_object_new_string(preview));
 			json_object_object_add(
 				pkt, "time",
 				json_object_get(field(ev, "time")));
 			json_object_object_add(pkt, "mine",
 					       json_object_new_boolean(mine));
 			line_emit(pkt);
+		} else if (chat && g_hash_table_contains(messaged, chat)) {
+			/* Chat status update paired with a message we already handled. */
+			continue;
 		} else {
+			if (chat && !g_strcmp0(chat, w->history_chat)) {
+				g_free(open_chat);
+				open_chat = g_strdup(chat);
+			}
 			reload = TRUE;
 		}
 	}
+	if (open_chat)
+		revalidate_history(w, open_chat);
 	if (reload)
 		line_event("changed", NULL, NULL);
-	else if (open_chat)
-		revalidate_history(w, open_chat);
 	if (w->history_chat && line_is_square_chat(w->history_chat) &&
 	    !w->ranges_pending) {
 		w->need_ranges = TRUE;
@@ -3478,8 +3508,18 @@ static gint64 maintain_square_sync(struct line_worker *w)
 	}
 	if (w->session.token_changed)
 		save_rotated_token(w);
-	w->square_poll_due = g_get_monotonic_time() +
-			     (w->foreground ? 4 : 25) * G_USEC_PER_SEC;
+	gint64 delay_us;
+
+	if (json_object_array_length(events) >= 50)
+		delay_us = 200 * 1000;
+	else if (w->foreground && w->history_chat &&
+		 line_is_square_chat(w->history_chat))
+		delay_us = 1 * G_USEC_PER_SEC;
+	else if (w->foreground)
+		delay_us = 2 * G_USEC_PER_SEC;
+	else
+		delay_us = 5 * G_USEC_PER_SEC;
+	w->square_poll_due = g_get_monotonic_time() + delay_us;
 	return w->square_poll_due;
 }
 
@@ -3545,6 +3585,11 @@ static gboolean message_operation(struct line_worker *w, J *op,
 			       json_object_new_string("chat_message"));
 	json_object_object_add(event, "chat", json_object_new_string(chat));
 	json_object_object_add(event, "id", json_object_new_string(id));
+	const char *preview = strfield(msg, "10");
+
+	if (preview && *preview)
+		json_object_object_add(event, "preview",
+				       json_object_new_string(preview));
 	gint64 time = json_object_get_int64(field(msg, "5"));
 
 	if (time <= 0)
@@ -3715,10 +3760,12 @@ static void live_operations(struct line_worker *w)
 	 */
 	if (batch.recovered_since > w->recovered_at)
 		reconnected(w);
-	else if (other)
-		line_event("changed", NULL, NULL);
-	else if (open_chat)
-		revalidate_history(w, open_chat);
+	else {
+		if (open_chat)
+			revalidate_history(w, open_chat);
+		if (other)
+			line_event("changed", NULL, NULL);
+	}
 	if (batch.failing && !w->live_failing) {
 		w->live_failing_since = g_get_monotonic_time();
 		wake_after(w, 1);

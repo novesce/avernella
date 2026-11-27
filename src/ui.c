@@ -1636,6 +1636,11 @@ static void chat_message(Json *packet)
 		json_object_object_add(moved, "time",
 				       json_object_new_int64(time));
 	json_object_object_add(moved, "lastId", json_object_new_string(id));
+	const char *preview = ui_string(packet, "preview", NULL);
+
+	if (preview && *preview)
+		json_object_object_add(moved, "preview",
+				       json_object_new_string(preview));
 	if (!mine)
 		json_object_object_add(
 			moved, "unread",
@@ -1665,7 +1670,21 @@ static void pushed_history(Json *packet)
 	    !json_object_is_type(rows, json_type_array) || ui.older_page ||
 	    ui.older_pending)
 		return;
-	ui.has_older = json_object_array_length(rows) >= 50;
+	size_t n = json_object_array_length(rows);
+
+	if (n && ui.chats) {
+		Json *newest = json_object_array_get_idx(rows, n - 1);
+		const char *preview = ui_string(newest, "text", NULL);
+		Json *summary = chat_summary(ui.selected);
+
+		if (summary && preview && *preview &&
+		    g_strcmp0(ui_string(summary, "preview", NULL), preview)) {
+			json_object_object_add(summary, "preview",
+					       json_object_new_string(preview));
+			ui_forget_rail();
+		}
+	}
+	ui.has_older = n >= 50;
 	set_json(&ui.history, rows);
 	set_string(&ui.notice, "");
 }
