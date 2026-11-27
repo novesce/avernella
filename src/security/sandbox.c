@@ -340,9 +340,11 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 			     const struct avernella_sandbox_opts *opts)
 {
 	static const char *const ro_dirs[] = {
+		"/app",
 		"/usr",
 		"/lib",
 		"/lib64",
+		"/run/host",
 		"/etc/fonts",
 		"/etc/ld.so.cache",
 		"/etc/ld.so.conf",
@@ -384,7 +386,8 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
 	int err;
 
 	for (size_t i = 0; i < ARRAY_SIZE(ro_dirs); i++) {
-		uint64_t right = (!strcmp(ro_dirs[i], "/usr") ||
+		uint64_t right = (!strcmp(ro_dirs[i], "/app") ||
+				  !strcmp(ro_dirs[i], "/usr") ||
 				  !strcmp(ro_dirs[i], "/lib") ||
 				  !strcmp(ro_dirs[i], "/lib64")) ?
 					 ro_exec :
