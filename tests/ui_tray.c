@@ -9,11 +9,15 @@
 #define ITEM "org.kde.StatusNotifierItem"
 #define IPATH "/StatusNotifierItem"
 #define MENU "com.canonical.dbusmenu"
+#define APP "io.github.novesce.Avernella"
+#define PORTAL "org.freedesktop.portal.Desktop"
+#define PORTAL_PATH "/org/freedesktop/portal/desktop"
 static GDBusConnection *bus;
 static char *item;
 static gboolean panel_host;
 static SDL_Window *window;
 static gboolean quit;
+static gboolean background_requested;
 static const char xml[] =
 	"<node><interface name='" WATCH "'>"
 	"<method name='RegisterStatusNotifierItem'><arg type='s' direction='in'/></method>"
@@ -70,17 +74,57 @@ static GVariant *rpc(const char *dest, const char *path, const char *iface,
 	return reply;
 }
 
-static void own(gboolean acquire)
+static void own_name(const char *name, gboolean acquire)
 {
 	g_autoptr(GVariant) reply = rpc(
 		"org.freedesktop.DBus", "/org/freedesktop/DBus",
 		"org.freedesktop.DBus", acquire ? "RequestName" : "ReleaseName",
-		acquire ? g_variant_new("(su)", WATCH, 4u) :
-			  g_variant_new("(s)", WATCH));
+		acquire ? g_variant_new("(su)", name, 4u) :
+			  g_variant_new("(s)", name));
 	guint status = 0;
 
 	g_variant_get(reply, "(u)", &status);
 	g_assert_cmpint(status, ==, 1);
+}
+
+static void own(gboolean acquire)
+{
+	own_name(WATCH, acquire);
+}
+
+static void request_background(GDBusConnection *c, const char *sender,
+			       const char *path, const char *iface,
+			       const char *method, GVariant *params,
+			       GDBusMethodInvocation *call, gpointer data)
+{
+	g_autoptr(GVariant) opts = NULL;
+	const char *parent, *token;
+	gboolean autostart;
+
+	(void)path;
+	(void)iface;
+	g_assert_cmpstr(method, ==, "RequestBackground");
+	g_assert_false(background_requested);
+	g_variant_get(params, "(&s@a{sv})", &parent, &opts);
+	g_assert_true(g_variant_lookup(opts, "handle_token", "&s", &token));
+	g_assert_true(g_variant_lookup(opts, "autostart", "b", &autostart));
+	g_assert_false(autostart);
+	g_autofree char *caller = g_strdup(sender + 1);
+
+	g_strdelimit(caller, ".", '_');
+	g_autofree char *answer =
+		g_strdup_printf(PORTAL_PATH "/request/%s/%s", caller, token);
+	GVariantBuilder results;
+
+	g_variant_builder_init(&results, G_VARIANT_TYPE_VARDICT);
+	g_variant_builder_add(&results, "{sv}", "background",
+			      g_variant_new_boolean(GPOINTER_TO_INT(data)));
+	g_dbus_method_invocation_return_value(call,
+					      g_variant_new("(o)", answer));
+	g_dbus_connection_emit_signal(
+		c, sender, answer, "org.freedesktop.portal.Request", "Response",
+		g_variant_new("(ua{sv})", 0u, &results), NULL);
+	background_requested = TRUE;
 }
 
 static void pump(void)
@@ -146,7 +190,7 @@ static void action(int id)
 						  g_variant_new_int32(0), 0u));
 }
 
-static void check_icon(GVariant *properties)
+static void check_icon(GVariant *properties, const char *expected_name)
 {
 	const char *name;
 	int width, height;
@@ -157,7 +201,7 @@ static void check_icon(GVariant *properties)
 	g_autoptr(GVariant) bytes = NULL;
 
 	g_assert_true(g_variant_lookup(properties, "IconName", "&s", &name));
-	g_assert_cmpstr(name, ==, "avernella");
+	g_assert_cmpstr(name, ==, expected_name);
 	g_assert_nonnull(pixmaps);
 	g_assert_cmpuint(g_variant_n_children(pixmaps), ==, 1);
 	g_variant_get_child(pixmaps, 0, "(ii@ay)", &width, &height, &bytes);
@@ -171,10 +215,19 @@ static void check_icon(GVariant *properties)
 	g_assert_cmpmem(data, size, expected, sizeof(expected));
 }
 
-static void tray(void)
+static void tray(gconstpointer fixture)
 {
+	gboolean sandboxed = fixture != NULL;
+	gboolean permitted = GPOINTER_TO_INT(fixture) == 1;
+	guint portal_object = 0;
+	g_autoptr(GVariant) properties = NULL, dict = NULL, show = NULL,
+			    menu = NULL, root = NULL, children = NULL;
+
+	quit = panel_host = background_requested = FALSE;
 	g_setenv("SDL_VIDEODRIVER", "dummy", TRUE);
 	g_unsetenv("LINE_DISABLE_TRAY");
+	if (sandboxed)
+		g_setenv("FLATPAK_ID", APP, TRUE);
 	g_autoptr(GTestDBus) dbus = g_test_dbus_new(G_TEST_DBUS_NONE);
 	g_test_dbus_up(dbus);
 	g_autoptr(GError) error = NULL;
@@ -192,6 +245,29 @@ static void tray(void)
 	g_assert_no_error(error);
 	g_assert_cmpuint(object, >, 0);
 	own(TRUE);
+	g_autoptr(GDBusNodeInfo) background = NULL;
+
+	if (sandboxed) {
+		static const GDBusInterfaceVTable portal_mock = {
+			.method_call = request_background,
+		};
+
+		background = g_dbus_node_info_new_for_xml(
+			"<node><interface name='org.freedesktop.portal.Background'>"
+			"<method name='RequestBackground'>"
+			"<arg type='s' direction='in'/>"
+			"<arg type='a{sv}' direction='in'/>"
+			"<arg type='o' direction='out'/>"
+			"</method></interface></node>",
+			&error);
+		g_assert_no_error(error);
+		portal_object = g_dbus_connection_register_object(
+			bus, PORTAL_PATH, background->interfaces[0],
+			&portal_mock, GINT_TO_POINTER(permitted), NULL, &error);
+		g_assert_no_error(error);
+		g_assert_cmpuint(portal_object, >, 0);
+		own_name(PORTAL, TRUE);
+	}
 	g_assert_cmpint(SDL_Init(SDL_INIT_VIDEO), ==, 0);
 	window = SDL_CreateWindow("Tray fixture", 0, 0, 160, 100, 0);
 	g_assert_nonnull(window);
@@ -207,25 +283,38 @@ static void tray(void)
 				      "StatusNotifierHostRegistered", NULL,
 				      &error);
 	g_assert_no_error(error);
+	if (sandboxed) {
+		g_assert_cmpstr(item, ==, APP ".StatusNotifierItem");
+		g_assert_false(ui_tray_hide(window));
+		ui_tray_close(window);
+		for (int i = 0; i < 200 && !background_requested; i++)
+			pump();
+		g_assert_true(background_requested);
+		if (!permitted) {
+			for (int i = 0; i < 30; i++)
+				pump();
+			g_assert_false(hidden());
+			g_assert_false(ui_tray_hide(window));
+			goto stop;
+		}
+	}
 	wait_for(HIDDEN_BY_CLOSE);
 	g_assert_true(hidden());
-	g_autoptr(GVariant) properties =
-		rpc(item, IPATH, "org.freedesktop.DBus.Properties", "GetAll",
-		    g_variant_new("(s)", ITEM));
-	g_autoptr(GVariant) dict = g_variant_get_child_value(properties, 0);
+	properties = rpc(item, IPATH, "org.freedesktop.DBus.Properties",
+			 "GetAll", g_variant_new("(s)", ITEM));
+	dict = g_variant_get_child_value(properties, 0);
 	const char *title = NULL;
 
 	g_assert_true(g_variant_lookup(dict, "Title", "&s", &title));
 	g_assert_cmpstr(title, ==, "Avernella");
-	check_icon(dict);
-	g_autoptr(GVariant) show =
-		rpc(item, IPATH, ITEM, "Activate", g_variant_new("(ii)", 0, 0));
+	check_icon(dict, sandboxed ? APP : "avernella");
+	show = rpc(item, IPATH, ITEM, "Activate", g_variant_new("(ii)", 0, 0));
 	wait_for(VISIBLE);
-	g_autoptr(GVariant) menu = rpc(
-		item, "/Menu", MENU, "GetLayout",
-		g_variant_new("(ii@as)", 0, -1, g_variant_new_strv(NULL, 0)));
-	g_autoptr(GVariant) root = g_variant_get_child_value(menu, 1),
-			    children = g_variant_get_child_value(root, 2);
+	menu = rpc(item, "/Menu", MENU, "GetLayout",
+		   g_variant_new("(ii@as)", 0, -1,
+				 g_variant_new_strv(NULL, 0)));
+	root = g_variant_get_child_value(menu, 1);
+	children = g_variant_get_child_value(root, 2);
 	g_assert_cmpuint(g_variant_n_children(children), ==, 3);
 	action(2);
 	wait_for(HIDDEN);
@@ -240,20 +329,32 @@ static void tray(void)
 	wait_for(HIDDEN_BY_CLOSE);
 	action(3);
 	wait_for(QUIT_APP);
+stop:
 	ui_tray_stop();
 	SDL_DestroyWindow(window);
 	SDL_Quit();
 	own(FALSE);
+	if (portal_object)
+		g_dbus_connection_unregister_object(bus, portal_object);
 	g_dbus_connection_unregister_object(bus, object);
 	g_dbus_connection_close_sync(bus, NULL, NULL);
 	g_clear_object(&bus);
 	g_clear_pointer(&item, g_free);
 	g_test_dbus_down(dbus);
+	if (sandboxed)
+		g_unsetenv("FLATPAK_ID");
 }
 
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
-	g_test_add_func("/tray/private-bus-menu-host-loss-and-fallback", tray);
+	if (!g_file_test("/.flatpak-info", G_FILE_TEST_EXISTS))
+		g_test_add_data_func(
+			"/tray/private-bus-menu-host-loss-and-fallback", NULL,
+			tray);
+	g_test_add_data_func("/tray/flatpak-background-allowed",
+			     GINT_TO_POINTER(1), tray);
+	g_test_add_data_func("/tray/flatpak-background-denied",
+			     GINT_TO_POINTER(2), tray);
 	return g_test_run();
 }

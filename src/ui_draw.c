@@ -549,7 +549,7 @@ static void collect_rail(void)
 		     i++) {
 			Json *row = json_object_array_get_idx(ui.chats, i);
 
-			if (json_object_get_int64(ui_field(row, "unread")) > 0)
+			if (ui_chat_unread(row) > 0)
 				rail_items.row[rail_items.available++] = row;
 		}
 		rail_items.valid = TRUE;
@@ -636,6 +636,21 @@ static void layout_sign_in(void)
 	ui.login_mode = (Rect){ x, ui.login.y + 54, inner, 34 };
 	ui.email_box = (Rect){ x, y + 19, inner, 38 };
 	ui.password_box = (Rect){ x, y + 83, inner, 38 };
+}
+
+static int composer_growth(int width)
+{
+	if (!context || !ui.selected || !ui.message.value ||
+	    !ui.message.value->len)
+		return 0;
+	g_autoptr(PangoLayout) draft = layout(ui.message.value->str, 15, 400,
+					      MAX(1, width - 20), TRUE);
+
+	ui_emoji_shape_editor(draft, 0, 0, 0);
+	int height;
+
+	pango_layout_get_pixel_size(draft, NULL, &height);
+	return CLAMP(height - 28, 0, 78);
 }
 
 void ui_layout(void)
@@ -793,13 +808,20 @@ void ui_layout(void)
 		ui.send = (Rect){ c.x + c.w - 90, tool_y - 1, 74, 34 };
 		bottom = c.y;
 	}
-	ui.conversation =
-		(Rect){ chat_x, HEADER_H + 1, w - chat_x,
-			MAX(80, bottom - HEADER_H - 1 -
-					(ui.notice && *ui.notice ? 52 : 0) -
-					(ui.reply_id ? 34 : 0)) };
-	/* A call in this chat sits above its messages, as in Discord. */
 	int target = ui_media_stage_height();
+	int status_h =
+		(ui.notice && *ui.notice ? 52 : 0) + (ui.reply_id ? 34 : 0);
+	int room = bottom - HEADER_H - 1 - status_h - target - 60;
+	int growth = MIN(composer_growth(ui.entry.w), MAX(0, room));
+
+	ui.entry.y -= growth;
+	ui.entry.h += growth;
+	ui.composer.y -= growth;
+	ui.composer.h += growth;
+	bottom -= growth;
+	ui.conversation = (Rect){ chat_x, HEADER_H + 1, w - chat_x,
+				  MAX(80, bottom - HEADER_H - 1 - status_h) };
+	/* A call in this chat sits above its messages, as in Discord. */
 	gint64 now = g_get_monotonic_time();
 	double left = 0.;
 
@@ -855,8 +877,10 @@ static Editor password_mask(GString *mask)
 		memcpy(mask->str + i * stride, bullet, stride);
 	mask->len = len * stride;
 	mask->str[mask->len] = 0;
-	return (Editor){ mask, cursor * stride, anchor * stride,
-			 password->scroll };
+	return (Editor){ .value = mask,
+			 .cursor = cursor * stride,
+			 .anchor = anchor * stride,
+			 .scroll = password->scroll };
 }
 
 int ui_password_index(int x)
@@ -981,14 +1005,6 @@ static void sign_in(void)
 		     x, bottom, inner, 12, 400, UI_SUBTLE, TRUE);
 }
 
-static int caret_x(PangoLayout *layout, int index)
-{
-	PangoRectangle strong;
-
-	pango_layout_get_cursor_pos(layout, index, &strong, NULL);
-	return PANGO_PIXELS(strong.x);
-}
-
 static int edit_padding(Editor *edit)
 {
 	if (edit == &ui.search)
@@ -1017,10 +1033,61 @@ int ui_edit_hit(Editor *edit, Rect r, int x)
 	return (int)(g_utf8_offset_to_pointer(s + index, trailing) - s);
 }
 
-int ui_text_index(Editor *edit, int x)
+static int message_top(Rect r, int height, int scroll)
 {
-	return ui_edit_hit(edit, edit == &ui.search ? ui.search_box : ui.entry,
-			   x);
+	return r.y + MAX(4, (r.h - height) / 2) - scroll;
+}
+
+int ui_message_index(int x, int y)
+{
+	if (!context)
+		return ui.message.value->len;
+	Rect r = ui.entry;
+
+	g_autoptr(PangoLayout) item =
+		layout(ui.message.value->str, 15, 400, MAX(1, r.w - 20), TRUE);
+	int height, index, trailing;
+
+	ui_emoji_shape_editor(item, 0, 0, 0);
+	decorate_draft_mentions(item, ui.message.value->str);
+	pango_layout_get_pixel_size(item, NULL, &height);
+	int top = message_top(r, height, ui.message.scroll_y);
+
+	pango_layout_xy_to_index(item, (x - r.x - 8) * PANGO_SCALE,
+				 (y - top) * PANGO_SCALE, &index, &trailing);
+	const char *s = ui.message.value->str;
+
+	return g_utf8_offset_to_pointer(s + index, trailing) - s;
+}
+
+static void compose_selection(PangoLayout *item, int from, int to, int x, int y,
+			      guint rgb)
+{
+	PangoLayoutIter *iter = pango_layout_get_iter(item);
+
+	do {
+		PangoLayoutLine *row =
+			pango_layout_iter_get_line_readonly(iter);
+		int start = row->start_index;
+
+		if (start >= to)
+			break;
+		if (start + row->length < from)
+			continue;
+		int *ranges, count, top, bottom;
+
+		pango_layout_iter_get_line_yrange(iter, &top, &bottom);
+		pango_layout_line_get_x_ranges(row, from, to, &ranges, &count);
+		for (int i = 0; i < count; i++) {
+			int a = x + PANGO_PIXELS(ranges[2 * i]);
+			int b = x + PANGO_PIXELS(ranges[2 * i + 1]);
+
+			box(a, y + PANGO_PIXELS(top), b - a,
+			    PANGO_PIXELS(bottom - top), 2, rgb);
+		}
+		g_free(ranges);
+	} while (pango_layout_iter_next_line(iter));
+	pango_layout_iter_free(iter);
 }
 
 static void draw_editor(Editor *edit, Rect r, gboolean focus,
@@ -1044,6 +1111,8 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 		outline(r, 8, blend(UI_INPUT, UI_ACCENT, focus_amount), 1.);
 	}
 	int pad = edit_padding(edit);
+	gboolean message = edit == &ui.message;
+	int width = MAX(1, r.w - pad - 12), ox = r.x + pad;
 
 	gboolean composing = focus && ui.composition && *ui.composition;
 	int from = MIN(edit->cursor, edit->anchor),
@@ -1065,24 +1134,39 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 		(ui_emoji_has_tokens() || ui_mention_span(0, &start, &end));
 
 	g_autoptr(PangoLayout) item =
-		rich ? layout(display, 15, 400, -1, FALSE) :
-		       label_layout(display, 15, 400, -1, FALSE, FALSE);
+		message ? layout(display, 15, 400, width, TRUE) :
+			  label_layout(display, 15, 400, -1, FALSE, FALSE);
 	if (rich)
 		ui_emoji_shape_editor(
 			item, composing ? from : 0, composing ? to : 0,
 			composing ? (int)strlen(ui.composition) : 0);
 	if (rich)
 		decorate_draft_mentions(item, edit->value->str);
-	int pos = caret_x(item, caret), width = r.w - pad - 12, ox = r.x + pad;
+	PangoRectangle cursor;
+	int height;
 
-	if (pos - edit->scroll > width - 2)
-		edit->scroll = pos - width + 2;
-	if (pos < edit->scroll)
-		edit->scroll = pos;
-	int origin = ox - edit->scroll, height;
-
+	pango_layout_get_cursor_pos(item, caret, &cursor, NULL);
 	pango_layout_get_pixel_size(item, NULL, &height);
+	int pos = PANGO_PIXELS(cursor.x);
+	int cy = PANGO_PIXELS(cursor.y), ch = PANGO_PIXELS(cursor.height);
 	int top = r.y + (r.h - height) / 2;
+
+	if (message) {
+		edit->scroll = 0;
+		edit->scroll_y =
+			CLAMP(edit->scroll_y, 0, MAX(0, height - r.h + 8));
+		if (cy < edit->scroll_y)
+			edit->scroll_y = cy;
+		if (cy + ch > edit->scroll_y + r.h - 8)
+			edit->scroll_y = cy + ch - r.h + 8;
+		top = message_top(r, height, edit->scroll_y);
+	} else {
+		if (pos - edit->scroll > width - 2)
+			edit->scroll = pos - width + 2;
+		if (pos < edit->scroll)
+			edit->scroll = pos;
+	}
+	int origin = ox - edit->scroll;
 
 	cairo_save(cr);
 	cairo_rectangle(cr, ox, r.y + 2, width, r.h - 4);
@@ -1093,24 +1177,21 @@ static void draw_editor(Editor *edit, Rect r, gboolean focus,
 		     edit == &ui.search ? 500 : 400,
 		     edit == &ui.search ? UI_SUBTLE : UI_MUTED, FALSE);
 	else {
-		if (focus && !composing && from != to) {
-			int a = caret_x(item, from), b = caret_x(item, to);
-
-			box(origin + MIN(a, b), top, ABS(b - a), height, 2,
-			    UI_TEXT_SELECTION);
-		}
-		paint(item, origin, top, UI_HEADING);
+		if (focus && !composing && from != to)
+			compose_selection(item, from, to, origin, top,
+					  UI_TEXT_SELECTION);
 		if (composing)
-			line(origin + caret_x(item, from), top + height - 1,
-			     origin + pos, top + height - 1, UI_ACCENT, 1.5);
+			compose_selection(item, from, caret, origin, top,
+					  UI_TEXT_SELECTION);
+		paint(item, origin, top, UI_HEADING);
 	}
 	if (focus && ui.active) {
-		line(origin + pos, top + 1, origin + pos, top + height - 1,
-		     UI_HEADING, 1);
+		line(origin + pos, top + cy + 1, origin + pos,
+		     top + cy + ch - 1, UI_HEADING, 1);
 		/* Anchor the IME candidate popover to the caret, including horizontal scrolling. */
 		static SDL_Rect last_ime;
-		SDL_Rect caret = { CLAMP(origin + pos, ox, ox + width), top, 1,
-				   height };
+		SDL_Rect caret = { CLAMP(origin + pos, ox, ox + width),
+				   top + cy, 1, ch };
 		if (memcmp(&caret, &last_ime, sizeof(caret))) {
 			SDL_SetTextInputRect(&caret);
 			last_ime = caret;
@@ -1330,7 +1411,7 @@ static void rail_avatar(Rect r, Json *c)
 	rail_button(r, selected, TRUE, 0);
 	avatar(ui_string(c, "name", id), r.x, r.y, r.w, id, id,
 	       ui_string(c, "avatarKey", NULL));
-	gint64 unread = json_object_get_int64(ui_field(c, "unread"));
+	gint64 unread = ui_chat_unread(c);
 	char count[4] = "99+";
 
 	if (unread < 100)
@@ -1387,9 +1468,8 @@ static int unread_chats(void)
 
 	for (size_t i = 0; ui.chats && i < json_object_array_length(ui.chats);
 	     i++)
-		total += MAX(0, json_object_get_int64(ui_field(
-					json_object_array_get_idx(ui.chats, i),
-					"unread")));
+		total += MAX(0, ui_chat_unread(json_object_array_get_idx(
+					ui.chats, i)));
 	return (int)MIN(total, 999);
 }
 
@@ -1557,6 +1637,41 @@ static void pin_glyph(int px, int py)
 	cairo_restore(cr);
 }
 
+static void chat_title(Json *chat, const char *name, int x, int y, int w,
+		       int size, int weight, guint ink)
+{
+	if (w < 20 || !ui_chat_muted(chat)) {
+		text(name, x, y, w, size, weight, ink, FALSE);
+		return;
+	}
+	g_autoptr(PangoLayout) title =
+		label_layout(name, size, weight, w - 18, FALSE, FALSE);
+	int width, height;
+
+	pango_layout_get_pixel_size(title, &width, &height);
+	paint(title, x, y, ink);
+	Rect icon = { x + width + 4, y + (height - 14) / 2, 14, 14 };
+
+	cairo_save(cr);
+	cairo_translate(cr, icon.x, icon.y);
+	color(UI_MUTED);
+	cairo_set_line_width(cr, 1.3);
+	cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+	cairo_move_to(cr, 9.5, 3);
+	cairo_curve_to(cr, 11, 4, 10.5, 7.5, 12, 10);
+	cairo_line_to(cr, 2, 10);
+	cairo_curve_to(cr, 3, 8.5, 3.25, 6.5, 3.5, 5.5);
+	cairo_stroke(cr);
+	cairo_move_to(cr, 6, 12.5);
+	cairo_line_to(cr, 8, 12.5);
+	cairo_move_to(cr, 2, 2);
+	cairo_line_to(cr, 12, 12);
+	cairo_stroke(cr);
+	cairo_restore(cr);
+	if (hovered(icon))
+		tooltip(icon, _("Notifications muted"), FALSE);
+}
+
 /*
  * LINE lists each chat's latest message. The chat list RPC carries only the
  * message ID, so remember the newest text of every chat opened here and show
@@ -1613,6 +1728,8 @@ static void remember_preview(void)
 
 static const char *chat_preview(Json *c)
 {
+	if (json_object_get_boolean(ui_field(c, "lastUnsent")))
+		return _("Message unsent");
 	struct preview *p =
 		previews ?
 			g_hash_table_lookup(previews, ui_string(c, "id", "")) :
@@ -1686,7 +1803,7 @@ static void line_chat_row(Json *c, Rect row, gboolean selected, double sel,
 			UI_ACCENT, 1);
 	avatar(name, row.x + 14, row.y + (row.h - side) / 2, side, id, id,
 	       ui_string(c, "avatarKey", NULL));
-	gint64 unread = json_object_get_int64(ui_field(c, "unread"));
+	gint64 unread = ui_chat_unread(c);
 	char stamp[64];
 
 	list_stamp(json_object_get_int64(ui_field(c, "time")), stamp,
@@ -1725,9 +1842,9 @@ static void line_chat_row(Json *c, Rect row, gboolean selected, double sel,
 	}
 	guint ink = selected || unread > 0 ? UI_HEADING : UI_BODY;
 
-	text(name, name_x, row.y + (subtitle ? 13 : (row.h - 20) / 2),
-	     MAX(1, name_right - name_x), 15, unread > 0 ? 650 : 550, ink,
-	     FALSE);
+	chat_title(c, name, name_x, row.y + (subtitle ? 13 : (row.h - 20) / 2),
+		   MAX(1, name_right - name_x), 15, unread > 0 ? 650 : 550,
+		   ink);
 	if (!subtitle)
 		return;
 	int x = name_x, width = right - (badge ? badge + 10 : 0) - name_x;
@@ -1900,7 +2017,7 @@ static void chats_panel(void)
 			outline(row, 6, UI_ACCENT, 1);
 		avatar(name, row.x + 8, row.y + 5, 32, id, id,
 		       ui_string(c, "avatarKey", NULL));
-		gint64 unread = json_object_get_int64(ui_field(c, "unread"));
+		gint64 unread = ui_chat_unread(c);
 		int badge = 0;
 
 		if (unread > 0) {
@@ -1925,9 +2042,10 @@ static void chats_panel(void)
 			    row_hover > .5	   ? UI_BODY :
 						     UI_MUTED;
 
-		text(name, row.x + 50, row.y + 11,
-		     row.w - 60 - (badge ? badge + 8 : 0) - (pinned ? 16 : 0),
-		     16, unread > 0 ? 600 : 500, ink, FALSE);
+		chat_title(c, name, row.x + 50, row.y + 11,
+			   row.w - 60 - (badge ? badge + 8 : 0) -
+				   (pinned ? 16 : 0),
+			   16, unread > 0 ? 600 : 500, ink);
 	}
 	cairo_restore(cr);
 	if (ui_compact() && ui.notice && *ui.notice)
@@ -2281,6 +2399,8 @@ static const char *reply_sender_name(Json *target)
 
 static char *reply_preview_text(Json *target)
 {
+	if (!strcmp(ui_string(target, "type", ""), "unsent"))
+		return g_strdup(_("Message unsent"));
 	const char *s = ui_string(target, "text", "");
 
 	if (!*s)
@@ -2387,8 +2507,12 @@ static void prepare_bubbles(Rect area)
 			int width = MIN(640, MAX(1, area.w - 2 * CHAT_MARGIN));
 			PangoRectangle logical;
 
-			row.body = layout(ui_string(msg, "text", ""), 13, 500,
-					  width, TRUE);
+			const char *label =
+				!strcmp(ui_string(msg, "type", ""), "unsent") ?
+					_("Message unsent") :
+					ui_string(msg, "text", "");
+
+			row.body = layout(label, 13, 500, width, TRUE);
 			pango_layout_set_alignment(row.body,
 						   PANGO_ALIGN_CENTER);
 			pango_layout_get_pixel_extents(row.body, NULL,
@@ -3755,9 +3879,9 @@ static void chat_view(void)
 		if (!line_style)
 			avatar(name, left, 12, 24, ui.selected, ui.selected,
 			       ui_string(chat, "avatarKey", NULL));
-		text(name, name_x, line_style ? 12 : 13,
-		     MAX(12, right - name_x - 16), line_style ? 17 : 16,
-		     line_style ? 700 : 600, UI_HEADING, FALSE);
+		chat_title(chat, name, name_x, line_style ? 12 : 13,
+			   MAX(12, right - name_x - 16), line_style ? 17 : 16,
+			   line_style ? 700 : 600, UI_HEADING);
 		header_peer =
 			*ui.selected == 'u' ?
 				(Rect){ left, 8,
@@ -4497,6 +4621,8 @@ finish_canvas:
 		history_scroll.reusable = TRUE;
 	}
 	history_damage.count = 0;
+	if (presented && painted_chat && !layer && scrim <= 0. && p == 0.)
+		ui_media_screenshot_presented();
 	if (painted_chat && presented)
 		ui_conversation_presented(ui_friends_active() || layer ||
 					  scrim > 0. || p != 0.);

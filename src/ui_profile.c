@@ -22,8 +22,6 @@ enum {
 	NAV = UI_SIDEBAR,
 	CONTENT = UI_BG,
 	NAV_HOVER = UI_HOVER,
-	NAV_SELECTED = UI_SELECTED,
-	ACCENT = UI_ACCENT,
 	DANGER = 0xda373c,
 	CHIP = UI_INPUT,
 	CARD_W = 300,
@@ -35,6 +33,9 @@ enum {
 	/* Tags well above the other modules' serials. */
 	TAG_BASE = 0x40000000
 };
+
+#define NAV_SELECTED UI_SELECTED
+#define ACCENT UI_ACCENT
 
 enum view {
 	NONE,
@@ -72,6 +73,7 @@ enum action {
 	A_NOTIFY,
 	A_SOUNDS,
 	A_THEME,
+	A_PALETTE,
 	A_LANGUAGE,
 	A_MOTION,
 	A_MOTION_SYSTEM,
@@ -920,6 +922,27 @@ static int appearance_section(int x, int y, int w)
 		y += choice_row(x, y, w, themes[i],
 				ui_theme_is_line() == (i == 1), A_THEME, i);
 	y += 18;
+	caption(_("Accent color"), x, y, w);
+	y += 26;
+	const char *const accents[] = {
+		_("Pink"),
+		_("Blue"),
+		_("Mint"),
+		_("Amber"),
+	};
+	int swatch_w = (w - 8) / 2;
+
+	for (guint i = 0; i < G_N_ELEMENTS(accents); i++) {
+		int left = x + (i % 2) * (swatch_w + 8);
+
+		choice_row(left, y, swatch_w, accents[i], ui_palette == i,
+			   A_PALETTE, i);
+		ui_draw_rounded((Rect){ left + swatch_w - 26, y + 13, 14, 14 },
+				7, ui_palettes[i].accent);
+		if (i % 2)
+			y += 44;
+	}
+	y += 18;
 	caption(_("Language"), x, y, w);
 	y += 26;
 	/*
@@ -1307,6 +1330,18 @@ static void activate(struct control c, int x)
 			break;
 		if (ui_theme_toggle(&error)) {
 			ui_theme_changed(height);
+			set_text(&p.settings_note, NULL);
+		} else
+			set_text(&p.settings_note, error->message);
+		break;
+	}
+	case A_PALETTE: {
+		g_autoptr(GError) error = NULL;
+
+		if (ui_palette == (enum ui_palette)c.arg)
+			break;
+		if (ui_theme_set_palette(c.arg, &error)) {
+			ui_theme_changed(ui_chat_row_height());
 			set_text(&p.settings_note, NULL);
 		} else
 			set_text(&p.settings_note, error->message);

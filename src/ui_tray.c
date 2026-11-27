@@ -8,6 +8,10 @@
 
 #define ITEM_PATH "/StatusNotifierItem"
 #define WATCHER_PATH "/StatusNotifierWatcher"
+#define PORTAL "org.freedesktop.portal.Desktop"
+#define PORTAL_PATH "/org/freedesktop/portal/desktop"
+#define APP_ID "io.github.novesce.Avernella"
+#define TRAY_BUS APP_ID ".StatusNotifierItem"
 #define MENU_PATH "/Menu"
 #define MENU_IFACE "com.canonical.dbusmenu"
 #define INPUT(t) "<arg type='" t "' direction='in'/>"
@@ -62,7 +66,15 @@ enum tray_action {
 	HIDE,
 	QUIT,
 	TOGGLE,
-	HOST_GONE
+	HOST_GONE,
+	BACKGROUND_ALLOWED
+};
+
+enum background_permission {
+	BACKGROUND_UNASKED,
+	BACKGROUND_PENDING,
+	BACKGROUND_GRANTED,
+	BACKGROUND_DECLINED,
 };
 
 struct host {
@@ -82,10 +94,14 @@ static struct {
 	GMainLoop *loop;
 	GThread *thread;
 	GCancellable *cancel;
+	GDBusConnection *bus;
 	GVariant *icon;
 	char *address, *name;
 	Uint32 event;
 	gint available;
+	gint background;
+	gboolean flatpak, close_pending;
+	guint background_signal;
 	guint pending;
 	struct host hosts[2];
 } tray;
@@ -108,6 +124,87 @@ static void availability(void)
 
 	if (g_atomic_int_exchange(&tray.available, active) && !active)
 		queue_action(HOST_GONE);
+}
+
+static void background_response(GDBusConnection *bus, const char *sender,
+				const char *path, const char *iface,
+				const char *signal, GVariant *parameters,
+				gpointer data)
+{
+	g_autoptr(GVariant) results = NULL;
+	guint code;
+	gboolean allowed = FALSE;
+
+	(void)sender;
+	(void)path;
+	(void)iface;
+	(void)signal;
+	(void)data;
+	if (!g_variant_is_of_type(parameters, G_VARIANT_TYPE("(ua{sv})")))
+		return;
+	g_dbus_connection_signal_unsubscribe(bus, tray.background_signal);
+	tray.background_signal = 0;
+	g_variant_get(parameters, "(u@a{sv})", &code, &results);
+	if (!code)
+		g_variant_lookup(results, "background", "b", &allowed);
+	g_atomic_int_set(&tray.background,
+			 allowed ? BACKGROUND_GRANTED : BACKGROUND_DECLINED);
+	if (allowed)
+		queue_action(BACKGROUND_ALLOWED);
+}
+
+static void background_requested(GObject *source, GAsyncResult *result,
+				 gpointer data)
+{
+	GDBusConnection *bus = G_DBUS_CONNECTION(source);
+	g_autoptr(GVariant) reply =
+		g_dbus_connection_call_finish(bus, result, NULL);
+	g_autofree char *expected = data;
+	const char *path = NULL;
+
+	tray.pending--;
+	if (reply)
+		g_variant_get(reply, "(&o)", &path);
+	if (tray.background_signal && g_strcmp0(path, expected)) {
+		g_dbus_connection_signal_unsubscribe(bus,
+						     tray.background_signal);
+		tray.background_signal = 0;
+		g_atomic_int_set(&tray.background, BACKGROUND_DECLINED);
+	}
+}
+
+static gboolean request_background(gpointer data)
+{
+	(void)data;
+	if (!tray.bus || g_cancellable_is_cancelled(tray.cancel))
+		return G_SOURCE_REMOVE;
+	const char *name = g_dbus_connection_get_unique_name(tray.bus);
+	g_autofree char *sender = g_strdup(name + 1);
+	g_autofree char *token =
+		g_strdup_printf("avernella_%08x", g_random_int());
+	GVariantBuilder options;
+
+	g_strdelimit(sender, ".", '_');
+	char *path =
+		g_strdup_printf(PORTAL_PATH "/request/%s/%s", sender, token);
+
+	tray.background_signal = g_dbus_connection_signal_subscribe(
+		tray.bus, PORTAL, "org.freedesktop.portal.Request", "Response",
+		path, NULL, G_DBUS_SIGNAL_FLAGS_NONE, background_response, NULL,
+		NULL);
+	g_variant_builder_init(&options, G_VARIANT_TYPE_VARDICT);
+	g_variant_builder_add(&options, "{sv}", "handle_token",
+			      g_variant_new_string(token));
+	g_variant_builder_add(&options, "{sv}", "autostart",
+			      g_variant_new_boolean(FALSE));
+	tray.pending++;
+	g_dbus_connection_call(tray.bus, PORTAL, PORTAL_PATH,
+			       "org.freedesktop.portal.Background",
+			       "RequestBackground",
+			       g_variant_new("(sa{sv})", "", &options),
+			       G_VARIANT_TYPE("(o)"), G_DBUS_CALL_FLAGS_NONE,
+			       5000, tray.cancel, background_requested, path);
+	return G_SOURCE_REMOVE;
 }
 
 /* D-Bus StatusNotifierItem pixmaps carry network-order ARGB bytes. */
@@ -153,8 +250,11 @@ static GVariant *property(GDBusConnection *bus, const char *sender,
 	}
 	if (!strcmp(name, "Category"))
 		return g_variant_new_string("Communications");
-	if (!strcmp(name, "Id") || !strcmp(name, "IconName"))
+	if (!strcmp(name, "Id"))
 		return g_variant_new_string("avernella");
+	if (!strcmp(name, "IconName"))
+		return g_variant_new_string(tray.flatpak ? APP_ID :
+							   "avernella");
 	if (!strcmp(name, "Title"))
 		return g_variant_new_string("Avernella");
 	if (!strcmp(name, "Status"))
@@ -480,6 +580,7 @@ static gpointer service(gpointer unused)
 		g_variant_ref_sink(g_variant_new("(su)", tray.name, 4u));
 	if (!bus || !info)
 		goto out;
+	tray.bus = bus;
 	g_dbus_connection_set_exit_on_close(bus, FALSE);
 	closed = g_signal_connect(bus, "closed", G_CALLBACK(lost_bus), NULL);
 	for (guint i = 0; i < 3; i++) {
@@ -522,12 +623,18 @@ static gpointer service(gpointer unused)
 	if (!g_cancellable_is_cancelled(tray.cancel))
 		g_main_loop_run(tray.loop);
 out:
+	tray.bus = NULL;
 	for (guint i = 0; i < 2; i++)
 		if (tray.hosts[i].proxy)
 			g_signal_handlers_disconnect_by_data(
 				tray.hosts[i].proxy, &tray.hosts[i]);
 	while (tray.pending)
 		g_main_context_iteration(tray.context, TRUE);
+	if (tray.background_signal) {
+		g_dbus_connection_signal_unsubscribe(bus,
+						     tray.background_signal);
+		tray.background_signal = 0;
+	}
 	for (guint i = 0; i < 2; i++)
 		g_clear_object(&tray.hosts[i].proxy);
 	if (bus) {
@@ -564,8 +671,12 @@ void ui_tray_start(void)
 		g_clear_pointer(&tray.address, g_free);
 		return;
 	}
-	tray.name = g_strdup_printf("org.kde.StatusNotifierItem-%u-1",
-				    (unsigned int)getpid());
+	tray.flatpak = !g_strcmp0(g_getenv("FLATPAK_ID"), APP_ID) ||
+		       g_file_test("/.flatpak-info", G_FILE_TEST_EXISTS);
+	tray.name = tray.flatpak ?
+			    g_strdup(TRAY_BUS) :
+			    g_strdup_printf("org.kde.StatusNotifierItem-%u-1",
+					    (unsigned int)getpid());
 	tray.context = g_main_context_new();
 	tray.loop = g_main_loop_new(tray.context, FALSE);
 	tray.cancel = g_cancellable_new();
@@ -596,11 +707,14 @@ void ui_tray_stop(void)
 	g_clear_pointer(&tray.address, g_free);
 	g_clear_pointer(&tray.name, g_free);
 	tray.event = 0;
+	tray.background = BACKGROUND_UNASKED;
+	tray.close_pending = FALSE;
 	memset(tray.hosts, 0, sizeof(tray.hosts));
 }
 
 void ui_present_window(SDL_Window *window)
 {
+	tray.close_pending = FALSE;
 	Uint32 flags = SDL_GetWindowFlags(window);
 
 	if (flags & SDL_WINDOW_HIDDEN)
@@ -614,8 +728,29 @@ gboolean ui_tray_hide(SDL_Window *window)
 {
 	if (!g_atomic_int_get(&tray.available))
 		return FALSE;
+	if (tray.flatpak &&
+	    g_atomic_int_get(&tray.background) != BACKGROUND_GRANTED)
+		return FALSE;
 	SDL_HideWindow(window);
 	return TRUE;
+}
+
+void ui_tray_close(SDL_Window *window)
+{
+	if (ui_tray_hide(window))
+		return;
+	if (tray.flatpak && tray.thread &&
+	    g_atomic_int_compare_and_exchange(
+		    &tray.background, BACKGROUND_UNASKED, BACKGROUND_PENDING)) {
+		/* Always execute on the tray context, even while it is starting. */
+		g_autoptr(GSource) request = g_idle_source_new();
+
+		g_source_set_callback(request, request_background, NULL, NULL);
+		g_source_attach(request, tray.context);
+	}
+	tray.close_pending = g_atomic_int_get(&tray.background) ==
+			     BACKGROUND_PENDING;
+	SDL_MinimizeWindow(window);
 }
 
 gboolean ui_tray_event(const SDL_Event *event, SDL_Window *window,
@@ -624,16 +759,22 @@ gboolean ui_tray_event(const SDL_Event *event, SDL_Window *window,
 	if (!tray.event || event->type != tray.event)
 		return FALSE;
 	enum tray_action action = event->user.code;
-	gboolean hidden = SDL_GetWindowFlags(window) & SDL_WINDOW_HIDDEN;
+	Uint32 flags = SDL_GetWindowFlags(window);
+	gboolean hidden = flags & SDL_WINDOW_HIDDEN;
 
 	if (action == QUIT)
 		*quitting = TRUE;
 	else if (action == SHOW ||
 		 (action == HOST_GONE && hidden &&
 		  !g_atomic_int_get(&tray.available)) ||
-		 (action == TOGGLE && hidden))
+		 (action == TOGGLE &&
+		  (flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED))))
 		ui_present_window(window);
 	else if (action == TOGGLE || action == HIDE)
+		ui_tray_close(window);
+	else if (action == BACKGROUND_ALLOWED && tray.close_pending) {
+		tray.close_pending = FALSE;
 		ui_tray_hide(window);
+	}
 	return TRUE;
 }

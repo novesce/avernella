@@ -114,6 +114,7 @@ Groups are TalkService *chats* of type GROUP (0). The old type ROOM (1) can be r
 | ----- | ------- |
 | 1 | Type (0 group) |
 | 2 | Chat MID |
+| 4 | Notification disabled for this group or room |
 | 6 | Name |
 | 7 | Picture path |
 | 8 → 1 | Group extra: field 2 "invitation by link disabled", field 3 the invitation ticket, field 4 a map of member MIDs, field 5 a map of pending invitee MIDs |

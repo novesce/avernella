@@ -15,11 +15,26 @@
 #define UI_LINE 0x412e40
 
 #define UI_HOVER 0x322031
-#define UI_SELECTED 0x492338
-#define UI_TEXT_SELECTION 0x783951
-#define UI_ACCENT 0xff5ba9
-#define UI_ACCENT_HOVER 0xff8fc2
-#define UI_ON_ACCENT 0x210d1a
+enum ui_palette {
+	UI_PALETTE_PINK,
+	UI_PALETTE_BLUE,
+	UI_PALETTE_MINT,
+	UI_PALETTE_AMBER,
+	UI_PALETTE_COUNT,
+};
+
+struct ui_palette_colors {
+	guint accent, hover, ink, selected, selection;
+};
+
+extern const struct ui_palette_colors ui_palettes[UI_PALETTE_COUNT];
+extern enum ui_palette ui_palette;
+
+#define UI_SELECTED (ui_palettes[ui_palette].selected)
+#define UI_TEXT_SELECTION (ui_palettes[ui_palette].selection)
+#define UI_ACCENT (ui_palettes[ui_palette].accent)
+#define UI_ACCENT_HOVER (ui_palettes[ui_palette].hover)
+#define UI_ON_ACCENT (ui_palettes[ui_palette].ink)
 
 #define UI_HEADING 0xfff5fa
 #define UI_BODY 0xeadce6
@@ -47,5 +62,6 @@
 void ui_theme_init(void);
 gboolean ui_theme_is_line(void);
 gboolean ui_theme_toggle(GError **error);
+gboolean ui_theme_set_palette(enum ui_palette palette, GError **error);
 
 #endif

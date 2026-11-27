@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "アクセントカラー" },
+	{ "Pink", "ピンク" },
+	{ "Blue", "ブルー" },
+	{ "Mint", "ミント" },
+	{ "Amber", "アンバー" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "モニターを共有する前にデスクトップのロックを解除してください。" },
 	{ "No active monitor is available to share.",
@@ -351,6 +356,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "その他の友だち" },
 	{ "Mute", "ミュート" },
 	{ "Mute (Alt+M)", "ミュート (Alt+M)" },
+	{ "Strict mute · On", "完全ミュート · オン" },
+	{ "Strict mute · Off", "完全ミュート · オフ" },
+	{ "Notifications muted", "通知をミュート中" },
 	{ "Mute conversation", "トークをミュート" },
 	{ "Mute or unmute", "ミュートのオン/オフ" },
 	{ "My Account", "マイアカウント" },
@@ -663,6 +671,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[通話]" },
 	{ "[Chat event]", "[トークのイベント]" },
 	{ "[Contact]", "[連絡先]" },
+	{ "Message unsent", "メッセージの送信を取り消しました" },
 	{ "[Empty message]", "[空のメッセージ]" },
 	{ "[File]", "[ファイル]" },
 	{ "[Flex message]", "[Flex Message]" },

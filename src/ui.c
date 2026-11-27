@@ -449,6 +449,10 @@ static int frame_wait(gint64 now, gboolean visual_animation)
 	gboolean requested = ui.dirty || ui.video_dirty || visual_animation ||
 			     history_scroll.end_us || list_scroll.end_us;
 	int wait = ui_frame_wait_ms(&frame_clock, now, requested);
+	int screenshot = ui_media_screenshot_wait(now);
+
+	if (screenshot >= 0 && (wait < 0 || screenshot < wait))
+		wait = screenshot;
 
 	if (emoji > now) {
 		int next_image = (int)MIN((emoji - now + 999) / 1000, G_MAXINT);
@@ -1197,7 +1201,7 @@ static void notify_unread(Json *rows)
 		guint64 last = ui_read_id(ui_string(row, "lastId", NULL));
 
 		if (!id || !last || time <= newest_time ||
-		    !g_strcmp0(id, ui.self_id) || ui_chat_muted(id) ||
+		    !g_strcmp0(id, ui.self_id) || ui_chat_muted(row) ||
 		    json_object_get_int64(ui_field(row, "unread")) <= 0)
 			continue;
 		UiReadCursor *cursor =
@@ -1636,6 +1640,7 @@ static void chat_message(Json *packet)
 		json_object_object_add(moved, "time",
 				       json_object_new_int64(time));
 	json_object_object_add(moved, "lastId", json_object_new_string(id));
+	json_object_object_del(moved, "lastUnsent");
 	const char *preview = ui_string(packet, "preview", NULL);
 
 	if (preview && *preview)
@@ -1708,6 +1713,44 @@ static Json *merge_recent_sent(Json *incoming)
 		json_object_array_add(merged, json_object_get(row));
 	}
 	return merged ? merged : json_object_get(incoming);
+}
+
+static void chat_message_unsent(Json *packet)
+{
+	const char *chat = ui_string(packet, "chat", NULL);
+	Json *row = ui_field(packet, "row");
+	const char *id = ui_string(row, "id", NULL);
+
+	if (!chat || !id || g_strcmp0(ui_string(row, "type", NULL), "unsent"))
+		return;
+	Json *summary = chat_summary(chat);
+
+	if (!g_strcmp0(ui_string(summary, "lastId", NULL), id)) {
+		json_object_object_del(summary, "preview");
+		json_object_object_add(summary, "lastUnsent",
+				       json_object_new_boolean(TRUE));
+		ui_forget_rail();
+		ui.dirty = TRUE;
+	}
+	if (g_strcmp0(chat, ui.selected))
+		return;
+	ui_media_message_unsent(chat, id);
+	for (size_t i = 0;
+	     ui.history && i < json_object_array_length(ui.history); i++) {
+		Json *old = json_object_array_get_idx(ui.history, i);
+
+		if (g_strcmp0(ui_string(old, "id", NULL), id))
+			continue;
+		/* A locally sent row can be newer than the worker's last page. */
+		if (!json_object_get_int64(ui_field(row, "time")))
+			json_object_object_add(
+				row, "time",
+				json_object_get(ui_field(old, "time")));
+		ui_forget_history();
+		json_object_array_put_idx(ui.history, i, json_object_get(row));
+		ui.dirty = TRUE;
+		break;
+	}
 }
 
 /* The worker revalidated the open chat and pushed what changed. */
@@ -1936,9 +1979,16 @@ void ui_update_friend_chat(Json *row)
 {
 	Json *chat = chat_summary(ui_string(row, "id", NULL));
 	const char *name = ui_string(row, "name", NULL);
-
 	const char *avatar = ui_string(row, "avatarKey", NULL);
+	Json *disabled = ui_field(row, "notificationDisabled");
 
+	if (chat && json_object_is_type(disabled, json_type_boolean) &&
+	    !json_object_equal(disabled,
+			       ui_field(chat, "notificationDisabled"))) {
+		json_object_object_add(chat, "notificationDisabled",
+				       json_object_get(disabled));
+		ui.dirty = TRUE;
+	}
 	if (chat && avatar && *avatar &&
 	    g_strcmp0(avatar, ui_string(chat, "avatarKey", NULL))) {
 		json_object_object_add(chat, "avatarKey",
@@ -2355,9 +2405,11 @@ static void handle_packet(Json *packet)
 
 	if (!strcmp(event, "call_incoming") && ui.connected &&
 	    notify_in_background()) {
-		Json *chat = chat_summary(ui_string(packet, "chat", NULL));
+		const char *id = ui_string(packet, "chat", NULL);
+		Json *chat = chat_summary(id);
 
-		ui_desktop_notify(ui_string(chat, "name", NULL), TRUE);
+		if (!ui_chat_strict_muted(id))
+			ui_desktop_notify(ui_string(chat, "name", NULL), TRUE);
 	}
 	if ((!strcmp(event, "call") || !strcmp(event, "call_incoming") ||
 	     !strcmp(event, "call_reception") ||
@@ -2401,6 +2453,9 @@ static void handle_packet(Json *packet)
 	else if (!strcmp(event, "chat_message") && ui.connected &&
 		 !ui.logging_out)
 		chat_message(packet);
+	else if (!strcmp(event, "message_unsent") && ui.connected &&
+		 !ui.logging_out)
+		chat_message_unsent(packet);
 	else if (!strcmp(event, "message_reads") && ui.connected &&
 		 !ui.logging_out)
 		ui_message_reads(packet);
@@ -2438,8 +2493,10 @@ static Rect editor_rect(const Editor *edit)
 	return edit == &ui.search ? ui.search_box : ui.entry;
 }
 
-static int editor_hit(Editor *edit, int x)
+static int editor_hit(Editor *edit, int x, int y)
 {
+	if (edit == &ui.message)
+		return ui_message_index(x, y);
 	return edit == &ui.login_password ?
 		       ui_password_index(x) :
 		       ui_edit_hit(edit, editor_rect(edit), x);
@@ -2495,9 +2552,22 @@ void ui_insert(Editor *edit, const char *s)
 	g_string_erase(edit->value, left, right - left);
 	g_autofree char *single = g_strdup(s);
 
-	for (char *p = single; *p; p++)
-		if (*p == '\r' || *p == '\n' || *p == '\t')
-			*p = ' ';
+	char *end = single;
+
+	for (const char *p = single; *p; p++) {
+		char ch = *p;
+
+		if (edit == &ui.message && ch == '\r') {
+			if (p[1] == '\n')
+				continue;
+			ch = '\n';
+		} else if (ch == '\r' || ch == '\t' ||
+			   (ch == '\n' && edit != &ui.message)) {
+			ch = ' ';
+		}
+		*end++ = ch;
+	}
+	*end = 0;
 	if (edit == &ui.message) {
 		ui_emoji_edit(left, right, strlen(single));
 		edit_mentions(left, right, strlen(single));
@@ -2611,6 +2681,15 @@ static void key(SDL_KeyboardEvent k)
 		 shift = (k.keysym.mod & KMOD_SHIFT) != 0;
 	if (ui.composition && *ui.composition && active_editor())
 		return; /* IME owns composing keys. */
+	if (ui.connected && ui.focus == F_MESSAGE && shift &&
+	    (code == SDLK_RETURN || code == SDLK_KP_ENTER)) {
+		if (!k.repeat) {
+			mention_popup_close();
+			ui_insert(&ui.message, "\n");
+			ui.dirty = TRUE;
+		}
+		return;
+	}
 	if (mp.open && mp.items && json_object_array_length(mp.items) &&
 	    ui.focus == F_MESSAGE) {
 		int count = (int)MIN(json_object_array_length(mp.items), 6u);
@@ -2959,7 +3038,7 @@ static void click(int x, int y)
 							      F_LOGIN_PASSWORD);
 			Editor *edit = active_editor();
 
-			edit->cursor = edit->anchor = editor_hit(edit, x);
+			edit->cursor = edit->anchor = editor_hit(edit, x, y);
 		}
 	} else if (ui_list_visible() && inside(ui.rail_chats, x, y))
 		focus_on(F_LIST);
@@ -2997,7 +3076,7 @@ static void click(int x, int y)
 		focus_on(search ? F_SEARCH : F_MESSAGE);
 		Editor *edit = active_editor();
 
-		edit->cursor = edit->anchor = ui_text_index(edit, x);
+		edit->cursor = edit->anchor = editor_hit(edit, x, y);
 	} else if (ui_chat_visible() && inside(ui.send, x, y))
 		send_message();
 	else if (ui_list_visible() && inside(ui.list_box, x, y))
@@ -3180,6 +3259,11 @@ static void event(SDL_Event *e)
 	if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP ||
 	    e->type == SDL_WINDOWEVENT)
 		ui_draw_pointer(e);
+	if (e->type == SDL_KEYDOWN && e->key.keysym.sym == SDLK_q &&
+	    (e->key.keysym.mod & KMOD_CTRL)) {
+		ui.quitting = TRUE;
+		return;
+	}
 	if (ui_media_event(e) || ui_liff_event(e))
 		return;
 	switch (e->type) {
@@ -3203,10 +3287,8 @@ static void event(SDL_Event *e)
 			break;
 		}
 		if (e->window.event == SDL_WINDOWEVENT_CLOSE) {
-			if (ui_tray_hide(ui.window))
-				SDL_FlushEvent(SDL_QUIT);
-			else
-				ui.quitting = TRUE;
+			ui_tray_close(ui.window);
+			SDL_FlushEvent(SDL_QUIT);
 		}
 		if (e->window.event == SDL_WINDOWEVENT_FOCUS_GAINED) {
 			ui.active = TRUE;
@@ -3260,7 +3342,8 @@ static void event(SDL_Event *e)
 			Rect box = editor_rect(edit);
 
 			if (inside(box, ui.hover_x, ui.hover_y)) {
-				int cursor = editor_hit(edit, ui.hover_x);
+				int cursor = editor_hit(edit, ui.hover_x,
+							ui.hover_y);
 
 				if (edit->cursor != cursor)
 					ui.dirty = TRUE;
@@ -3370,10 +3453,14 @@ int line_ui(int argc, char **argv)
 	SDL_SetHint(SDL_HINT_VIDEO_X11_NET_WM_BYPASS_COMPOSITOR, "0");
 	SDL_SetHint(SDL_HINT_IME_SHOW_UI, "1");
 	SDL_SetHint("SDL_QUIT_ON_LAST_WINDOW_CLOSE", "0");
-	/* Desktops match the window to avernella.desktop by this ID. */
-	SDL_SetHint("SDL_APP_ID", "avernella");
-	SDL_SetHint("SDL_VIDEO_WAYLAND_WMCLASS", "avernella");
-	SDL_SetHint("SDL_VIDEO_X11_WMCLASS", "avernella");
+	const char *app_id = g_getenv("FLATPAK_ID");
+
+	/* Desktops match the window to the installed desktop entry. */
+	if (!app_id || !*app_id)
+		app_id = "avernella";
+	SDL_SetHint("SDL_APP_ID", app_id);
+	SDL_SetHint("SDL_VIDEO_WAYLAND_WMCLASS", app_id);
+	SDL_SetHint("SDL_VIDEO_X11_WMCLASS", app_id);
 	if (SDL_Init(SDL_INIT_VIDEO) < 0) {
 		g_printerr("SDL: %s\n", SDL_GetError());
 		ui_instance_close();

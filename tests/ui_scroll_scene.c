@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "camera.h"
 #include "media_io.h"
+#include "screenshot.h"
 #include "ui_private.h"
 #include "ui_gpu.h"
+#include "ui_chat_lists.h"
+#include "ui_chat_tools.h"
 #include "ui_motion.h"
 #include "ui_sounds.h"
 #include <gmodule.h>
@@ -18,12 +21,23 @@ enum {
 static uint32_t texture[H][W], presented[H][W];
 static unsigned int sparse, full, uploaded;
 static gboolean skip;
+static gint screenshot_requested;
 static gint64 scene_time = 1000000;
 static struct gpu_rect dirty;
 
 G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
 {
 	return scene_time;
+}
+
+char *line_desktop_screenshot(const char *parent, GCancellable *cancel,
+			      GError **error)
+{
+	(void)parent;
+	(void)cancel;
+	(void)error;
+	g_atomic_int_inc(&screenshot_requested);
+	return NULL;
 }
 
 /* A deterministic consumer of the production scene's texel-copy commands. */
@@ -775,6 +789,116 @@ static void check_history_motion(void)
 	settle();
 }
 
+static void check_strict_mute(void)
+{
+	static const char group[] = "c00000000000000000000000000000013";
+
+	g_autoptr(J) row = obj();
+	g_autofree char *prior = ui.selected;
+	SDL_Event key = { .key = { .type = SDL_KEYDOWN,
+				   .keysym = { .sym = SDLK_F10,
+					       .mod = KMOD_SHIFT } } };
+
+	ui.selected = g_strdup(group);
+	json_object_object_add(row, "id", json_object_new_string(group));
+	json_object_object_add(row, "name", json_object_new_string("Garden"));
+	json_object_object_add(row, "unread", json_object_new_int(11));
+	json_object_array_add(ui.chats, json_object_get(row));
+	ui_lists_login("u00000000000000000000000000000099");
+	g_assert_true(ui_lists_ready());
+	ui_refilter_chats();
+	ui_forget_rail();
+	ui_draw();
+	g_assert_false(ui_chat_muted(row));
+	g_assert_cmpstr(ui_rail_chat_at(30, 100), ==, group);
+	guint32 header =
+		crc32(0, (const Bytef *)presented, W * 48 * sizeof(uint32_t));
+
+	/* A server-muted group still displays its unread count. */
+	json_object_object_add(row, "notificationDisabled",
+			       json_object_new_boolean(TRUE));
+	ui_draw();
+	g_assert_true(ui_chat_muted(row));
+	g_assert_cmpint(ui_chat_unread(row), ==, 11);
+	g_assert_cmpuint(crc32(0, (const Bytef *)presented,
+			       W * 48 * sizeof(uint32_t)),
+			 !=, header);
+	json_object_object_add(row, "notificationDisabled",
+			       json_object_new_boolean(FALSE));
+	g_assert_false(ui_chat_muted(row));
+
+	/* Exercise the actual group context menu's strict mute setting. */
+	ui.focus = F_MESSAGE;
+	g_assert_true(ui_lists_event(&key));
+	key.key.keysym.mod = KMOD_NONE;
+	key.key.keysym.sym = SDLK_DOWN;
+	g_assert_true(ui_lists_event(&key));
+	g_assert_true(ui_lists_event(&key));
+	key.key.keysym.sym = SDLK_RETURN;
+	g_assert_true(ui_lists_event(&key));
+	key.key.keysym.sym = SDLK_ESCAPE;
+	g_assert_true(ui_lists_event(&key));
+	ui_draw();
+	g_assert_true(ui_chat_strict_muted(group));
+	g_assert_true(ui_chat_muted(row));
+	g_assert_cmpint(ui_chat_unread(row), ==, 0);
+	g_assert_cmpint(json_object_get_int(ui_field(row, "unread")), ==, 11);
+	g_assert_null(ui_rail_chat_at(30, 100));
+
+	ui_lists_reset();
+	g_free(ui.selected);
+	ui.selected = g_steal_pointer(&prior);
+	ui_forget_rail();
+	json_object_array_del_idx(ui.chats,
+				  json_object_array_length(ui.chats) - 1, 1);
+	ui_refilter_chats();
+}
+
+static void check_multiline_composer(void)
+{
+	ui_draw();
+	int base = ui.composer.h;
+
+	ui_insert(&ui.message, "One\nTwo\nThree");
+	ui_draw();
+	g_assert_cmpint(ui.composer.h, >, base);
+	int index =
+		ui_message_index(ui.entry.x + 8, ui.entry.y + ui.entry.h / 2);
+
+	g_assert_cmpint(index, ==, strlen("One\n"));
+	ui.message.anchor = 0;
+	ui_insert(&ui.message, "");
+	ui_draw();
+	g_assert_cmpint(ui.composer.h, ==, base);
+}
+
+static void check_screenshot_after_close(void)
+{
+	SDL_Event click = { .button = { .type = SDL_MOUSEBUTTONDOWN,
+					.button = SDL_BUTTON_LEFT,
+					.x = W / 2,
+					.y = (H - 320) / 2 + 232 } };
+
+	ui.photos = TRUE;
+	ui_chat_tools_open();
+	ui_draw();
+	g_assert_true(ui_chat_tools_active());
+	g_assert_true(ui_chat_tools_event(&click));
+	g_assert_false(ui_chat_tools_active());
+	g_assert_cmpint(ui_media_screenshot_wait(scene_time), ==, -1);
+	g_assert_cmpint(g_atomic_int_get(&screenshot_requested), ==, 0);
+	ui_draw();
+	g_assert_cmpint(ui_media_screenshot_wait(scene_time), >, 0);
+	scene_time += G_USEC_PER_SEC;
+	g_assert_cmpint(ui_media_screenshot_wait(scene_time), ==, -1);
+	for (int i = 0; i < 1000 && !g_atomic_int_get(&screenshot_requested);
+	     i++)
+		g_usleep(1000);
+	ui_media_shutdown();
+	g_assert_cmpint(g_atomic_int_get(&screenshot_requested), ==, 1);
+	ui.photos = FALSE;
+}
+
 static void history(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -798,6 +922,8 @@ static void history(void)
 	ui.name = g_strdup("Ada");
 	ui.message.value = g_string_new("");
 	ui.search.value = g_string_new("");
+	check_multiline_composer();
+	check_screenshot_after_close();
 	for (int i = 0; i < 55; i++) {
 		Json *row = json_object_new_object();
 		char message[72];
@@ -851,6 +977,7 @@ static void history(void)
 	ui_theme_changed(row_height);
 	check_message_receipts();
 	check_chat_event();
+	check_strict_mute();
 	check_row_animation();
 	check_history_motion();
 	/* Exercise receipt widths with RTL shaping and a compact chat pane. */

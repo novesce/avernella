@@ -364,6 +364,29 @@ static void large_cache(void)
 	line_session_clear(&restored);
 }
 
+static void unsent_index(void)
+{
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) record = json_tokener_parse(
+		"{\"c00000000000000000000000000000001\":{\"101\":1731000000000}}");
+	Line session = { 0 };
+	int dir = line_store_open(&session, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpint(dir, >=, 0);
+	line_store_write_unsent("u00000000000000000000000000000001", record);
+	g_autoptr(J) owned = line_store_read_unsent(
+		dir, "u00000000000000000000000000000001");
+	g_autoptr(J) other = line_store_read_unsent(
+		dir, "u00000000000000000000000000000002");
+
+	g_assert_true(json_object_equal(owned, record));
+	g_assert_cmpint(json_object_object_length(other), ==, 0);
+	g_assert_cmpint(unlinkat(dir, "unsent.json", 0), ==, 0);
+	g_assert_cmpint(close(dir), ==, 0);
+	line_session_clear(&session);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -383,6 +406,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/state/unreadable-session-discarded",
 			unreadable_session_discarded);
 	g_test_add_func("/state/oversized-cache", large_cache);
+	g_test_add_func("/state/unsent-index", unsent_index);
 	int result = g_test_run();
 	g_autofree char *sub = g_build_filename(sandbox, "avernella", NULL);
 

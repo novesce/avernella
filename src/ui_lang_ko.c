@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "강조 색상" },
+	{ "Pink", "분홍" },
+	{ "Blue", "파랑" },
+	{ "Mint", "민트" },
+	{ "Amber", "호박색" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "모니터를 공유하려면 먼저 데스크톱 잠금을 해제하세요." },
 	{ "No active monitor is available to share.",
@@ -346,6 +351,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "친구 더 보기" },
 	{ "Mute", "음소거" },
 	{ "Mute (Alt+M)", "음소거 (Alt+M)" },
+	{ "Strict mute · On", "모든 알림 끄기 · 켜짐" },
+	{ "Strict mute · Off", "모든 알림 끄기 · 꺼짐" },
+	{ "Notifications muted", "알림이 꺼져 있음" },
 	{ "Mute conversation", "대화 알림 끄기" },
 	{ "Mute or unmute", "음소거 켜기/끄기" },
 	{ "My Account", "내 계정" },
@@ -655,6 +663,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[통화]" },
 	{ "[Chat event]", "[채팅 이벤트]" },
 	{ "[Contact]", "[연락처]" },
+	{ "Message unsent", "메시지 전송이 취소되었습니다" },
 	{ "[Empty message]", "[빈 메시지]" },
 	{ "[File]", "[파일]" },
 	{ "[Flex message]", "[Flex 메시지]" },

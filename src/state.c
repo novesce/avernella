@@ -18,6 +18,71 @@
 static const char *const legacy_dirs[] = { "kitatide", "line-linux" };
 #define STORE_DIR_FLAGS (O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC | O_RDONLY)
 #define MAX_SESSION_SIZE ((size_t)8 * 1024 * 1024)
+#define UNSENT_FILE "unsent.json"
+#define MAX_UNSENT_SIZE ((size_t)512 * 1024)
+
+J *line_store_read_unsent(int dir, const char *mid)
+{
+	int fd = openat(dir, UNSENT_FILE,
+			O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
+	struct stat st;
+
+	g_autofree char *text = NULL;
+
+	g_autoptr(J) record = NULL;
+	size_t used = 0;
+	J *chats;
+
+	if (fd < 0)
+		return obj();
+	if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != getuid() ||
+	    (st.st_mode & 077) || st.st_size < 2 ||
+	    (guint64)st.st_size > MAX_UNSENT_SIZE)
+		goto done;
+
+	text = g_malloc(st.st_size + 1);
+	while (used < (size_t)st.st_size) {
+		ssize_t n = read(fd, text + used, st.st_size - used);
+
+		if (n < 0 && errno == EINTR)
+			continue;
+		if (n <= 0)
+			goto done;
+		used += n;
+	}
+	text[used] = 0;
+	record = json_tokener_parse(text);
+done:
+	close(fd);
+	chats = field(record, "chats");
+	return !g_strcmp0(strfield(record, "account"), mid) &&
+			       json_object_is_type(chats, json_type_object) ?
+		       json_object_get(chats) :
+		       obj();
+}
+
+void line_store_write_unsent(const char *mid, J *rows)
+{
+	g_autoptr(J) record = obj();
+	g_autofree char *path = NULL;
+	size_t size;
+
+	if (!mid || !rows)
+		return;
+	json_object_object_add(record, "account", json_object_new_string(mid));
+	json_object_object_add(record, "chats", json_object_get(rows));
+	const char *text = json_object_to_json_string_length(
+		record, JSON_C_TO_STRING_PLAIN, &size);
+
+	if (size > MAX_UNSENT_SIZE)
+		return;
+	path = g_build_filename(g_get_user_state_dir(), LINE_STATE_DIR,
+				UNSENT_FILE, NULL);
+	g_file_set_contents_full(path, text, size,
+				 G_FILE_SET_CONTENTS_CONSISTENT |
+					 G_FILE_SET_CONTENTS_DURABLE,
+				 0600, NULL);
+}
 
 static gboolean io_failure(const char *action, GError **error)
 {
@@ -41,7 +106,7 @@ void line_session_clear(Line *s)
 	*s = (Line){ .service_code = -1 };
 }
 
-static gboolean load(int dir, Line *s, GError **error)
+gboolean line_store_load(int dir, Line *s, GError **error)
 {
 	int fd = openat(dir, SESSION,
 			O_RDONLY | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
@@ -175,7 +240,7 @@ static gboolean migrate_store(int root, GError **error)
 		}
 		g_autoptr(GError) unreadable = NULL;
 		Line probe = { .service_code = -1 };
-		gboolean usable = load(dir, &probe, &unreadable);
+		gboolean usable = line_store_load(dir, &probe, &unreadable);
 
 		line_session_clear(&probe);
 		if (!usable) {
@@ -240,7 +305,7 @@ int line_store_open(Line *s, GError **error)
 	if (dir < 0)
 		return -1;
 	if (lock_store(dir, LINE_STATE_DIR, error) &&
-	    remove_incomplete(dir, error) && load(dir, s, error))
+	    remove_incomplete(dir, error) && line_store_load(dir, s, error))
 		return dir;
 	close(dir);
 	return -1;

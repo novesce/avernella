@@ -72,8 +72,9 @@ enum {
 	PROFILE_TTL_SECONDS = 120
 };
 
-struct cached_profile_name {
+struct cached_profile {
 	gint64 expires;
+	int notification_disabled; /* -1 means the reply omitted it. */
 	char name[];
 };
 
@@ -92,7 +93,9 @@ void line_profile_operation(Line *s, J *op)
 	case 10:
 	case 11:
 	case 49:
+	case 70:
 	case 78:
+	case 80:
 	case 121:
 	case 122:
 	case 141:
@@ -102,7 +105,8 @@ void line_profile_operation(Line *s, J *op)
 	}
 }
 
-static void cache_profile(Line *s, const char *id, const char *name)
+static void cache_profile(Line *s, const char *id, const char *name,
+			  int notification_disabled)
 {
 	gsize n = strlen(name);
 
@@ -119,10 +123,11 @@ static void cache_profile(Line *s, const char *id, const char *name)
 		if (g_hash_table_iter_next(&it, NULL, NULL))
 			g_hash_table_iter_remove(&it);
 	}
-	struct cached_profile_name *entry = g_malloc(sizeof(*entry) + n + 1);
+	struct cached_profile *entry = g_malloc(sizeof(*entry) + n + 1);
 
 	entry->expires = g_get_monotonic_time() +
 			 (gint64)PROFILE_TTL_SECONDS * G_USEC_PER_SEC;
+	entry->notification_disabled = notification_disabled;
 	memcpy(entry->name, name, n + 1);
 	g_hash_table_replace(s->profiles, g_strdup(id), entry);
 }
@@ -132,14 +137,15 @@ static void cache_profile(Line *s, const char *id, const char *name)
  * looked up, can still have readable history. Store only names for requested IDs.
  */
 static void remember_profile(Line *s, J *names, const char *id,
-			     const char *name, const char *path)
+			     const char *name, const char *path,
+			     int notification_disabled)
 {
 	if (!id || !field(names, id))
 		return;
-	if (name) {
+	if (name)
 		put(names, id, string(name));
-		cache_profile(s, id, name);
-	}
+	if (name || notification_disabled >= 0)
+		cache_profile(s, id, name ? name : "", notification_disabled);
 	if (s->pictures) {
 		if (path && *path == '/' && strlen(path) <= 1024)
 			put(s->pictures, id, string(path));
@@ -174,7 +180,7 @@ static void resolve_users(Line *s, J *mids, J *names)
 			if (!name)
 				name = nonempty(field(u, "3"), "2");
 			remember_profile(s, names, nonempty(u, "1"), name,
-					 nonempty(field(u, "3"), "3"));
+					 nonempty(field(u, "3"), "3"), -1);
 		}
 		return;
 	}
@@ -198,11 +204,12 @@ static void resolve_users(Line *s, J *mids, J *names)
 
 		if (!label)
 			label = nonempty(contact, "22");
-		remember_profile(s, names, id, label, nonempty(contact, "37"));
+		remember_profile(s, names, id, label, nonempty(contact, "37"),
+				 -1);
 	}
 }
 
-static void resolve_groups(Line *s, J *mids, J *names)
+static void resolve_groups(Line *s, J *mids, J *names, J *summaries)
 {
 	g_autoptr(J) args = obj();
 	J *req = obj();
@@ -218,13 +225,21 @@ static void resolve_groups(Line *s, J *mids, J *names)
 
 	for (size_t i = 0; i < length(groups); i++) {
 		J *group = at(groups, i);
+		const char *id = nonempty(group, "2");
+		J *disabled = field(group, "4");
+		J *summary = id ? field(summaries, id) : NULL;
+		int state = json_object_is_type(disabled, json_type_boolean) ?
+				    json_object_get_boolean(disabled) :
+				    -1;
 
-		remember_profile(s, names, nonempty(group, "2"),
-				 nonempty(group, "6"), nonempty(group, "7"));
+		if (summary && state >= 0)
+			boolean(summary, "notificationDisabled", state);
+		remember_profile(s, names, id, nonempty(group, "6"),
+				 nonempty(group, "7"), state);
 	}
 }
 
-void line_resolve_names(Line *s, J *names, char type)
+static void resolve_names(Line *s, J *names, char type, J *summaries)
 {
 	/* Snapshot IDs first: looking up names replaces values in names. */
 	g_autoptr(J) ids = array();
@@ -233,9 +248,14 @@ void line_resolve_names(Line *s, J *names, char type)
 	json_object_object_foreach(names, id, name) {
 		if (id[0] != type || json_object_get_string_len(name))
 			continue;
-		const struct cached_profile_name *cached =
+		const struct cached_profile *cached =
 			s->profiles ? g_hash_table_lookup(s->profiles, id) :
 				      NULL;
+		J *summary = field(summaries, id);
+
+		if (cached && summary && cached->notification_disabled >= 0)
+			boolean(summary, "notificationDisabled",
+				cached->notification_disabled);
 		if (cached && cached->expires > now)
 			put(names, id, string(cached->name));
 		else
@@ -250,8 +270,13 @@ void line_resolve_names(Line *s, J *names, char type)
 		if (type == 'u')
 			resolve_users(s, batch, names);
 		else
-			resolve_groups(s, batch, names);
+			resolve_groups(s, batch, names, summaries);
 	}
+}
+
+void line_resolve_names(Line *s, J *names, char type)
+{
+	resolve_names(s, names, type, NULL);
 }
 
 static int chat_order(const void *a, const void *b)
@@ -355,7 +380,8 @@ J *line_chats(Line *s, GError **error)
 		g_hash_table_add(cursors, (gpointer)cursor);
 	}
 	line_resolve_names(s, names, 'u');
-	line_resolve_names(s, names, 'c');
+	resolve_names(s, names, 'c', summaries);
+	resolve_names(s, names, 'r', summaries);
 	J *rows = array();
 
 	json_object_object_foreach(summaries, id, row) {
@@ -621,6 +647,128 @@ static int message_order(const void *a, const void *b)
 	guint64 ri = g_ascii_strtoull(strfield(rhs, "id"), NULL, 10);
 
 	return (li > ri) - (li < ri);
+}
+
+static guint64 message_id(const char *id)
+{
+	guint64 value;
+
+	if (!id ||
+	    !g_ascii_string_to_unsigned(id, 10, 1, G_MAXINT64, &value, NULL))
+		return 0;
+	return value;
+}
+
+gboolean line_unsend_operation(J *op, const char **chat, const char **id)
+{
+	J *kind = field(op, "3");
+
+	/* DESTROY_MESSAGE and NOTIFIED_DESTROY_MESSAGE have the same shape. */
+	if (!json_object_is_type(kind, json_type_int))
+		return FALSE;
+	gint64 type = json_object_get_int64(kind);
+
+	if (type != 64 && type != 65)
+		return FALSE;
+	*chat = strfield(op, "10");
+	*id = strfield(op, "11");
+	return talk_id(*chat) && message_id(*id);
+}
+
+J *line_unsent_row(const char *id, gint64 time)
+{
+	J *row = obj();
+
+	put(row, "id", string(id));
+	put(row, "type", string("unsent"));
+	put(row, "text", string("Message unsent"));
+	number(row, "time", time);
+	return row;
+}
+
+void line_remember_unsent(J *ids, const char *id, gint64 time)
+{
+	J *entry = field(ids, id);
+
+	if (entry && (!time || json_object_get_int64(entry) > 0))
+		return;
+	if (!entry && json_object_object_length(ids) >= 128) {
+		struct json_object_iterator first = json_object_iter_begin(ids);
+
+		json_object_object_del(ids, json_object_iter_peek_name(&first));
+	}
+	number(ids, id, time);
+}
+
+void line_redact_unsent(J *ids, J *rows, J *raw, guint64 cleared,
+			gboolean latest)
+{
+	if (!json_object_is_type(ids, json_type_object))
+		return;
+	guint64 oldest = G_MAXUINT64, newest = 0;
+	gboolean added = FALSE;
+
+	for (size_t i = 0; i < length(rows); i++) {
+		J *row = at(rows, i);
+		const char *id = strfield(row, "id");
+		guint64 value = message_id(id);
+
+		if (!value)
+			continue;
+		oldest = MIN(oldest, value);
+		newest = MAX(newest, value);
+		J *entry = field(ids, id);
+
+		if (entry) {
+			gint64 time = json_object_get_int64(field(row, "time"));
+
+			if (time > 0 && !json_object_get_int64(entry))
+				json_object_set_int64(entry, time);
+			json_object_array_put_idx(rows, i,
+						  line_unsent_row(id, time));
+		}
+	}
+	/* Always keep the real delivery cursor, even for a redacted message. */
+	if (raw) {
+		json_object_object_foreach(ids, id, entry) {
+			J *old = field(raw, id);
+
+			if (!old)
+				continue;
+			J *stub = obj();
+
+			put(stub, "4", string(id));
+			put(stub, "5", json_object_get(field(old, "5")));
+			put(stub, "6", json_object_get(field(old, "6")));
+			boolean(stub, "unsent", TRUE);
+			put(raw, id, stub);
+			(void)entry;
+		}
+	}
+	/*
+	 * LINE may omit the cleared record entirely. Retain its known send
+	 * time when this page spans the ID, including the head of a chat.
+	 */
+	if (!rows)
+		return;
+	json_object_object_foreach(ids, id, entry) {
+		guint64 value = message_id(id);
+		gint64 time = json_object_get_int64(entry);
+
+		if (time <= 0 || value <= cleared ||
+		    (newest && value < oldest) || (!latest && value > newest))
+			continue;
+		gboolean present = FALSE;
+
+		for (size_t i = 0; !present && i < length(rows); i++)
+			present = !g_strcmp0(id, strfield(at(rows, i), "id"));
+		if (present)
+			continue;
+		json_object_array_add(rows, line_unsent_row(id, time));
+		added = TRUE;
+	}
+	if (added)
+		json_object_array_sort(rows, message_order);
 }
 
 /* Embeddings, overrides, isolates and marks that reorder displayed text. */

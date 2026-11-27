@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "Warna aksen" },
+	{ "Pink", "Merah muda" },
+	{ "Blue", "Biru" },
+	{ "Mint", "Mint" },
+	{ "Amber", "Ambar" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "Buka kunci desktop sebelum membagikan monitor." },
 	{ "No active monitor is available to share.",
@@ -348,6 +353,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "Teman lainnya" },
 	{ "Mute", "Bisukan" },
 	{ "Mute (Alt+M)", "Bisukan (Alt+M)" },
+	{ "Strict mute · On", "Bisukan semua · Aktif" },
+	{ "Strict mute · Off", "Bisukan semua · Nonaktif" },
+	{ "Notifications muted", "Notifikasi dibisukan" },
 	{ "Mute conversation", "Bisukan percakapan" },
 	{ "Mute or unmute", "Bisukan atau bunyikan" },
 	{ "My Account", "Akun Saya" },
@@ -654,6 +662,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[Panggilan]" },
 	{ "[Chat event]", "[Peristiwa obrolan]" },
 	{ "[Contact]", "[Kontak]" },
+	{ "Message unsent", "Pesan ditarik" },
 	{ "[Empty message]", "[Pesan kosong]" },
 	{ "[Flex message]", "[Pesan Flex]" },
 	{ "[Gift]", "[Hadiah]" },

@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "強調色" },
+	{ "Pink", "粉紅色" },
+	{ "Blue", "藍色" },
+	{ "Mint", "薄荷綠" },
+	{ "Amber", "琥珀色" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "請先解鎖桌面，再分享螢幕。" },
 	{ "No active monitor is available to share.",
@@ -319,6 +324,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "更多好友" },
 	{ "Mute", "靜音" },
 	{ "Mute (Alt+M)", "靜音 (Alt+M)" },
+	{ "Strict mute · On", "嚴格靜音 · 已開啟" },
+	{ "Strict mute · Off", "嚴格靜音 · 已關閉" },
+	{ "Notifications muted", "通知已靜音" },
 	{ "Mute conversation", "將對話設為免打擾" },
 	{ "Mute or unmute", "靜音或取消靜音" },
 	{ "My Account", "我的帳號" },
@@ -622,6 +630,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[通話]" },
 	{ "[Chat event]", "[聊天事件]" },
 	{ "[Contact]", "[聯絡人]" },
+	{ "Message unsent", "訊息已收回" },
 	{ "[Empty message]", "[空訊息]" },
 	{ "[File]", "[檔案]" },
 	{ "[Flex message]", "[Flex 訊息]" },

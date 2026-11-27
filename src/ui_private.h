@@ -38,6 +38,7 @@ typedef struct {
 	GString *value;
 	int cursor, anchor; /* UTF-8 byte offsets */
 	int scroll;
+	int scroll_y;
 } Editor;
 
 typedef struct {
@@ -261,7 +262,9 @@ const char *ui_string(Json *obj, const char *key, const char *fallback);
 
 static inline gboolean ui_is_chat_event(Json *row)
 {
-	return !g_strcmp0(ui_string(row, "type", NULL), "chat_event");
+	const char *kind = ui_string(row, "type", "");
+
+	return !strcmp(kind, "chat_event") || !strcmp(kind, "unsent");
 }
 
 gboolean ui_draw_init(void);
@@ -275,7 +278,7 @@ void ui_forget_history(void);
 void ui_draw_shutdown(void);
 void ui_forget_labels(void);
 void ui_layout(void);
-int ui_text_index(Editor *editor, int x);
+int ui_message_index(int x, int y);
 
 void ui_rpc(const char *method, Json *params, guint tag); /* consumes params */
 void ui_sign_out(void);
@@ -299,6 +302,8 @@ void ui_media_refresh_flex(void);
 void ui_media_reset(void);
 void ui_media_shutdown(void);
 void ui_media_screenshot(void);
+void ui_media_screenshot_presented(void);
+int ui_media_screenshot_wait(gint64 now);
 gboolean ui_media_event(SDL_Event *e);
 void ui_media_reply(const char *method, Json *params, guint tag, Json *result,
 		    const char *error);
@@ -325,6 +330,7 @@ void ui_media_thumb(Json *row, Rect area);
 void ui_media_select_chat(void);
 gboolean ui_media_can_call(gboolean video);
 void ui_media_reply_sent(const char *chat);
+void ui_media_message_unsent(const char *chat, const char *id);
 Json *ui_row_at(int x, int y);
 const char *ui_flex_link_at(int x, int y);
 /* Newly allocated URL under (x, y) in a text message, or NULL. */

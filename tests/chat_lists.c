@@ -141,6 +141,36 @@ static void mute_and_motion(void)
 	g_remove(file);
 }
 
+static void strict_mute(void)
+{
+	g_autoptr(GError) e = NULL;
+	struct chat_lists *s = chat_lists_open(USER, &e);
+
+	g_assert_no_error(e);
+	g_assert_false(chat_strict_muted(s, CHAT));
+	g_assert_false(chat_strict_mute_toggle(s, PEER, &e));
+	g_assert_nonnull(e);
+	g_clear_error(&e);
+	g_assert_true(chat_strict_mute_toggle(s, CHAT, &e));
+	g_assert_true(chat_strict_muted(s, CHAT));
+	g_assert_false(chat_muted(s, CHAT));
+	chat_lists_free(s);
+
+	s = chat_lists_open(OTHER, &e);
+	g_assert_no_error(e);
+	g_assert_false(chat_strict_muted(s, CHAT));
+	chat_lists_free(s);
+	s = chat_lists_open(USER, &e);
+	g_assert_no_error(e);
+	g_assert_true(chat_strict_muted(s, CHAT));
+	g_assert_true(chat_strict_mute_toggle(s, CHAT, &e));
+	g_assert_false(chat_strict_muted(s, CHAT));
+	chat_lists_free(s);
+	g_autofree char *file = settings_file(USER);
+
+	g_remove(file);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -151,6 +181,8 @@ int main(int argc, char **argv)
 			round_trip);
 	g_test_add_func("/lists/invalid-input-and-local-files", rejected);
 	g_test_add_func("/lists/muted-chats-and-motion", mute_and_motion);
+	g_test_add_func("/lists/strict-mute-per-group-and-account",
+			strict_mute);
 	int rc = g_test_run();
 	g_autofree char *dir = g_build_filename(state_dir, "avernella", NULL);
 

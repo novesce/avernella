@@ -9,9 +9,10 @@ int line_ui(int argc, char **argv);
 int __real_SDL_PollEvent(SDL_Event *ev);
 
 static const char chat[] = "u00000000000000000000000000000001";
-static const char draft[] = "Still composing…";
+static const char draft[] = "Still composing…\n";
 static enum {
 	OPEN_CHAT,
+	WAIT_FOR_NEWLINE,
 	CHECK_RECONNECT,
 	CHECK_MANUAL_REFRESH,
 	WAIT_FOR_OUTAGE,
@@ -59,8 +60,10 @@ static int worker(void)
 			if (histories == 1)
 				puts("{\"event\":\"reconnected\"}");
 		} else if (!strcmp(method, "olderHistory")) {
-			printf("{\"id\":%d,\"result\":{\"messages\":[{\"id\":\"0\","
-			       "\"text\":\"Earlier message\"}]}}\n",
+			printf("{\"id\":%d,\"result\":{\"messages\":[{\"id\":\"101\","
+			       "\"time\":1000,\"text\":\"Earlier message\"},"
+			       "{\"id\":\"102\",\"time\":1001,\"type\":\"sticker\","
+			       "\"hasSound\":true}]}}\n",
 			       id);
 			puts("{\"event\":\"sync_unavailable\",\"message\":\"Offline\"}");
 			puts("{\"event\":\"reconnected\"}");
@@ -68,6 +71,11 @@ static int worker(void)
 			/* All requests from the last refresh have now arrived. */
 			g_assert_cmpint(chats, ==, 4);
 			g_assert_cmpint(histories, ==, 3);
+			for (int i = 101; i <= 102; i++)
+				printf("{\"event\":\"message_unsent\",\"chat\":\"%s\","
+				       "\"row\":{\"id\":\"%d\",\"type\":\"unsent\","
+				       "\"text\":\"Message unsent\",\"time\":0}}\n",
+				       chat, i);
 			puts("{\"event\":\"status\",\"message\":\"Check complete\"}");
 		} else {
 			printf("{\"id\":%d,\"result\":{}}\n", id);
@@ -86,14 +94,26 @@ int __wrap_SDL_PollEvent(SDL_Event *ev)
 	const char *text = ui_string(row, "text", "");
 	SDL_Event input = { 0 };
 
-	if (step != OPEN_CHAT) {
+	if (step == WAIT_FOR_NEWLINE) {
+		g_assert_cmpstr(ui.message.value->str, ==, draft);
+		step = CHECK_RECONNECT;
+	}
+	if (step > WAIT_FOR_NEWLINE) {
 		g_assert_cmpstr(ui.message.value->str, ==, draft);
 		g_assert_cmpstr(ui.selected, ==, chat);
 	}
 	if (step == OPEN_CHAT && room) {
 		ui_open_conversation(room);
-		ui_insert(&ui.message, draft);
+		ui.focus = F_MESSAGE;
+		ui_insert(&ui.message, "Still composing…");
+		input.key = (SDL_KeyboardEvent){
+			.type = SDL_KEYDOWN,
+			.state = SDL_PRESSED,
+			.keysym = { .sym = SDLK_RETURN, .mod = KMOD_SHIFT },
+		};
 		step++;
+		*ev = input;
+		return 1;
 	} else if (step == CHECK_RECONNECT && !strcmp(text, "Page 2")) {
 		g_assert_cmpstr(ui_string(room, "lastId", NULL), ==, "2");
 		input.type = SDL_MOUSEBUTTONDOWN;
@@ -122,7 +142,21 @@ int __wrap_SDL_PollEvent(SDL_Event *ev)
 	} else if (step == WAIT_FOR_BARRIER &&
 		   !g_strcmp0(ui.notice, "Check complete")) {
 		g_assert_true(ui.older_page);
-		g_assert_cmpstr(text, ==, "Earlier message");
+		g_assert_cmpuint(json_object_array_length(ui.history), ==, 2);
+		for (size_t i = 0; i < 2; i++) {
+			Json *message =
+				json_object_array_get_idx(ui.history, i);
+
+			g_assert_true(ui_is_chat_event(message));
+			g_assert_cmpstr(ui_string(message, "type", ""), ==,
+					"unsent");
+			g_assert_cmpstr(ui_string(message, "text", ""), ==,
+					"Message unsent");
+			g_assert_null(ui_field(message, "hasSound"));
+			g_assert_cmpint(
+				json_object_get_int(ui_field(message, "time")),
+				==, 1000 + i);
+		}
 		input.type = SDL_QUIT;
 		step++;
 	}

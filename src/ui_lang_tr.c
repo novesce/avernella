@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "Vurgu rengi" },
+	{ "Pink", "Pembe" },
+	{ "Blue", "Mavi" },
+	{ "Mint", "Nane yeşili" },
+	{ "Amber", "Kehribar" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "Bir monitörü paylaşmadan önce masaüstünün kilidini açın." },
 	{ "No active monitor is available to share.",
@@ -337,6 +342,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "Daha fazla arkadaş" },
 	{ "Mute", "Sesi kapat" },
 	{ "Mute (Alt+M)", "Sesi kapat (Alt+M)" },
+	{ "Strict mute · On", "Tümünü sessize al · Açık" },
+	{ "Strict mute · Off", "Tümünü sessize al · Kapalı" },
+	{ "Notifications muted", "Bildirimler sessize alındı" },
 	{ "Mute conversation", "Konuşmanın sesini kapat" },
 	{ "Mute or unmute", "Sesi kapat veya aç" },
 	{ "My Account", "Hesabım" },
@@ -644,6 +652,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[Arama]" },
 	{ "[Chat event]", "[Sohbet olayı]" },
 	{ "[Contact]", "[Kişi]" },
+	{ "Message unsent", "Mesaj geri alındı" },
 	{ "[Empty message]", "[Boş mesaj]" },
 	{ "[File]", "[Dosya]" },
 	{ "[Flex message]", "[Flex mesajı]" },

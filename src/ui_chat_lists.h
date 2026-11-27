@@ -20,7 +20,9 @@ gboolean ui_notifications_enabled(void);
 gboolean ui_notifications_set(gboolean on);
 gboolean ui_sounds_enabled(void);
 gboolean ui_sounds_set(gboolean on);
-gboolean ui_chat_muted(const char *chat);
+gboolean ui_chat_muted(Json *row);
+gboolean ui_chat_strict_muted(const char *chat);
+gint64 ui_chat_unread(Json *row);
 /* Saves the reduced-motion choice: 1, 0, or -1 for the desktop's. */
 gboolean ui_motion_save(int reduce);
 void ui_lists_open_preferences(void);

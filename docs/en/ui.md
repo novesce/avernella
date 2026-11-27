@@ -121,14 +121,14 @@ Scrolling follows the desktop's natural-scrolling setting, separately for the to
 
 ## Themes
 
-[`ui_theme.c`](../../src/ui_theme.c) and [`ui_theme.h`](../../src/ui_theme.h) define two layouts that share one palette.
+[`ui_theme.c`](../../src/ui_theme.c) and [`ui_theme.h`](../../src/ui_theme.h) define two layouts. Under **User Settings → Appearance**, select Pink, Blue, Mint or Amber for either layout. The app saves the choice under `$XDG_CONFIG_HOME/avernella/accent` and applies it immediately.
 
 | Theme | Look | How it differs in code |
 | ----- | ---- | ---------------------- |
 | **LINE** (default) | Modeled on LINE's desktop app: a narrow navigation bar with Friends and Chats tabs and the account buttons at its foot, 68-pixel chat rows showing the latest message, time and unread count, incoming bubbles on the left and your bubbles on the right, an input pane with emoji, file and **Send** buttons | `ui_theme_is_line()` is true. `line_bar()`, `line_chat_row()` and `line_composer()` in `ui_draw.c` draw it. `ui_profile_place()` moves the profile, Inbox and settings buttons into the bar. |
 | **Avernella** | A compact layout with a server-style rail (unread chats pinned as round shortcuts), 44-pixel chat rows, messages grouped by sender, a user panel at the bottom left, and one rounded composer bar | `server_rail()`, `chats_panel()`, `user_panel()` and `composer()` in `ui_draw.c` |
 
-Both use Avernella's dark plum surfaces and hot-pink accent (`UI_BG`, `UI_PANEL`, `UI_ACCENT` and the rest in `ui_theme.h`). The LINE theme maps LINE's green onto the pink accent (`UI_BUBBLE_OUT`, `UI_NAV_ACTIVE`). Colors are `0xRRGGBB` integers.
+Both layouts use Avernella’s dark plum surfaces and default to Pink. The chosen accent colors the sent bubbles, unread badges and active tab (`UI_BUBBLE_OUT`, `UI_NAV_ACTIVE`). The renderer uses `0xRRGGBB` values from the active palette.
 
 The choice is read once at start (`ui_theme_init()`) from `~/.config/avernella/layout`: the file containing exactly `avernella\n` selects the Avernella theme, and anything else selects LINE. `ui_theme_toggle()` writes the file atomically and flips the theme. `ui_theme_changed()` in `ui.c` then fixes scroll offsets for the new row height (`ui_chat_row_height()`) and relayouts.
 
@@ -163,6 +163,7 @@ Each feature module follows the same pattern, so once you know one you know them
 - The refresh button, **Ctrl+R**, and a recovered connection also retry failed image downloads as they come into view. Images already loaded stay cached.
 - **Filtering:** typing in the search box (Ctrl+F) filters by name (`ui_refilter_chats()`).
 - **Folders and pins:** [`ui_chat_lists.c`](../../src/ui_chat_lists.c) draws the folder selector and its menu, and [`chat_lists.c`](../../src/chat_lists.c) stores folders, pins, mutes and shortcuts per account. Right-click a chat to pin, mute or add it to a folder.
+- **Muted chats:** A crossed-out bell appears next to the name in the chat list and the header. It reflects the LINE notification setting for a group or room and any local mute. Right-click a group and toggle **Strict mute** to suppress notifications, sounds and unread badges, including for mentions and `@All`. This setting is local to the signed-in account on this device. The chat still receives messages and sends read receipts when viewed.
 - **Unread badges and read receipts:** see [Read receipts](#read-receipts) below.
 
 ### Conversation
@@ -190,7 +191,7 @@ All in [`ui_media.c`](../../src/ui_media.c):
 - **Thumbnails:** `ui_media_thumb()` with a bounded cache (`reserve_thumbnail()`, `evict_thumbnail()`).
 - **Video:** `open_video()` asks for the file with `openVideo` and plays it with `ffplay` through [`video_play.c`](../../src/video_play.c). With the native renderer, FFplay uses the selected Vulkan GPU to display the clip. On compatible drivers it also decodes video with NVDEC on NVIDIA or Vulkan Video on AMD and Intel. Video cards show a poster from `videoPoster` when LINE has one.
 - **Camera video messages:** **Record video** uses [`video_record.c`](../../src/video_record.c), which runs `ffmpeg` with V4L2 and PulseAudio to write an H.264/AAC MP4 into a private file. On NVIDIA, the recorder tests H.264 NVENC before opening the camera and falls back to the software encoder if startup fails. You review the clip and then send it.
-- **Screenshots:** Ctrl+Alt+S or **Take screenshot** in the chat tools. [`screenshot.c`](../../src/screenshot.c) asks the XDG Screenshot portal, and the result opens as an attachment.
+- **Screenshots:** Ctrl+Alt+S or **Take screenshot** in the chat tools. [`screenshot.c`](../../src/screenshot.c) asks the XDG Screenshot portal, and the result opens as an attachment. The client closes Chat Tools and presents the uncovered chat before asking the portal.
 - **Saving:** Save writes the downloaded bytes through `saveFile`, using `line_save_media()` in the worker, with an atomic rename.
 
 ### Flex Messages and rich messages
@@ -253,7 +254,7 @@ The UI decides when you have *seen* the latest message, and the worker tells LIN
 
 ### Tray
 
-[`ui_tray.c`](../../src/ui_tray.c) registers a StatusNotifierItem (`org.kde.StatusNotifierItem-<pid>-1`) with the session's StatusNotifierWatcher, exporting the icon as network-order ARGB pixmaps and a `com.canonical.dbusmenu` menu with Open, Hide and Quit. It runs its D-Bus service on the `line-tray` thread. When a tray host exists, closing the window hides it (`ui_tray_hide()`) instead of quitting. `LINE_DISABLE_TRAY=1` turns this off.
+[`ui_tray.c`](../../src/ui_tray.c) exports a StatusNotifierItem and an Open, Hide and Quit menu over GDBus. Closing the window hides it in the tray or minimizes it when a tray icon is unavailable. Sync and notifications continue in the background. In Flatpak, the app asks the Background portal for permission before hiding. Use Ctrl+Q or Quit in the tray menu to exit.
 
 ### Notifications
 
@@ -282,6 +283,8 @@ A sound thread opens and closes the playback device. If a call connects while th
 | Ctrl+E | Emoji and stickers | `ui_media.c` |
 | Ctrl+O | Attach a file | `ui_media.c` |
 | Ctrl+V | Paste text, a picture or a file | `ui.c`, `ui_media.c` |
+| Enter / Shift+Enter | Send the message / insert a newline | `ui.c` |
+| Ctrl+Q | Quit Avernella | `ui.c` |
 | Ctrl+Shift+T | Chat tools | `ui_media.c` |
 | Ctrl+Alt+S | Take a screenshot | `ui_media.c` |
 | Ctrl+, | User Settings | `ui_profile.c` |

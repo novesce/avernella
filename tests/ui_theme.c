@@ -44,9 +44,27 @@ static void preference(void)
 	g_assert_true(ui_theme_is_line());
 }
 
+static void palette_preference(void)
+{
+	g_autoptr(GError) error = NULL;
+
+	ui_theme_init();
+	g_assert_cmpuint(UI_ACCENT, ==, 0xff5ba9);
+	g_assert_true(ui_theme_set_palette(UI_PALETTE_MINT, &error));
+	g_assert_no_error(error);
+	g_assert_cmpuint(UI_ACCENT, ==, 0x55dbad);
+	ui_theme_init();
+	g_assert_cmpuint(ui_palette, ==, UI_PALETTE_MINT);
+	g_assert_true(ui_theme_toggle(&error));
+	ui_theme_init();
+	g_assert_false(ui_theme_is_line());
+	g_assert_cmpuint(UI_ACCENT, ==, 0x55dbad);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
 	g_test_add_func("/ui/theme/preference", preference);
+	g_test_add_func("/ui/theme/palette", palette_preference);
 	return g_test_run();
 }

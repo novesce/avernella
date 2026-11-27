@@ -69,6 +69,11 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd);
 
 /* Runs the Vault IPC event loop until EOF or fatal error. */
 int avernella_vault_run(struct avernella_vault *vault, int client_fd);
+/* Start before processing credentials or starting any worker threads. */
+int avernella_vault_broker_start(struct avernella_worker_proc *broker);
+/* Returns a connected Vault socket, or -errno. */
+int avernella_vault_reconnect(int broker);
+int avernella_vault_disconnect(int broker);
 
 /* Client-side helpers called by sandboxed workers (no secrets in worker). */
 int avernella_vault_client_ping(int vault_fd);
@@ -92,6 +97,9 @@ gboolean avernella_vault_client_rotate_token(int vault_fd, const char *access,
 					     const char *refresh,
 					     gint64 refresh_at, GError **error);
 gboolean avernella_vault_client_wipe(int vault_fd, GError **error);
+gboolean avernella_vault_client_restore(int vault_fd, const Line *session,
+					int dirfd, GError **error);
+gboolean avernella_vault_disconnected(const GError *error);
 
 /* Supervisor worker slot with bounded crash-respawn policy. */
 struct avernella_supervised_worker {

@@ -87,6 +87,11 @@ static J *group_row(J *chat, const char *fallback)
 	if (picture)
 		json_object_object_add(row, "avatarKey",
 				       json_object_new_string(picture));
+	J *disabled = field(chat, "4");
+
+	if (json_object_is_type(disabled, json_type_boolean))
+		json_object_object_add(row, "notificationDisabled",
+				       json_object_get(disabled));
 	return row;
 }
 

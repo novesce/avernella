@@ -58,6 +58,11 @@ J *line_history_older_since(Line *s, const char *chat, J *boundary,
 			    gboolean *more, GError **error);
 J *line_message_action(Line *s, const char *id, const char *reaction,
 		       GError **error);
+gboolean line_unsend_operation(J *op, const char **chat, const char **id);
+void line_remember_unsent(J *ids, const char *id, gint64 time);
+void line_redact_unsent(J *ids, J *rows, J *raw, guint64 cleared,
+			gboolean latest);
+J *line_unsent_row(const char *id, gint64 time);
 
 void line_profile_operation(Line *s, J *op);
 

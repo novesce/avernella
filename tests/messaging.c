@@ -11,6 +11,7 @@
 
 static gboolean reject_key, repeat_cursor, older_contacts_service;
 static unsigned int sends, pages, profiles, group_profiles;
+static gboolean group_unmuted;
 static gboolean reject_read;
 static unsigned int read_requests;
 static const char *expected_body, *expected_chat, *expected_mention;
@@ -122,8 +123,11 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"\":{\"3\":{\"22\":\"Alice\",\"27\":\"Al\"}}}}");
 	if (!strcmp(method, "getChats")) {
 		group_profiles++;
-		return json_tokener_parse("{\"1\":[{\"2\":\"" GROUP
-					  "\",\"6\":\"Tea club\"}]}");
+		return json_tokener_parse(
+			group_unmuted ? "{\"1\":[{\"2\":\"" GROUP
+					"\",\"4\":false,\"6\":\"Tea club\"}]}" :
+					"{\"1\":[{\"2\":\"" GROUP
+					"\",\"4\":true,\"6\":\"Tea club\"}]}");
 	}
 	if (!strcmp(method, "getRecentMessagesV2")) {
 		g_assert_cmpstr(strfield(args, "2:str"), ==, ALICE);
@@ -260,6 +264,8 @@ static void chat_list(void)
 	g_assert_cmpint(json_object_get_int64(field(group, "clearThrough")), ==,
 			11);
 	g_assert_cmpint(json_object_get_int64(field(group, "unread")), ==, 2);
+	g_assert_true(
+		json_object_get_boolean(field(group, "notificationDisabled")));
 	g_assert_cmpstr(strfield(json_object_array_get_idx(chats, 1), "name"),
 			==, "Alice");
 	repeat_cursor = TRUE;
@@ -553,6 +559,9 @@ static void profile_reuse(void)
 		g_assert_no_error(e);
 		g_assert_nonnull(chats);
 		g_assert_nonnull(history);
+		g_assert_true(json_object_get_boolean(
+			field(json_object_array_get_idx(chats, 0),
+			      "notificationDisabled")));
 		g_assert_cmpstr(strfield(json_object_array_get_idx(history, 0),
 					 "from"),
 				==, "Alice");
@@ -563,13 +572,21 @@ static void profile_reuse(void)
 	json_object_object_add(op, "3", json_object_new_int(26));
 	line_profile_operation(&s, op);
 	g_assert_cmpuint(g_hash_table_size(s.profiles), ==, 2);
-	json_object_object_add(op, "3", json_object_new_int(2));
+	/* Another device changed the group's notification setting. */
+	json_object_object_add(op, "3", json_object_new_int(121));
 	line_profile_operation(&s, op);
 	g_assert_cmpuint(g_hash_table_size(s.profiles), ==, 0);
+	group_unmuted = TRUE;
 	g_autoptr(J) refresh = line_chats(&s, &e);
 	g_assert_no_error(e);
 	g_assert_cmpuint(profiles, ==, 2);
 	g_assert_cmpuint(group_profiles, ==, 2);
+	J *mute = field(json_object_array_get_idx(refresh, 0),
+			"notificationDisabled");
+
+	g_assert_true(json_object_is_type(mute, json_type_boolean));
+	g_assert_false(json_object_get_boolean(mute));
+	group_unmuted = FALSE;
 	g_clear_pointer(&s.profiles, g_hash_table_unref);
 }
 
@@ -975,6 +992,53 @@ static void cards_sound_and_forward(void)
 	g_clear_pointer(&s.profiles, g_hash_table_unref);
 }
 
+static void unsent_rows(void)
+{
+	g_autoptr(J) op = json_tokener_parse("{\"3\":65,\"10\":\"" GROUP
+					     "\",\"11\":\"42\"}");
+	g_autoptr(J) ids = obj();
+	g_autoptr(J) rows = json_tokener_parse(
+		"[{\"id\":\"41\",\"time\":101,\"type\":\"text\",\"text\":\"Hi\"},"
+		"{\"id\":\"42\",\"time\":102,\"type\":\"text\",\"text\":\"Gone\"},"
+		"{\"id\":\"44\",\"time\":104,\"type\":\"sticker\",\"hasSound\":true}]");
+	g_autoptr(J) raw = json_tokener_parse(
+		"{\"42\":{\"4\":\"42\",\"5\":102,\"6\":1002,\"10\":\"Gone\"},"
+		"\"44\":{\"4\":\"44\",\"5\":104,\"6\":1004,\"15\":7,\"18\":{}}}");
+	const char *chat, *id;
+
+	g_assert_true(line_unsend_operation(op, &chat, &id));
+	g_assert_cmpstr(chat, ==, GROUP);
+	g_assert_cmpstr(id, ==, "42");
+	line_remember_unsent(ids, id, 0);
+	line_remember_unsent(ids, "43", 103);
+	line_remember_unsent(ids, "44", 104);
+	line_remember_unsent(ids, "40", 100);
+	json_object_object_add(op, "3", json_object_new_int(64));
+	g_assert_true(line_unsend_operation(op, &chat, &id));
+	json_object_object_add(op, "11", json_object_new_string("-42"));
+	g_assert_false(line_unsend_operation(op, &chat, &id));
+
+	line_redact_unsent(ids, rows, raw, 40, TRUE);
+	g_assert_cmpuint(json_object_array_length(rows), ==, 4);
+	for (size_t i = 1; i < 4; i++) {
+		J *row = json_object_array_get_idx(rows, i);
+
+		g_assert_cmpstr(strfield(row, "type"), ==, "unsent");
+		g_assert_cmpstr(strfield(row, "text"), ==, "Message unsent");
+		g_assert_cmpint(json_object_get_int(field(row, "time")), ==,
+				101 + i);
+		g_assert_null(field(row, "hasSound"));
+	}
+	g_assert_null(field(field(raw, "42"), "10"));
+	g_assert_null(field(field(raw, "44"), "18"));
+	g_assert_true(
+		json_object_get_boolean(field(field(raw, "44"), "unsent")));
+	g_assert_cmpint(json_object_get_int(field(field(raw, "44"), "6")), ==,
+			1004);
+	line_redact_unsent(ids, rows, raw, 40, TRUE);
+	g_assert_cmpuint(json_object_array_length(rows), ==, 4);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -983,6 +1047,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/messaging/read-watermark", checked_watermark);
 	g_test_add_func("/messaging/peer-read-counts", peer_read_counts);
 	g_test_add_func("/messaging/history", recent_messages);
+	g_test_add_func("/messaging/unsent-rows", unsent_rows);
 	g_test_add_func("/messaging/flex-history", flex_messages);
 	g_test_add_func("/messaging/rich-messages", rich_messages);
 	g_test_add_func("/messaging/call-and-chat-notices",

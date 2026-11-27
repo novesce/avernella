@@ -200,6 +200,8 @@ It is stored as the `MENTION` metadata value. **Note:** metadata isn't encrypted
 - **React:** `react` on `/S4` with `{1: {1: reqSeq, 2: message ID (i64), 3: {1: type}}}`. Types: 1 none (remove), 2 nice, 3 love, 4 fun, 5 amazing, 6 sad, 7 omg. The UI labels them Like, Love, Laugh, Amazing, Sad and Surprised.
 - **Unsend:** `unsendMessage` with `{1: reqSeq, 2: message ID}`. The worker allows it only for your own messages.
 
+When LINE confirms an unsend or sends operation 64 or 65, Avernella replaces the matching message, including a sticker, with a centered **Message unsent** label. The app discards the content from its cached history and keeps a bounded local record of the chat, message ID, and original send time when known. That record belongs to the signed-in account and keeps a delayed history response from restoring the original content.
+
 ## Read receipts
 
 `line_mark_read()` calls `sendChatChecked` on `/S4` with `{1: reqSeq, 2: chat, 3: last message ID}`, omitting the optional session ID as the desktop app does. It refuses your own Keep Memo chat. The UI decides when to send it (see [UI: read receipts](ui.md#read-receipts)), and the worker keeps receipt targets monotonic (`read_acks`, `unread_heads`), so a late acknowledgement never moves a receipt backwards.

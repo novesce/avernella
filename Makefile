@@ -257,7 +257,7 @@ build/%.o: src/%.c Makefile | build
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
 build/test-emoji-message: tests/emoji_message.c build/messaging.o build/rich_message.o build/sealing.o build/thrift.o build/liff_url.o
-build/test-ui-emoji: tests/ui_emoji.c build/ui_emoji.o build/ui_motion.o $(UI_LANG_OBJECTS)
+build/test-ui-emoji: tests/ui_emoji.c build/ui_emoji.o build/ui_theme.o build/ui_motion.o $(UI_LANG_OBJECTS)
 build/test-ui-apng: tests/ui_apng.c build/ui_apng.o build/ui_pixels.o
 build/test-emoji: tests/emoji.c build/emoji.o
 build/test-media: tests/media.c build/media.o build/media_crypto.o build/media_io.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
@@ -357,7 +357,7 @@ build/test-shared-content: tests/shared_content.c build/shared_content.o build/h
 build/test-ui-instance: tests/ui_instance.c build/ui_instance.o
 build/test-ui-tray: tests/ui_tray.c build/ui_tray.o build/ui_logo.o build/ui_pixels.o $(UI_LANG_OBJECTS)
 build/test-ui-notifications: tests/ui_notifications.c build/ui_notifications.o $(UI_LANG_OBJECTS)
-build/test-ui-friends: tests/ui_friends.c build/ui_friends.o build/ui_motion.o $(UI_LANG_OBJECTS)
+build/test-ui-friends: tests/ui_friends.c build/ui_friends.o build/ui_motion.o build/ui_theme.o $(UI_LANG_OBJECTS)
 build/test-ui-read: tests/ui_read.c
 build/test-stickers: tests/stickers.c build/stickers.o build/thrift.o
 build/test-sealing: tests/sealing.c build/sealing.o build/thrift.o
@@ -384,7 +384,7 @@ build/test-ui-chat-refresh: tests/ui_chat_refresh.c build/ui_gpu.o build/tune.o
 build/test-ui-worker-stop: private LDFLAGS += -Wl,--wrap=SDL_PollEvent,--wrap=waitpid
 build/test-ui-worker-stop: tests/ui_worker_stop.c build/ui_gpu.o build/tune.o
 build/test-monitor-picker: private LDFLAGS += -Wl,--wrap=SDL_WaitEvent
-build/test-monitor-picker: tests/monitor_picker.c build/monitor_picker.o build/ui_monitor_picker.o $(UI_LANG_OBJECTS)
+build/test-monitor-picker: tests/monitor_picker.c build/monitor_picker.o build/ui_monitor_picker.o build/ui_theme.o $(UI_LANG_OBJECTS)
 build/test-screencast-cinnamon: tests/screencast_cinnamon.c build/screencast_cinnamon.o
 build/test-ui-scroll-scene: tests/ui_scroll_scene.c
 build/test-ui-scroll-scene: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time
@@ -393,7 +393,8 @@ UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test
 UI_FIXTURE_TARGETS += build/test-ui-chat-refresh
 UI_FIXTURE_TARGETS += build/test-ui-worker-stop
 $(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_openchat.o build/ui_find.o
-$(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/screenshot.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
+$(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
+$(filter-out build/test-ui-scroll-scene,$(UI_FIXTURE_TARGETS)): build/screenshot.o
 $(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
 $(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o build/sandbox.o build/security/sandbox.o build/security/ipc.o $(UI_LANG_OBJECTS)
 build/render-bench:

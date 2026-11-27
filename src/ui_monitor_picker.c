@@ -243,6 +243,7 @@ int ui_pick_share_monitor(int count, char **labels)
 	    prctl(PR_SET_PDEATHSIG, SIGTERM) || getppid() != parent)
 		return 1;
 	ui_lang_init();
+	ui_theme_init();
 	SDL_SetHintWithPriority(SDL_HINT_NO_SIGNAL_HANDLERS, "1",
 				SDL_HINT_OVERRIDE);
 	SDL_SetHint("SDL_APP_ID", "avernella");

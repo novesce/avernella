@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "Màu nhấn" },
+	{ "Pink", "Hồng" },
+	{ "Blue", "Xanh dương" },
+	{ "Mint", "Xanh bạc hà" },
+	{ "Amber", "Hổ phách" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "Mở khóa màn hình trước khi chia sẻ." },
 	{ "No active monitor is available to share.",
@@ -346,6 +351,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "Thêm bạn bè" },
 	{ "Mute", "Tắt tiếng" },
 	{ "Mute (Alt+M)", "Tắt tiếng (Alt+M)" },
+	{ "Strict mute · On", "Tắt mọi thông báo · Bật" },
+	{ "Strict mute · Off", "Tắt mọi thông báo · Tắt" },
+	{ "Notifications muted", "Đã tắt thông báo" },
 	{ "Mute conversation", "Tắt thông báo cuộc trò chuyện" },
 	{ "Mute or unmute", "Bật hoặc tắt tiếng" },
 	{ "My Account", "Tài khoản của tôi" },
@@ -655,6 +663,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[Cuộc gọi]" },
 	{ "[Chat event]", "[Sự kiện trò chuyện]" },
 	{ "[Contact]", "[Liên hệ]" },
+	{ "Message unsent", "Tin nhắn đã được thu hồi" },
 	{ "[Empty message]", "[Tin nhắn trống]" },
 	{ "[File]", "[Tệp]" },
 	{ "[Flex message]", "[Tin nhắn Flex]" },

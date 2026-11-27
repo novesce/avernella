@@ -31,6 +31,9 @@ enum avernella_ipc_op {
 	IPC_OP_VAULT_LOAD_SESSION = 0x0109,
 	IPC_OP_VAULT_ECDH = 0x010a,
 	IPC_OP_VAULT_OWN_PUBLIC = 0x010b,
+	IPC_OP_VAULT_RESTORE = 0x010c,
+	IPC_OP_VAULT_RECONNECT = 0x010d,
+	IPC_OP_VAULT_DISCONNECT = 0x010e,
 
 	/* Supervisor <-> UI / Workers (brokered resources & health) */
 	IPC_OP_SPAWN_LIFF = 0x0201,

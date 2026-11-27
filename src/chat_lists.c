@@ -173,8 +173,10 @@ static gboolean valid_settings(Json *o)
 	if (!json_object_is_type(o, json_type_object))
 		return FALSE;
 	Json *folders = get(o, "folders"), *pins = get(o, "pins"),
-	     *bindings = get(o, "bindings"), *muted = get(o, "muted");
+	     *bindings = get(o, "bindings"), *muted = get(o, "muted"),
+	     *strict = get(o, "strictMuted");
 	if ((pins && !valid_set(pins)) || (muted && !valid_set(muted)) ||
+	    (strict && !valid_set(strict)) ||
 	    (get(o, "motion") &&
 	     !json_object_is_type(get(o, "motion"), json_type_boolean)) ||
 	    (bindings && !json_object_is_type(bindings, json_type_object)) ||
@@ -429,6 +431,21 @@ gboolean chat_muted(struct chat_lists *l, const char *chat)
 gboolean chat_mute_toggle(struct chat_lists *l, const char *chat, GError **e)
 {
 	return toggle_in(l, NULL, "muted", chat, e);
+}
+
+gboolean chat_strict_muted(struct chat_lists *l, const char *chat)
+{
+	return l && chat && *chat == 'c' &&
+	       json_object_get_boolean(
+		       get(get(l->settings, "strictMuted"), chat));
+}
+
+gboolean chat_strict_mute_toggle(struct chat_lists *l, const char *chat,
+				 GError **e)
+{
+	if (!chat || *chat != 'c')
+		return fail(e, "Choose a group conversation.");
+	return toggle_in(l, NULL, "strictMuted", chat, e);
 }
 
 int chat_motion(struct chat_lists *l)

@@ -25,6 +25,7 @@ enum action {
 	DELETE,
 	PIN,
 	MUTE,
+	STRICT_MUTE,
 	PREF,
 	ALERT,
 	BIND
@@ -133,7 +134,7 @@ static gboolean matches(Json *row, const char *id)
 	const char *view = chat_current_view(panel.store);
 
 	if (!strcmp(view, "unread"))
-		return json_object_get_int64(ui_field(row, "unread")) > 0;
+		return ui_chat_unread(row) > 0;
 	if (!strcmp(view, "pinned"))
 		return ui_list_pinned(id);
 	if (!strcmp(view, "groups"))
@@ -273,6 +274,12 @@ static void choices(void)
 			    _("Unmute conversation") :
 			    _("Mute conversation"),
 		    NULL, 0);
+		if (panel.chat && *panel.chat == 'c')
+			add(STRICT_MUTE,
+			    ui_chat_strict_muted(panel.chat) ?
+				    _("Strict mute · On") :
+				    _("Strict mute · Off"),
+			    NULL, 0);
 	}
 	Json *folders = chat_folders(panel.store);
 
@@ -360,6 +367,14 @@ static void activate(struct choice *c)
 		if (report(e))
 			choices();
 		ui.dirty = TRUE;
+		return;
+	case STRICT_MUTE:
+		chat_strict_mute_toggle(panel.store, panel.chat, &e);
+		if (report(e)) {
+			choices();
+			ui_forget_rail();
+			ui_refilter_chats();
+		}
 		return;
 	case PIN:
 		chat_pin_toggle(panel.store, panel.chat, &e);
@@ -747,9 +762,26 @@ void ui_lists_draw(void)
 			      450, muted, TRUE);
 }
 
-gboolean ui_chat_muted(const char *chat)
+gboolean ui_chat_strict_muted(const char *chat)
 {
-	return chat_muted(panel.store, chat);
+	return chat_strict_muted(panel.store, chat);
+}
+
+gboolean ui_chat_muted(Json *row)
+{
+	const char *id = ui_string(row, "id", NULL);
+	Json *disabled = ui_field(row, "notificationDisabled");
+
+	return ui_chat_strict_muted(id) || chat_muted(panel.store, id) ||
+	       (json_object_is_type(disabled, json_type_boolean) &&
+		json_object_get_boolean(disabled));
+}
+
+gint64 ui_chat_unread(Json *row)
+{
+	return ui_chat_strict_muted(ui_string(row, "id", NULL)) ?
+		       0 :
+		       json_object_get_int64(ui_field(row, "unread"));
 }
 
 gboolean ui_notifications_set(gboolean on)

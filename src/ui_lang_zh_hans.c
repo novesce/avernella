@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "强调色" },
+	{ "Pink", "粉色" },
+	{ "Blue", "蓝色" },
+	{ "Mint", "薄荷绿" },
+	{ "Amber", "琥珀色" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "请先解锁桌面，再共享显示器。" },
 	{ "No active monitor is available to share.",
@@ -320,6 +325,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "更多好友" },
 	{ "Mute", "静音" },
 	{ "Mute (Alt+M)", "静音 (Alt+M)" },
+	{ "Strict mute · On", "严格静音 · 已开启" },
+	{ "Strict mute · Off", "严格静音 · 已关闭" },
+	{ "Notifications muted", "通知已静音" },
 	{ "Mute conversation", "将对话设为免打扰" },
 	{ "Mute or unmute", "静音或取消静音" },
 	{ "My Account", "我的账号" },
@@ -623,6 +631,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[通话]" },
 	{ "[Chat event]", "[聊天事件]" },
 	{ "[Contact]", "[联系人]" },
+	{ "Message unsent", "消息已撤回" },
 	{ "[Empty message]", "[空消息]" },
 	{ "[File]", "[文件]" },
 	{ "[Flex message]", "[Flex 消息]" },

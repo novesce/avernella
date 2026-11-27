@@ -51,9 +51,10 @@ static struct {
 enum {
 	PANEL = UI_DIALOG,
 	INK = UI_HEADING,
-	MUTED = UI_MUTED,
-	FOCUS = UI_ACCENT
+	MUTED = UI_MUTED
 };
+
+#define FOCUS UI_ACCENT
 
 static void set(char **slot, const char *s)
 {

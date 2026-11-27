@@ -3,6 +3,11 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Accent color", "สีเน้น" },
+	{ "Pink", "ชมพู" },
+	{ "Blue", "ฟ้า" },
+	{ "Mint", "เขียวมิ้นต์" },
+	{ "Amber", "เหลืองอำพัน" },
 	{ "Unlock the desktop before sharing a monitor.",
 	  "ปลดล็อกเดสก์ท็อปก่อนแชร์จอภาพ" },
 	{ "No active monitor is available to share.",
@@ -322,6 +327,9 @@ static const char *const strings[][2] = {
 	{ "More friends", "เพื่อนเพิ่มเติม" },
 	{ "Mute", "ปิดไมค์" },
 	{ "Mute (Alt+M)", "ปิดไมค์ (Alt+M)" },
+	{ "Strict mute · On", "ปิดการแจ้งเตือนทั้งหมด · เปิด" },
+	{ "Strict mute · Off", "ปิดการแจ้งเตือนทั้งหมด · ปิด" },
+	{ "Notifications muted", "ปิดการแจ้งเตือนแล้ว" },
 	{ "Mute conversation", "ปิดเสียงบทสนทนา" },
 	{ "Mute or unmute", "ปิดหรือเปิดไมค์" },
 	{ "My Account", "บัญชีของฉัน" },
@@ -626,6 +634,7 @@ static const char *const strings[][2] = {
 	{ "[Call]", "[การโทร]" },
 	{ "[Chat event]", "[เหตุการณ์แชท]" },
 	{ "[Contact]", "[รายชื่อติดต่อ]" },
+	{ "Message unsent", "ข้อความถูกถอน" },
 	{ "[Empty message]", "[ข้อความว่าง]" },
 	{ "[File]", "[ไฟล์]" },
 	{ "[Flex message]", "[เฟล็กซ์เมสเสจ]" },

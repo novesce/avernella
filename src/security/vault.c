@@ -4,6 +4,7 @@
 #include "state.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <gio/gio.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -11,7 +12,10 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -247,6 +251,35 @@ static bool valid_token_bytes(const char *tok)
 	return true;
 }
 
+/* The worker passes its already-locked state directory, never a pathname. */
+static int restore_session(struct avernella_vault *vault, int dirfd, J *req,
+			   GError **error)
+{
+	const char *mid = strfield(req, "mid");
+	const char *access = strfield(req, "access");
+	const char *refresh = strfield(req, "refresh");
+	Line saved = { .service_code = -1 };
+	struct stat st;
+	int rc = -EINVAL;
+
+	if (dirfd < 0 || fstat(dirfd, &st) < 0 || !S_ISDIR(st.st_mode) ||
+	    st.st_uid != geteuid() || (st.st_mode & 077) || !mid || !*mid ||
+	    !valid_token_bytes(access) ||
+	    (refresh && !valid_token_bytes(refresh)))
+		return rc;
+	if (!line_store_load(dirfd, &saved, error))
+		return -EIO;
+	if (saved.access && (!saved.mid || !strcmp(saved.mid, mid))) {
+		rc = avernella_vault_load_secrets(vault, mid, access, refresh,
+						  saved.keys, saved.seq);
+		if (!rc)
+			vault->session.refresh_at =
+				json_object_get_int64(field(req, "refreshAt"));
+	}
+	line_session_clear(&saved);
+	return rc;
+}
+
 int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 {
 	struct avernella_ipc_hdr hdr;
@@ -460,9 +493,12 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		    json_object_is_type(refresh_at, json_type_int))
 			vault->session.refresh_at =
 				json_object_get_int64(refresh_at);
-		if (vault->dirfd >= 0)
-			(void)line_store_save(vault->dirfd, &vault->session,
-					      NULL);
+		if (vault->dirfd >= 0 &&
+		    !line_store_save(vault->dirfd, &vault->session, &error)) {
+			err = reply_error(client_fd, hdr.req_id, -EIO,
+					  error->message);
+			goto out;
+		}
 		out = obj();
 		json_object_object_add(out, "rotated",
 				       json_object_new_boolean(TRUE));
@@ -497,6 +533,24 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		out = obj();
 		json_object_object_add(out, "loaded",
 				       json_object_new_boolean(TRUE));
+		err = reply_json(client_fd, hdr.req_id, out);
+		goto out;
+	}
+
+	if (hdr.op == IPC_OP_VAULT_RESTORE) {
+		err = restore_session(vault, recv_fd, req, &error);
+		if (err) {
+			err = reply_error(
+				client_fd, hdr.req_id, err,
+				error ? error->message :
+					"Could not restore the Key Vault session.");
+			goto out;
+		}
+		if (vault->dirfd >= 0)
+			close(vault->dirfd);
+		vault->dirfd = recv_fd;
+		recv_fd = -1;
+		out = obj();
 		err = reply_json(client_fd, hdr.req_id, out);
 		goto out;
 	}
@@ -565,8 +619,15 @@ out:
 		g_error_free(error);
 	if (out)
 		json_object_put(out);
-	if (req)
+	if (req) {
+		if (hdr.op == IPC_OP_VAULT_RESTORE ||
+		    hdr.op == IPC_OP_VAULT_LOAD_SESSION ||
+		    hdr.op == IPC_OP_VAULT_ROTATE_TOKEN) {
+			line_secret_json_wipe(field(req, "access"));
+			line_secret_json_wipe(field(req, "refresh"));
+		}
 		json_object_put(req);
+	}
 	if (buf) {
 		explicit_bzero(buf, AVERNELLA_IPC_MAX_PAYLOAD);
 		free(buf);
@@ -586,6 +647,31 @@ int avernella_vault_run(struct avernella_vault *vault, int client_fd)
 	}
 }
 
+static void ipc_problem(GError **error, int failure)
+{
+	switch (failure) {
+	case -EPIPE:
+	case -ECONNRESET:
+	case -ENOTCONN:
+	case -EAGAIN:
+	case -ETIMEDOUT:
+	case -EPROTO:
+		g_set_error_literal(error, G_IO_ERROR,
+				    G_IO_ERROR_CONNECTION_CLOSED,
+				    "The Key Vault disconnected.");
+		break;
+	default:
+		g_set_error(error, LINE_ERROR, 1,
+			    "Key Vault communication failed (%s).",
+			    g_strerror(-failure));
+	}
+}
+
+gboolean avernella_vault_disconnected(const GError *error)
+{
+	return g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CONNECTION_CLOSED);
+}
+
 static J *vault_rpc_fd(int vault_fd, enum avernella_ipc_op op, J *req,
 		       int pass_fd, GError **error)
 {
@@ -603,41 +689,34 @@ static J *vault_rpc_fd(int vault_fd, enum avernella_ipc_op op, J *req,
 	if (req) {
 		tx_str = json_object_to_json_string_length(
 			req, JSON_C_TO_STRING_PLAIN, &tx_len);
-		if (tx_len > AVERNELLA_IPC_MAX_PAYLOAD) {
-			g_set_error_literal(error, LINE_ERROR, 1,
-					    "Vault request exceeds IPC limit.");
-			return NULL;
-		}
+		if (tx_len > AVERNELLA_IPC_MAX_PAYLOAD)
+			goto too_large;
 		tx.payload_len = (uint32_t)tx_len;
-	}
-
-	err = avernella_ipc_send(vault_fd, &tx, tx_len ? tx_str : NULL,
-				 pass_fd >= 0 ? &pass_fd : NULL,
-				 pass_fd >= 0 ? 1 : 0);
-	if (err) {
-		g_set_error(error, LINE_ERROR, 1, "Vault IPC send failed: %s",
-			    strerror(-err));
-		return NULL;
 	}
 
 	rx_buf = calloc(1, AVERNELLA_IPC_MAX_PAYLOAD + 1U);
 	if (!rx_buf) {
 		g_set_error_literal(error, LINE_ERROR, 1, "Out of memory.");
-		return NULL;
+		goto out;
+	}
+	err = avernella_ipc_send(vault_fd, &tx, tx_len ? tx_str : NULL,
+				 pass_fd >= 0 ? &pass_fd : NULL,
+				 pass_fd >= 0 ? 1 : 0);
+	if (err) {
+		ipc_problem(error, err);
+		goto out;
 	}
 
 	err = avernella_ipc_recv(vault_fd, &rx, rx_buf,
 				 AVERNELLA_IPC_MAX_PAYLOAD, NULL, 0, NULL);
 	if (err) {
-		g_set_error(error, LINE_ERROR, 1, "Vault IPC recv failed: %s",
-			    strerror(-err));
+		ipc_problem(error, err);
 		goto out;
 	}
 	rx_buf[rx.payload_len] = '\0';
 
 	if (rx.req_id != tx.req_id) {
-		g_set_error_literal(error, LINE_ERROR, 1,
-				    "Vault IPC correlation mismatch.");
+		ipc_problem(error, -EPROTO);
 		goto out;
 	}
 	if (rx.op != IPC_OP_REPLY_OK) {
@@ -650,9 +729,22 @@ static J *vault_rpc_fd(int vault_fd, enum avernella_ipc_op op, J *req,
 	if (!reply)
 		g_set_error_literal(error, LINE_ERROR, 1,
 				    "Unreadable Vault reply.");
+	goto out;
+too_large:
+	g_set_error_literal(error, LINE_ERROR, 1,
+			    "Vault request exceeds IPC limit.");
 out:
-	explicit_bzero(rx_buf, AVERNELLA_IPC_MAX_PAYLOAD);
-	free(rx_buf);
+	if (rx_buf) {
+		explicit_bzero(rx_buf, AVERNELLA_IPC_MAX_PAYLOAD);
+		free(rx_buf);
+	}
+	if (tx_str &&
+	    (op == IPC_OP_VAULT_RESTORE || op == IPC_OP_VAULT_LOAD_SESSION ||
+	     op == IPC_OP_VAULT_ROTATE_TOKEN)) {
+		explicit_bzero((char *)tx_str, tx_len);
+		line_secret_json_wipe(field(req, "access"));
+		line_secret_json_wipe(field(req, "refresh"));
+	}
 	return reply;
 }
 
@@ -753,7 +845,13 @@ gint32 avernella_vault_client_reserve_seq(int vault_fd, GError **error)
 
 	if (!rep)
 		return -1;
-	return json_object_get_int(field(rep, "seq"));
+	gint64 seq = json_object_get_int64(field(rep, "seq"));
+
+	if (seq <= 0 || seq > G_MAXINT32) {
+		ipc_problem(error, -EPROTO);
+		return -1;
+	}
+	return (gint32)seq;
 }
 
 gboolean avernella_vault_client_load_session(int vault_fd, const char *mid,
@@ -866,6 +964,212 @@ gboolean avernella_vault_client_wipe(int vault_fd, GError **error)
 	g_autoptr(J) rep =
 		vault_rpc(vault_fd, IPC_OP_VAULT_WIPE_SESSION, NULL, error);
 	return rep != NULL;
+}
+
+gboolean avernella_vault_client_restore(int vault_fd, const Line *session,
+					int dirfd, GError **error)
+{
+	if (!session || !session->mid || !session->access || dirfd < 0) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Could not restore the Key Vault session.");
+		return FALSE;
+	}
+	g_autoptr(J) req = obj();
+
+	json_object_object_add(req, "mid",
+			       json_object_new_string(session->mid));
+	json_object_object_add(req, "access",
+			       json_object_new_string(session->access));
+	if (session->refresh && *session->refresh)
+		json_object_object_add(
+			req, "refresh",
+			json_object_new_string(session->refresh));
+	json_object_object_add(req, "refreshAt",
+			       json_object_new_int64(session->refresh_at));
+	g_autoptr(J) rep =
+		vault_rpc_fd(vault_fd, IPC_OP_VAULT_RESTORE, req, dirfd, error);
+
+	return rep != NULL;
+}
+
+static int vault_child_entry(int fd, uint32_t active, void *userdata)
+{
+	struct avernella_vault vault;
+
+	(void)active;
+	(void)userdata;
+	if (avernella_vault_init(&vault, -1) < 0)
+		return 1;
+	int rc = avernella_vault_run(&vault, fd);
+
+	avernella_vault_destroy(&vault);
+	return rc < 0;
+}
+
+static int set_socket_timeout(int fd)
+{
+	struct timeval timeout = { .tv_sec = 3 };
+
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) <
+		    0 ||
+	    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) <
+		    0)
+		return -errno;
+	return 0;
+}
+
+static void vault_broker_loop(int fd)
+{
+	static const struct avernella_sandbox_opts opts = {
+		.role = SANDBOX_ROLE_VAULT,
+		.keep_stderr = true,
+	};
+	struct avernella_worker_proc vault = { .pid = -1,
+					       .pidfd = -1,
+					       .ctrl_fd = -1 };
+	gint64 renewed = 0;
+	unsigned int attempts = 0;
+	struct avernella_ipc_hdr req;
+
+	/* Requests consist only of a command header. Secrets go directly to Vault. */
+	while (!avernella_ipc_recv(fd, &req, NULL, 0, NULL, 0, NULL)) {
+		struct avernella_ipc_hdr reply = { .op = IPC_OP_REPLY_OK,
+						   .req_id = req.req_id };
+
+		if (req.op == IPC_OP_VAULT_DISCONNECT) {
+			avernella_worker_close(&vault);
+			if (avernella_ipc_send(fd, &reply, NULL, NULL, 0))
+				break;
+			continue;
+		}
+		if (req.op != IPC_OP_VAULT_RECONNECT)
+			break;
+		gint64 now = g_get_monotonic_time();
+
+		if (now - renewed >= 60 * G_USEC_PER_SEC) {
+			renewed = now;
+			attempts = 0;
+		}
+		if (attempts >= 4) {
+			if (reply_error(fd, req.req_id, -EAGAIN, NULL))
+				break;
+			continue;
+		}
+		attempts++;
+		/* Reap the old Vault before a replacement can access the store. */
+		avernella_worker_close(&vault);
+		int rc = avernella_spawn_worker(&opts, vault_child_entry, NULL,
+						&vault);
+
+		if (rc) {
+			if (reply_error(fd, req.req_id, rc, NULL))
+				break;
+			continue;
+		}
+		rc = avernella_ipc_send(fd, &reply, NULL, &vault.ctrl_fd, 1);
+		close(vault.ctrl_fd);
+		vault.ctrl_fd = -1;
+		if (rc)
+			break;
+	}
+	avernella_worker_close(&vault);
+}
+
+int avernella_vault_broker_start(struct avernella_worker_proc *broker)
+{
+	int pair[2];
+	int rc = avernella_ipc_socketpair(pair);
+	pid_t parent = getpid();
+
+	if (rc)
+		return rc;
+	rc = set_socket_timeout(pair[0]);
+	if (rc)
+		goto fail;
+	pid_t pid = fork();
+
+	if (pid < 0) {
+		rc = -errno;
+		goto fail;
+	}
+	if (!pid) {
+		int fd = STDERR_FILENO + 1;
+
+		close(pair[0]);
+		if (prctl(PR_SET_PDEATHSIG, SIGKILL) < 0 ||
+		    getppid() != parent || prctl(PR_SET_DUMPABLE, 0) < 0 ||
+		    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+			_exit(1);
+		if (pair[1] != fd) {
+			if (dup3(pair[1], fd, O_CLOEXEC) < 0)
+				_exit(1);
+			close(pair[1]);
+		}
+		close(STDIN_FILENO);
+		close(STDOUT_FILENO);
+		if (avernella_close_extra_fds(fd) < 0)
+			_exit(1);
+		vault_broker_loop(fd);
+		_exit(0);
+	}
+	close(pair[1]);
+	*broker = (struct avernella_worker_proc){ .pid = pid,
+						  .pidfd = -1,
+						  .ctrl_fd = pair[0] };
+	return 0;
+fail:
+	close(pair[0]);
+	close(pair[1]);
+	return rc;
+}
+
+static int request_broker(int broker, enum avernella_ipc_op op)
+{
+	static uint32_t next_id = 1;
+	struct avernella_ipc_hdr tx = { .op = op, .req_id = next_id++ }, rx;
+	int rc = avernella_ipc_send(broker, &tx, NULL, NULL, 0);
+
+	if (rc)
+		return rc;
+	/* A previous call can time out while the broker waits for a child. */
+	for (unsigned int i = 0; i < 4; i++) {
+		int fd = -1;
+		size_t count;
+
+		rc = avernella_ipc_recv(broker, &rx, NULL, 0, &fd, 1, &count);
+		if (rc)
+			return rc;
+		if (rx.req_id == tx.req_id && rx.op == IPC_OP_REPLY_OK &&
+		    count == (op == IPC_OP_VAULT_RECONNECT ? 1U : 0U))
+			return count ? fd : 0;
+		if (fd >= 0)
+			close(fd);
+		if (rx.req_id == tx.req_id)
+			return rx.op == IPC_OP_REPLY_ERR && rx.status < 0 ?
+				       rx.status :
+				       -EPROTO;
+	}
+	return -EPROTO;
+}
+
+int avernella_vault_reconnect(int broker)
+{
+	int fd = request_broker(broker, IPC_OP_VAULT_RECONNECT);
+
+	if (fd < 0)
+		return fd;
+	int rc = set_socket_timeout(fd);
+
+	if (rc) {
+		close(fd);
+		return rc;
+	}
+	return fd;
+}
+
+int avernella_vault_disconnect(int broker)
+{
+	return request_broker(broker, IPC_OP_VAULT_DISCONNECT);
 }
 
 int avernella_supervisor_start(struct avernella_supervised_worker *slot,

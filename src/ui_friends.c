@@ -15,11 +15,12 @@ enum {
 	SUBTLE = UI_SUBTLE,
 	TAB_INK = UI_MUTED,
 	TAB_HOVER = UI_HOVER,
-	TAB_SELECTED = UI_SELECTED,
 	/* Discord friend rows: 62 px with a divider between them. */
 	ROW_H = 62,
 	N_TABS = 8
 };
+
+#define TAB_SELECTED UI_SELECTED
 
 enum friends_page {
 	OFF,

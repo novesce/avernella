@@ -92,7 +92,7 @@ struct line_worker {
 	char *group_ticket_id;
 	/* Profiles the window opened, and incoming friend requests. */
 	J *cards, *requests;
-	J *unread_heads, *read_acks;
+	J *unread_heads, *read_acks, *unsent;
 	/* Only the open chat needs peer receipts. One lookup may be in flight. */
 	J *peer_ranges, *peer_notices;
 	gboolean need_ranges, publish_reads, ranges_pending;
@@ -121,7 +121,10 @@ struct line_worker {
 	guint image_count;
 	int image_wake;
 	guint generation;
-	struct avernella_worker_proc vault;
+	struct avernella_worker_proc vault_broker;
+	int vault_fd;
+	gint64 vault_retry_at;
+	gboolean vault_has_keys;
 };
 
 /* One JSON line to the UI, with a lease descriptor when fd >= 0. */
@@ -243,6 +246,7 @@ static void clear_view(struct line_worker *w)
 	g_clear_pointer(&w->group_ticket_id, g_free);
 	g_clear_pointer(&w->unread_heads, json_object_put);
 	g_clear_pointer(&w->read_acks, json_object_put);
+	g_clear_pointer(&w->unsent, json_object_put);
 	g_clear_pointer(&w->peer_ranges, json_object_put);
 	g_clear_pointer(&w->peer_notices, json_object_put);
 	w->need_ranges = w->publish_reads = FALSE;
@@ -266,47 +270,93 @@ static void clear_view(struct line_worker *w)
 	g_hash_table_remove_all(w->left_groups);
 }
 
-static int vault_child_entry(int ctrl_fd, uint32_t active, void *userdata)
+static void drop_vault(struct line_worker *w)
 {
-	struct avernella_vault vault;
-	int rc;
+	if (w->vault_fd >= 0)
+		close(w->vault_fd);
+	w->vault_fd = -1;
+}
 
-	(void)active;
-	(void)userdata;
-	if (avernella_vault_init(&vault, -1) < 0)
-		return 1;
-	rc = avernella_vault_run(&vault, ctrl_fd);
-	avernella_vault_destroy(&vault);
-	return rc < 0 ? 1 : 0;
+static gboolean ensure_vault(struct line_worker *w, GError **error)
+{
+	if (w->vault_fd >= 0)
+		return TRUE;
+	gint64 now = g_get_monotonic_time();
+
+	if (w->vault_broker.ctrl_fd >= 0 && now >= w->vault_retry_at) {
+		int fd = avernella_vault_reconnect(w->vault_broker.ctrl_fd);
+
+		w->vault_retry_at = g_get_monotonic_time() + G_USEC_PER_SEC;
+		if (fd >= 0) {
+			if (!avernella_vault_client_ping(fd) &&
+			    avernella_vault_client_restore(fd, &w->session,
+							   w->dir, error)) {
+				w->vault_fd = fd;
+				w->vault_retry_at = 0;
+				return TRUE;
+			}
+			close(fd);
+			if (error && *error)
+				return FALSE;
+		}
+	}
+	g_set_error_literal(error, LINE_ERROR, 1, "Key Vault is unavailable.");
+	return FALSE;
+}
+
+/* Retry only a local operation. The network request has not been sent. */
+static gboolean retry_vault(struct line_worker *w, GError **error)
+{
+	if (!avernella_vault_disconnected(*error))
+		return FALSE;
+	drop_vault(w);
+	g_clear_error(error);
+	return ensure_vault(w, error);
 }
 
 static gboolean worker_vault_ecdh(void *ctx, gint32 key_id,
 				  const guint8 peer_pub[32],
 				  guint8 shared_out[32], GError **error)
 {
-	struct avernella_worker_proc *vault = ctx;
+	struct line_worker *w = ctx;
 
-	if (!vault || vault->ctrl_fd < 0) {
-		g_set_error_literal(error, LINE_ERROR, 1,
-				    "Key Vault is unavailable.");
-		return FALSE;
-	}
-	return avernella_vault_client_ecdh(vault->ctrl_fd, key_id, peer_pub,
-					   shared_out, error);
+	g_autoptr(GError) failure = NULL;
+
+	if (!ensure_vault(w, &failure))
+		goto fail;
+	if (avernella_vault_client_ecdh(w->vault_fd, key_id, peer_pub,
+					shared_out, &failure) ||
+	    (retry_vault(w, &failure) &&
+	     avernella_vault_client_ecdh(w->vault_fd, key_id, peer_pub,
+					 shared_out, &failure)))
+		return TRUE;
+fail:
+	if (avernella_vault_disconnected(failure))
+		drop_vault(w);
+	g_propagate_error(error, g_steal_pointer(&failure));
+	return FALSE;
 }
 
 static gboolean worker_vault_pub(void *ctx, gint32 key_id, guint8 pub_out[32],
 				 GError **error)
 {
-	struct avernella_worker_proc *vault = ctx;
+	struct line_worker *w = ctx;
 
-	if (!vault || vault->ctrl_fd < 0) {
-		g_set_error_literal(error, LINE_ERROR, 1,
-				    "Key Vault is unavailable.");
-		return FALSE;
-	}
-	return avernella_vault_client_own_public(vault->ctrl_fd, key_id,
-						 pub_out, error);
+	g_autoptr(GError) failure = NULL;
+
+	if (!ensure_vault(w, &failure))
+		goto fail;
+	if (avernella_vault_client_own_public(w->vault_fd, key_id, pub_out,
+					      &failure) ||
+	    (retry_vault(w, &failure) &&
+	     avernella_vault_client_own_public(w->vault_fd, key_id, pub_out,
+					       &failure)))
+		return TRUE;
+fail:
+	if (avernella_vault_disconnected(failure))
+		drop_vault(w);
+	g_propagate_error(error, g_steal_pointer(&failure));
+	return FALSE;
 }
 
 static const struct line_sealing_vault_ops worker_vault_ops = {
@@ -335,26 +385,31 @@ static void scrub_worker_own_keys(J *keys)
 
 static void sync_vault_session(struct line_worker *w)
 {
-	Line *s = &w->session;
-	g_autoptr(GError) err = NULL;
-
-	if (w->vault.ctrl_fd < 0 || !s->access)
+	if (w->vault_has_keys || !w->session.access || !w->session.mid ||
+	    w->dir < 0 || !ensure_vault(w, NULL))
 		return;
-	int pass_dir = w->dir >= 0 ? fcntl(w->dir, F_DUPFD_CLOEXEC, 0) : -1;
-
-	if (avernella_vault_client_load_session(w->vault.ctrl_fd, s->mid,
-						s->access, s->refresh, s->keys,
-						s->seq, pass_dir, &err))
-		scrub_worker_own_keys(s->keys);
-	if (pass_dir >= 0)
-		close(pass_dir);
+	w->vault_has_keys = TRUE;
+	line_sealing_set_vault(&worker_vault_ops, w);
+	scrub_worker_own_keys(w->session.keys);
 }
 
 static gboolean forget(struct line_worker *w, GError **error)
 {
+	/* Wait for the old Vault before unlinking its session file. */
+	drop_vault(w);
+	int rc = w->vault_has_keys ?
+			 avernella_vault_disconnect(w->vault_broker.ctrl_fd) :
+			 0;
+
+	if (rc < 0 && rc != -EPIPE && rc != -ECONNRESET) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Could not close the Key Vault session.");
+		return FALSE;
+	}
 	clear_view(w);
-	if (w->vault.ctrl_fd >= 0)
-		(void)avernella_vault_client_wipe(w->vault.ctrl_fd, NULL);
+	w->vault_has_keys = FALSE;
+	w->vault_retry_at = 0;
+	line_sealing_set_vault(NULL, NULL);
 	line_session_clear(&w->session);
 	return line_store_forget(w->dir, error);
 }
@@ -563,6 +618,7 @@ static J *login(struct line_worker *w, GError **error)
 		w->friends = obj();
 		w->opened_chats = obj();
 		w->read_acks = obj();
+		w->unsent = line_store_read_unsent(w->dir, s->mid);
 		w->ready = TRUE;
 		/*
 		 * Move Letter Sealing private keys into the memfd_secret() Key
@@ -607,7 +663,28 @@ static J *login(struct line_worker *w, GError **error)
  */
 static gint32 reserve_sequence(struct line_worker *w, GError **error)
 {
-	return line_store_sequence(w->dir, &w->session, error);
+	/* A startup failure might have cleared since the last attempt. */
+	sync_vault_session(w);
+	if (!w->vault_has_keys)
+		return line_store_sequence(w->dir, &w->session, error);
+	g_autoptr(GError) failure = NULL;
+	gint32 seq = 0;
+
+	if (ensure_vault(w, &failure)) {
+		seq = avernella_vault_client_reserve_seq(w->vault_fd, &failure);
+		if (seq <= 0 && retry_vault(w, &failure))
+			seq = avernella_vault_client_reserve_seq(w->vault_fd,
+								 &failure);
+	}
+	if (seq > 0) {
+		w->session.seq = seq;
+		return seq;
+	}
+	if (avernella_vault_disconnected(failure))
+		drop_vault(w);
+	if (failure)
+		g_propagate_error(error, g_steal_pointer(&failure));
+	return 0;
 }
 
 static void remember_friend(struct line_worker *w, J *row)
@@ -930,9 +1007,15 @@ static J *recent_history(struct line_worker *w, const char *chat, J **raw,
 		}
 		return rows;
 	}
-	return line_history_with_summary(&w->session, chat,
-					 g_hash_table_lookup(w->chats, chat),
-					 raw, error);
+	J *rows = line_history_with_summary(&w->session, chat,
+					    g_hash_table_lookup(w->chats, chat),
+					    raw, error);
+
+	if (rows)
+		line_redact_unsent(field(w->unsent, chat), rows,
+				   raw ? *raw : NULL, history_clear_id(w, chat),
+				   TRUE);
+	return rows;
 }
 
 static J *previous_history(struct line_worker *w, const char *chat, J *boundary,
@@ -965,9 +1048,14 @@ static J *previous_history(struct line_worker *w, const char *chat, J *boundary,
 		}
 		return rows;
 	}
-	return line_history_older_since(&w->session, chat, boundary,
-					history_clear_id(w, chat), raw, more,
-					error);
+	guint64 cleared = history_clear_id(w, chat);
+	J *rows = line_history_older_since(&w->session, chat, boundary, cleared,
+					   raw, more, error);
+
+	if (rows)
+		line_redact_unsent(field(w->unsent, chat), rows,
+				   raw ? *raw : NULL, cleared, FALSE);
+	return rows;
 }
 
 static J *find_messages(struct line_worker *w, const char *chat, J *params,
@@ -1231,6 +1319,14 @@ static J *chat_directory(struct line_worker *w, GError **error)
 		if (id) {
 			g_hash_table_insert(w->chats, g_strdup(id), row);
 			json_object_object_del(w->opened_chats, id);
+			const char *last_id = strfield(row, "lastId");
+
+			if (last_id && field(field(w->unsent, id), last_id)) {
+				json_object_object_del(row, "preview");
+				json_object_object_add(
+					row, "lastUnsent",
+					json_object_new_boolean(TRUE));
+			}
 			if (json_object_get_int64(field(row, "unread")) > 0 &&
 			    strfield(row, "lastId"))
 				json_object_object_add(
@@ -1394,6 +1490,64 @@ static void cache_clear(struct line_worker *w)
 	g_hash_table_remove_all(w->history_cache);
 	g_queue_clear_full(&w->history_lru, g_free);
 	g_clear_pointer(&w->revalidate, g_free);
+}
+
+/* Replace the content, retaining at most the ID and the send time. */
+static void message_unsent(struct line_worker *w, const char *chat,
+			   const char *id)
+{
+	J *ids = field(w->unsent, chat);
+	J *summary = g_hash_table_lookup(w->chats, chat);
+	gboolean last = !g_strcmp0(strfield(summary, "lastId"), id);
+	gboolean open = !g_strcmp0(w->history_chat, chat);
+	struct cached_history *cached =
+		g_hash_table_lookup(w->history_cache, chat);
+	J *raw = open ? field(w->messages, id) : NULL;
+	gint64 time = 0;
+
+	if (!w->unsent)
+		return;
+	if (!raw && cached)
+		raw = field(cached->raw, id);
+	time = json_object_get_int64(field(raw, "5"));
+	if (!time && last)
+		time = json_object_get_int64(field(summary, "time"));
+	if (!json_object_is_type(ids, json_type_object)) {
+		if (json_object_object_length(w->unsent) >= 64) {
+			struct json_object_iterator oldest =
+				json_object_iter_begin(w->unsent);
+
+			json_object_object_del(
+				w->unsent, json_object_iter_peek_name(&oldest));
+		}
+		ids = obj();
+		json_object_object_add(w->unsent, chat, ids);
+	}
+	J *previous = field(ids, id);
+	gboolean changed = !previous ||
+			   (time > 0 && !json_object_get_int64(previous));
+
+	line_remember_unsent(ids, id, time);
+	if (cached)
+		line_redact_unsent(ids, cached->rows, cached->raw,
+				   cached->cleared_through, TRUE);
+	if (open && (!cached || cached->raw != w->messages))
+		line_redact_unsent(ids, NULL, w->messages, 0, FALSE);
+	if (last) {
+		json_object_object_del(summary, "preview");
+		json_object_object_add(summary, "lastUnsent",
+				       json_object_new_boolean(TRUE));
+	}
+	if (changed)
+		line_store_write_unsent(w->session.mid, w->unsent);
+
+	g_autoptr(J) event = obj();
+
+	json_object_object_add(event, "event",
+			       json_object_new_string("message_unsent"));
+	json_object_object_add(event, "chat", json_object_new_string(chat));
+	json_object_object_add(event, "row", line_unsent_row(id, time));
+	line_emit(event);
 }
 
 /* The latest page of a chat from LINE, with attachment names. */
@@ -2596,6 +2750,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	gboolean selected = !g_strcmp0(chat, w->history_chat);
 	J *msg = selected && id ? field(w->messages, id) : NULL;
 
+	if (json_object_get_boolean(field(msg, "unsent")))
+		msg = NULL;
 	if (!strcmp(method, "forwardMessage"))
 		return forward_message(w, strfield(params, "destination"), msg,
 				       error);
@@ -2628,7 +2784,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(
 				error,
 				"Select a LINE sticker from your packs.");
-		if (reply_to && (!selected || !field(w->messages, reply_to)))
+		if (reply_to && (!selected || !field(w->messages, reply_to) ||
+				 field(field(w->unsent, chat), reply_to)))
 			return problem(error, "Select a message to reply to.");
 		gint32 seq = reserve_sequence(w, error);
 
@@ -2799,7 +2956,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(
 				error,
 				"Enter a message of up to 20,000 UTF-8 bytes.");
-		if (reply_to && (!selected || !field(w->messages, reply_to)))
+		if (reply_to && (!selected || !field(w->messages, reply_to) ||
+				 field(field(w->unsent, chat), reply_to)))
 			return problem(error, "Select a message to reply to.");
 		if ((react || unsend) && !msg)
 			return problem(
@@ -2916,6 +3074,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 				s, id, react ? reaction : NULL, error);
 		s->seq = reserved;
 		if (ack) {
+			if (unsend)
+				message_unsent(w, chat, id);
 			g_hash_table_remove(w->history_cache, chat);
 			if (!unsend && !react && w->messages &&
 			    !g_strcmp0(chat, w->history_chat)) {
@@ -3346,6 +3506,12 @@ static void handle(struct line_worker *w, const char *line)
 static gboolean apply_operation(struct line_worker *w, J *op)
 {
 	Line *s = &w->session;
+	const char *chat, *id;
+
+	if (line_unsend_operation(op, &chat, &id)) {
+		message_unsent(w, chat, id);
+		return TRUE;
+	}
 	enum peer_notice notice = line_peer_read_notice(s->mid, w->history_chat,
 							w->peer_notices, op);
 
@@ -3422,6 +3588,25 @@ static void maintain_tokens(struct line_worker *w)
 			error ? error->message : "unknown", (long long)wait);
 }
 
+static gboolean save_vault_token(struct line_worker *w, GError **error)
+{
+	const Line *s = &w->session;
+
+	if (!ensure_vault(w, error))
+		return FALSE;
+	if (avernella_vault_client_rotate_token(
+		    w->vault_fd, s->access, s->refresh, s->refresh_at, error))
+		return TRUE;
+	/* Persisting the same token is idempotent. */
+	if (retry_vault(w, error) &&
+	    avernella_vault_client_rotate_token(
+		    w->vault_fd, s->access, s->refresh, s->refresh_at, error))
+		return TRUE;
+	if (avernella_vault_disconnected(*error))
+		drop_vault(w);
+	return FALSE;
+}
+
 static void save_rotated_token(struct line_worker *w)
 {
 	Line *s = &w->session;
@@ -3429,10 +3614,8 @@ static void save_rotated_token(struct line_worker *w)
 	if (s->access && s->token_changed) {
 		g_autoptr(GError) storage_error = NULL;
 		gboolean saved =
-			w->vault.ctrl_fd >= 0 ?
-				avernella_vault_client_rotate_token(
-					w->vault.ctrl_fd, s->access, s->refresh,
-					s->refresh_at, &storage_error) :
+			w->vault_has_keys ?
+				save_vault_token(w, &storage_error) :
 				line_store_save(w->dir, s, &storage_error);
 
 		if (!saved) {
@@ -3723,6 +3906,9 @@ static gboolean message_operation(struct line_worker *w, J *op,
 	/* One-to-one chats are named after the other person. */
 	const char *chat =
 		json_object_get_int(field(msg, "3")) == 0 && !mine ? from : to;
+
+	if (field(field(w->unsent, chat), id))
+		return TRUE;
 	g_autoptr(J) event = obj();
 
 	json_object_object_add(event, "event",
@@ -4040,25 +4226,21 @@ static int worker(int credentials_fd)
 				  credentials_fd >= 0 ? credentials_fd :
 							STDERR_FILENO);
 	/*
-	 * Spawn the isolated memfd_secret() Key Vault child BEFORE installing
+	 * Spawn the isolated Key Vault broker BEFORE installing
 	 * the worker's Landlock/seccomp sandbox and before any thread starts.
 	 */
-	struct avernella_worker_proc vault_proc = { .pid = -1,
-						    .pidfd = -1,
-						    .ctrl_fd = -1 };
-	struct avernella_sandbox_opts vault_opts = {
-		.role = SANDBOX_ROLE_VAULT,
-		.keep_stderr = true,
-	};
+	struct avernella_worker_proc broker = { .pid = -1,
+						.pidfd = -1,
+						.ctrl_fd = -1 };
 
-	(void)avernella_spawn_worker(&vault_opts, vault_child_entry, NULL,
-				     &vault_proc);
+	(void)avernella_vault_broker_start(&broker);
 	/* Before any thread starts, so every later thread inherits it. */
 	line_sandbox_worker();
 	struct line_worker w = {
 		.dir = -1,
 		.credentials_fd = credentials_fd,
-		.vault = vault_proc,
+		.vault_broker = broker,
+		.vault_fd = -1,
 		.sync.revision = -1,
 		.displayed_revision = -1,
 		.renewal_timer = timerfd_create(CLOCK_REALTIME,
@@ -4066,12 +4248,6 @@ static int worker(int credentials_fd)
 		.timer = timerfd_create(CLOCK_MONOTONIC,
 					TFD_CLOEXEC | TFD_NONBLOCK)
 	};
-	if (w.vault.ctrl_fd >= 0) {
-		if (avernella_vault_client_ping(w.vault.ctrl_fd) == 0)
-			line_sealing_set_vault(&worker_vault_ops, &w.vault);
-		else
-			avernella_worker_close(&w.vault);
-	}
 	w.image_wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	w.image_requests = g_async_queue_new_full(image_free);
 	w.image_results = g_async_queue_new_full(image_free);
@@ -4157,7 +4333,8 @@ static int worker(int credentials_fd)
 		close(w.image_wake);
 	clear_view(&w);
 	line_sealing_set_vault(NULL, NULL);
-	avernella_worker_close(&w.vault);
+	drop_vault(&w);
+	avernella_worker_close(&w.vault_broker);
 	if (frame_fd >= 0)
 		close(frame_fd);
 	g_hash_table_unref(w.leases);
@@ -4195,6 +4372,7 @@ static gboolean launch_url_arg(const char *arg)
 
 int main(int argc, char **argv)
 {
+	signal(SIGPIPE, SIG_IGN);
 	umask(0077);
 	line_tune_process();
 	if (argc == 2 && !strcmp(argv[1], "--worker"))

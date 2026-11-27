@@ -140,6 +140,8 @@ static struct {
 	guint screenshot_event;
 	GThread *screenshot_thread;
 	GCancellable *screenshot_cancel;
+	char *screenshot_chat;
+	gint64 screenshot_after;
 	LineVideoPlayback *playback;
 	GSubprocess *audio_clip;
 	guint play_event, play_serial, play_overlay;
@@ -1198,6 +1200,8 @@ void ui_media_select_chat(void)
 	ui_find_reset();
 	ui_chat_tools_reset();
 	ui_shared_reset();
+	g_clear_pointer(&m.screenshot_chat, g_free);
+	m.screenshot_after = 0;
 	if (m.screenshot_cancel)
 		g_cancellable_cancel(m.screenshot_cancel);
 	m.epoch++;
@@ -1381,14 +1385,8 @@ static gpointer take_screenshot(gpointer data)
 	return SDL_PushEvent(&e) == 1 ? NULL : out;
 }
 
-void ui_media_screenshot(void)
+static void start_screenshot(void)
 {
-	if (!ui.selected || !ui.photos || m.mode != CLOSED)
-		return;
-	if (m.screenshot_thread) {
-		ui_status(_("A screenshot request is already open."));
-		return;
-	}
 	if (!m.screenshot_event)
 		m.screenshot_event = SDL_RegisterEvents(1);
 	if (m.screenshot_event == (Uint32)-1) {
@@ -1418,6 +1416,51 @@ void ui_media_screenshot(void)
 		g_clear_object(&m.screenshot_cancel);
 		ui_status(_("Could not start a screenshot request."));
 	}
+}
+
+void ui_media_screenshot(void)
+{
+	if (!ui.selected || !ui.photos || m.mode != CLOSED)
+		return;
+	if (m.screenshot_thread || m.screenshot_chat) {
+		ui_status(_("A screenshot request is already open."));
+		return;
+	}
+	m.screenshot_chat = g_strdup(ui.selected);
+	ui.dirty = TRUE;
+}
+
+void ui_media_screenshot_presented(void)
+{
+	if (!m.screenshot_chat || m.screenshot_after)
+		return;
+	SDL_DisplayMode mode;
+	int display = SDL_GetWindowDisplayIndex(ui.window);
+	int hz = 60;
+
+	if (display >= 0 && !SDL_GetCurrentDisplayMode(display, &mode) &&
+	    mode.refresh_rate > 0)
+		hz = mode.refresh_rate;
+	/* Give the compositor time to sample the newly presented surface. */
+	m.screenshot_after = g_get_monotonic_time() + 2 * G_USEC_PER_SEC / hz;
+}
+
+int ui_media_screenshot_wait(gint64 now)
+{
+	if (!m.screenshot_chat)
+		return -1;
+	gboolean ready = ui.connected && ui.photos && !ui_media_layer() &&
+			 !g_strcmp0(m.screenshot_chat, ui.selected);
+
+	if (ready && !m.screenshot_after)
+		return -1;
+	if (ready && now < m.screenshot_after)
+		return (m.screenshot_after - now + 999) / 1000;
+	g_clear_pointer(&m.screenshot_chat, g_free);
+	m.screenshot_after = 0;
+	if (ready)
+		start_screenshot();
+	return -1;
 }
 
 static void free_record_event(struct recording_event *event)
@@ -1800,6 +1843,16 @@ void ui_media_reply_sent(const char *chat)
 		g_clear_pointer(&m.reply_text, g_free);
 		ui.dirty = TRUE;
 	}
+}
+
+void ui_media_message_unsent(const char *chat, const char *id)
+{
+	if (m.thumbs)
+		g_hash_table_remove(m.thumbs, id);
+	if (!g_strcmp0(chat, m.chat) && !g_strcmp0(id, m.id))
+		close_overlay();
+	if (!g_strcmp0(id, ui.reply_id))
+		ui_media_reply_sent(chat);
 }
 
 static void picture(Json *row)
@@ -4879,7 +4932,7 @@ gboolean ui_media_event(SDL_Event *e)
 	}
 	Json *row = ui_row_at(x, y);
 
-	if (!row)
+	if (!row || !strcmp(ui_string(row, "type", ""), "unsent"))
 		return FALSE;
 	if (e->button.button == SDL_BUTTON_RIGHT) {
 		m.menu_x = x;

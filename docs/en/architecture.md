@@ -26,7 +26,9 @@ Avernella is one executable, `avernella`, that runs as **two processes**, plus a
   legy.line-apps.com · obs.line-apps.com · LINE CDNs · call relays    the app's own site
 ```
 
-The split has one purpose: **the process that draws untrusted content never holds your LINE credentials, and the process that holds the credentials never draws anything.** Pictures, Flex cards and rich messages from strangers are decoded and drawn in the UI process. Tokens, the refresh token and Letter Sealing private keys exist only in the worker. Web pages from LINE apps run in a third process with its own sandbox.
+The split has one purpose: **the process that draws untrusted content never holds your LINE credentials, and the process that holds the credentials never draws anything.** Pictures, Flex cards and rich messages from strangers are decoded and drawn in the UI process. The network worker and the Key Vault handle your credentials. Web pages from LINE apps run in a third process with its own sandbox.
+
+The worker starts the Vault supervisor before reading credentials and applying its sandbox. They communicate over anonymous Unix socket pairs. When the Vault disconnects, the supervisor starts a replacement, which restores Letter Sealing keys and the persisted request-sequence limit through the already-locked state directory descriptor. Safe local operations retry once after reconnecting. Requests already sent to LINE follow their existing retry rules.
 
 ## The UI process
 

@@ -40,6 +40,9 @@ gboolean chat_sounds_set(struct chat_lists *lists, gboolean on, GError **e);
 gboolean chat_muted(struct chat_lists *lists, const char *chat);
 gboolean chat_mute_toggle(struct chat_lists *lists, const char *chat,
 			  GError **e);
+gboolean chat_strict_muted(struct chat_lists *lists, const char *chat);
+gboolean chat_strict_mute_toggle(struct chat_lists *lists, const char *chat,
+				 GError **e);
 /* Reduced motion: 1 always, 0 never, -1 follow the desktop. */
 int chat_motion(struct chat_lists *lists);
 gboolean chat_motion_set(struct chat_lists *lists, int reduce, GError **e);
