@@ -164,7 +164,7 @@ static struct {
 	gboolean emoji_busy;
 	guint use_seq, frame, last_full_frame, previous_full_frame;
 	gboolean avatar_busy, flex_busy, flex_invalid_reported;
-	guint session, avatar_seq;
+	guint session, avatar_seq, flex_serial;
 	GThreadPool *pool;
 	cairo_surface_t *image;
 	struct call_picture call_frame, self_frame, share_frame;
@@ -426,6 +426,17 @@ void ui_media_refresh(void)
 			g_hash_table_foreach_remove(caches[i],
 						    refresh_thumbnail, NULL);
 	/* Emoji load failures can change a cached message layout. */
+	ui_forget_history();
+	ui.dirty = TRUE;
+}
+
+void ui_media_refresh_flex(void)
+{
+	if (m.flex_images)
+		g_hash_table_remove_all(m.flex_images);
+	m.flex_busy = FALSE;
+	m.flex_serial = 0;
+	m.flex_invalid_reported = FALSE;
 	ui_forget_history();
 	ui.dirty = TRUE;
 }
@@ -1138,7 +1149,10 @@ static void complete_decode(struct decode_job *job)
 			if (!job->image)
 				media_debug("decode failed");
 			store_thumbnail(image, &job->image);
+		}
+		if (job->serial == m.flex_serial) {
 			m.flex_busy = FALSE;
+			m.flex_serial = 0;
 		}
 	} else if ((job->role == AVATAR || job->role == EMOJI) &&
 		   job->epoch == m.session) {
@@ -1252,6 +1266,7 @@ void ui_media_reset(void)
 		g_hash_table_remove_all(m.avatars);
 	g_clear_pointer(&m.flex_images, g_hash_table_unref);
 	m.flex_busy = FALSE;
+	m.flex_serial = 0;
 	m.flex_invalid_reported = FALSE;
 	g_clear_pointer(&m.call_chat, g_free);
 	g_clear_pointer(&m.call_name, g_free);
@@ -1644,6 +1659,7 @@ cairo_surface_t *ui_flex_image(const char *url)
 		entry->serial = ++m.avatar_seq;
 		g_hash_table_insert(m.flex_images, g_strdup(url), entry);
 		m.flex_busy = TRUE;
+		m.flex_serial = entry->serial;
 		Json *params = json_object_new_object();
 
 		json_object_object_add(params, "url",
@@ -3793,7 +3809,14 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		if (current && !start_decode(fd, FLEX_IMAGE, url, tag, FALSE)) {
 			thumbnail_unavailable(m.flex_images, url, entry, error,
 					      NULL);
+			if (tag == m.flex_serial) {
+				m.flex_busy = FALSE;
+				m.flex_serial = 0;
+			}
+			ui.dirty = TRUE;
+		} else if (!current && tag == m.flex_serial) {
 			m.flex_busy = FALSE;
+			m.flex_serial = 0;
 			ui.dirty = TRUE;
 		}
 		return;

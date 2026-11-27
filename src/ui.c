@@ -1680,11 +1680,13 @@ static void retry_read_receipt(void)
 		cursor->attempted = cursor->confirmed;
 }
 
-static void refresh_content(void)
+static void refresh_content(gboolean manual)
 {
 	if (!ui.connected || ui.logging_out)
 		return;
 	ui_media_refresh();
+	if (manual)
+		ui_media_refresh_flex();
 	retry_read_receipt();
 	refresh();
 }
@@ -2314,7 +2316,7 @@ static void handle_packet(Json *packet)
 	else if (!strcmp(event, "changed") && ui.connected && !ui.logging_out)
 		refresh();
 	else if (!strcmp(event, "reconnected"))
-		refresh_content();
+		refresh_content(FALSE);
 	else if (!strcmp(event, "chat_message") && ui.connected &&
 		 !ui.logging_out)
 		chat_message(packet);
@@ -2579,7 +2581,7 @@ static void key(SDL_KeyboardEvent k)
 	int shortcut = ui_list_shortcut(k);
 
 	if (shortcut == LIST_REFRESH) {
-		refresh_content();
+		refresh_content(TRUE);
 		return;
 	}
 	if (ctrl && (code == SDLK_PAGEUP || code == SDLK_END) &&
@@ -2654,7 +2656,7 @@ static void key(SDL_KeyboardEvent k)
 		else if (ui.focus == F_SEND || ui.focus == F_MESSAGE)
 			send_message();
 		else if (ui.focus == F_RELOAD)
-			refresh_content();
+			refresh_content(TRUE);
 		else if (ui.focus == F_LOGOUT)
 			logout();
 		return;
@@ -2906,7 +2908,7 @@ static void click(int x, int y)
 	else if (ui_list_visible() && inside(ui.logout, x, y))
 		logout();
 	else if (ui_list_visible() && inside(ui.reload, x, y))
-		refresh_content();
+		refresh_content(TRUE);
 	else if ((ui_list_visible() && inside(ui.search_box, x, y)) ||
 		 (ui_chat_visible() && ui.selected && inside(ui.entry, x, y))) {
 		gboolean search = ui_list_visible() &&

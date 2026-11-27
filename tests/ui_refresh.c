@@ -136,6 +136,49 @@ static void flex_invalid_image(void)
 	ui_media_reset();
 }
 
+static void flex_manual_refresh(void)
+{
+	g_autofree char *path = NULL;
+	guint32 pixel = 0xff112233;
+	cairo_surface_t *png;
+	int fd = g_file_open_tmp("avernella-refresh-XXXXXX", &path, NULL);
+
+	g_assert_cmpint(fd, >=, 0);
+	close(fd);
+	png = cairo_image_surface_create_for_data((unsigned char *)&pixel,
+						  CAIRO_FORMAT_ARGB32, 1, 1, 4);
+	g_assert_cmpint(cairo_surface_write_to_png(png, path), ==,
+			CAIRO_STATUS_SUCCESS);
+	cairo_surface_destroy(png);
+
+	/* Manual refresh evicts a cached Flex/Rich image and re-fetches it. */
+	g_assert_null(ui_flex_image(url));
+	reply(path, NULL);
+	wait_for_decode();
+	g_assert_nonnull(ui_flex_image(url));
+	g_assert_null(request);
+
+	ui_media_refresh_flex();
+	g_assert_null(ui_flex_image(url));
+	g_assert_nonnull(request);
+
+	/* A late reply from before another manual refresh must not wedge busy. */
+	guint stale_tag = request_tag;
+	Json *stale_params = g_steal_pointer(&request);
+
+	ui_media_refresh_flex();
+	ui_media_reply("flexImage", stale_params, stale_tag, NULL, "Cancelled");
+	json_object_put(stale_params);
+
+	g_assert_null(ui_flex_image(url));
+	g_assert_nonnull(request);
+	reply(path, NULL);
+	wait_for_decode();
+	g_assert_nonnull(ui_flex_image(url));
+	g_assert_cmpint(g_remove(path), ==, 0);
+	ui_media_reset();
+}
+
 int main(int argc, char **argv)
 {
 	int result;
@@ -146,6 +189,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/refresh/flex-image", flex_recovers);
 	g_test_add_func("/refresh/flex-late-failure", flex_late_failure);
 	g_test_add_func("/refresh/flex-invalid-image", flex_invalid_image);
+	g_test_add_func("/refresh/flex-manual-refresh", flex_manual_refresh);
 	result = g_test_run();
 
 	ui_media_shutdown();

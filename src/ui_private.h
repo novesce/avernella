@@ -295,6 +295,7 @@ void ui_mention_member(const char *id, const char *name);
 gboolean ui_mention_span(guint i, int *start, int *end);
 void ui_media_login(Json *result);
 void ui_media_refresh(void);
+void ui_media_refresh_flex(void);
 void ui_media_reset(void);
 void ui_media_shutdown(void);
 void ui_media_screenshot(void);
