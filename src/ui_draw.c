@@ -1964,13 +1964,14 @@ enum {
 };
 
 struct message_layout {
-	PangoLayout *body, *byline, *clock, *short_clock, *date, *reactions;
+	PangoLayout *body, *byline, *clock, *short_clock, *date, *reactions,
+		*reply_sender, *reply_preview;
 	struct ui_flex_layout *flex;
 	int y, w, h, top; /* top: offset of the message below any divider */
-	int x, body_top, body_h, text_origin;
+	int x, body_top, body_h, text_origin, reply_h;
 	gboolean mine, group, photo, video, rich, receipt, notice, has_links,
 		contact_card, location_card;
-	Json *message; /* borrowed from the cached history */
+	Json *message, *reply_target; /* borrowed from the cached history */
 };
 
 static struct {
@@ -1994,6 +1995,8 @@ static void drop_bubble(gpointer data)
 	g_clear_object(&row->short_clock);
 	g_clear_object(&row->date);
 	g_clear_object(&row->reactions);
+	g_clear_object(&row->reply_sender);
+	g_clear_object(&row->reply_preview);
 	ui_flex_free(row->flex);
 }
 
@@ -2269,6 +2272,30 @@ static gboolean rich_loadable(Json *rich)
 	return FALSE;
 }
 
+static const char *reply_sender_name(Json *target)
+{
+	if (json_object_get_boolean(ui_field(target, "own")))
+		return ui.name ? ui.name : _("You");
+	return ui_string(target, "from", "LINE");
+}
+
+static char *reply_preview_text(Json *target)
+{
+	const char *s = ui_string(target, "text", "");
+
+	if (!*s)
+		s = ui_string(target, "filename",
+			      ui_string(target, "type", "Message"));
+	else if (*s == '[')
+		s = _(s);
+	char *flat = g_strdup(s);
+
+	for (char *p = flat; *p; p++)
+		if (*p == '\r' || *p == '\n' || *p == '\t')
+			*p = ' ';
+	return flat;
+}
+
 static void prepare_bubbles(Rect area)
 {
 	cairo_matrix_t matrix;
@@ -2283,6 +2310,15 @@ static void prepare_bubbles(Rect area)
 		return;
 	ui_forget_history();
 	size_t count = ui.history ? json_object_array_length(ui.history) : 0;
+	g_autoptr(GHashTable) by_id = g_hash_table_new(g_str_hash, g_str_equal);
+
+	for (size_t i = 0; i < count; i++) {
+		Json *m = json_object_array_get_idx(ui.history, i);
+		const char *mid = ui_string(m, "id", NULL);
+
+		if (mid && *mid)
+			g_hash_table_insert(by_id, (gpointer)mid, m);
+	}
 
 	cache.rows = g_array_sized_new(
 		FALSE, FALSE, sizeof(struct message_layout), (guint)count);
@@ -2431,41 +2467,67 @@ static void prepare_bubbles(Rect area)
 			/* Attachments arrive labelled "[Photo]" and so on. */
 			else if (*body == '[')
 				body = _(body);
-			g_autofree char *with_reply =
-				ui_field(msg, "replyTo") ?
-					g_strdup_printf("↪ Reply\n%s", body) :
-					NULL;
 
 			int text_w = line_style ?
 					     MAX(1, maxw - 2 * BUBBLE_PAD_X) :
 					     maxw;
+			const char *reply_to = ui_string(msg, "replyTo", NULL);
+			int quote_w = 0;
 
-			row.body = layout(with_reply ? with_reply : body,
-					  line_style ? 15 : 16, 400, text_w,
-					  TRUE);
-			ui_emoji_shape_history(row.body, body,
-					       with_reply ? "↪ Reply\n" : "",
+			if (reply_to && *reply_to) {
+				row.reply_target =
+					g_hash_table_lookup(by_id, reply_to);
+				int indent = row.reply_target ? 26 : 10;
+				int qw = MAX(1, text_w - indent);
+				const char *rsender =
+					row.reply_target ?
+						reply_sender_name(
+							row.reply_target) :
+						_("Reply");
+				g_autofree char *rprev =
+					row.reply_target ?
+						reply_preview_text(
+							row.reply_target) :
+						g_strdup(_("Original message"));
+				int sw = 0, sh = 0, pw = 0, ph = 0;
+
+				row.reply_sender =
+					layout(rsender, 12, 700, qw, FALSE);
+				row.reply_preview =
+					layout(rprev, 12, 400, qw, FALSE);
+				pango_layout_get_pixel_size(row.reply_sender,
+							    &sw, &sh);
+				pango_layout_get_pixel_size(row.reply_preview,
+							    &pw, &ph);
+				quote_w = MIN(text_w, indent + MAX(sw, pw));
+				row.reply_h = MAX(row.reply_target ? 24 : 18,
+						  sh + ph + 2) +
+					      12;
+			}
+
+			row.body = layout(body, line_style ? 15 : 16, 400,
+					  text_w, TRUE);
+			ui_emoji_shape_history(row.body, body, "",
 					       ui_field(msg, "emojis"));
-			decorate_mentions(row.body, body,
-					  with_reply ? strlen("↪ Reply\n") : 0,
+			decorate_mentions(row.body, body, 0,
 					  ui_field(msg, "mentions"),
 					  line_style && row.mine);
 			row.has_links = decorate_message_links(
-				row.body, with_reply ? strlen("↪ Reply\n") : 0,
-				line_style && row.mine);
+				row.body, 0, line_style && row.mine);
 			PangoRectangle logical;
 
 			pango_layout_get_pixel_extents(row.body, NULL,
 						       &logical);
-			body_height = logical.height;
+			int content_w = MAX(logical.width, quote_w);
+
+			body_height = row.reply_h + logical.height;
 			if (line_style) {
 				/* Pango places RTL text at the far edge of its wrap width. */
 				row.text_origin = -logical.x;
-				row.w = MAX(1, logical.width) +
-					2 * BUBBLE_PAD_X;
+				row.w = MAX(1, content_w) + 2 * BUBBLE_PAD_X;
 				body_height += 2 * BUBBLE_PAD_Y;
 			} else
-				row.w = MAX(32, logical.width);
+				row.w = MAX(32, content_w);
 		}
 		Json *reactions = ui_field(msg, "reactions");
 
@@ -2667,15 +2729,16 @@ char *ui_text_link_at(int x, int y)
 	int lx = x - (cache.line_style ?
 			      body.x + BUBBLE_PAD_X + row->text_origin :
 			      body.x);
-	int ly = y - (cache.line_style ? body.y + BUBBLE_PAD_Y : body.y);
+	int ly = y - (cache.line_style ? body.y + BUBBLE_PAD_Y : body.y) -
+		 row->reply_h;
 	int index = 0, trailing = 0;
 
-	if (!pango_layout_xy_to_index(row->body, lx * PANGO_SCALE,
+	if (ly < 0 ||
+	    !pango_layout_xy_to_index(row->body, lx * PANGO_SCALE,
 				      ly * PANGO_SCALE, &index, &trailing))
 		return NULL;
 	const char *full = pango_layout_get_text(row->body);
-	size_t pos = ui_field(row->message, "replyTo") ? strlen("↪ Reply\n") :
-							 0;
+	size_t pos = 0;
 	size_t start = 0, end = 0;
 
 	while (next_url_span(full, &pos, &start, &end))
@@ -3009,6 +3072,42 @@ static gboolean history_row_damaged(int top, int height)
 	return FALSE;
 }
 
+static void draw_reply_quote(const struct message_layout *r, int qx, int qy,
+			     int qw, gboolean on_accent)
+{
+	if (!r->reply_h || !r->reply_sender || !r->reply_preview)
+		return;
+	guint sender_rgb = on_accent	    ? UI_BUBBLE_OUT_INK :
+			   cache.line_style ? UI_BUBBLE_IN_INK :
+					      UI_HEADING;
+	guint preview_rgb =
+		on_accent ? blend(UI_BUBBLE_OUT_INK, UI_BUBBLE_OUT, 0.30) :
+			    UI_MUTED;
+	guint div_rgb = on_accent ?
+				blend(UI_BUBBLE_OUT_INK, UI_BUBBLE_OUT, 0.72) :
+				UI_LINE;
+	int indent = r->reply_target ? 26 : 10;
+
+	if (r->reply_target) {
+		gboolean own = json_object_get_boolean(
+			ui_field(r->reply_target, "own"));
+		const char *name = reply_sender_name(r->reply_target);
+		const char *sid = ui_string(r->reply_target, "senderId",
+					    own ? ui.self_id : "");
+
+		avatar(name, qx, qy + 3, 20, sid ? sid : "", ui.selected,
+		       ui_string(r->reply_target, "avatarKey", NULL));
+	} else
+		box(qx, qy + 2, 2, r->reply_h - 14, 1,
+		    on_accent ? preview_rgb : UI_ACCENT);
+	int sh = 0;
+
+	pango_layout_get_pixel_size(r->reply_sender, NULL, &sh);
+	paint(r->reply_sender, qx + indent, qy, sender_rgb);
+	paint(r->reply_preview, qx + indent, qy + sh + 1, preview_rgb);
+	line(qx, qy + r->reply_h - 6, qx + qw, qy + r->reply_h - 6, div_rgb, 1);
+}
+
 static void text_bubble(const struct message_layout *r, Rect body)
 {
 	guint fill = r->mine ? UI_BUBBLE_OUT : UI_BUBBLE_IN;
@@ -3027,8 +3126,10 @@ static void text_bubble(const struct message_layout *r, Rect body)
 		cairo_close_path(cr);
 		cairo_fill(cr);
 	}
+	draw_reply_quote(r, body.x + BUBBLE_PAD_X, body.y + BUBBLE_PAD_Y,
+			 MAX(1, body.w - 2 * BUBBLE_PAD_X), r->mine);
 	paint(r->body, body.x + BUBBLE_PAD_X + r->text_origin,
-	      body.y + BUBBLE_PAD_Y,
+	      body.y + BUBBLE_PAD_Y + r->reply_h,
 	      r->mine ? UI_BUBBLE_OUT_INK : UI_BUBBLE_IN_INK);
 }
 
@@ -3268,8 +3369,10 @@ static void message_rows(Rect area)
 							       r->body_h - 4 });
 		else if (cache.line_style)
 			text_bubble(r, body);
-		else
-			paint(r->body, x, y, UI_BODY);
+		else {
+			draw_reply_quote(r, x, y, r->w, FALSE);
+			paint(r->body, x, y + r->reply_h, UI_BODY);
+		}
 		if ((int)i == hover && r->has_links) {
 			g_autofree char *url =
 				ui_text_link_at(ui.hover_x, ui.hover_y);
@@ -3414,6 +3517,25 @@ static void glyph_clip(Rect e, guint ink)
 	cairo_restore(cr);
 }
 
+static char *reply_banner_text(void)
+{
+	if (!ui.reply_id || !ui.history)
+		return g_strdup(_("Replying to message"));
+	size_t n = json_object_array_length(ui.history);
+
+	for (size_t i = 0; i < n; i++) {
+		Json *m = json_object_array_get_idx(ui.history, i);
+
+		if (!g_strcmp0(ui_string(m, "id", NULL), ui.reply_id)) {
+			g_autofree char *prev = reply_preview_text(m);
+
+			return g_strdup_printf("%s: %s", reply_sender_name(m),
+					       prev);
+		}
+	}
+	return g_strdup(_("Replying to message"));
+}
+
 /*
  * LINE's input pane: a flat band across the chat with the text on top, the
  * emoji and attachment tools under it and a Send button at the right.
@@ -3427,11 +3549,12 @@ static void line_composer(void)
 	box(c.x, c.y, c.w, c.h, 0, UI_SIDEBAR);
 	if (replying) {
 		Rect bar = { c.x, c.y - 34, c.w, 34 };
+		g_autofree char *label = reply_banner_text();
 
 		box(bar.x, bar.y, bar.w, bar.h, 0, UI_DIALOG);
 		box(bar.x, bar.y, 3, bar.h, 0, UI_ACCENT);
-		text(_("Replying to message"), bar.x + 16, bar.y + 9,
-		     bar.w - 140, 13, 500, UI_BODY, FALSE);
+		text(label, bar.x + 16, bar.y + 9, bar.w - 140, 13, 500,
+		     UI_BODY, FALSE);
 		text(_("Esc to cancel"), bar.x + bar.w - 112, bar.y + 10, 100,
 		     12, 500, UI_SUBTLE, FALSE);
 	}
@@ -3500,10 +3623,11 @@ static void composer(int s, int w)
 
 	if (ui.reply_id && !g_strcmp0(ui.reply_chat, ui.selected)) {
 		Rect bar = { c.x, c.y - 34, c.w, 42 };
+		g_autofree char *label = reply_banner_text();
 
 		box(bar.x, bar.y, bar.w, bar.h, 8, UI_PANEL);
-		text(_("Replying to message"), bar.x + 16, bar.y + 8,
-		     bar.w - 140, 14, 500, UI_MUTED, FALSE);
+		text(label, bar.x + 16, bar.y + 8, bar.w - 140, 14, 500,
+		     UI_MUTED, FALSE);
 		text(_("Esc to cancel"), bar.x + bar.w - 116, bar.y + 8, 104,
 		     12, 500, UI_SUBTLE, FALSE);
 	}
