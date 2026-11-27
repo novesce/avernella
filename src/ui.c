@@ -37,6 +37,7 @@
 #include <string.h>
 #include <sys/eventfd.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -680,8 +681,28 @@ static void post_line(char *text, int fd, gpointer data)
 
 struct wire_write {
 	size_t size;
+	int fd;
 	char data[];
 };
+
+static void wire_write_free(gpointer p)
+{
+	struct wire_write *w = p;
+
+	if (!w)
+		return;
+	if (w->fd >= 0)
+		close(w->fd);
+	g_free(w);
+}
+
+static gboolean is_upload_method(const char *name)
+{
+	return !strcmp(name, "sendPhoto") || !strcmp(name, "sendFile") ||
+	       !strcmp(name, "updateMyPicture") ||
+	       !strcmp(name, "updateGroupPicture") ||
+	       !strcmp(name, "squareUpdatePicture");
+}
 
 enum {
 	WORKER_QUIT_GRACE_MS = 2250
@@ -730,7 +751,7 @@ static gpointer pump(gpointer data)
 		gboolean stopping = g_atomic_int_get(&wire.stopping);
 
 		if (stopping) {
-			g_clear_pointer(&writing, g_free);
+			g_clear_pointer(&writing, wire_write_free);
 		} else if (!writing) {
 			writing = g_async_queue_try_pop(wire.writes);
 			offset = 0;
@@ -765,8 +786,37 @@ static gpointer pump(gpointer data)
 		}
 		if (writing && (fds[0].revents & POLLOUT)) {
 			size_t left = writing->size - offset;
-			ssize_t n = send(wire.fd, writing->data + offset, left,
+			ssize_t n;
+
+			if (writing->fd >= 0 && offset == 0) {
+				union {
+					struct cmsghdr align;
+					char bytes[CMSG_SPACE(sizeof(int))];
+				} ctrl;
+				struct iovec iov = { writing->data, left };
+				struct msghdr msg = {
+					.msg_iov = &iov,
+					.msg_iovlen = 1,
+					.msg_control = ctrl.bytes,
+					.msg_controllen = sizeof(ctrl.bytes),
+				};
+				struct cmsghdr *cm = CMSG_FIRSTHDR(&msg);
+
+				memset(&ctrl, 0, sizeof(ctrl));
+				cm->cmsg_level = SOL_SOCKET;
+				cm->cmsg_type = SCM_RIGHTS;
+				cm->cmsg_len = CMSG_LEN(sizeof(int));
+				memcpy(CMSG_DATA(cm), &writing->fd,
+				       sizeof(int));
+				n = sendmsg(wire.fd, &msg, MSG_NOSIGNAL);
+				if (n > 0) {
+					close(writing->fd);
+					writing->fd = -1;
+				}
+			} else {
+				n = send(wire.fd, writing->data + offset, left,
 					 MSG_NOSIGNAL);
+			}
 			if (n < 0 && (errno == EINTR || errno == EAGAIN))
 				continue;
 			if (n < 0 && errno == EPIPE &&
@@ -776,7 +826,7 @@ static gpointer pump(gpointer data)
 				break;
 			offset += n;
 			if ((size_t)n == left)
-				g_clear_pointer(&writing, g_free);
+				g_clear_pointer(&writing, wire_write_free);
 		}
 		if (fds[2].revents & POLLIN)
 			pump_preview(generation);
@@ -784,7 +834,7 @@ static gpointer pump(gpointer data)
 		    !g_atomic_int_get(&wire.stopping))
 			break;
 	}
-	g_free(writing);
+	wire_write_free(writing);
 	line_wire_reader_clear(&reader);
 	post_packet(generation, NULL, -1);
 	return NULL;
@@ -988,7 +1038,7 @@ static gboolean start_worker(int credentials_fd)
 	wire.fd = pair[0];
 	wire.preview = preview[0];
 	fcntl(wire.fd, F_SETFL, O_NONBLOCK);
-	wire.writes = g_async_queue_new_full(g_free);
+	wire.writes = g_async_queue_new_full(wire_write_free);
 	g_atomic_int_set(&wire.stopping, FALSE);
 	wire.thread = g_thread_new("line-ipc", pump,
 				   GUINT_TO_POINTER(wire.generation));
@@ -1000,6 +1050,23 @@ static guint submit(struct ui_request *saved, const char *name, Json *args)
 	guint id = ++wire.seq;
 
 	g_hash_table_insert(wire.requests, GUINT_TO_POINTER(id), saved);
+	int upload_fd = -1;
+
+	if (args && is_upload_method(name)) {
+		const char *path = ui_string(args, "path", NULL);
+
+		if (path && *path) {
+			int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+			struct stat st;
+
+			if (fd >= 0) {
+				if (!fstat(fd, &st) && S_ISREG(st.st_mode))
+					upload_fd = fd;
+				else
+					close(fd);
+			}
+		}
+	}
 	Json *packet = json_object_new_object();
 
 	json_object_object_add(packet, "id", json_object_new_int64(id));
@@ -1011,6 +1078,7 @@ static guint submit(struct ui_request *saved, const char *name, Json *args)
 	struct wire_write *line = g_malloc(sizeof(*line) + size + 1);
 
 	line->size = size + 1;
+	line->fd = upload_fd;
 	memcpy(line->data, encoded, size);
 	line->data[size] = '\n';
 	json_object_put(packet);

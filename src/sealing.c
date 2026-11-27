@@ -488,21 +488,61 @@ static void remember_secret(Line *s, const char *to, const char *from,
 	s->next_secret = (s->next_secret + 1) % SHARED_SLOTS;
 }
 
+static struct line_sealing_vault_ops sealing_vault_ops;
+static void *sealing_vault_ctx;
+
+void line_sealing_set_vault(const struct line_sealing_vault_ops *ops, void *ctx)
+{
+	if (ops)
+		sealing_vault_ops = *ops;
+	else
+		memset(&sealing_vault_ops, 0, sizeof(sealing_vault_ops));
+	sealing_vault_ctx = ops ? ctx : NULL;
+}
+
+gboolean line_own_ecdh(Line *s, gint32 key_id, const guint8 peer_pub[32],
+		       guint8 shared_out[32], GError **error)
+{
+	guint8 priv[32];
+
+	if (!own_key(s, key_id, priv, error))
+		return FALSE;
+	gboolean ok = shared_secret(priv, peer_pub, shared_out);
+
+	OPENSSL_cleanse(priv, sizeof(priv));
+	if (!ok)
+		return fail(error, "Invalid Letter Sealing public key.");
+	return TRUE;
+}
+
+gboolean line_own_public(Line *s, gint32 key_id, guint8 pub_out[32],
+			 GError **error)
+{
+	guint8 priv[32];
+
+	if (!own_key(s, key_id, priv, error))
+		return FALSE;
+	gboolean ok = public_from_private(priv, pub_out);
+
+	OPENSSL_cleanse(priv, sizeof(priv));
+	if (!ok)
+		return fail(error, "Invalid local Letter Sealing identity.");
+	return TRUE;
+}
+
 static gboolean direct_shared_secret(Line *s, gint32 own_id, const char *peer,
 				     gint32 *peer_id, gboolean negotiate,
 				     int type, guint8 shared[32],
 				     GError **error)
 {
-	guint8 pub[32], priv[32];
+	guint8 pub[32];
 
-	if (!own_key(s, own_id, priv, error))
+	if (!peer_key(s, peer, negotiate, type, peer_id, pub, error))
 		return FALSE;
-	gboolean ok = peer_key(s, peer, negotiate, type, peer_id, pub, error);
-
-	if (ok && !shared_secret(priv, pub, shared))
-		ok = fail(error, "Invalid Letter Sealing public key.");
-	OPENSSL_cleanse(priv, sizeof(priv));
-	return ok;
+	if (!field(s->keys, "own") && sealing_vault_ops.ecdh)
+		return sealing_vault_ops.ecdh(sealing_vault_ctx, own_id, pub,
+					      shared, error);
+	return line_own_ecdh(s, own_id, pub, shared, error);
 }
 
 static gboolean public_by_id(Line *s, const char *user, gint32 id,
@@ -510,14 +550,9 @@ static gboolean public_by_id(Line *s, const char *user, gint32 id,
 {
 	if (strcmp(user, s->mid))
 		return peer_key(s, user, FALSE, 0, &id, out, error);
-	guint8 own[32];
-
-	if (!own_key(s, id, own, error))
-		return FALSE;
-	gboolean ok = public_from_private(own, out);
-
-	OPENSSL_cleanse(own, sizeof(own));
-	return ok || fail(error, "Invalid local Letter Sealing identity.");
+	if (!field(s->keys, "own") && sealing_vault_ops.pub)
+		return sealing_vault_ops.pub(sealing_vault_ctx, id, out, error);
+	return line_own_public(s, id, out, error);
 }
 
 static gboolean group_private_key(Line *s, const char *chat, gboolean latest,
@@ -565,14 +600,17 @@ static gboolean group_private_key(Line *s, const char *chat, gboolean latest,
 			error,
 			"This group does not accept Letter Sealing v2 for this message type.");
 
-	guint8 pub[32], priv[32], shared[32], key[32], iv[32],
+	guint8 pub[32], shared[32], key[32], iv[32],
 		plain[48 + EVP_MAX_BLOCK_LENGTH];
-	if (!public_by_id(s, creator, creator_id, pub, error) ||
-	    !own_key(s, receiver_id, priv, error))
+	if (!public_by_id(s, creator, creator_id, pub, error))
 		return FALSE;
-	gboolean ok = shared_secret(priv, pub, shared);
-
-	OPENSSL_cleanse(priv, sizeof(priv));
+	gboolean ok = (!field(s->keys, "own") && sealing_vault_ops.ecdh) ?
+			      sealing_vault_ops.ecdh(sealing_vault_ctx,
+						     receiver_id, pub, shared,
+						     error) :
+			      line_own_ecdh(s, receiver_id, pub, shared, error);
+	if (!ok)
+		return FALSE;
 	gsize size = 0;
 
 	if (ok) {

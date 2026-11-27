@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "profile_image.h"
 #include "friends.h"
+#include "media_io.h"
 #include "obs_http.h"
 #include <errno.h>
 #include <fcntl.h>
@@ -216,8 +217,10 @@ GBytes *line_profile_jpeg(GBytes *image, GError **error)
 /* A named pipe or device must never block the worker. */
 static GBytes *read_picture(const char *path, GError **error)
 {
-	int fd = path && *path ? open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK) :
-				 -1;
+	int fd = line_media_take_staged_fd();
+
+	if (fd < 0 && path && *path)
+		fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 	struct stat st;
 
 	if (fd < 0)

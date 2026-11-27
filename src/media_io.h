@@ -66,3 +66,10 @@ ssize_t line_wire_read(struct line_wire_reader *r, int socket, char *buf,
 		       gpointer data);
 gboolean line_save_media(const char *path, GBytes *bytes, gboolean replace,
 			 GError **error);
+/*
+ * Single-slot read-only FD staged from UI -> worker over SCM_RIGHTS for the
+ * currently executing upload RPC so the sandboxed worker never open()s $HOME.
+ */
+void line_media_stage_fd(int fd);
+int line_media_take_staged_fd(void);
+void line_media_clear_staged_fd(void);

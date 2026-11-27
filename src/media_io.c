@@ -362,6 +362,31 @@ gboolean line_wire_send(int socket, const char *text, gsize length, int fd)
 	return TRUE;
 }
 
+static int staged_upload_fd = -1;
+
+void line_media_stage_fd(int fd)
+{
+	if (staged_upload_fd >= 0)
+		close(staged_upload_fd);
+	staged_upload_fd = fd;
+}
+
+int line_media_take_staged_fd(void)
+{
+	int fd = staged_upload_fd;
+
+	staged_upload_fd = -1;
+	return fd;
+}
+
+void line_media_clear_staged_fd(void)
+{
+	if (staged_upload_fd >= 0) {
+		close(staged_upload_fd);
+		staged_upload_fd = -1;
+	}
+}
+
 void line_wire_reader_init(struct line_wire_reader *r)
 {
 	r->input = g_string_new(NULL);
@@ -423,9 +448,14 @@ ssize_t line_wire_read(struct line_wire_reader *r, int socket, char *buf,
 				  .msg_controllen = sizeof(control.bytes) };
 	ssize_t got = recvmsg(socket, &message, MSG_CMSG_CLOEXEC);
 
+	if (got < 0 && errno == ENOTSOCK) {
+		got = read(socket, buf, size);
+		message.msg_controllen = 0;
+		message.msg_flags = 0;
+	}
 	if (got <= 0)
 		return got;
-	int fd = passed_fd(&message, got);
+	int fd = message.msg_controllen ? passed_fd(&message, got) : -1;
 	ssize_t fd_line = -1;
 
 	if (fd >= 0) {

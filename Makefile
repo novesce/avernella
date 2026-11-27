@@ -260,7 +260,7 @@ build/test-emoji-message: tests/emoji_message.c build/messaging.o build/rich_mes
 build/test-ui-emoji: tests/ui_emoji.c build/ui_emoji.o build/ui_motion.o $(UI_LANG_OBJECTS)
 build/test-ui-apng: tests/ui_apng.c build/ui_apng.o build/ui_pixels.o
 build/test-emoji: tests/emoji.c build/emoji.o
-build/test-media: tests/media.c build/media.o build/media_crypto.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
+build/test-media: tests/media.c build/media.o build/media_crypto.o build/media_io.o build/sealing.o build/thrift.o build/messaging.o build/rich_message.o build/liff_url.o
 build/test-call: LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_QueueAudio,--wrap=SDL_DequeueAudio
 build/test-call: tests/call.c build/call.o build/call_group.o build/call_schema.o build/call_wire.o build/call_audio.o build/call_denoise.o build/call_video.o build/call_srtp.o build/call_pdtp.o build/camera_pixels.o build/media_io.o build/tune.o build/udp_batch.o
 build/test-call-group: tests/call_group.c build/call_group.o build/call_schema.o build/call_wire.o
@@ -345,12 +345,12 @@ build/test-chiptune: tests/chiptune.c build/chiptune.o
 build/test-ui-sounds: private LDFLAGS += -Wl,--wrap=SDL_OpenAudioDevice,--wrap=SDL_CloseAudioDevice,--wrap=SDL_PauseAudioDevice
 build/test-ui-sounds: tests/ui_sounds.c build/ui_sounds.o build/chiptune.o
 build/test-denoise: tests/call_denoise.c build/call_denoise.o
-build/test-profile-image: tests/profile_image.c build/profile_image.o
+build/test-profile-image: tests/profile_image.c build/profile_image.o build/media_io.o
 build/test-rich-message: tests/rich_message.c build/rich_message.o build/liff_url.o
 build/test-clipboard-paste: tests/clipboard_paste.c build/clipboard_paste.o
 build/test-groups: tests/groups.c build/groups.o build/thrift.o build/liff_url.o
 build/test-square: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
-build/test-square: tests/square.c build/square.o build/square_search.o build/groups.o build/rich_message.o build/profile_image.o build/thrift.o build/liff_url.o build/http_tune.o
+build/test-square: tests/square.c build/square.o build/square_search.o build/groups.o build/rich_message.o build/profile_image.o build/media_io.o build/thrift.o build/liff_url.o build/http_tune.o
 build/test-chat-lists: tests/chat_lists.c build/chat_lists.o
 build/test-shared-content: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
 build/test-shared-content: tests/shared_content.c build/shared_content.o build/http_tune.o

@@ -254,6 +254,9 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 	GError *error = NULL;
 	int err;
 
+	int recv_fd = -1;
+	size_t nfds = 0;
+
 	if (!vault || client_fd < 0)
 		return -EINVAL;
 
@@ -262,7 +265,7 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		return -ENOMEM;
 
 	err = avernella_ipc_recv(client_fd, &hdr, buf,
-				 AVERNELLA_IPC_MAX_PAYLOAD, NULL, 0, NULL);
+				 AVERNELLA_IPC_MAX_PAYLOAD, &recv_fd, 1, &nfds);
 	if (err)
 		goto out;
 	buf[hdr.payload_len] = '\0';
@@ -418,6 +421,8 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 
 	if (hdr.op == IPC_OP_VAULT_ROTATE_TOKEN) {
 		const char *next = strfield(req, "access");
+		const char *next_refresh = strfield(req, "refresh");
+		J *refresh_at = field(req, "refreshAt");
 
 		if (!valid_token_bytes(next)) {
 			err = reply_error(client_fd, hdr.req_id, -EINVAL,
@@ -432,6 +437,27 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 			goto out;
 		}
 		vault->session.access = vault->secrets->access;
+		if (next_refresh && *next_refresh) {
+			if (!valid_token_bytes(next_refresh)) {
+				err = reply_error(client_fd, hdr.req_id,
+						  -EINVAL,
+						  "Invalid refresh token");
+				goto out;
+			}
+			err = copy_secret_str(vault->secrets->refresh,
+					      sizeof(vault->secrets->refresh),
+					      next_refresh);
+			if (err) {
+				err = reply_error(client_fd, hdr.req_id, err,
+						  "Refresh token too large");
+				goto out;
+			}
+			vault->session.refresh = vault->secrets->refresh;
+		}
+		if (refresh_at &&
+		    json_object_is_type(refresh_at, json_type_int))
+			vault->session.refresh_at =
+				json_object_get_int64(refresh_at);
 		if (vault->dirfd >= 0)
 			(void)line_store_save(vault->dirfd, &vault->session,
 					      NULL);
@@ -442,9 +468,97 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		goto out;
 	}
 
+	if (hdr.op == IPC_OP_VAULT_LOAD_SESSION) {
+		const char *mid = strfield(req, "mid");
+		const char *access = strfield(req, "access");
+		const char *refresh = strfield(req, "refresh");
+		J *keys = field(req, "keys");
+		gint32 seq = json_object_get_int(field(req, "seq"));
+
+		if (nfds == 1 && recv_fd >= 0) {
+			if (vault->dirfd >= 0)
+				close(vault->dirfd);
+			vault->dirfd = recv_fd;
+			recv_fd = -1;
+		}
+		err = avernella_vault_load_secrets(
+			vault, mid, access, refresh,
+			keys && json_object_is_type(keys, json_type_object) ?
+				keys :
+				NULL,
+			seq);
+		if (err) {
+			err = reply_error(client_fd, hdr.req_id, err,
+					  "Failed to load session into Vault");
+			goto out;
+		}
+		out = obj();
+		json_object_object_add(out, "loaded",
+				       json_object_new_boolean(TRUE));
+		err = reply_json(client_fd, hdr.req_id, out);
+		goto out;
+	}
+
+	if (hdr.op == IPC_OP_VAULT_ECDH) {
+		gint32 key_id = json_object_get_int(field(req, "keyId"));
+		const char *peer_b64 = strfield(req, "peerPub");
+		gsize peer_len = 0;
+		guint8 *peer_pub = NULL;
+		guint8 shared[32];
+
+		if (peer_b64)
+			peer_pub = g_base64_decode(peer_b64, &peer_len);
+		if (!peer_pub || peer_len != 32) {
+			g_free(peer_pub);
+			err = reply_error(client_fd, hdr.req_id, -EINVAL,
+					  "Invalid peer public key");
+			goto out;
+		}
+		if (!line_own_ecdh(&vault->session, key_id, peer_pub, shared,
+				   &error)) {
+			g_free(peer_pub);
+			err = reply_error(client_fd, hdr.req_id, -EACCES,
+					  error ? error->message :
+						  "Vault ECDH failed");
+			goto out;
+		}
+		g_free(peer_pub);
+		g_autofree char *shared_b64 =
+			g_base64_encode(shared, sizeof(shared));
+
+		explicit_bzero(shared, sizeof(shared));
+		out = obj();
+		json_object_object_add(out, "shared",
+				       json_object_new_string(shared_b64));
+		err = reply_json(client_fd, hdr.req_id, out);
+		goto out;
+	}
+
+	if (hdr.op == IPC_OP_VAULT_OWN_PUBLIC) {
+		gint32 key_id = json_object_get_int(field(req, "keyId"));
+		guint8 pub[32];
+
+		if (!line_own_public(&vault->session, key_id, pub, &error)) {
+			err = reply_error(
+				client_fd, hdr.req_id, -EACCES,
+				error ? error->message :
+					"Vault own public key failed");
+			goto out;
+		}
+		g_autofree char *pub_b64 = g_base64_encode(pub, sizeof(pub));
+
+		out = obj();
+		json_object_object_add(out, "pub",
+				       json_object_new_string(pub_b64));
+		err = reply_json(client_fd, hdr.req_id, out);
+		goto out;
+	}
+
 	err = reply_error(client_fd, hdr.req_id, -ENOSYS,
 			  "Unknown Vault operation");
 out:
+	if (recv_fd >= 0)
+		close(recv_fd);
 	if (error)
 		g_error_free(error);
 	if (out)
@@ -470,8 +584,8 @@ int avernella_vault_run(struct avernella_vault *vault, int client_fd)
 	}
 }
 
-static J *vault_rpc(int vault_fd, enum avernella_ipc_op op, J *req,
-		    GError **error)
+static J *vault_rpc_fd(int vault_fd, enum avernella_ipc_op op, J *req,
+		       int pass_fd, GError **error)
 {
 	static uint32_t seq_id = 1;
 	struct avernella_ipc_hdr tx, rx;
@@ -495,8 +609,9 @@ static J *vault_rpc(int vault_fd, enum avernella_ipc_op op, J *req,
 		tx.payload_len = (uint32_t)tx_len;
 	}
 
-	err = avernella_ipc_send(vault_fd, &tx, tx_len ? tx_str : NULL, NULL,
-				 0);
+	err = avernella_ipc_send(vault_fd, &tx, tx_len ? tx_str : NULL,
+				 pass_fd >= 0 ? &pass_fd : NULL,
+				 pass_fd >= 0 ? 1 : 0);
 	if (err) {
 		g_set_error(error, LINE_ERROR, 1, "Vault IPC send failed: %s",
 			    strerror(-err));
@@ -537,6 +652,12 @@ out:
 	explicit_bzero(rx_buf, AVERNELLA_IPC_MAX_PAYLOAD);
 	free(rx_buf);
 	return reply;
+}
+
+static J *vault_rpc(int vault_fd, enum avernella_ipc_op op, J *req,
+		    GError **error)
+{
+	return vault_rpc_fd(vault_fd, op, req, -1, error);
 }
 
 int avernella_vault_client_ping(int vault_fd)
@@ -631,6 +752,118 @@ gint32 avernella_vault_client_reserve_seq(int vault_fd, GError **error)
 	if (!rep)
 		return -1;
 	return json_object_get_int(field(rep, "seq"));
+}
+
+gboolean avernella_vault_client_load_session(int vault_fd, const char *mid,
+					     const char *access,
+					     const char *refresh, J *keys,
+					     gint32 seq, int dirfd,
+					     GError **error)
+{
+	g_autoptr(J) req = obj();
+
+	if (mid)
+		json_object_object_add(req, "mid", json_object_new_string(mid));
+	if (access)
+		json_object_object_add(req, "access",
+				       json_object_new_string(access));
+	if (refresh)
+		json_object_object_add(req, "refresh",
+				       json_object_new_string(refresh));
+	if (keys)
+		json_object_object_add(req, "keys", json_object_get(keys));
+	json_object_object_add(req, "seq", json_object_new_int(seq));
+	g_autoptr(J) rep = vault_rpc_fd(vault_fd, IPC_OP_VAULT_LOAD_SESSION,
+					req, dirfd, error);
+	return rep != NULL;
+}
+
+gboolean avernella_vault_client_ecdh(int vault_fd, gint32 key_id,
+				     const guint8 peer_pub[32],
+				     guint8 shared_out[32], GError **error)
+{
+	char *peer_b64 = g_base64_encode(peer_pub, 32);
+	J *req = obj();
+	J *rep = NULL;
+	const char *shared_b64;
+	gsize len = 0;
+	guint8 *raw = NULL;
+	gboolean ok = FALSE;
+
+	json_object_object_add(req, "keyId", json_object_new_int(key_id));
+	json_object_object_add(req, "peerPub",
+			       json_object_new_string(peer_b64));
+	g_free(peer_b64);
+	rep = vault_rpc(vault_fd, IPC_OP_VAULT_ECDH, req, error);
+	json_object_put(req);
+	if (!rep)
+		return FALSE;
+	shared_b64 = strfield(rep, "shared");
+	if (shared_b64)
+		raw = g_base64_decode(shared_b64, &len);
+	json_object_put(rep);
+	if (!raw || len != 32) {
+		g_free(raw);
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Vault returned invalid ECDH secret.");
+		return FALSE;
+	}
+	memcpy(shared_out, raw, 32);
+	explicit_bzero(raw, 32);
+	g_free(raw);
+	ok = TRUE;
+	return ok;
+}
+
+gboolean avernella_vault_client_own_public(int vault_fd, gint32 key_id,
+					   guint8 pub_out[32], GError **error)
+{
+	g_autoptr(J) req = obj();
+
+	json_object_object_add(req, "keyId", json_object_new_int(key_id));
+	g_autoptr(J) rep =
+		vault_rpc(vault_fd, IPC_OP_VAULT_OWN_PUBLIC, req, error);
+	if (!rep)
+		return FALSE;
+	const char *pub_b64 = strfield(rep, "pub");
+	gsize len = 0;
+	g_autofree guint8 *raw = pub_b64 ? g_base64_decode(pub_b64, &len) :
+					   NULL;
+
+	if (!raw || len != 32) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Vault returned invalid public key.");
+		return FALSE;
+	}
+	memcpy(pub_out, raw, 32);
+	return TRUE;
+}
+
+gboolean avernella_vault_client_rotate_token(int vault_fd, const char *access,
+					     const char *refresh,
+					     gint64 refresh_at, GError **error)
+{
+	g_autoptr(J) req = obj();
+
+	if (access)
+		json_object_object_add(req, "access",
+				       json_object_new_string(access));
+	if (refresh && *refresh)
+		json_object_object_add(req, "refresh",
+				       json_object_new_string(refresh));
+	if (refresh_at)
+		json_object_object_add(req, "refreshAt",
+				       json_object_new_int64(refresh_at));
+	g_autoptr(J) rep =
+		vault_rpc(vault_fd, IPC_OP_VAULT_ROTATE_TOKEN, req, error);
+	return rep != NULL;
+}
+
+gboolean avernella_vault_client_wipe(int vault_fd, GError **error)
+{
+	g_autoptr(J) rep =
+		vault_rpc(vault_fd, IPC_OP_VAULT_WIPE_SESSION, NULL, error);
+	return rep != NULL;
 }
 
 int avernella_supervisor_start(struct avernella_supervised_worker *slot,

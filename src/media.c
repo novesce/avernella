@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "media.h"
 #include "media_crypto.h"
+#include "media_io.h"
 #include "messaging.h"
 #include "obs_http.h"
 #include "sealing.h"
@@ -40,8 +41,14 @@ static GBytes *read_attachment(const char *path, GError **error)
 		media_error(error, "Choose a file to send.");
 		return NULL;
 	}
-	/* A named pipe must not block the worker before fstat can reject it. */
-	int fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+	/*
+	 * Prefer the read-only FD passed by the UI over SCM_RIGHTS so the
+	 * Landlock-confined worker never needs open() access to $HOME.
+	 */
+	int fd = line_media_take_staged_fd();
+
+	if (fd < 0)
+		fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
 
 	if (fd < 0) {
 		g_set_error(error, G_FILE_ERROR, g_file_error_from_errno(errno),

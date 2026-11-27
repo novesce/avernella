@@ -22,6 +22,7 @@
 #include "net_route.h"
 #include "monitor_picker.h"
 #include "sandbox.h"
+#include "sealing.h"
 #include "security/ipc.h"
 #include "security/sandbox.h"
 #include "security/vault.h"
@@ -117,6 +118,7 @@ struct line_worker {
 	guint image_count;
 	int image_wake;
 	guint generation;
+	struct avernella_worker_proc vault;
 };
 
 /* One JSON line to the UI, with a lease descriptor when fd >= 0. */
@@ -259,9 +261,95 @@ static void clear_view(struct line_worker *w)
 	g_hash_table_remove_all(w->left_groups);
 }
 
+static int vault_child_entry(int ctrl_fd, uint32_t active, void *userdata)
+{
+	struct avernella_vault vault;
+	int rc;
+
+	(void)active;
+	(void)userdata;
+	if (avernella_vault_init(&vault, -1) < 0)
+		return 1;
+	rc = avernella_vault_run(&vault, ctrl_fd);
+	avernella_vault_destroy(&vault);
+	return rc < 0 ? 1 : 0;
+}
+
+static gboolean worker_vault_ecdh(void *ctx, gint32 key_id,
+				  const guint8 peer_pub[32],
+				  guint8 shared_out[32], GError **error)
+{
+	struct avernella_worker_proc *vault = ctx;
+
+	if (!vault || vault->ctrl_fd < 0) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Key Vault is unavailable.");
+		return FALSE;
+	}
+	return avernella_vault_client_ecdh(vault->ctrl_fd, key_id, peer_pub,
+					   shared_out, error);
+}
+
+static gboolean worker_vault_pub(void *ctx, gint32 key_id, guint8 pub_out[32],
+				 GError **error)
+{
+	struct avernella_worker_proc *vault = ctx;
+
+	if (!vault || vault->ctrl_fd < 0) {
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Key Vault is unavailable.");
+		return FALSE;
+	}
+	return avernella_vault_client_own_public(vault->ctrl_fd, key_id,
+						 pub_out, error);
+}
+
+static const struct line_sealing_vault_ops worker_vault_ops = {
+	.ecdh = worker_vault_ecdh,
+	.pub = worker_vault_pub,
+};
+
+static void scrub_worker_own_keys(J *keys)
+{
+	J *own = field(keys, "own");
+
+	if (!own || !json_object_is_type(own, json_type_object))
+		return;
+	json_object_object_foreach(own, k, v) {
+		(void)k;
+		if (v && json_object_is_type(v, json_type_string)) {
+			size_t len = (size_t)json_object_get_string_len(v);
+			char *raw = (char *)json_object_get_string(v);
+
+			if (raw && len)
+				explicit_bzero(raw, len);
+		}
+	}
+	json_object_object_del(keys, "own");
+}
+
+static void sync_vault_session(struct line_worker *w)
+{
+	Line *s = &w->session;
+	g_autoptr(GError) err = NULL;
+
+	if (w->vault.ctrl_fd < 0 || !s->access)
+		return;
+	int pass_dir = w->dir >= 0 ? fcntl(w->dir, F_DUPFD_CLOEXEC, 0) : -1;
+
+	if (avernella_vault_client_load_session(w->vault.ctrl_fd, s->mid,
+						s->access, s->refresh, s->keys,
+						s->seq, pass_dir, &err))
+		scrub_worker_own_keys(s->keys);
+	if (pass_dir >= 0)
+		close(pass_dir);
+}
+
 static gboolean forget(struct line_worker *w, GError **error)
 {
 	clear_view(w);
+	if (w->vault.ctrl_fd >= 0)
+		(void)avernella_vault_client_wipe(w->vault.ctrl_fd, NULL);
 	line_session_clear(&w->session);
 	return line_store_forget(w->dir, error);
 }
@@ -471,6 +559,11 @@ static J *login(struct line_worker *w, GError **error)
 		w->opened_chats = obj();
 		w->read_acks = obj();
 		w->ready = TRUE;
+		/*
+		 * Move Letter Sealing private keys into the memfd_secret() Key
+		 * Vault process and scrub them from the worker heap.
+		 */
+		sync_vault_session(w);
 		/*
 		 * Start with one baseline revision. Afterwards only a changed
 		 * revision refreshes visible chats. Back off when disconnected.
@@ -2563,14 +2656,12 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			bytes = line_download_attachment(s, msg, error);
 		if (!bytes)
 			return NULL;
-		if (!strcmp(method, "photo"))
-			return line_media_lease(w->leases, bytes, error);
-		return line_save_media(path, bytes,
-				       json_object_get_boolean(
-					       field(params, "replace")),
-				       error) ?
-			       json_object_new_boolean(TRUE) :
-			       NULL;
+		/*
+		 * Both photo previews and saveFile return a read-only memfd
+		 * lease over SCM_RIGHTS so the Landlock-confined worker never
+		 * writes to user-chosen paths in $HOME.
+		 */
+		return line_media_lease(w->leases, bytes, error);
 	}
 	gboolean text_send = !strcmp(method, "send"),
 		 photo = !strcmp(method, "sendPhoto"),
@@ -3094,12 +3185,21 @@ static void save_rotated_token(struct line_worker *w)
 
 	if (s->access && s->token_changed) {
 		g_autoptr(GError) storage_error = NULL;
-		if (!line_store_save(w->dir, s, &storage_error)) {
+		gboolean saved =
+			w->vault.ctrl_fd >= 0 ?
+				avernella_vault_client_rotate_token(
+					w->vault.ctrl_fd, s->access, s->refresh,
+					s->refresh_at, &storage_error) :
+				line_store_save(w->dir, s, &storage_error);
+
+		if (!saved) {
 			w->save_retry =
 				g_get_monotonic_time() + 2 * G_USEC_PER_SEC;
 			line_event("status", "message", storage_error->message);
-		} else
+		} else {
+			s->token_changed = FALSE;
 			w->save_retry = 0;
+		}
 	}
 	line_live_sync_set_access(w->live, s->access);
 }
@@ -3592,6 +3692,17 @@ static void sync_revision(struct line_worker *w)
 	save_rotated_token(w);
 }
 
+static void handle_wire_line(char *text, int fd, gpointer data)
+{
+	struct line_worker *w = data;
+
+	if (fd >= 0)
+		line_media_stage_fd(fd);
+	handle(w, text);
+	line_media_clear_staged_fd();
+	g_free(text);
+}
+
 static int worker(int credentials_fd)
 {
 	/*
@@ -3614,15 +3725,30 @@ static int worker(int credentials_fd)
 	} else {
 		frame_fd = -1;
 	}
-	/* Strip any stray inherited FDs before installing Landlock/seccomp. */
+	/* Strip any stray inherited FDs before spawning Vault & sandboxing. */
 	avernella_close_extra_fds(frame_fd >= 0	      ? frame_fd :
 				  credentials_fd >= 0 ? credentials_fd :
 							STDERR_FILENO);
+	/*
+	 * Spawn the isolated memfd_secret() Key Vault child BEFORE installing
+	 * the worker's Landlock/seccomp sandbox and before any thread starts.
+	 */
+	struct avernella_worker_proc vault_proc = { .pid = -1,
+						    .pidfd = -1,
+						    .ctrl_fd = -1 };
+	struct avernella_sandbox_opts vault_opts = {
+		.role = SANDBOX_ROLE_VAULT,
+		.keep_stderr = true,
+	};
+
+	(void)avernella_spawn_worker(&vault_opts, vault_child_entry, NULL,
+				     &vault_proc);
 	/* Before any thread starts, so every later thread inherits it. */
 	line_sandbox_worker();
 	struct line_worker w = {
 		.dir = -1,
 		.credentials_fd = credentials_fd,
+		.vault = vault_proc,
 		.sync.revision = -1,
 		.displayed_revision = -1,
 		.renewal_timer = timerfd_create(CLOCK_REALTIME,
@@ -3630,6 +3756,8 @@ static int worker(int credentials_fd)
 		.timer = timerfd_create(CLOCK_MONOTONIC,
 					TFD_CLOEXEC | TFD_NONBLOCK)
 	};
+	if (w.vault.ctrl_fd >= 0)
+		line_sealing_set_vault(&worker_vault_ops, &w.vault);
 	w.image_wake = eventfd(0, EFD_CLOEXEC | EFD_NONBLOCK);
 	w.image_requests = g_async_queue_new_full(image_free);
 	w.image_results = g_async_queue_new_full(image_free);
@@ -3642,7 +3770,9 @@ static int worker(int credentials_fd)
 		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	w.square_history_tokens =
 		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
-	g_autoptr(GString) pending = g_string_sized_new(2048);
+	struct line_wire_reader wire_in;
+
+	line_wire_reader_init(&wire_in);
 	struct pollfd fds[] = { { .fd = STDIN_FILENO, .events = POLLIN },
 				{ .fd = w.timer, .events = POLLIN },
 				{ .fd = w.image_wake, .events = POLLIN },
@@ -3660,24 +3790,15 @@ static int worker(int credentials_fd)
 		}
 		if (fds[0].revents) {
 			static char block[64 * 1024];
-			ssize_t n = read(STDIN_FILENO, block, sizeof(block));
+			ssize_t n = line_wire_read(&wire_in, STDIN_FILENO,
+						   block, sizeof(block),
+						   handle_wire_line, &w);
 
 			if (n < 0 && errno == EINTR)
 				continue;
 			if (n <= 0)
 				break;
-			g_string_append_len(pending, block, n);
-			char *cursor = pending->str,
-			     *end = cursor + pending->len;
-			char *newline;
-
-			while ((newline = memchr(cursor, '\n', end - cursor))) {
-				*newline = 0;
-				handle(&w, cursor);
-				cursor = newline + 1;
-			}
-			g_string_erase(pending, 0, cursor - pending->str);
-			if (pending->len > 1024 * 1024)
+			if (wire_in.input && wire_in.input->len > 1024 * 1024)
 				break;
 		}
 		if (fds[2].revents & POLLIN)
@@ -3705,6 +3826,8 @@ static int worker(int credentials_fd)
 	}
 	if (fds[5].fd >= 0)
 		close(fds[5].fd);
+	line_wire_reader_clear(&wire_in);
+	line_media_clear_staged_fd();
 	line_voice_close();
 	g_clear_pointer(&w.live, line_live_sync_stop);
 	if (w.image_thread) {
@@ -3716,6 +3839,8 @@ static int worker(int credentials_fd)
 	if (w.image_wake >= 0)
 		close(w.image_wake);
 	clear_view(&w);
+	line_sealing_set_vault(NULL, NULL);
+	avernella_worker_close(&w.vault);
 	if (frame_fd >= 0)
 		close(frame_fd);
 	g_hash_table_unref(w.leases);

@@ -22,3 +22,23 @@ char *line_open_text(Line *s, J *message, GError **error);
 J *line_seal_payload(Line *s, const char *chat, int content_type, J *payload,
 		     GError **error);
 J *line_open_payload(Line *s, J *message, int content_type, GError **error);
+
+/*
+ * Low-level local identity operations used by the isolated memfd_secret()
+ * Key Vault process so X25519 private keys never reside in the worker.
+ */
+gboolean line_own_ecdh(Line *s, gint32 key_id, const guint8 peer_pub[32],
+		       guint8 shared_out[32], GError **error);
+gboolean line_own_public(Line *s, gint32 key_id, guint8 pub_out[32],
+			 GError **error);
+
+struct line_sealing_vault_ops {
+	gboolean (*ecdh)(void *ctx, gint32 key_id, const guint8 peer_pub[32],
+			 guint8 shared_out[32], GError **error);
+	gboolean (*pub)(void *ctx, gint32 key_id, guint8 pub_out[32],
+			GError **error);
+};
+
+/* Installs an optional out-of-process Key Vault for own X25519 private keys. */
+void line_sealing_set_vault(const struct line_sealing_vault_ops *ops,
+			    void *ctx);

@@ -152,7 +152,7 @@ static struct {
 	GHashTable *paste_sent;
 	char *chat, *id, *path, *title, *note, *directory, *call_chat,
 		*call_name, *call_state, *call_video_peer, *reply_text;
-	gboolean avatar_pick;
+	gboolean avatar_pick, save_replace;
 	gboolean friend_qr, save, photo, working, thumb_busy, muted, can_mute,
 		copying, sticker;
 	Editor edit;
@@ -2049,10 +2049,7 @@ static void save_to(gboolean overwrite)
 {
 	Json *p = args(m.chat, m.id);
 
-	json_object_object_add(p, "path", json_object_new_string(m.path));
-	if (overwrite)
-		json_object_object_add(p, "replace",
-				       json_object_new_boolean(TRUE));
+	m.save_replace = overwrite;
 	m.working = TRUE;
 	set(&m.note, _("Saving…"));
 	ui_rpc("saveFile", p, m.serial);
@@ -4065,11 +4062,74 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			ui_status(error);
 		return;
 	}
+	if (!strcmp(method, "saveFile")) {
+		int fd = result && json_object_is_type(result,
+						       json_type_object) ?
+				 lease_fd(result, LINE_MEDIA_LIMIT) :
+				 -1;
+		Json *lease = result && json_object_is_type(result,
+							    json_type_object) ?
+				      ui_field(result, "lease") :
+				      NULL;
+
+		if (lease) {
+			Json *rel = json_object_new_object();
+
+			json_object_object_add(rel, "lease",
+					       json_object_get(lease));
+			ui_rpc("releaseMedia", rel, 0);
+		}
+		if (fd >= 0) {
+			struct stat st;
+			g_autoptr(GBytes) bytes = NULL;
+			g_autoptr(GError) save_err = NULL;
+
+			if (!fstat(fd, &st) && st.st_size > 0 &&
+			    st.st_size <= LINE_MEDIA_LIMIT) {
+				gsize total = (gsize)st.st_size, used = 0;
+				guint8 *buf = g_malloc(total);
+
+				while (used < total) {
+					ssize_t got = read(fd, buf + used,
+							   total - used);
+
+					if (got < 0 && errno == EINTR)
+						continue;
+					if (got <= 0)
+						break;
+					used += (gsize)got;
+				}
+				if (used == total)
+					bytes = g_bytes_new_take(buf, total);
+				else
+					g_free(buf);
+			}
+			close(fd);
+			if (!bytes ||
+			    !line_save_media(m.path, bytes, m.save_replace,
+					     &save_err)) {
+				const char *msg =
+					save_err ?
+						save_err->message :
+						_("Could not save the file.");
+
+				if (m.mode != CLOSED && m.serial == tag) {
+					m.working = FALSE;
+					set(&m.note, msg);
+				} else {
+					ui_status(msg);
+				}
+				return;
+			}
+		}
+		if (tag && tag == m.serial && m.mode != CLOSED)
+			close_overlay();
+		ui_status(_("File saved."));
+		return;
+	}
 	if (tag && tag == m.serial && m.mode != CLOSED)
 		close_overlay();
-	if (!strcmp(method, "saveFile"))
-		ui_status(_("File saved."));
-	else {
+	{
 		ui.stick_bottom = TRUE;
 		ui_refresh();
 	}

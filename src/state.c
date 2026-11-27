@@ -208,27 +208,35 @@ static gboolean remove_incomplete(int dir, GError **error)
 int line_store_open(Line *s, GError **error)
 {
 	const char *base = g_get_user_state_dir();
-	int root = -1;
-
-	if (!g_mkdir_with_parents(base, 0700))
-		root = open(base, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
-	if (root < 0) {
-		io_failure("open", error);
-		return -1;
-	}
-	int dir = openat(root, LINE_STATE_DIR, STORE_DIR_FLAGS);
+	g_autofree char *direct = g_build_filename(base, LINE_STATE_DIR, NULL);
+	int dir = open(direct, STORE_DIR_FLAGS);
 
 	if (dir < 0 && errno == ENOENT) {
-		if (!migrate_store(root, error)) {
-			close(root);
+		int root = -1;
+
+		if (!g_mkdir_with_parents(base, 0700))
+			root = open(base, O_DIRECTORY | O_CLOEXEC | O_RDONLY);
+		if (root < 0) {
+			io_failure("open", error);
 			return -1;
 		}
-		if (!mkdirat(root, LINE_STATE_DIR, 0700) || errno == EEXIST)
-			dir = openat(root, LINE_STATE_DIR, STORE_DIR_FLAGS);
-	}
-	if (dir < 0)
+		dir = openat(root, LINE_STATE_DIR, STORE_DIR_FLAGS);
+		if (dir < 0 && errno == ENOENT) {
+			if (!migrate_store(root, error)) {
+				close(root);
+				return -1;
+			}
+			if (!mkdirat(root, LINE_STATE_DIR, 0700) ||
+			    errno == EEXIST)
+				dir = openat(root, LINE_STATE_DIR,
+					     STORE_DIR_FLAGS);
+		}
+		if (dir < 0)
+			io_failure("open", error);
+		close(root);
+	} else if (dir < 0) {
 		io_failure("open", error);
-	close(root);
+	}
 	if (dir < 0)
 		return -1;
 	if (lock_store(dir, LINE_STATE_DIR, error) &&

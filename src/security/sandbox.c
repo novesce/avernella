@@ -326,7 +326,8 @@ static void build_xdg_path(char *buf, size_t len, const char *env_var,
 		snprintf(buf, len, "%s/%s/%s", home, home_rel, sub);
 }
 
-static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi)
+static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi,
+			     const struct avernella_sandbox_opts *opts)
 {
 	static const char *const ro_dirs[] = {
 		"/usr",
@@ -338,18 +339,28 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi)
 		"/etc/ld.so.conf.d",
 		"/etc/xdg",
 		"/etc/vulkan",
+		"/etc/egl",
 		"/etc/glvnd",
 		"/etc/ssl",
 		"/etc/ca-certificates",
+		"/etc/pki",
+		"/etc/resolv.conf",
+		"/etc/hosts",
+		"/etc/nsswitch.conf",
+		"/etc/localtime",
+		"/etc/alsa",
+		"/etc/pipewire",
+		"/etc/pulse",
 		"/sys/dev/char",
 		"/sys/devices",
 		"/sys/bus/pci",
+		"/sys/class/drm",
+		"/sys/class/video4linux",
 		"/proc/self",
 	};
 	static const char *const rw_dev_dirs[] = {
-		"/dev/dri",
-		"/dev/shm",
-		"/tmp/.X11-unix",
+		"/dev/null", "/dev/zero", "/dev/urandom",   "/dev/random",
+		"/dev/dri",  "/dev/shm",  "/tmp/.X11-unix",
 	};
 	uint64_t ro = AVSB_FS_RO_BASE;
 	uint64_t ro_exec = AVSB_FS_RO_BASE | LANDLOCK_ACCESS_FS_EXECUTE;
@@ -378,6 +389,14 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi)
 		if (err)
 			return err;
 	}
+	if (opts && opts->allow_camera) {
+		for (int i = 0; i < 8; i++) {
+			snprintf(path, sizeof(path), "/dev/video%d", i);
+			err = add_path_rule(ruleset, path, dev_rw, handled_fs);
+			if (err)
+				return err;
+		}
+	}
 
 	/* Allow strictly Avernella's own XDG config, cache, data, runtime. */
 	build_xdg_path(path, sizeof(path), "XDG_CONFIG_HOME", ".config",
@@ -397,6 +416,14 @@ static int populate_ui_rules(int ruleset, uint64_t handled_fs, int abi)
 	}
 
 	build_xdg_path(path, sizeof(path), "XDG_DATA_HOME", ".local/share",
+		       "avernella");
+	if (path[0]) {
+		err = add_path_rule(ruleset, path, rw, handled_fs);
+		if (err)
+			return err;
+	}
+
+	build_xdg_path(path, sizeof(path), "XDG_STATE_HOME", ".local/state",
 		       "avernella");
 	if (path[0]) {
 		err = add_path_rule(ruleset, path, rw, handled_fs);
@@ -523,7 +550,8 @@ int avernella_landlock_apply(const struct avernella_sandbox_opts *opts,
 	}
 
 	if (opts->role == SANDBOX_ROLE_UI) {
-		err = populate_ui_rules(ruleset, attr.handled_access_fs, abi);
+		err = populate_ui_rules(ruleset, attr.handled_access_fs, abi,
+					opts);
 		if (err)
 			goto out;
 	} else if (opts->role == SANDBOX_ROLE_MEDIA) {

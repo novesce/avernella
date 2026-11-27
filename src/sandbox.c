@@ -291,8 +291,10 @@ static const struct {
 	guint layers;
 } switches[] = {
 	{ "seccomp", LINE_SANDBOX_SECCOMP },
-	{ "landlock",
-	  LINE_SANDBOX_LANDLOCK_NET | LINE_SANDBOX_LANDLOCK_SIGNAL },
+	{ "landlock", LINE_SANDBOX_LANDLOCK_NET | LINE_SANDBOX_LANDLOCK_SIGNAL |
+			      LINE_SANDBOX_LANDLOCK_FS |
+			      LINE_SANDBOX_LANDLOCK_ABSTRACT },
+	{ "landlock-fs", LINE_SANDBOX_LANDLOCK_FS },
 	{ "mdwe", LINE_SANDBOX_MDWE },
 	{ "seal", LINE_SANDBOX_SEAL },
 	{ "shstk", LINE_SANDBOX_SHADOW_STACK },
@@ -653,6 +655,26 @@ guint line_sandbox_worker(void)
 		layers |= LINE_SANDBOX_NO_NEW_PRIVS;
 		if (!(off & LINE_SANDBOX_LANDLOCK_NET))
 			layers |= landlock();
+		if (!(off & LINE_SANDBOX_LANDLOCK_FS)) {
+			const char *state_dir = getenv("LINE_STATE_DIR");
+			const char *extra_rw[1];
+			struct avernella_sandbox_opts fs_opts = {
+				.role = SANDBOX_ROLE_UI,
+				.allow_gpu_ioctl = true,
+				.allow_camera = true,
+			};
+			uint32_t fs_active = 0;
+
+			if (state_dir && state_dir[0] == '/') {
+				extra_rw[0] = state_dir;
+				fs_opts.extra_rw_paths = extra_rw;
+				fs_opts.n_extra_rw_paths = 1;
+			}
+			if (avernella_landlock_apply(&fs_opts, &fs_active) ==
+				    0 &&
+			    (fs_active & AVSB_ACTIVE_LANDLOCK_FS))
+				layers |= LINE_SANDBOX_LANDLOCK_FS;
+		}
 		if (!(off & LINE_SANDBOX_SECCOMP) && seccomp())
 			layers |= LINE_SANDBOX_SECCOMP;
 	}
