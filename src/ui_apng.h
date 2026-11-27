@@ -10,6 +10,8 @@
  */
 void ui_apng_attach(cairo_surface_t *poster, const guint8 *encoded,
 		    gsize bytes);
+cairo_surface_t *ui_gif_decode(const guint8 *encoded, gsize bytes, int limit,
+			       int max_edge, gboolean animate);
 void ui_apng_replay(cairo_surface_t *poster);
 cairo_surface_t *ui_apng_frame(cairo_surface_t *poster, gint64 now_us,
 			       gint64 *until_us);

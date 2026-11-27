@@ -869,6 +869,9 @@ static cairo_surface_t *decode_image(guint8 *data, gsize size, int limit,
 static cairo_surface_t *decode_pixels(guint8 *bytes, gsize n, int limit,
 				      int max_edge, gboolean animate)
 {
+	if (n >= 6 &&
+	    (!memcmp(bytes, "GIF89a", 6) || !memcmp(bytes, "GIF87a", 6)))
+		return ui_gif_decode(bytes, n, limit, max_edge, animate);
 	cairo_surface_t *image = decode_image(bytes, n, limit, max_edge);
 
 	if (animate && image)
@@ -1590,8 +1593,7 @@ void ui_media_thumb(Json *row, Rect r)
 	struct media_thumbnail *t = thumbnail(row, "photo");
 
 	if (t && t->image)
-		ui_draw_image(t->sticker ? animation_frame(t->image) : t->image,
-			      r);
+		ui_draw_image(animation_frame(t->image), r);
 	else
 		ui_draw_label(t && t->reason ? _("Open image to retry") :
 					       _("Loading image…"),
@@ -1835,6 +1837,7 @@ static gboolean is_image_path(const char *path)
 	return g_str_has_suffix(lower, ".jpeg") ||
 	       g_str_has_suffix(lower, ".jpg") ||
 	       g_str_has_suffix(lower, ".png") ||
+	       g_str_has_suffix(lower, ".gif") ||
 	       g_str_has_suffix(lower, ".webp");
 }
 
@@ -1867,7 +1870,7 @@ static void prepare_attachment(const char *path)
 	set(&m.title, name);
 	m.photo = picture_file;
 	if (picture_file) {
-		m.working = start_decode(fd, LOCAL, NULL, m.serial, FALSE);
+		m.working = start_decode(fd, LOCAL, NULL, m.serial, TRUE);
 		if (!m.working)
 			set(&m.note, _("Could not read this image."));
 	} else
@@ -3998,8 +4001,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			!avatar && !tag && m.thumbs ?
 				g_hash_table_lookup(m.thumbs, id) :
 				NULL;
-		gboolean animate = (role == ORIGINAL && m.sticker) ||
-				   (thumb && thumb->sticker);
+		gboolean animate = role == ORIGINAL || role == THUMBNAIL;
 		if (!error && fd >= 0 &&
 		    start_decode(fd, role, id, tag, animate))
 			return;
@@ -5099,9 +5101,7 @@ void ui_media_overlay(void)
 		Rect image = { x + 20, y + (m.mode == PREVIEW ? 93 : 62),
 			       w - 40, h - (m.mode == PREVIEW ? 210 : 178) };
 		if (m.image)
-			ui_draw_image(m.sticker ? animation_frame(m.image) :
-						  m.image,
-				      image);
+			ui_draw_image(animation_frame(m.image), image);
 		else if (m.working)
 			ui_draw_label(_("Loading…"),
 				      (Rect){ image.x, image.y + 12, image.w,

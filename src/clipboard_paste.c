@@ -17,9 +17,8 @@ static const struct {
 	const char *mime, *extension;
 } pictures[] = {
 	/* Lossless first: screenshots and copied images are usually PNG. */
-	{ "image/png", ".png" },
-	{ "image/webp", ".webp" },
-	{ "image/jpeg", ".jpg" },
+	{ "image/png", ".png" },   { "image/gif", ".gif" },
+	{ "image/webp", ".webp" }, { "image/jpeg", ".jpg" },
 	{ "image/jpg", ".jpg" },
 };
 
@@ -60,6 +59,9 @@ static gboolean looks_like(const guint8 *d, gsize n, const char *mime)
 {
 	if (!strcmp(mime, "image/png"))
 		return n >= 8 && !memcmp(d, "\211PNG\r\n\032\n", 8);
+	if (!strcmp(mime, "image/gif"))
+		return n >= 6 &&
+		       (!memcmp(d, "GIF89a", 6) || !memcmp(d, "GIF87a", 6));
 	if (!strcmp(mime, "image/webp"))
 		return n >= 12 && !memcmp(d, "RIFF", 4) &&
 		       !memcmp(d + 8, "WEBP", 4);

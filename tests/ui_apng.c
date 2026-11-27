@@ -228,6 +228,56 @@ static void aggregate_limit(void)
 		cairo_surface_destroy(posters[i]);
 }
 
+static void gif_animation(void)
+{
+	/* Minimal 2x1 2-frame GIF89a: frame 0 red (#ff0000), frame 1 blue (#0000ff), 50ms each, infinite loop. */
+	static const guint8 gif[] = {
+		'G', 'I', 'F', '8', '9', 'a', 2, 0, 1, 0, 0x80, 0,
+		0, /* 2x1, GCT 2 entries */
+		0xff, 0x00, 0x00, /* color 0: red */
+		0x00, 0x00, 0xff, /* color 1: blue */
+		/* NETSCAPE2.0 loop=0 */
+		0x21, 0xff, 11, 'N', 'E', 'T', 'S', 'C', 'A', 'P', 'E', '2',
+		'.', '0', 3, 1, 0, 0, 0,
+		/* GCE frame 0: delay=5 (50ms) */
+		0x21, 0xf9, 4, 0, 5, 0, 0, 0,
+		/* Image 0: 2x1, color 0,0 -> LZW min=2: clear(4), 0, 0, eoi(5) = 0b00101_000_000_100 = 0x44, 0x01? */
+		0x2c, 0, 0, 0, 0, 2, 0, 1, 0, 0, 2, 2, 0x04, 0x0a,
+		0, /* 3-bit codes: 4(100), 0(000), 0(000), 5(101) -> byte0=00_000_100=0x04, byte1=0000101_0=0x0a */
+		/* GCE frame 1: delay=5 (50ms) */
+		0x21, 0xf9, 4, 0, 5, 0, 0, 0,
+		/* Image 1: 2x1, color 1,1 -> 3-bit codes: 4(100), 1(001), 1(001), 5(101) -> byte0=01_001_100=0x4c, byte1=0000101_0=0x0a */
+		0x2c, 0, 0, 0, 0, 2, 0, 1, 0, 0, 2, 2, 0x4c, 0x0a, 0, 0x3b
+	};
+	cairo_surface_t *poster =
+		ui_gif_decode(gif, sizeof(gif), 64, 512, TRUE);
+	g_assert_nonnull(poster);
+	g_assert_cmpint(cairo_image_surface_get_width(poster), ==, 2);
+	g_assert_cmpint(cairo_image_surface_get_height(poster), ==, 1);
+
+	gint64 until = 0;
+	cairo_surface_t *f0 = ui_apng_frame(poster, 1000, &until);
+	g_assert_nonnull(f0);
+	g_assert_cmpint(until, ==, 51000);
+	g_assert_cmphex(*(const guint32 *)cairo_image_surface_get_data(f0), ==,
+			0xffff0000u);
+
+	cairo_surface_t *f1 = ui_apng_frame(poster, 51000, &until);
+	g_assert_nonnull(f1);
+	g_assert_cmpint(until, ==, 101000);
+	g_assert_cmphex(*(const guint32 *)cairo_image_surface_get_data(f1), ==,
+			0xff0000ffu);
+
+	/* Loops continuously back to frame 0. */
+	cairo_surface_t *f2 = ui_apng_frame(poster, 101000, &until);
+	g_assert_cmphex(*(const guint32 *)cairo_image_surface_get_data(f2), ==,
+			0xffff0000u);
+	cairo_surface_destroy(poster);
+
+	/* Truncated / corrupt GIF returns NULL safely. */
+	g_assert_null(ui_gif_decode(gif, 10, 64, 512, TRUE));
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -237,5 +287,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/apng/malformed-static-fallback", invalid);
 	g_test_add_func("/apng/single-frame-separate-default", one_frame);
 	g_test_add_func("/apng/bounded-aggregate", aggregate_limit);
+	g_test_add_func("/apng/gif-animation", gif_animation);
 	return g_test_run();
 }

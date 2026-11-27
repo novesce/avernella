@@ -17,7 +17,9 @@ enum {
 	MAX_COLOR_CHUNKS = 64 * 1024,
 	MAX_ANIMATION_PIXELS = 32 * 1024 * 1024,
 	MAX_ONE = 12 * 1024 * 1024,
-	MAX_ALL = 32 * 1024 * 1024
+	MAX_ALL = 32 * 1024 * 1024,
+	MAX_GIF_FRAMES = 256,
+	MAX_GIF_ENCODED = 32 * 1024 * 1024
 };
 
 struct apng_frame {
@@ -455,4 +457,403 @@ cairo_surface_t *ui_apng_frame(cairo_surface_t *poster, gint64 now,
 		*until = now <= G_MAXINT64 - delta ? now + delta : G_MAXINT64;
 	}
 	return a->frames[lo].surface;
+}
+
+/*
+ * Bounded GIF87a/GIF89a decoder sharing the APNG animation playback engine.
+ * Supports global/local palettes, LZW (2..8 bit min code size), 4-pass
+ * interlacing, transparency, all disposal modes, and NETSCAPE2.0 looping.
+ */
+static guint16 le16(const guint8 *p)
+{
+	return (guint16)p[0] | ((guint16)p[1] << 8);
+}
+
+static gboolean gif_skip_subblocks(const guint8 *d, gsize n, gsize *pos)
+{
+	while (*pos < n) {
+		guint8 len = d[(*pos)++];
+
+		if (!len)
+			return TRUE;
+		if (len > n - *pos)
+			return FALSE;
+		*pos += len;
+	}
+	return FALSE;
+}
+
+static gboolean gif_lzw_decode(const guint8 *d, gsize n, gsize *pos,
+			       guint8 min_bits, guint8 *out, gsize out_len)
+{
+	if (min_bits < 2 || min_bits > 8)
+		return FALSE;
+	guint16 prefix[4096];
+	guint8 suffix[4096], stack[4096];
+	guint clear_code = 1u << min_bits;
+	guint eoi_code = clear_code + 1;
+	guint code_size = min_bits + 1;
+	guint next_code = eoi_code + 1;
+	guint mask = (1u << code_size) - 1;
+	gint prev = -1;
+	guint8 first = 0;
+
+	for (guint i = 0; i < clear_code; i++) {
+		prefix[i] = 0;
+		suffix[i] = (guint8)i;
+	}
+	guint32 bit_buf = 0;
+	guint bit_cnt = 0;
+	gsize written = 0;
+	gboolean done = FALSE;
+
+	while (*pos < n) {
+		guint8 block_len = d[(*pos)++];
+
+		if (!block_len)
+			return written > 0;
+		if (block_len > n - *pos)
+			return FALSE;
+		const guint8 *blk = d + *pos;
+
+		*pos += block_len;
+		if (done)
+			continue;
+		for (guint i = 0; i < block_len; i++) {
+			bit_buf |= (guint32)blk[i] << bit_cnt;
+			bit_cnt += 8;
+			while (bit_cnt >= code_size) {
+				guint code = bit_buf & mask;
+
+				bit_buf >>= code_size;
+				bit_cnt -= code_size;
+				if (code == clear_code) {
+					code_size = min_bits + 1;
+					next_code = eoi_code + 1;
+					mask = (1u << code_size) - 1;
+					prev = -1;
+					continue;
+				}
+				if (code == eoi_code) {
+					done = TRUE;
+					break;
+				}
+				if (code > next_code)
+					return FALSE;
+				guint cur = code;
+				guint sp = 0;
+
+				if (code == next_code) {
+					if (prev < 0)
+						return FALSE;
+					stack[sp++] = first;
+					cur = (guint)prev;
+				}
+				while (cur >= clear_code) {
+					if (sp >= 4096)
+						return FALSE;
+					stack[sp++] = suffix[cur];
+					cur = prefix[cur];
+				}
+				first = (guint8)cur;
+				stack[sp++] = first;
+				while (sp > 0 && written < out_len)
+					out[written++] = stack[--sp];
+				if (prev >= 0 && next_code < 4096) {
+					prefix[next_code] = (guint16)prev;
+					suffix[next_code] = first;
+					next_code++;
+					if (next_code == (1u << code_size) &&
+					    code_size < 12) {
+						code_size++;
+						mask = (1u << code_size) - 1;
+					}
+				}
+				prev = (gint)code;
+			}
+		}
+	}
+	return FALSE;
+}
+
+static cairo_surface_t *gif_scale_frame(cairo_surface_t *canvas, guint src_w,
+					guint src_h, guint dst_w, guint dst_h)
+{
+	cairo_surface_t *frame = image(dst_w, dst_h);
+
+	if (!frame)
+		return NULL;
+	if (src_w == dst_w && src_h == dst_h) {
+		memcpy(cairo_image_surface_get_data(frame),
+		       cairo_image_surface_get_data(canvas),
+		       (gsize)cairo_image_surface_get_stride(frame) * dst_h);
+		cairo_surface_mark_dirty(frame);
+		return frame;
+	}
+	cairo_t *cr = cairo_create(frame);
+
+	cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+	cairo_scale(cr, (double)dst_w / src_w, (double)dst_h / src_h);
+	cairo_set_source_surface(cr, canvas, 0, 0);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+	cairo_paint(cr);
+	cairo_destroy(cr);
+	cairo_surface_flush(frame);
+	return frame;
+}
+
+cairo_surface_t *ui_gif_decode(const guint8 *d, gsize n, int limit,
+			       int max_edge, gboolean animate)
+{
+	if (!d || n < 14 || n > MAX_GIF_ENCODED ||
+	    (memcmp(d, "GIF89a", 6) && memcmp(d, "GIF87a", 6)))
+		return NULL;
+	guint w = le16(d + 6), h = le16(d + 8);
+
+	if (!w || !h || w > (guint)max_edge || h > (guint)max_edge ||
+	    (gsize)w * h > MAX_ANIMATION_PIXELS)
+		return NULL;
+	guint out_w = w, out_h = h;
+
+	if (limit > 0 && MAX(w, h) > (guint)limit) {
+		if (w >= h) {
+			out_w = (guint)limit;
+			out_h = MAX(1u, (guint)((guint64)h * limit / w));
+		} else {
+			out_h = (guint)limit;
+			out_w = MAX(1u, (guint)((guint64)w * limit / h));
+		}
+	}
+	gsize pos = 13;
+	guint8 packed = d[10];
+	const guint8 *gct = NULL;
+	guint gct_len = 0;
+
+	if (packed & 0x80) {
+		gct_len = 1u << ((packed & 7u) + 1u);
+		if (gct_len * 3u > n - pos)
+			return NULL;
+		gct = d + pos;
+		pos += gct_len * 3u;
+	}
+	cairo_surface_t *canvas = image(w, h);
+
+	if (!canvas)
+		return NULL;
+	guint32 *cpix = (guint32 *)cairo_image_surface_get_data(canvas);
+	guint cstride = (guint)(cairo_image_surface_get_stride(canvas) / 4);
+	g_autofree guint32 *saved = NULL;
+	g_autofree guint8 *idx_buf = NULL;
+	gsize idx_cap = 0;
+	GArray *frames = g_array_new(FALSE, FALSE, sizeof(struct apng_frame));
+	gsize frame_bytes = (gsize)out_w * out_h * 4;
+	gsize reserved = 0;
+	guint plays = 1;
+	gboolean has_loop = FALSE;
+	guint8 disposal = 0;
+	gboolean has_trans = FALSE;
+	guint8 trans_idx = 0;
+	gint64 delay_us = 100 * 1000;
+	gint64 total_us = 0;
+	cairo_surface_t *poster = NULL;
+
+	while (pos < n) {
+		guint8 intro = d[pos++];
+
+		if (intro == 0x3B) /* Trailer */
+			break;
+		if (intro == 0x21) { /* Extension */
+			if (pos >= n)
+				break;
+			guint8 label = d[pos++];
+
+			if (label == 0xF9 && pos + 6 <= n && d[pos] == 4) {
+				guint8 gce_p = d[pos + 1];
+				guint16 cs = le16(d + pos + 2);
+
+				disposal = (gce_p >> 2) & 7u;
+				has_trans = (gce_p & 1u) != 0;
+				trans_idx = d[pos + 4];
+				delay_us = (gint64)(cs <= 1 ? 10 : cs) * 10000;
+				pos += 5;
+				if (!gif_skip_subblocks(d, n, &pos))
+					break;
+			} else if (label == 0xFF && pos + 12 <= n &&
+				   d[pos] == 11 &&
+				   (!memcmp(d + pos + 1, "NETSCAPE2.0", 11) ||
+				    !memcmp(d + pos + 1, "ANIMEXTS1.0", 11))) {
+				pos += 12;
+				if (pos + 4 <= n && d[pos] == 3 &&
+				    d[pos + 1] == 1) {
+					guint16 loops = le16(d + pos + 2);
+
+					has_loop = TRUE;
+					plays = loops == 0 ? G_MAXUINT :
+							     (guint)loops + 1u;
+					pos += 4;
+				}
+				if (!gif_skip_subblocks(d, n, &pos))
+					break;
+			} else if (!gif_skip_subblocks(d, n, &pos)) {
+				break;
+			}
+			continue;
+		}
+		if (intro != 0x2C) /* Not an Image Descriptor */
+			break;
+		if (pos + 9 > n)
+			break;
+		guint left = le16(d + pos), top = le16(d + pos + 2);
+		guint iw = le16(d + pos + 4), ih = le16(d + pos + 6);
+		guint8 ipacked = d[pos + 8];
+
+		pos += 9;
+		const guint8 *ct = gct;
+		guint ct_len = gct_len;
+
+		if (ipacked & 0x80) {
+			ct_len = 1u << ((ipacked & 7u) + 1u);
+			if (ct_len * 3u > n - pos)
+				break;
+			ct = d + pos;
+			pos += ct_len * 3u;
+		}
+		if (pos >= n)
+			break;
+		guint8 min_bits = d[pos++];
+		gsize npx = (gsize)iw * ih;
+
+		if (!iw || !ih || left + iw > w || top + ih > h || !ct) {
+			if (!gif_skip_subblocks(d, n, &pos))
+				break;
+			continue;
+		}
+		if (npx > idx_cap) {
+			g_free(idx_buf);
+			idx_buf = g_try_malloc(npx);
+			if (!idx_buf)
+				break;
+			idx_cap = npx;
+		}
+		if (!gif_lzw_decode(d, n, &pos, min_bits, idx_buf, npx))
+			break;
+		if (disposal == 3) {
+			if (!saved)
+				saved = g_try_malloc_n((gsize)cstride * h,
+						       sizeof(guint32));
+			if (saved)
+				memcpy(saved, cpix,
+				       (gsize)cstride * h * sizeof(guint32));
+		}
+		gboolean interlaced = (ipacked & 0x40) != 0;
+		static const guint pass_start[4] = { 0, 4, 2, 1 };
+		static const guint pass_step[4] = { 8, 8, 4, 2 };
+		guint src_row = 0;
+
+		for (guint pass = 0; pass < (interlaced ? 4u : 1u); pass++) {
+			guint y0 = interlaced ? pass_start[pass] : 0;
+			guint dy = interlaced ? pass_step[pass] : 1;
+
+			for (guint y = y0; y < ih; y += dy) {
+				const guint8 *srow =
+					idx_buf + (gsize)src_row * iw;
+				guint32 *drow = cpix +
+						(gsize)(top + y) * cstride +
+						left;
+
+				src_row++;
+				for (guint x = 0; x < iw; x++) {
+					guint8 idx = srow[x];
+
+					if ((has_trans && idx == trans_idx) ||
+					    idx >= ct_len)
+						continue;
+					const guint8 *rgb = ct + (gsize)idx * 3;
+
+					drow[x] = 0xff000000u |
+						  ((guint32)rgb[0] << 16) |
+						  ((guint32)rgb[1] << 8) |
+						  (guint32)rgb[2];
+				}
+			}
+		}
+		cairo_surface_mark_dirty(canvas);
+		if (!poster) {
+			poster = gif_scale_frame(canvas, w, h, out_w, out_h);
+			if (!poster)
+				break;
+		}
+		if (animate && frames->len < MAX_GIF_FRAMES &&
+		    reserved + frame_bytes <= MAX_ONE) {
+			gboolean budget_ok = FALSE;
+
+			G_LOCK(animation_memory);
+			if (frame_bytes <= MAX_ALL - bytes_used) {
+				bytes_used += frame_bytes;
+				budget_ok = TRUE;
+			}
+			G_UNLOCK(animation_memory);
+			if (budget_ok) {
+				cairo_surface_t *fs =
+					frames->len == 0 ?
+						cairo_surface_reference(
+							poster) :
+						gif_scale_frame(canvas, w, h,
+								out_w, out_h);
+				if (fs) {
+					total_us += delay_us;
+					struct apng_frame f = {
+						.surface = fs, .end = total_us
+					};
+
+					g_array_append_val(frames, f);
+					reserved += frame_bytes;
+				} else {
+					G_LOCK(animation_memory);
+					bytes_used -= frame_bytes;
+					G_UNLOCK(animation_memory);
+				}
+			}
+		}
+		if (!animate)
+			break;
+		if (disposal == 2) {
+			for (guint y = 0; y < ih; y++)
+				memset(cpix + (gsize)(top + y) * cstride + left,
+				       0, (gsize)iw * sizeof(guint32));
+		} else if (disposal == 3 && saved) {
+			memcpy(cpix, saved,
+			       (gsize)cstride * h * sizeof(guint32));
+		}
+		disposal = 0;
+		has_trans = FALSE;
+		delay_us = 100 * 1000;
+	}
+	cairo_surface_destroy(canvas);
+	if (poster && animate && frames->len >= 2) {
+		struct apng_animation *a = g_malloc0(
+			sizeof(*a) + sizeof(struct apng_frame) * frames->len);
+		a->count = frames->len;
+		a->plays = has_loop ? plays : G_MAXUINT;
+		a->reserved = reserved;
+		a->start = -1;
+		memcpy(a->frames, frames->data,
+		       sizeof(struct apng_frame) * frames->len);
+		if (cairo_surface_set_user_data(poster, &animation_key, a,
+						release_animation) !=
+		    CAIRO_STATUS_SUCCESS)
+			release_animation(a);
+	} else {
+		for (guint i = 0; i < frames->len; i++)
+			cairo_surface_destroy(
+				g_array_index(frames, struct apng_frame, i)
+					.surface);
+		if (reserved) {
+			G_LOCK(animation_memory);
+			bytes_used -= reserved;
+			G_UNLOCK(animation_memory);
+		}
+	}
+	g_array_free(frames, TRUE);
+	return poster;
 }
