@@ -14,9 +14,10 @@ gboolean line_obs_upload_profile(const char *token, const char *mid,
 				 GBytes *jpeg, GError **error);
 gboolean line_obs_upload_group_profile(const char *token, const char *chat_mid,
 				       GBytes *jpeg, GError **error);
-char *line_obs_upload_square(const char *token, const char *message_id,
+char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 			     const char *name, const char *media_type,
-			     GBytes *plain, GError **error);
+			     guint64 duration_ms, GBytes *plain,
+			     GError **error);
 GBytes *line_obs_download_square(const char *token, const char *message_id,
 				 GError **error);
 GBytes *line_obs_download_square_preview(const char *token,

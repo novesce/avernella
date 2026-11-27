@@ -147,17 +147,26 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 	return g_bytes_ref(preview_blob);
 }
 
-char *line_obs_upload_square(const char *token, const char *message_id,
-			     const char *name, const char *type, GBytes *body,
-			     GError **error)
+static int square_upload_count;
+
+char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
+			     const char *name, const char *type,
+			     guint64 duration_ms, GBytes *body, GError **error)
 {
-	(void)token;
-	(void)message_id;
-	(void)name;
-	(void)type;
-	(void)body;
-	g_set_error_literal(error, LINE_ERROR, 1, "Unused square upload");
-	return NULL;
+	(void)duration_ms;
+	square_upload_count++;
+	if (!strcmp(token, "stale-token")) {
+		g_set_error_literal(error, LINE_ERROR, LINE_OBS_UNAUTHORIZED,
+				    "LINE media service returned HTTP 401.");
+		return NULL;
+	}
+	g_assert_cmpstr(token, ==, "fixture-token");
+	g_assert_cmpstr(chat, ==, "m00000000000000000000000000000001");
+	g_assert_cmpint(seq, ==, 77);
+	g_assert_cmpstr(name, ==, "image.png");
+	g_assert_cmpstr(type, ==, "IMAGE");
+	g_assert_cmpuint(g_bytes_get_size(body), >, 0);
+	return g_strdup("609999999999");
 }
 
 GBytes *line_obs_download_square(const char *token, const char *message_id,
@@ -564,11 +573,44 @@ static void token_refresh(void)
 	g_assert_cmpint(s.obs_until, ==, 0);
 }
 
+static void square_image_upload(void)
+{
+	Line s = { .obs_token = g_strdup("stale-token"),
+		   .obs_until = G_MAXINT64 };
+	g_autoptr(GError) error = NULL;
+	g_autofree char *path = NULL;
+	int fd = g_file_open_tmp("avernella-sq-XXXXXX.png", &path, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpint(fd, >=, 0);
+	static const guint8 png[16] = { 0x89, 'P',  'N', 'G', '\r', '\n',
+					0x1a, '\n', 0,	 0,   0,    0,
+					0,    0,    0,	 0 };
+	g_assert_cmpint(write(fd, png, sizeof(png)), ==, sizeof(png));
+	close(fd);
+
+	token_count = 0;
+	square_upload_count = 0;
+	stale_token = TRUE;
+	g_autoptr(J) receipt = line_send_square_attachment(
+		&s, "m00000000000000000000000000000001",
+		"p00000000000000000000000000000001", path, LINE_MEDIA_IMAGE, 77,
+		&error);
+	unlink(path);
+	g_assert_no_error(error);
+	g_assert_nonnull(receipt);
+	g_assert_cmpstr(strfield(receipt, "id"), ==, "609999999999");
+	g_assert_cmpint(square_upload_count, ==, 2);
+	g_assert_cmpint(token_count, ==, 2);
+	g_free(s.obs_token);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/media/legacy-no-sealed-fallback", legacy);
 	g_test_add_func("/media/video-stale-obs-token-refresh", token_refresh);
+	g_test_add_func("/media/square-image-v1-upload", square_image_upload);
 	g_test_add_func("/media/independent-crypto-vector", crypto_vector);
 	g_test_add_func("/media/independent-video-chunks", chunk_vector);
 	g_test_add_data_func("/media/group-image",

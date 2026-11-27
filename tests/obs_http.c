@@ -10,8 +10,8 @@ static struct curl_slist *headers;
 static const char *url, *token_reply = "3600\x1e"
 				       "test-obs-token";
 static const char *expected_url;
-static gboolean upload, profile_upload, anonymous, legacy_preview,
-	old_preview_path, large_preview;
+static gboolean upload, profile_upload, square_upload, anonymous,
+	legacy_preview, old_preview_path, large_preview;
 static int token_requests, preview_requests, performs;
 static long http_status = 200, timeout;
 
@@ -111,7 +111,23 @@ CURLcode __wrap_curl_easy_perform(CURL *c)
 			g_autofree char *str = g_strndup((char *)blob, len);
 
 			g_autoptr(J) params = json_tokener_parse(str);
-			if (profile_upload) {
+			if (square_upload) {
+				g_assert_cmpstr(strfield(params, "ver"), ==,
+						"1.0");
+				g_assert_cmpstr(strfield(params, "oid"), ==,
+						"reqseq");
+				g_assert_cmpstr(strfield(params, "reqseq"), ==,
+						"42");
+				g_assert_cmpstr(
+					strfield(params, "tomid"), ==,
+					"m00000000000000000000000000000001");
+				g_assert_cmpstr(strfield(params, "type"), ==,
+						"IMAGE");
+				g_assert_cmpstr(strfield(params, "range"), ==,
+						"bytes 0-2/3");
+				g_assert_cmpstr(strfield(params, "quality"), ==,
+						"100");
+			} else if (profile_upload) {
 				g_assert_cmpstr(strfield(params, "type"), ==,
 						"image");
 				g_assert_cmpstr(strfield(params, "ver"), ==,
@@ -312,14 +328,17 @@ static void square_obs(void)
 	g_autoptr(GError) e = NULL;
 	g_autoptr(GBytes) bytes = g_bytes_new_static("abc", 3);
 
-	upload = profile_upload = TRUE;
-	anonymous = legacy_preview = old_preview_path = large_preview = FALSE;
+	upload = square_upload = TRUE;
+	profile_upload = anonymous = legacy_preview = old_preview_path =
+		large_preview = FALSE;
 	http_status = 200;
-	expected_url = "https://obs.line-apps.com/r/g2/m/1001";
+	expected_url = "https://obs.line-apps.com/r/g2/m/reqseq";
 	g_autofree char *oid = line_obs_upload_square(
-		"test-obs-token", "1001", "photo.jpg", "image", bytes, &e);
+		"test-obs-token", "m00000000000000000000000000000001", 42,
+		"photo.jpg", "IMAGE", 0, bytes, &e);
 	g_assert_no_error(e);
-	g_assert_cmpstr(oid, ==, "1001");
+	g_assert_cmpstr(oid, ==, "new-oid");
+	square_upload = FALSE;
 
 	profile_upload = TRUE;
 	expected_url = "https://obs.line-apps.com/r/g2/member/"

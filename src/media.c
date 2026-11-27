@@ -374,24 +374,29 @@ static const char *square_media_type(int type)
 {
 	switch (type) {
 	case LINE_MEDIA_IMAGE:
-		return "image";
+		return "IMAGE";
 	case LINE_MEDIA_VIDEO:
-		return "video";
+		return "VIDEO";
 	case LINE_MEDIA_AUDIO:
-		return "audio";
+		return "AUDIO";
 	case LINE_MEDIA_FILE:
-		return "file";
+		return "FILE";
 	default:
 		return NULL;
 	}
 }
 
-/* Consumes its input buffer. Sends plaintext media in an OpenChat (/r/g2/m). */
+/*
+ * Consumes its input buffer. Sends plaintext media in an OpenChat via OBS V1
+ * (/r/g2/m/reqseq), where OBS creates and delivers the message and returns the
+ * message ID in x-obs-oid.
+ */
 static J *send_square_attachment_bytes(Line *s, const char *chat,
 				       const char *my_member_id, GBytes *bytes,
 				       const char *filename, int type,
 				       gint32 seq, GError **error)
 {
+	(void)my_member_id;
 	g_autoptr(GBytes) original = bytes;
 	const char *mtype = square_media_type(type);
 
@@ -399,7 +404,6 @@ static J *send_square_attachment_bytes(Line *s, const char *chat,
 		media_error(error, "Select an OpenChat conversation.");
 		return NULL;
 	}
-	gsize size = g_bytes_get_size(original);
 	guint64 duration = type == LINE_MEDIA_VIDEO ? video_duration(original) :
 						      0;
 	const char *format = type == LINE_MEDIA_IMAGE ? image_format(original) :
@@ -410,44 +414,47 @@ static J *send_square_attachment_bytes(Line *s, const char *chat,
 	}
 	const char *basename = line_safe_filename(filename) ? filename :
 							      "attachment";
-	g_autoptr(J) meta = obj();
-	g_autofree char *size_str = g_strdup_printf("%zu", size);
-
-	if (type == LINE_MEDIA_FILE) {
-		json_object_object_add(meta, "FILE_NAME",
-				       json_object_new_string(basename));
-		json_object_object_add(meta, "FILE_SIZE",
-				       json_object_new_string(size_str));
-	}
-	if (duration) {
-		g_autofree char *millis =
-			g_strdup_printf("%" G_GUINT64_FORMAT, duration);
-
-		json_object_object_add(meta, "DURATION",
-				       json_object_new_string(millis));
-	}
-	g_autoptr(J) receipt = line_square_send_media_stub(
-		s, chat, my_member_id, type, meta, seq, error);
-	if (!receipt)
-		return NULL;
-	const char *msg_id = strfield(receipt, "id");
-
-	g_autoptr(LineSecret) token = line_obs_token(s, error);
-
-	if (!token)
-		return NULL;
 	g_autofree char *upload_name =
 		type == LINE_MEDIA_FILE ?
 			g_strdup(basename) :
-			g_strdup_printf("%s.%s", msg_id,
+			g_strdup_printf("%s.%s",
+					format			 ? "image" :
+					type == LINE_MEDIA_VIDEO ? "video" :
+								   "audio",
 					format			 ? format :
 					type == LINE_MEDIA_VIDEO ? "mp4" :
 								   "m4a");
-	g_autofree char *oid = line_obs_upload_square(
-		token, msg_id, upload_name, mtype, original, error);
-	if (!oid)
+	g_autoptr(GError) failure = NULL;
+	g_autofree char *oid = NULL;
+
+	for (int i = 0; i < 2; i++) {
+		g_autoptr(LineSecret) token = line_obs_token(s, &failure);
+
+		if (!token)
+			break;
+		oid = line_obs_upload_square(token, chat, seq, upload_name,
+					     mtype, duration, original,
+					     &failure);
+		if (oid)
+			break;
+		if (i || !g_error_matches(failure, LINE_ERROR,
+					  LINE_OBS_UNAUTHORIZED))
+			break;
+		g_clear_error(&failure);
+		line_secret_set(&s->obs_token, NULL);
+		s->obs_until = 0;
+	}
+	if (!oid) {
+		if (failure)
+			g_propagate_error(error, g_steal_pointer(&failure));
 		return NULL;
-	return g_steal_pointer(&receipt);
+	}
+	J *receipt = obj();
+
+	json_object_object_add(receipt, "id", json_object_new_string(oid));
+	json_object_object_add(receipt, "sentAt",
+			       json_object_new_int64(g_get_real_time() / 1000));
+	return receipt;
 }
 
 J *line_send_square_attachment(Line *s, const char *chat,

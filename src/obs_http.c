@@ -141,9 +141,9 @@ void line_obs_http_close(void)
 }
 
 static GBytes *transfer_full(const char *url, const char *token,
-			     const char *metadata, GBytes *upload, char **oid,
-			     char **hash, gsize limit, long timeout,
-			     GError **error)
+			     const char *metadata, const char *content_type,
+			     GBytes *upload, char **oid, char **hash,
+			     gsize limit, long timeout, GError **error)
 {
 	if (line_cooldown_check(url, error))
 		return NULL;
@@ -159,7 +159,10 @@ static GBytes *transfer_full(const char *url, const char *token,
 	struct curl_slist *headers = NULL;
 	const char *const list[] = {
 		auth, metadata, token ? LINE_APP_HEADER : NULL,
-		upload ? "Content-Type: application/octet-stream" : NULL,
+		upload ? (content_type ?
+				  content_type :
+				  "Content-Type: application/octet-stream") :
+			 NULL,
 		upload ? "Expect:" : NULL
 	};
 	struct obs_response_body body = { .bytes = g_byte_array_new(),
@@ -254,8 +257,8 @@ static GBytes *transfer(const char *url, const char *token,
 			const char *metadata, GBytes *upload, char **oid,
 			gsize limit, long timeout, GError **error)
 {
-	return transfer_full(url, token, metadata, upload, oid, NULL, limit,
-			     timeout, error);
+	return transfer_full(url, token, metadata, NULL, upload, oid, NULL,
+			     limit, timeout, error);
 }
 
 char *line_obs_upload(const char *token, const char *sid, const char *oid,
@@ -411,49 +414,94 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 	return data;
 }
 
-/*
- * OpenChat (Square) attachments live under /r/g2/m/<msgId> and are not
- * Letter-Sealed (ar8.b in LINE Android 26.16.0).
- */
-char *line_obs_upload_square(const char *token, const char *message_id,
-			     const char *name, const char *media_type,
-			     GBytes *plain, GError **e)
+static const char *square_content_type(const char *name, const char *media_type)
 {
-	if (!token || !digits(message_id) || !name || !media_type || !plain ||
+	const char *dot = name ? strrchr(name, '.') : NULL;
+
+	if (dot && dot[1]) {
+		if (!g_ascii_strcasecmp(dot + 1, "jpg") ||
+		    !g_ascii_strcasecmp(dot + 1, "jpeg"))
+			return "Content-Type: image/jpeg";
+		if (!g_ascii_strcasecmp(dot + 1, "png"))
+			return "Content-Type: image/png";
+		if (!g_ascii_strcasecmp(dot + 1, "gif"))
+			return "Content-Type: image/gif";
+		if (!g_ascii_strcasecmp(dot + 1, "webp"))
+			return "Content-Type: image/webp";
+		if (!g_ascii_strcasecmp(dot + 1, "mp4"))
+			return "Content-Type: video/mp4";
+		if (!g_ascii_strcasecmp(dot + 1, "m4a"))
+			return "Content-Type: audio/mp4";
+		if (!g_ascii_strcasecmp(dot + 1, "mp3"))
+			return "Content-Type: audio/mpeg";
+	}
+	if (!strcmp(media_type, "IMAGE"))
+		return "Content-Type: image/jpeg";
+	if (!strcmp(media_type, "VIDEO"))
+		return "Content-Type: video/mp4";
+	if (!strcmp(media_type, "AUDIO"))
+		return "Content-Type: audio/mp3";
+	return "Content-Type: application/octet-stream";
+}
+
+/*
+ * OpenChat (Square) attachments use LINE's V1 OBS flow (h51.z / w44.a in LINE
+ * Android 26.19.0): POST directly to /r/g2/m/reqseq with tomid, oid="reqseq",
+ * and reqseq. OBS delivers the message to the OpenChat and returns the created
+ * message ID in the x-obs-oid response header.
+ */
+char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
+			     const char *name, const char *media_type,
+			     guint64 duration_ms, GBytes *plain, GError **e)
+{
+	if (!token || !chat || *chat != 'm' || !segment(chat) || seq <= 0 ||
+	    !name || !*name || !media_type || !plain ||
 	    !g_bytes_get_size(plain) ||
-	    (strcmp(media_type, "image") && strcmp(media_type, "video") &&
-	     strcmp(media_type, "audio") && strcmp(media_type, "file"))) {
+	    (strcmp(media_type, "IMAGE") && strcmp(media_type, "VIDEO") &&
+	     strcmp(media_type, "AUDIO") && strcmp(media_type, "FILE"))) {
 		invalid(e);
 		return NULL;
 	}
 	gsize n = g_bytes_get_size(plain);
-	g_autofree char *size_str = g_strdup_printf("%zu", n);
+	g_autofree char *range = g_strdup_printf("bytes 0-%zu/%zu", n - 1, n);
+	g_autofree char *seq_str = g_strdup_printf("%" G_GINT32_FORMAT, seq);
 
 	g_autoptr(J) params = obj();
 
+	json_object_object_add(params, "ver", json_object_new_string("1.0"));
 	json_object_object_add(params, "name", json_object_new_string(name));
-	json_object_object_add(params, "oid",
-			       json_object_new_string(message_id));
-	json_object_object_add(params, "size",
-			       json_object_new_string(size_str));
 	json_object_object_add(params, "type",
 			       json_object_new_string(media_type));
-	json_object_object_add(params, "ver", json_object_new_string("2.0"));
+	json_object_object_add(params, "tomid", json_object_new_string(chat));
+	json_object_object_add(params, "oid", json_object_new_string("reqseq"));
+	json_object_object_add(params, "reqseq",
+			       json_object_new_string(seq_str));
+	json_object_object_add(params, "range", json_object_new_string(range));
+	if (!strcmp(media_type, "IMAGE"))
+		json_object_object_add(params, "quality",
+				       json_object_new_string("100"));
+	if (duration_ms &&
+	    (!strcmp(media_type, "VIDEO") || !strcmp(media_type, "AUDIO"))) {
+		g_autofree char *dur =
+			g_strdup_printf("%" G_GUINT64_FORMAT, duration_ms);
+
+		json_object_object_add(params, "duration",
+				       json_object_new_string(dur));
+	}
 	const char *json =
 		json_object_to_json_string_ext(params, JSON_C_TO_STRING_PLAIN);
 	g_autofree char *b64 =
 		g_base64_encode((const guint8 *)json, strlen(json));
 	g_autofree char *hdr = g_strconcat("x-obs-params: ", b64, NULL);
-	g_autofree char *url = g_strconcat("https://obs.line-apps.com/r/g2/m/",
-					   message_id, NULL);
+	const char *ctype = square_content_type(name, media_type);
 	char *oid = NULL;
 
-	g_autoptr(GBytes) reply = transfer_full(url, token, hdr, plain, NULL,
-						NULL, 65536, 90L, e);
+	g_autoptr(GBytes) reply =
+		transfer_full("https://obs.line-apps.com/r/g2/m/reqseq", token,
+			      hdr, ctype, plain, &oid, NULL, 65536, 90L, e);
 
 	if (!reply)
 		return NULL;
-	oid = g_strdup(message_id);
 	return oid;
 }
 
@@ -511,8 +559,8 @@ char *line_obs_upload_square_profile(const char *token, const char *scope,
 		"https://obs.line-apps.com/r/g2/%s/%s", scope, oid);
 	char *hash = NULL;
 
-	g_autoptr(GBytes) reply = transfer_full(url, token, hdr, jpeg, NULL,
-						&hash, 65536, 60L, e);
+	g_autoptr(GBytes) reply = transfer_full(url, token, hdr, NULL, jpeg,
+						NULL, &hash, 65536, 60L, e);
 
 	if (!reply) {
 		g_free(hash);
