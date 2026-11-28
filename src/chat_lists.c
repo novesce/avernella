@@ -64,8 +64,8 @@ static Json *map(Json *obj, const char *key)
 
 static gboolean valid_mid(const char *id)
 {
-	return id && strlen(id) == 33 && strchr("ucr", id[0]) &&
-	       strspn(id + 1, "0123456789abcdef") == 32;
+	return id && strlen(id) == 33 && strchr("ucrm", id[0]) &&
+	       strspn(id + 1, "0123456789abcdefABCDEF") == 32;
 }
 
 static gboolean valid_name(const char *name)
@@ -422,15 +422,25 @@ gboolean chat_folder_toggle(struct chat_lists *l, const char *name,
 	return toggle_in(l, name, NULL, chat, e);
 }
 
-gboolean chat_muted(struct chat_lists *l, const char *chat)
+gboolean chat_muted(struct chat_lists *l, const char *chat,
+		    gboolean server_muted)
 {
-	return l && chat &&
-	       json_object_get_boolean(get(get(l->settings, "muted"), chat));
+	Json *muted = l ? get(get(l->settings, "muted"), chat) : NULL;
+
+	return muted ? json_object_get_boolean(muted) : server_muted;
 }
 
-gboolean chat_mute_toggle(struct chat_lists *l, const char *chat, GError **e)
+gboolean chat_set_muted(struct chat_lists *l, const char *chat, gboolean muted,
+			GError **e)
 {
-	return toggle_in(l, NULL, "muted", chat, e);
+	if (!valid_mid(chat))
+		return fail(e, "Choose an available conversation.");
+	Json *settings = copy(l);
+
+	if (settings)
+		json_object_object_add(map(settings, "muted"), chat,
+				       json_object_new_boolean(muted));
+	return commit(l, settings, e);
 }
 
 gboolean chat_strict_muted(struct chat_lists *l, const char *chat)

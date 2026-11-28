@@ -267,13 +267,18 @@ static void peer_fullscreen(void)
 	SDL_Quit();
 }
 
-static Json *share_request;
+static Json *share_request, *dial_request;
 static guint share_tag;
 
 void __real_ui_rpc(const char *method, Json *params, guint tag);
 
 void __wrap_ui_rpc(const char *method, Json *params, guint tag)
 {
+	if (!strcmp(method, "callStart")) {
+		g_assert_null(dial_request);
+		dial_request = params;
+		return;
+	}
 	if (strcmp(method, "callShare")) {
 		__real_ui_rpc(method, params, tag);
 		return;
@@ -347,6 +352,38 @@ static void group_share_controls(void)
 	g_clear_pointer(&ui.notice, g_free);
 }
 
+static void confirm_outgoing_call(void)
+{
+	static const char peer[] = "u00000000000000000000000000000001";
+
+	ui.connected = ui.calls = ui.video_calls = TRUE;
+	ui.width = 900;
+	ui.chats = json_object_new_array();
+	ui.selected = g_strdup(peer);
+	ui.call = (Rect){ 800, 8, 32, 32 };
+	ui.video = (Rect){ 840, 8, 32, 32 };
+
+	click(806, 10, 1);
+	g_assert_null(dial_request);
+	g_assert_cmpint(ui_media_layer(), >, 0);
+	key(SDLK_ESCAPE);
+	g_assert_null(dial_request);
+	g_assert_cmpint(ui_media_layer(), ==, 0);
+
+	click(846, 10, 1);
+	g_assert_null(dial_request);
+	key(SDLK_RETURN);
+	g_assert_nonnull(dial_request);
+	g_assert_cmpstr(ui_string(dial_request, "chat", ""), ==, peer);
+	g_assert_true(json_object_get_boolean(ui_field(dial_request, "video")));
+
+	g_clear_pointer(&dial_request, json_object_put);
+	g_clear_pointer(&ui.selected, g_free);
+	g_clear_pointer(&ui.chats, json_object_put);
+	ui_media_shutdown();
+	ui.connected = ui.calls = ui.video_calls = FALSE;
+}
+
 static void group_call_capabilities(void)
 {
 	static const char group[] = "c00000000000000000000000000000000";
@@ -399,5 +436,6 @@ int main(int argc, char **argv)
 			group_call_capabilities);
 	g_test_add_func("/call/group-share-controls", group_share_controls);
 	g_test_add_func("/call/fullscreen-peer", peer_fullscreen);
+	g_test_add_func("/call/confirm-outgoing", confirm_outgoing_call);
 	return g_test_run();
 }

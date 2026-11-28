@@ -48,6 +48,7 @@ typedef struct {
 	int width, height;
 	/* Animated height of the call stage above the messages. */
 	int stage_h;
+	int sidebar_drag_width;
 	gboolean dirty, active, connected, authenticating, logging_out,
 		getting_chats, quitting;
 	gboolean video_dirty;
@@ -73,7 +74,7 @@ typedef struct {
 		hover_x, hover_y;
 	gboolean stick_bottom;
 	gboolean older_page, older_pending, has_older;
-	Rect older_button, latest_button, folders_button;
+	Rect older_button, latest_button, folders_button, sidebar_split;
 	Rect login_mode, email_box, password_box;
 	Rect chat_tools, find_button, friends_button, openchat_button,
 		new_group, members, emoji, attach, call, video, login, back,
@@ -117,6 +118,7 @@ void ui_draw_centered(const char *s, Rect r, int size, int weight, guint rgb);
 
 /* Left edge of the main pane: the rail and list stay visible beside it. */
 int ui_content_x(void);
+int ui_sidebar_max_width(void);
 enum ui_icon {
 	UI_ICON_PEOPLE,
 	UI_ICON_MESSAGE,
@@ -290,6 +292,9 @@ gboolean ui_media_paste(void);
 void ui_status(const char *message);
 void ui_refresh(void);
 void ui_show_latest(void);
+void ui_jump_to_message(const char *id);
+char *ui_take_message_jump(void);
+void ui_history_jump_offset(int offset);
 void ui_restore_input(void);
 void ui_edit_key(Editor *edit, SDL_KeyboardEvent key);
 void ui_insert(Editor *edit, const char *text);
@@ -302,6 +307,7 @@ void ui_media_refresh_flex(void);
 void ui_media_reset(void);
 void ui_media_shutdown(void);
 void ui_media_screenshot(void);
+void ui_media_record_video(void);
 void ui_media_screenshot_presented(void);
 int ui_media_screenshot_wait(gint64 now);
 gboolean ui_media_event(SDL_Event *e);
@@ -326,6 +332,9 @@ void ui_media_dmabuf_frame(const struct line_preview_frame *frame, int fd,
 int ui_media_draw_scene(const struct gpu_scene *scene);
 void ui_media_preview_frame(const struct line_preview_frame *frame, int fd);
 void ui_media_overlay(void);
+gboolean ui_media_image_viewer(void);
+gint64 ui_media_image_deadline(void);
+void ui_media_draw_image_viewer(gint64 now_us);
 void ui_media_present_video(double y_offset);
 void ui_media_gpu_video(struct gpu_scene *scene, double y_offset);
 void ui_media_reset_renderer(void);
@@ -352,6 +361,11 @@ void ui_draw_label(const char *s, Rect r, int size, int weight, guint rgb,
 		   gboolean wrap);
 void ui_draw_button(Rect r, const char *s, gboolean primary);
 void ui_draw_image(cairo_surface_t *image, Rect r);
+struct ui_image_rect;
+void ui_draw_viewed_image(cairo_surface_t *image,
+			  const struct ui_image_rect *bounds, Rect clip,
+			  guint angle);
+void ui_draw_viewer_backdrop(void);
 void ui_draw_rotated_image(cairo_surface_t *image, Rect r, unsigned int angle);
 void ui_draw_path_entry(Editor *editor, Rect r);
 cairo_surface_t *ui_avatar(const char *chat, const char *id, const char *key);

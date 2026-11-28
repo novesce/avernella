@@ -214,9 +214,13 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	if (!strcmp(method, "getChatRoomAnnouncements")) {
 		g_assert_cmpstr(strfield(args, "2:str"), ==, GROUP);
 		return json_tokener_parse(
-			"[{\"1\":9007199254740993,\"3\":{\"2\":\"Meeting\"},"
+			"[{\"1\":9007199254740993,\"3\":{\"2\":\"Meeting\","
+			"\"3\":\"line://nv/chatMsg?chatId=" GROUP
+			"&messageId=901\"},"
 			"\"4\":\"" SELF "\",\"6\":1},"
-			"{\"1\":11,\"4\":\"" ALICE "\",\"6\":1},{\"1\":0}]");
+			"{\"1\":11,\"3\":{\"3\":\"line://nv/chatMsg?chatId=" ALICE
+			"&messageId=902\"},\"4\":\"" ALICE
+			"\",\"6\":1},{\"1\":0}]");
 	}
 	if (!strcmp(method, "createChatRoomAnnouncement")) {
 		J *body = field(args, "4:obj");
@@ -681,6 +685,8 @@ static void announcements(void)
 	J *theirs = json_object_array_get_idx(rows, 1);
 
 	g_assert_cmpstr(strfield(mine, "id"), ==, "9007199254740993");
+	g_assert_cmpstr(strfield(mine, "messageId"), ==, "901");
+	g_assert_null(strfield(theirs, "messageId"));
 	g_assert_true(json_object_get_boolean(field(mine, "canRemove")));
 	g_assert_false(json_object_get_boolean(field(theirs, "canRemove")));
 	g_autoptr(J) result =
@@ -688,6 +694,7 @@ static void announcements(void)
 
 	g_assert_no_error(error);
 	g_assert_cmpstr(strfield(result, "id"), ==, "12");
+	g_assert_cmpstr(strfield(result, "messageId"), ==, "901");
 	g_autoptr(J) removed = line_remove_announcement(
 		&s, GROUP, strfield(mine, "id"), 44, &error);
 

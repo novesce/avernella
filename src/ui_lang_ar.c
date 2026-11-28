@@ -3,6 +3,19 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Could not open the desktop file chooser.",
+	  "تعذّر فتح نافذة اختيار الملفات في النظام." },
+	{ "Voice call", "مكالمة صوتية" },
+	{ "Start call", "بدء المكالمة" },
+	{ "Attachment", "مرفق" },
+	{ "Send as file", "إرسال كملف" },
+	{ "Zoom out", "تصغير" },
+	{ "Zoom in", "تكبير" },
+	{ "Actual size", "الحجم الفعلي" },
+	{ "Fit to window", "ملاءمة النافذة" },
+	{ "Rotate clockwise", "تدوير مع عقارب الساعة" },
+	{ "Previous image", "الصورة السابقة" },
+	{ "Next image", "الصورة التالية" },
 	{ "Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.",
 	  "انسخ مسودة رسالتك، ثم سجّل الخروج واربط الجهاز مجددًا برمز QR لتحديث Letter Sealing." },
 	{ "Accent color", "لون التمييز" },

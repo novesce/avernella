@@ -266,6 +266,7 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		return json_tokener_parse(
 			"{\"1\":[{\"1\":\"" CHAT_MID "\",\"2\":\"" SQ_MID
 			"\",\"3\":1,\"4\":\"Main Room\",\"5\":\"0hChatHash\",\"7\":3}],"
+			"\"2\":{\"" CHAT_MID "\":{\"5\":false}},"
 			"\"3\":{\"" CHAT_MID
 			"\":{\"3\":{\"1\":{\"1\":\"" PEER_MEM
 			"\",\"2\":\"" CHAT_MID
@@ -351,6 +352,10 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"{\"1\":[{\"1\":77,\"2\":0,\"3\":{\"1\":{\"1\":\"1001\",\"2\":\"Pinned notice\"}}}]}");
 	}
 	if (!strcmp(method, "createSquareChatAnnouncement")) {
+		J *seq = field(field(req, "3:obj"), "1:i64");
+
+		g_assert_nonnull(seq);
+		g_assert_cmpint(json_object_get_int64(seq), ==, 0);
 		return json_tokener_parse(
 			"{\"1\":{\"1\":78,\"2\":0,\"3\":{\"1\":{\"1\":\"1001\",\"2\":\"New notice\"}}}}");
 	}
@@ -528,7 +533,9 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			"{\"1\":{\"1\":555},\"2\":[{\"3\":29,\"4\":{\"30\":{\"1\":\"" CHAT_MID
 			"\",\"2\":{\"1\":{\"1\":\"" PEER_MEM
 			"\",\"2\":\"" CHAT_MID
-			"\",\"4\":\"1010\",\"5\":1700000010000,\"10\":\"Ping\"}}}}}],"
+			"\",\"4\":\"1010\",\"5\":1700000010000,\"10\":\"Ping\"}}}}},"
+			"{\"3\":37,\"4\":{\"37\":{\"1\":\"" CHAT_MID
+			"\",\"2\":77}}}],"
 			"\"3\":\"sync-2\"}");
 	}
 	if (!strcmp(method, "getPopularKeywords")) {
@@ -647,6 +654,8 @@ static void test_chats_and_history(void)
 	g_assert_cmpstr(strfield(row, "id"), ==, CHAT_MID);
 	g_assert_cmpstr(strfield(row, "squareMid"), ==, SQ_MID);
 	g_assert_cmpstr(strfield(row, "name"), ==, "Main Room");
+	g_assert_true(
+		json_object_get_boolean(field(row, "notificationDisabled")));
 	g_assert_cmpint(json_object_get_int(field(row, "unread")), ==, 2);
 	g_assert_cmpstr(strfield(c2s, CHAT_MID), ==, SQ_MID);
 	g_assert_cmpstr(strfield(s.pictures, CHAT_MID), ==, "/0hChatHash");
@@ -759,6 +768,9 @@ static void test_messaging(void)
 		line_square_announcements(&s, CHAT_MID, TRUE, &error);
 	g_assert_no_error(error);
 	g_assert_cmpuint(json_object_array_length(anns), ==, 1);
+	g_assert_cmpstr(strfield(json_object_array_get_idx(anns, 0),
+				 "messageId"),
+			==, "1001");
 
 	g_autoptr(J) created = line_square_announce_message(
 		&s, CHAT_MID, "1001", "New notice", PEER_MEM, 1700000001000, 4,
@@ -897,7 +909,11 @@ static void test_lifecycle_and_sync(void)
 	g_assert_no_error(error);
 	g_assert_cmpint(sub_id, ==, 555);
 	g_assert_cmpstr(sync_tok, ==, "sync-2");
-	g_assert_cmpuint(json_object_array_length(evs), ==, 1);
+	g_assert_cmpuint(json_object_array_length(evs), ==, 2);
+	J *announcement = json_object_array_get_idx(evs, 1);
+
+	g_assert_cmpstr(strfield(announcement, "kind"), ==, "announcements");
+	g_assert_cmpstr(strfield(announcement, "chat"), ==, CHAT_MID);
 
 	/* SquareException resets s->service_code to -1. */
 	force_sq_error = TRUE;

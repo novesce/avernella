@@ -61,10 +61,30 @@ static void palette_preference(void)
 	g_assert_cmpuint(UI_ACCENT, ==, 0x55dbad);
 }
 
+static void sidebar_preference(void)
+{
+	g_autoptr(GError) error = NULL;
+	g_autofree char *path = g_build_filename(
+		g_get_user_config_dir(), "avernella", "sidebar-width", NULL);
+
+	ui_theme_init();
+	g_assert_cmpint(ui_theme_sidebar_width(), ==, 0);
+	g_assert_true(ui_theme_save_sidebar_width(316, &error));
+	g_assert_no_error(error);
+	ui_theme_init();
+	g_assert_cmpint(ui_theme_sidebar_width(), ==, 316);
+
+	g_assert_true(g_file_set_contents(path, "2147483647", -1, &error));
+	g_assert_no_error(error);
+	ui_theme_init();
+	g_assert_cmpint(ui_theme_sidebar_width(), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
 	g_test_add_func("/ui/theme/preference", preference);
 	g_test_add_func("/ui/theme/palette", palette_preference);
+	g_test_add_func("/ui/theme/sidebar", sidebar_preference);
 	return g_test_run();
 }

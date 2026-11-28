@@ -19,8 +19,11 @@
 #include "qr_scan.h"
 #include "ui_apng.h"
 #include "ui_motion.h"
+#include "ui_image_view.h"
 #include "ui_pixels.h"
 #include "screenshot.h"
+#include "file_chooser.h"
+#include "ui_window.h"
 #include "clipboard_paste.h"
 #include <gio/gio.h>
 #include <glib/gstdio.h>
@@ -31,6 +34,7 @@
 #include <SDL_syswm.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <png.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -65,6 +69,7 @@ enum media_mode {
 	REACT,
 	UNSEND,
 	REPLACE,
+	CONFIRM_CALL,
 	DIAL,
 	CALL,
 	CAMERA,
@@ -161,6 +166,19 @@ enum stage_tile {
 	TILE_PEER_SCREEN,
 };
 
+enum image_control {
+	IMAGE_NOTHING,
+	IMAGE_ZOOM_OUT,
+	IMAGE_ZOOM_IN,
+	IMAGE_RESET,
+	IMAGE_ROTATE,
+	IMAGE_SAVE,
+	IMAGE_PREVIOUS,
+	IMAGE_NEXT,
+	IMAGE_CLOSE,
+	IMAGE_CONTROLS
+};
+
 static struct {
 	enum media_mode mode;
 	guint epoch, serial, call_serial, decode_event, record_event;
@@ -182,12 +200,13 @@ static struct {
 	char *chat, *id, *path, *title, *note, *directory, *call_chat,
 		*call_name, *call_state, *call_video_peer, *reply_text;
 	gboolean avatar_pick, save_replace;
-	gboolean friend_qr, save, photo, working, thumb_busy, muted, can_mute,
-		copying, sticker;
+	gboolean friend_qr, save, photo, as_file, working, thumb_busy, muted,
+		can_mute, copying, sticker;
 	Editor edit;
 	GPtrArray *entries;
 	int offset, cursor, menu_x, menu_y;
-	Rect dialog, path_entry, items, up, primary, secondary, third;
+	Rect dialog, path_entry, items, up, primary, secondary, third,
+		file_option;
 	GHashTable *thumbs, *avatars, *emoji, *flex_images;
 	gsize cache_bytes;
 	gboolean emoji_busy;
@@ -196,6 +215,14 @@ static struct {
 	guint session, avatar_seq, flex_serial;
 	GThreadPool *pool;
 	cairo_surface_t *image;
+	struct ui_image_view viewer;
+	Rect view_clip, view_controls[IMAGE_CONTROLS];
+	Rect view_bar;
+	enum image_control view_press;
+	gboolean view_down, view_outside, view_dragged;
+	int view_x, view_y, view_last_x, view_last_y;
+	char *view_album;
+	const char *view_suffix;
 	struct call_picture call_frame, self_frame, share_frame;
 	gboolean video_call, video_ready, camera_enabled;
 	/* Screen sharing: the peer's stream, ours, and the focused tile. */
@@ -527,6 +554,8 @@ static void clear_overlay(enum media_mode next)
 		g_unlink(m.paste);
 	g_clear_pointer(&m.paste, g_free);
 	m.copying = m.sticker = FALSE;
+	m.as_file = FALSE;
+	m.file_option = (Rect){ 0 };
 	m.working = FALSE;
 	g_clear_pointer(&m.chat, g_free);
 	g_clear_pointer(&m.id, g_free);
@@ -534,6 +563,13 @@ static void clear_overlay(enum media_mode next)
 	g_clear_pointer(&m.title, g_free);
 	g_clear_pointer(&m.note, g_free);
 	g_clear_pointer(&m.image, cairo_surface_destroy);
+	g_clear_pointer(&m.view_album, g_free);
+	m.view_suffix = NULL;
+	m.viewer = (struct ui_image_view){ 0 };
+	memset(m.view_controls, 0, sizeof(m.view_controls));
+	m.view_bar = m.view_clip = (Rect){ 0 };
+	m.view_down = m.view_dragged = m.view_outside = FALSE;
+	m.view_press = IMAGE_NOTHING;
 	g_clear_pointer(&m.entries, g_ptr_array_unref);
 	if (m.row) {
 		json_object_put(m.row);
@@ -569,6 +605,7 @@ void ui_media_album_photo(const char *album, const char *id)
 	if (!ui.selected || !album || !id)
 		return;
 	begin(VIEW, ui.selected, id, _("Album photo"));
+	set(&m.view_album, album);
 	m.working = TRUE;
 	Json *p = args(ui.selected, id);
 
@@ -638,6 +675,22 @@ static int lease_fd(Json *result, gsize bound)
 		return -1;
 	}
 	return fd;
+}
+
+static const char *image_suffix(int fd)
+{
+	guint8 header[12];
+	ssize_t n = pread(fd, header, sizeof(header), 0);
+
+	if (n < 12)
+		return "jpg";
+	if (!png_sig_cmp(header, 0, 8))
+		return "png";
+	if (!memcmp(header, "GIF8", 4))
+		return "gif";
+	if (!memcmp(header, "RIFF", 4) && !memcmp(header + 8, "WEBP", 4))
+		return "webp";
+	return "jpg";
 }
 
 static gboolean image_shape(int w, int h)
@@ -1073,7 +1126,8 @@ static void decoder(gpointer ptr, gpointer unused)
 
 	if (!fstat(job->fd, &st) && S_ISREG(st.st_mode) && st.st_size > 0 &&
 	    (guint64)st.st_size <= IMAGE_BOUND) {
-		int limit = job->role == CLIPBOARD ? G_MAXINT :
+		int limit = job->role == CLIPBOARD || job->role == ORIGINAL ?
+				    G_MAXINT :
 			    job->role == THUMBNAIL ? THUMB_EDGE :
 			    job->role == AVATAR	   ? AVATAR_EDGE :
 			    job->edge		   ? job->edge :
@@ -1239,11 +1293,15 @@ static void complete_decode(struct decode_job *job)
 	ui.dirty = TRUE;
 }
 
+static void cancel_attachment(void);
+static void stop_attachment(void);
+
 void ui_media_select_chat(void)
 {
 	ui_find_reset();
 	ui_chat_tools_reset();
 	ui_shared_reset();
+	cancel_attachment();
 	g_clear_pointer(&m.screenshot_chat, g_free);
 	m.screenshot_after = 0;
 	if (m.screenshot_cancel)
@@ -1532,6 +1590,7 @@ static void record_finished(char *path, char *error, gpointer state)
 void ui_media_shutdown(void)
 {
 	ui_media_reset();
+	stop_attachment();
 	if (m.play_event && m.play_event != (Uint32)-1) {
 		SDL_Event event;
 
@@ -1949,7 +2008,8 @@ static void prepare_attachment(const char *path)
 		set(&m.note, _("Choose a JPEG, PNG or WebP photo."));
 		return;
 	}
-	int fd = open_regular(copy, picture_file ? IMAGE_BOUND : G_MAXSIZE);
+	int fd = open_regular(copy,
+			      picture_file ? IMAGE_BOUND : LINE_MEDIA_LIMIT);
 
 	if (fd < 0) {
 		if (m.mode == CLOSED)
@@ -1972,6 +2032,130 @@ static void prepare_attachment(const char *path)
 			set(&m.note, _("Could not read this image."));
 	} else
 		close(fd);
+}
+
+struct attachment_choice {
+	char *parent, *title, *images, *path;
+	GCancellable *cancel;
+	guint event, epoch;
+	gboolean failed;
+};
+
+static struct {
+	struct ui_window_export *parent;
+	GThread *thread;
+	GCancellable *cancel;
+	guint event;
+} chooser;
+
+static void free_attachment_choice(struct attachment_choice *choice)
+{
+	g_object_unref(choice->cancel);
+	g_free(choice->parent);
+	g_free(choice->title);
+	g_free(choice->images);
+	g_free(choice->path);
+	g_free(choice);
+}
+
+static gpointer choose_attachment(gpointer data)
+{
+	struct attachment_choice *choice = data;
+	g_autoptr(GError) error = NULL;
+
+	choice->path = line_choose_file(choice->parent, choice->title,
+					choice->images, choice->cancel, &error);
+	choice->failed =
+		!choice->path &&
+		!g_error_matches(error, G_IO_ERROR, G_IO_ERROR_CANCELLED);
+
+	SDL_Event e = { 0 };
+
+	e.type = choice->event;
+	e.user.data1 = choice;
+
+	return SDL_PushEvent(&e) == 1 ? NULL : choice;
+}
+
+static void open_attachment(void)
+{
+	if (chooser.thread || !ui.selected)
+		return;
+	if (!chooser.event)
+		chooser.event = SDL_RegisterEvents(1);
+	if (chooser.event == (Uint32)-1) {
+		ui_status(_("Could not open this attachment."));
+		return;
+	}
+	struct attachment_choice *choice = g_new0(struct attachment_choice, 1);
+
+	choice->cancel = g_cancellable_new();
+	choice->event = chooser.event;
+	choice->epoch = m.epoch;
+	choice->title = g_strdup(_("Choose an attachment"));
+	if (!ui.files)
+		choice->images = g_strdup(_("Photo"));
+	chooser.parent = ui_window_export(ui.window, &choice->parent);
+	chooser.cancel = g_object_ref(choice->cancel);
+	chooser.thread = g_thread_try_new("line-file-chooser",
+					  choose_attachment, choice, NULL);
+	if (!chooser.thread) {
+		g_clear_pointer(&chooser.parent, ui_window_unexport);
+		g_clear_object(&chooser.cancel);
+		free_attachment_choice(choice);
+		ui_status(_("Could not open this attachment."));
+	}
+}
+
+static void join_attachment(void)
+{
+	if (!chooser.thread)
+		return;
+	struct attachment_choice *undelivered = g_thread_join(chooser.thread);
+
+	if (undelivered)
+		free_attachment_choice(undelivered);
+	chooser.thread = NULL;
+	g_clear_object(&chooser.cancel);
+	g_clear_pointer(&chooser.parent, ui_window_unexport);
+}
+
+static void cancel_attachment(void)
+{
+	if (chooser.cancel)
+		g_cancellable_cancel(chooser.cancel);
+}
+
+static void stop_attachment(void)
+{
+	cancel_attachment();
+	join_attachment();
+	if (chooser.event && chooser.event != (Uint32)-1) {
+		SDL_Event e;
+
+		while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, chooser.event,
+				      chooser.event) == 1)
+			free_attachment_choice(e.user.data1);
+	}
+}
+
+static gboolean attachment_event(const SDL_Event *e)
+{
+	if (!chooser.event || e->type != chooser.event)
+		return FALSE;
+	struct attachment_choice *choice = e->user.data1;
+
+	join_attachment();
+	if (ui.connected && ui.selected && choice->epoch == m.epoch &&
+	    (ui.photos || ui.files) && !ui_media_layer()) {
+		if (choice->path)
+			prepare_attachment(choice->path);
+		else if (choice->failed)
+			ui_status(
+				_("Could not open the desktop file chooser."));
+	}
+	free_attachment_choice(choice);
+	return TRUE;
 }
 
 static void unlink_path(gpointer path)
@@ -2114,8 +2298,13 @@ static void directory(const char *folder)
 
 static void open_picker(gboolean save, Json *row, gboolean friend_qr)
 {
-	g_autofree char *dir =
-		g_strdup(m.directory ? m.directory : g_get_home_dir());
+	const char *downloads =
+		save ? g_get_user_special_dir(G_USER_DIRECTORY_DOWNLOAD) : NULL;
+	const char *fallback =
+		downloads && g_file_test(downloads, G_FILE_TEST_IS_DIR) ?
+			downloads :
+			g_get_home_dir();
+	g_autofree char *dir = g_strdup(m.directory ? m.directory : fallback);
 	const char *name = save ? ui_string(row, "filename", "attachment") :
 				  _("Choose an attachment");
 	g_autofree char *base = g_path_get_basename(name);
@@ -2165,6 +2354,9 @@ static void save_to(gboolean overwrite)
 {
 	Json *p = args(m.chat, m.id);
 
+	if (m.view_album)
+		json_object_object_add(p, "album",
+				       json_object_new_string(m.view_album));
 	m.save_replace = overwrite;
 	m.working = TRUE;
 	set(&m.note, _("Saving…"));
@@ -2545,7 +2737,7 @@ static gboolean call_camera_available(void)
 	       !m.share_in_video;
 }
 
-static void dial(gboolean video)
+static void confirm_call(gboolean video)
 {
 	if (call_active()) {
 		show_call();
@@ -2553,24 +2745,30 @@ static void dial(gboolean video)
 	}
 	if (!ui_media_can_call(video))
 		return;
-	const char *peer = ui.selected;
+	const char *peer = ui_string(ui_selected_chat(), "name", ui.selected);
 
-	for (size_t i = 0; ui.chats && i < json_object_array_length(ui.chats);
-	     i++) {
-		Json *c = json_object_array_get_idx(ui.chats, i);
-
-		if (!g_strcmp0(ui_string(c, "id", ""), ui.selected)) {
-			peer = ui_string(c, "name", ui.selected);
-			break;
-		}
-	}
 	request_video = video;
+	begin(CONFIRM_CALL, ui.selected, NULL, peer);
+}
+
+static void dial(void)
+{
+	if (call_active()) {
+		show_call();
+		return;
+	}
+	if (g_strcmp0(ui.selected, m.chat) ||
+	    !ui_media_can_call(request_video)) {
+		close_overlay();
+		return;
+	}
 	m.call_serial++;
-	begin(DIAL, ui.selected, NULL, peer);
-	set(&m.call_note, NULL);
-	if (video)
+	begin(DIAL, m.chat, NULL, m.title);
+	if (request_video)
 		set(&m.call_note,
 		    _("Your camera and microphone start when the call connects."));
+	else
+		set(&m.call_note, NULL);
 	call_rpc("callStart");
 }
 
@@ -4178,6 +4376,9 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 				g_hash_table_lookup(m.thumbs, id) :
 				NULL;
 		gboolean animate = role == ORIGINAL || role == THUMBNAIL;
+
+		if (role == ORIGINAL && fd >= 0 && !error)
+			m.view_suffix = image_suffix(fd);
 		if (!error && fd >= 0 &&
 		    start_decode(fd, role, id, tag, animate))
 			return;
@@ -4264,31 +4465,29 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 		return;
 	}
 	if (!strcmp(method, "saveFile")) {
-		int fd = result && json_object_is_type(result,
-						       json_type_object) ?
-				 lease_fd(result, LINE_MEDIA_LIMIT) :
-				 -1;
-		Json *lease = result && json_object_is_type(result,
-							    json_type_object) ?
-				      ui_field(result, "lease") :
-				      NULL;
+		Json *lease = ui_field(result, "lease");
 
 		if (lease) {
-			Json *rel = json_object_new_object();
+			Json *rel = obj();
 
 			json_object_object_add(rel, "lease",
 					       json_object_get(lease));
 			ui_rpc("releaseMedia", rel, 0);
 		}
-		if (fd >= 0) {
-			struct stat st;
-			g_autoptr(GBytes) bytes = NULL;
-			g_autoptr(GError) save_err = NULL;
+		if (m.serial != tag || !m.working || !m.path)
+			return;
 
+		int fd = lease_fd(result, LINE_MEDIA_LIMIT);
+
+		g_autoptr(GError) save_err = NULL;
+		g_autoptr(GBytes) bytes = NULL;
+		struct stat st;
+
+		if (fd >= 0) {
 			if (!fstat(fd, &st) && st.st_size > 0 &&
 			    st.st_size <= LINE_MEDIA_LIMIT) {
-				gsize total = (gsize)st.st_size, used = 0;
-				guint8 *buf = g_malloc(total);
+				gsize total = st.st_size, used = 0;
+				g_autofree guint8 *buf = g_malloc(total);
 
 				while (used < total) {
 					ssize_t got = read(fd, buf + used,
@@ -4298,33 +4497,23 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 						continue;
 					if (got <= 0)
 						break;
-					used += (gsize)got;
+					used += got;
 				}
 				if (used == total)
-					bytes = g_bytes_new_take(buf, total);
-				else
-					g_free(buf);
+					bytes = g_bytes_new_take(
+						g_steal_pointer(&buf), total);
 			}
 			close(fd);
-			if (!bytes ||
-			    !line_save_media(m.path, bytes, m.save_replace,
-					     &save_err)) {
-				const char *msg =
-					save_err ?
-						save_err->message :
-						_("Could not save the file.");
-
-				if (m.mode != CLOSED && m.serial == tag) {
-					m.working = FALSE;
-					set(&m.note, msg);
-				} else {
-					ui_status(msg);
-				}
-				return;
-			}
 		}
-		if (tag && tag == m.serial && m.mode != CLOSED)
-			close_overlay();
+		if (!bytes || !line_save_media(m.path, bytes, m.save_replace,
+					       &save_err)) {
+			m.working = FALSE;
+			set(&m.note, save_err ? save_err->message :
+						_("Could not save the file."));
+			ui.dirty = TRUE;
+			return;
+		}
+		close_overlay();
 		ui_status(_("File saved."));
 		return;
 	}
@@ -4340,8 +4529,10 @@ static const char *attachment_type(const char *path)
 {
 	g_autofree char *lower = g_ascii_strdown(path ? path : "", -1);
 
-	if (g_str_has_suffix(lower, ".mp4") ||
-	    g_str_has_suffix(lower, ".mov") || g_str_has_suffix(lower, ".webm"))
+	/* Keep the original bytes for containers outside the video route. */
+	if (m.as_file)
+		return "file";
+	if (g_str_has_suffix(lower, ".mp4") || g_str_has_suffix(lower, ".mov"))
 		return "video";
 	if (g_str_has_suffix(lower, ".m4a") ||
 	    g_str_has_suffix(lower, ".mp3") ||
@@ -4437,8 +4628,8 @@ static void primary(void)
 		m.working = TRUE;
 		ui_rpc("unsend", args(m.chat, m.id), m.serial);
 		break;
-	case DIAL:
-		call_rpc("callStart");
+	case CONFIRM_CALL:
+		dial();
 		break;
 	case CALL:
 		if (!g_strcmp0(m.call_state, "incoming"))
@@ -4468,6 +4659,339 @@ static void second(void)
 			call_rpc("callMute");
 	} else if (!m.working || m.mode == VIEW || m.mode == PLAY_VIDEO)
 		close_overlay();
+}
+
+gboolean ui_media_image_viewer(void)
+{
+	return m.mode == VIEW;
+}
+
+gint64 ui_media_image_deadline(void)
+{
+	return m.mode == VIEW ? m.viewer.zoom_end : 0;
+}
+
+/* History is in display order. Find the nearest photo in this direction. */
+static Json *view_neighbor(int direction)
+{
+	if (m.sticker || m.copying || m.view_album || !ui.history || !m.id ||
+	    g_strcmp0(m.chat, ui.selected))
+		return NULL;
+	gboolean found = FALSE;
+	int count = json_object_array_length(ui.history);
+
+	for (int i = direction > 0 ? 0 : count - 1; i >= 0 && i < count;
+	     i += direction) {
+		Json *row = json_object_array_get_idx(ui.history, i);
+		const char *id = ui_string(row, "id", "");
+
+		if (found && *id &&
+		    !strcmp(ui_string(row, "type", ""), "photo"))
+			return row;
+		if (!strcmp(id, m.id))
+			found = TRUE;
+	}
+	return NULL;
+}
+
+static void view_save(void)
+{
+	Json *row = json_object_new_object();
+	g_autofree char *album = g_strdup(m.view_album);
+	g_autofree char *name = g_strdup_printf(
+		"LINE-%s.%s", m.id, m.view_suffix ? m.view_suffix : "jpg");
+
+	json_object_object_add(row, "id", json_object_new_string(m.id));
+	json_object_object_add(row, "filename", json_object_new_string(name));
+	open_picker(TRUE, row, FALSE);
+	json_object_put(row);
+	set(&m.view_album, album);
+}
+
+static void view_action(enum image_control action)
+{
+	struct ui_image_view *v = &m.viewer;
+	gint64 now = g_get_monotonic_time();
+	Json *row;
+
+	switch (action) {
+	case IMAGE_ZOOM_OUT:
+	case IMAGE_ZOOM_IN: {
+		double x = v->viewport.x + v->viewport.w / 2.;
+		double y = v->viewport.y + v->viewport.h / 2.;
+
+		ui_image_view_zoom(v, action == IMAGE_ZOOM_IN ? 1. : -1., x, y,
+				   now, !ui_reduce_motion());
+		break;
+	}
+	case IMAGE_RESET:
+		if (m.image)
+			ui_image_view_reset(v);
+		break;
+	case IMAGE_ROTATE:
+		if (m.image) {
+			ui_image_view_sample(v, now);
+			ui_image_view_rotate(v);
+		}
+		break;
+	case IMAGE_SAVE:
+		if (m.image && m.id)
+			view_save();
+		break;
+	case IMAGE_PREVIOUS:
+	case IMAGE_NEXT:
+		row = view_neighbor(action == IMAGE_PREVIOUS ? -1 : 1);
+		if (row)
+			picture(row);
+		break;
+	case IMAGE_CLOSE:
+		close_overlay();
+		break;
+	default:
+		break;
+	}
+	ui.dirty = TRUE;
+}
+
+static enum image_control control_at(int x, int y)
+{
+	for (guint i = IMAGE_ZOOM_OUT; i < IMAGE_CONTROLS; i++)
+		if (at(m.view_controls[i], x, y))
+			return i;
+	return IMAGE_NOTHING;
+}
+
+static gboolean view_at(int x, int y)
+{
+	struct ui_image_rect r = ui_image_view_rect(&m.viewer);
+
+	return m.image && at(m.view_clip, x, y) && x >= r.x && y >= r.y &&
+	       x < r.x + r.w && y < r.y + r.h;
+}
+
+static gboolean view_key(const SDL_KeyboardEvent *event)
+{
+	enum image_control action;
+
+	switch (event->keysym.sym) {
+	case SDLK_ESCAPE:
+		action = IMAGE_CLOSE;
+		break;
+	case SDLK_LEFT:
+		action = IMAGE_PREVIOUS;
+		break;
+	case SDLK_RIGHT:
+		action = IMAGE_NEXT;
+		break;
+	case SDLK_PLUS:
+	case SDLK_EQUALS:
+	case SDLK_KP_PLUS:
+		action = IMAGE_ZOOM_IN;
+		break;
+	case SDLK_MINUS:
+	case SDLK_KP_MINUS:
+		action = IMAGE_ZOOM_OUT;
+		break;
+	case SDLK_0:
+	case SDLK_KP_0:
+		action = IMAGE_RESET;
+		break;
+	case SDLK_r:
+		action = IMAGE_ROTATE;
+		break;
+	case SDLK_s:
+		if (!(event->keysym.mod & KMOD_CTRL))
+			return TRUE;
+		action = IMAGE_SAVE;
+		break;
+	default:
+		return TRUE;
+	}
+	if (!event->repeat)
+		view_action(action);
+	return TRUE;
+}
+
+static gboolean view_event(SDL_Event *event)
+{
+	switch (event->type) {
+	case SDL_KEYDOWN:
+		return view_key(&event->key);
+	case SDL_MOUSEBUTTONDOWN: {
+		int x = event->button.x, y = event->button.y;
+
+		if (event->button.button != SDL_BUTTON_LEFT)
+			return TRUE;
+		m.view_down = TRUE;
+		m.view_dragged = FALSE;
+		m.view_press = control_at(x, y);
+		m.view_outside = !view_at(x, y) && !at(m.view_bar, x, y);
+		ui.hover_x = m.view_x = m.view_last_x = x;
+		ui.hover_y = m.view_y = m.view_last_y = y;
+		ui.dirty = TRUE;
+		return TRUE;
+	}
+	case SDL_MOUSEBUTTONUP: {
+		int x = event->button.x, y = event->button.y;
+		enum image_control pressed = m.view_press;
+
+		if (event->button.button != SDL_BUTTON_LEFT || !m.view_down)
+			return TRUE;
+		m.view_down = FALSE;
+		m.view_press = IMAGE_NOTHING;
+		if (!m.view_dragged && pressed && pressed == control_at(x, y))
+			view_action(pressed);
+		else if (!m.view_dragged && !pressed && m.view_outside &&
+			 !view_at(x, y) && !at(m.view_bar, x, y))
+			view_action(IMAGE_CLOSE);
+		ui.dirty = TRUE;
+		return TRUE;
+	}
+	case SDL_MOUSEMOTION: {
+		int x = event->motion.x, y = event->motion.y;
+		enum image_control hover = control_at(x, y);
+
+		if (hover != control_at(ui.hover_x, ui.hover_y))
+			ui.dirty = TRUE;
+		ui.hover_x = x;
+		ui.hover_y = y;
+		if (!(event->motion.state & SDL_BUTTON_LMASK))
+			m.view_down = FALSE;
+		if (m.view_down && !m.view_press) {
+			m.view_dragged |=
+				abs(x - m.view_x) + abs(y - m.view_y) >= 5;
+			if (m.view_dragged && !m.view_outside && m.image) {
+				ui_image_view_sample(&m.viewer,
+						     g_get_monotonic_time());
+				ui_image_view_pan(&m.viewer, x - m.view_last_x,
+						  y - m.view_last_y);
+				m.view_last_x = x;
+				m.view_last_y = y;
+				ui.dirty = TRUE;
+			}
+		}
+		return TRUE;
+	}
+	case SDL_MOUSEWHEEL: {
+		int x, y;
+
+#if SDL_VERSION_ATLEAST(2, 26, 0)
+		x = event->wheel.mouseX;
+		y = event->wheel.mouseY;
+#else
+		SDL_GetMouseState(&x, &y);
+#endif
+		ui_image_view_zoom(&m.viewer, ui_wheel_y(&event->wheel), x, y,
+				   g_get_monotonic_time(), !ui_reduce_motion());
+		ui.dirty = TRUE;
+		return TRUE;
+	}
+	case SDL_DROPFILE:
+		SDL_free(event->drop.file);
+		return TRUE;
+	case SDL_TEXTINPUT:
+	case SDL_TEXTEDITING:
+		return TRUE;
+	case SDL_WINDOWEVENT:
+		if (event->window.event == SDL_WINDOWEVENT_FOCUS_LOST) {
+			m.view_down = FALSE;
+			m.view_press = IMAGE_NOTHING;
+		}
+		break;
+	default:
+		break;
+	}
+	return FALSE;
+}
+
+static void draw_view_control(enum image_control key, const char *glyph,
+			      const char *label, Rect at_box, int size)
+{
+	m.view_controls[key] = at_box;
+	double hover = ui_draw_hover(at_box);
+
+	if (hover > 0. || m.view_press == key) {
+		guint fill = m.view_press == key ?
+				     UI_ACCENT :
+				     ui_blend(UI_RAISED, UI_SELECTED, hover);
+
+		ui_draw_rounded(at_box, at_box.h / 2, fill);
+	}
+	ui_draw_centered(glyph, at_box, size, 700,
+			 m.view_press == key ? UI_ON_ACCENT : UI_HEADING);
+	if (label && at(at_box, ui.hover_x, ui.hover_y))
+		ui_draw_tooltip(at_box, label);
+}
+
+void ui_media_draw_image_viewer(gint64 now_us)
+{
+	struct ui_image_view *v = &m.viewer;
+	const int size = 40, step = 46;
+	const int count = IMAGE_SAVE - IMAGE_ZOOM_OUT + 1;
+	const int width = count * step + 10;
+	const int left = (ui.width - width) / 2;
+
+	ui_draw_viewer_backdrop();
+	memset(m.view_controls, 0, sizeof(m.view_controls));
+	m.view_clip = (Rect){ 10, 52, ui.width - 20, ui.height - 128 };
+	m.view_bar = (Rect){ 0 };
+	if (m.image) {
+		struct ui_image_rect clip = { m.view_clip.x, m.view_clip.y,
+					      m.view_clip.w, m.view_clip.h };
+
+		ui_image_view_layout(v, clip,
+				     cairo_image_surface_get_width(m.image),
+				     cairo_image_surface_get_height(m.image),
+				     ui_pixel_scale());
+		ui_image_view_sample(v, ui_reduce_motion() && v->zoom_end ?
+						v->zoom_end :
+						now_us);
+		struct ui_image_rect bounds = ui_image_view_rect(v);
+
+		ui_draw_viewed_image(animation_frame(m.image), &bounds,
+				     m.view_clip, v->rotation);
+		m.view_bar = (Rect){ left, ui.height - 61, width, size + 10 };
+		ui_draw_rounded(m.view_bar, (size + 10) / 2, UI_RAISED);
+		const int y = m.view_bar.y + 5;
+		const char *const glyphs[] = { "−", "+",
+					       v->fitted ? "1:1" : "⊡", "↻",
+					       "↓" };
+		const char *const tips[] = {
+			_("Zoom out"),
+			_("Zoom in"),
+			v->fitted ? _("Actual size") : _("Fit to window"),
+			_("Rotate clockwise"),
+			_("Save attachment…"),
+		};
+
+		for (int i = 0; i < count; i++)
+			draw_view_control(
+				IMAGE_ZOOM_OUT + i, glyphs[i], tips[i],
+				(Rect){ left + 8 + step * i, y, size, size },
+				i == 2 ? 15 : 23);
+	} else {
+		const char *notice = m.note ? m.note : _("Loading…");
+
+		ui_draw_label(notice,
+			      (Rect){ 20, ui.height / 2 - 18, ui.width - 40,
+				      68 },
+			      15, 550, UI_HEADING, TRUE);
+	}
+	Rect title = { 20, 14, ui.width - 84, size };
+
+	ui_draw_label(m.title, title, 18, 650, UI_HEADING, FALSE);
+	draw_view_control(IMAGE_CLOSE, "×", _("Close"),
+			  (Rect){ ui.width - 54, 10, size, size }, 24);
+	if (view_neighbor(-1))
+		draw_view_control(
+			IMAGE_PREVIOUS, "‹", _("Previous image"),
+			(Rect){ 12, ui.height / 2 - size / 2, size, size }, 30);
+	if (view_neighbor(1))
+		draw_view_control(IMAGE_NEXT, "›", _("Next image"),
+				  (Rect){ ui.width - size - 12,
+					  ui.height / 2 - size / 2, size,
+					  size },
+				  30);
 }
 
 static int visible_rows(void)
@@ -4550,9 +5074,9 @@ static gboolean handle_key(SDL_KeyboardEvent k)
 			show_emoji();
 			return TRUE;
 		}
-		if (ctrl && code == SDLK_o && ui_chat_visible() &&
+		if (ctrl && code == SDLK_o && !k.repeat && ui_chat_visible() &&
 		    ui.selected && (ui.files || ui.photos)) {
-			open_picker(FALSE, NULL, FALSE);
+			open_attachment();
 			return TRUE;
 		}
 		if (code == SDLK_ESCAPE && ui.reply_id &&
@@ -4634,8 +5158,19 @@ static gboolean handle_key(SDL_KeyboardEvent k)
 	return TRUE;
 }
 
+void ui_media_record_video(void)
+{
+	if (!ui.connected || !ui.selected || !ui.files)
+		return;
+	begin(CAMERA, ui.selected, NULL, _("Record a video"));
+	set(&m.note,
+	    _("Start the camera and microphone to record a video message."));
+}
+
 static void click_overlay(int x, int y, int clicks)
 {
+	if (m.mode == CONFIRM_CALL && clicks > 1)
+		return;
 	if (m.mode == CALL) {
 		if (clicks == 2 && m.first_click_tile &&
 		    enter_fullscreen(m.first_click_tile)) {
@@ -4658,9 +5193,15 @@ static void click_overlay(int x, int y, int clicks)
 	}
 	if (at(m.third, x, y) && m.mode == PICK && !m.save && !m.friend_qr &&
 	    !m.avatar_pick) {
-		begin(CAMERA, ui.selected, NULL, _("Record a video"));
-		set(&m.note,
-		    _("Start the camera and microphone to record a video message."));
+		ui_media_record_video();
+		return;
+	}
+	if (m.mode == PREVIEW && !m.working && at(m.file_option, x, y)) {
+		m.as_file = TRUE;
+		m.photo = FALSE;
+		set(&m.note, NULL);
+		g_clear_pointer(&m.image, cairo_surface_destroy);
+		ui.dirty = TRUE;
 		return;
 	}
 	if (at(m.third, x, y) && m.mode == PREVIEW && m.path) {
@@ -4796,6 +5337,8 @@ static gboolean fullscreen_event(SDL_Event *e)
 
 gboolean ui_media_event(SDL_Event *e)
 {
+	if (attachment_event(e))
+		return TRUE;
 	if (m.play_event && e->type == m.play_event) {
 		struct clip_event *clip = e->user.data1;
 
@@ -4870,6 +5413,8 @@ gboolean ui_media_event(SDL_Event *e)
 	}
 	if (ui_media_fullscreen() && fullscreen_event(e))
 		return TRUE;
+	if (m.mode == VIEW)
+		return view_event(e);
 	if (e->type == SDL_MOUSEBUTTONDOWN &&
 	    e->button.button == SDL_BUTTON_LEFT) {
 		if (e->button.clicks <= 1) {
@@ -4894,8 +5439,10 @@ gboolean ui_media_event(SDL_Event *e)
 	}
 	if (m.mode == CLOSED && ui_profile_event(e))
 		return TRUE;
-	if (m.mode == CLOSED && !ui_lists_active() &&
-	    (ui_chat_tools_event(e) || ui_shared_event(e)))
+	if ((m.mode == CLOSED || call_stage_inline()) && !ui_lists_active() &&
+	    ui_chat_tools_event(e))
+		return TRUE;
+	if (m.mode == CLOSED && !ui_lists_active() && ui_shared_event(e))
 		return TRUE;
 	if (m.mode == CLOSED && ui_lists_active() && ui_lists_event(e))
 		return TRUE;
@@ -5041,15 +5588,15 @@ gboolean ui_media_event(SDL_Event *e)
 			return TRUE;
 		}
 		if ((ui.files || ui.photos) && at(ui.attach, x, y)) {
-			open_picker(FALSE, NULL, FALSE);
+			open_attachment();
 			return TRUE;
 		}
 		if (ui_media_can_call(FALSE) && at(ui.call, x, y)) {
-			dial(FALSE);
+			confirm_call(FALSE);
 			return TRUE;
 		}
 		if (ui_media_can_call(TRUE) && at(ui.video, x, y)) {
-			dial(TRUE);
+			confirm_call(TRUE);
 			return TRUE;
 		}
 	}
@@ -5128,7 +5675,8 @@ void ui_media_overlay(void)
 		ui_lists_draw();
 		return;
 	}
-	if (m.mode == CLOSED && ui_chat_tools_active()) {
+	if ((m.mode == CLOSED || call_stage_inline()) &&
+	    ui_chat_tools_active()) {
 		ui_chat_tools_draw();
 		return;
 	}
@@ -5194,8 +5742,12 @@ void ui_media_overlay(void)
 		draw_call_stage();
 		return;
 	}
-	int w = MIN(620, ui.width - 24),
-	    h = MIN(m.mode == VIEW ? ui.height - 24 : 530, ui.height - 24);
+	int w = MIN(620, ui.width - 24), h = MIN(530, ui.height - 24);
+
+	if (m.mode == CONFIRM_CALL) {
+		w = MIN(w, 420);
+		h = MIN(h, 182);
+	}
 	if (m.mode == UNSEND || m.mode == REPLACE || m.mode == CAMERA ||
 	    m.mode == RECORDING || m.mode == PLAY_VIDEO)
 		h = MIN(h, 246);
@@ -5218,6 +5770,8 @@ void ui_media_overlay(void)
 					 _("Choose an attachment")) :
 		m.mode == PREVIEW ?
 			(m.photo ? _("Send photo") : _("Send file")) :
+		m.mode == CONFIRM_CALL ?
+			(request_video ? _("Video call") : _("Voice call")) :
 		m.mode == REACT	  ? _("React to message") :
 		m.mode == UNSEND  ? _("Unsend message") :
 		m.mode == REPLACE ? _("File already exists") :
@@ -5269,13 +5823,11 @@ void ui_media_overlay(void)
 		}
 		yes = m.save ? _("Save") : _("Choose");
 		no = _("Cancel");
-	} else if (m.mode == VIEW || m.mode == PREVIEW) {
-		if (m.mode == PREVIEW)
-			ui_draw_label(m.title,
-				      (Rect){ x + 20, y + 55, w - 40, 30 }, 15,
-				      500, muted, FALSE);
-		Rect image = { x + 20, y + (m.mode == PREVIEW ? 93 : 62),
-			       w - 40, h - (m.mode == PREVIEW ? 210 : 178) };
+	} else if (m.mode == PREVIEW) {
+		ui_draw_label(m.title, (Rect){ x + 20, y + 55, w - 40, 30 }, 15,
+			      500, muted, FALSE);
+		Rect image = { x + 20, y + 93, w - 40, h - 210 };
+
 		if (m.image)
 			ui_draw_image(animation_frame(m.image), image);
 		else if (m.working)
@@ -5283,17 +5835,25 @@ void ui_media_overlay(void)
 				      (Rect){ image.x, image.y + 12, image.w,
 					      32 },
 				      15, 500, muted, FALSE);
-		if (m.mode == PREVIEW && !m.photo &&
-		    strcmp(attachment_type(m.path), "file")) {
-			m.third = (Rect){ x + 20, y + 102, 136, 36 };
+		m.file_option = (Rect){ 0 };
+		gboolean playable = !m.photo &&
+				    strcmp(attachment_type(m.path), "file");
+
+		if (playable && !m.working) {
+			m.third = (Rect){ x + 20, y + 102, 132, 36 };
 			ui_draw_button(m.third, _("Play preview"), FALSE);
 		}
-		if (m.mode == VIEW)
-			yes = _("Close");
-		else {
-			yes = m.working ? _("Please wait…") : _("Send");
-			no = _("Cancel");
+		if (!m.working && ui.files && (m.photo || playable)) {
+			int option_x = x + (playable ? 160 : 20);
+
+			m.file_option = (Rect){ option_x,
+						m.photo ? bottom - 80 : y + 102,
+						MIN(152, x + w - 20 - option_x),
+						36 };
+			ui_draw_button(m.file_option, _("Send as file"), FALSE);
 		}
+		yes = m.working ? _("Please wait…") : _("Send");
+		no = _("Cancel");
 	} else if (m.mode == PLAY_VIDEO) {
 		no = _("Close");
 		if (!m.working) {

@@ -224,6 +224,8 @@ Announcements are pinned notes at the top of a chat. They live on LINE's servers
 | Create | `createChatRoomAnnouncement` | `{1: reqSeq, 2: chat, 3: 0, 4: {1: 5, 2: text, 3: "line://nv/chatMsg?chatId=<chat>&messageId=<id>"}}` |
 | Remove | `removeChatRoomAnnouncement` | `{1: reqSeq, 2: chat, 3: announcement ID (i64)}` |
 
+OpenChat uses `getSquareChatAnnouncements`, `createSquareChatAnnouncement` and `deleteSquareChatAnnouncement` on SquareService. The client reads the original message ID from the text announcement, or from a chat-scoped LINE message link for a regular chat. Talk operation 30 and Square event 37 refresh the banner for the open conversation.
+
 ## Searching
 
 There is no server-side search API for personal chats, so search runs over pages the worker fetches:

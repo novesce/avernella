@@ -24,8 +24,8 @@ static struct {
 	GArray *matches;
 	guint serial, pending;
 	int selected, offset;
-	Rect field, list, accept, cancel, announcements_button, shared_button,
-		search_button, screenshot_button;
+	Rect field, list, accept, view, cancel, announcements_button,
+		shared_button, search_button, screenshot_button, record_button;
 } tools;
 
 static gboolean inside(Rect rect, int x, int y)
@@ -127,6 +127,162 @@ void ui_chat_tools_announce(Json *row)
 	open_page(PUBLISH, row);
 }
 
+static struct {
+	char *chat, *collapsed;
+	Json *rows;
+	Rect box, preview, list, toggle;
+	guint pending;
+	gboolean changed;
+} banner;
+
+void ui_chat_announcements_refresh(const char *chat)
+{
+	if (!banner.chat || (chat && g_strcmp0(chat, banner.chat)))
+		return;
+	if (banner.pending) {
+		banner.changed = TRUE;
+		return;
+	}
+	Json *params = json_object_new_object();
+
+	json_object_object_add(params, "chat",
+			       json_object_new_string(banner.chat));
+	banner.pending = ++tools.serial;
+	ui_rpc("announcements", params, banner.pending);
+}
+
+void ui_chat_announcements_select(const char *chat)
+{
+	if (!g_strcmp0(chat, banner.chat))
+		return;
+	g_free(banner.chat);
+	banner.chat = g_strdup(chat);
+	g_clear_pointer(&banner.collapsed, g_free);
+	g_clear_pointer(&banner.rows, json_object_put);
+	banner.pending = 0;
+	banner.changed = FALSE;
+	banner.box = (Rect){ 0 };
+	if (chat)
+		ui_chat_announcements_refresh(chat);
+	ui.dirty = TRUE;
+}
+
+static Json *newest_announcement(void)
+{
+	Json *newest = NULL;
+	gint64 time = -1;
+
+	for (size_t i = 0;
+	     banner.rows && i < json_object_array_length(banner.rows); i++) {
+		Json *row = json_object_array_get_idx(banner.rows, i);
+		gint64 date = json_object_get_int64(ui_field(row, "createdAt"));
+
+		if (date > time) {
+			newest = row;
+			time = date;
+		}
+	}
+	return newest;
+}
+
+static gboolean banner_collapsed(void)
+{
+	return banner.collapsed &&
+	       !g_strcmp0(banner.collapsed,
+			  ui_string(newest_announcement(), "id", NULL));
+}
+
+static void banner_set_rows(Json *rows)
+{
+	Json *latest = json_object_get(rows);
+
+	g_clear_pointer(&banner.rows, json_object_put);
+	banner.rows = latest;
+	if (banner.collapsed && !banner_collapsed())
+		g_clear_pointer(&banner.collapsed, g_free);
+	ui.dirty = TRUE;
+}
+
+static void banner_edit(Json *posted, const char *removed)
+{
+	if (g_strcmp0(banner.chat, tools.chat))
+		return;
+	const char *id = posted ? ui_string(posted, "id", NULL) : removed;
+
+	if (!id)
+		return;
+	Json *rows = json_object_new_array();
+
+	if (posted)
+		json_object_array_add(rows, json_object_get(posted));
+	for (size_t i = 0;
+	     banner.rows && i < json_object_array_length(banner.rows); i++) {
+		Json *r = json_object_array_get_idx(banner.rows, i);
+
+		if (g_strcmp0(id, ui_string(r, "id", NULL)))
+			json_object_array_add(rows, json_object_get(r));
+	}
+	banner_set_rows(rows);
+	json_object_put(rows);
+}
+
+int ui_chat_announcements_height(void)
+{
+	if (!banner.rows || !json_object_array_length(banner.rows) ||
+	    g_strcmp0(banner.chat, ui.selected))
+		return 0;
+	return banner_collapsed() ? 36 : 50;
+}
+
+void ui_chat_announcements_place(Rect region)
+{
+	int height = ui_chat_announcements_height();
+
+	banner.box = height ? (Rect){ region.x, region.y, region.w, height } :
+			      (Rect){ 0 };
+	banner.preview = banner.list = banner.toggle = (Rect){ 0 };
+	if (!height)
+		return;
+	gboolean collapsed = banner_collapsed();
+
+	banner.toggle = (Rect){ region.x + region.w - 41, region.y + 5, 30,
+				height - 10 };
+	banner.preview = (Rect){ region.x + 14, region.y,
+				 region.w - (collapsed ? 60 : 97), height };
+	if (!collapsed)
+		banner.list = (Rect){ banner.toggle.x - 39, region.y + 8, 32,
+				      height - 16 };
+}
+
+void ui_chat_announcements_draw(void)
+{
+	Rect r = banner.box;
+
+	if (!r.h)
+		return;
+	gboolean collapsed = banner_collapsed();
+
+	ui_draw_box(r, UI_PANEL);
+	ui_draw_button(banner.toggle, collapsed ? "⌄" : "⌃", FALSE);
+	if (collapsed) {
+		ui_draw_label(_("Announcements"),
+			      (Rect){ banner.preview.x, r.y + 8,
+				      banner.preview.w, r.h - 8 },
+			      13, 550, UI_MUTED, FALSE);
+		return;
+	}
+	ui_draw_button(banner.list, "…", FALSE);
+	ui_draw_label(_("Announcements"),
+		      (Rect){ banner.preview.x, r.y + 4, banner.preview.w, 17 },
+		      11, 650, UI_ACCENT, FALSE);
+	const char *text = ui_string(newest_announcement(), "text", "");
+
+	ui_draw_label(text,
+		      (Rect){ banner.preview.x, r.y + 21, banner.preview.w,
+			      27 },
+		      14, 550, UI_HEADING, FALSE);
+}
+
 static void close_tools(void)
 {
 	ui_chat_tools_reset();
@@ -178,6 +334,39 @@ static void open_announcements(void)
 	request("announcements", NULL, NULL);
 }
 
+static void show_message(Json *row)
+{
+	g_autofree char *id = g_strdup(ui_string(row, "messageId", NULL));
+
+	if (tools.page != CLOSED)
+		close_tools();
+	if (id)
+		ui_jump_to_message(id);
+}
+
+gboolean ui_chat_announcements_click(int x, int y)
+{
+	if (!inside(banner.box, x, y))
+		return FALSE;
+	if (inside(banner.toggle, x, y) ||
+	    (banner_collapsed() && inside(banner.preview, x, y))) {
+		if (banner_collapsed())
+			g_clear_pointer(&banner.collapsed, g_free);
+		else
+			banner.collapsed = g_strdup(
+				ui_string(newest_announcement(), "id", ""));
+		ui.dirty = TRUE;
+	} else if (inside(banner.list, x, y) ||
+		   (inside(banner.preview, x, y) &&
+		    !ui_string(newest_announcement(), "messageId", NULL))) {
+		open_page(ANNOUNCEMENTS, NULL);
+		open_announcements();
+	} else if (inside(banner.preview, x, y)) {
+		show_message(newest_announcement());
+	}
+	return TRUE;
+}
+
 static void primary(void)
 {
 	if (tools.pending)
@@ -220,6 +409,16 @@ gboolean ui_chat_tools_reply(const char *method, guint tag, Json *result,
 
 	if (!list && !announce && !remove && !forward)
 		return FALSE;
+	if (list && banner.pending && tag == banner.pending) {
+		banner.pending = 0;
+		if (!error && json_object_is_type(result, json_type_array))
+			banner_set_rows(result);
+		if (banner.changed) {
+			banner.changed = FALSE;
+			ui_chat_announcements_refresh(NULL);
+		}
+		return TRUE;
+	}
 	if (!tools.pending || tag != tools.pending)
 		return TRUE;
 	tools.pending = 0;
@@ -234,6 +433,8 @@ gboolean ui_chat_tools_reply(const char *method, guint tag, Json *result,
 		}
 		g_clear_pointer(&tools.announcements, json_object_put);
 		tools.announcements = json_object_get(result);
+		if (!g_strcmp0(tools.chat, banner.chat))
+			banner_set_rows(result);
 		ui.dirty = TRUE;
 	} else if (forward) {
 		Json *target = item(tools.selected);
@@ -246,6 +447,8 @@ gboolean ui_chat_tools_reply(const char *method, guint tag, Json *result,
 		if (current)
 			ui_show_latest();
 	} else {
+		banner_edit(announce ? result : NULL,
+			    remove ? tools.remove : NULL);
 		open_announcements();
 	}
 	return TRUE;
@@ -284,9 +487,15 @@ gboolean ui_chat_tools_event(SDL_Event *event)
 			close_tools();
 		else if ((key.keysym.sym == SDLK_RETURN ||
 			  key.keysym.sym == SDLK_KP_ENTER) &&
-			 !key.repeat)
-			primary();
-		else if (!tools.pending && key.keysym.sym == SDLK_UP)
+			 !key.repeat) {
+			Json *row = item(tools.selected);
+
+			if (!tools.pending && tools.page == ANNOUNCEMENTS &&
+			    ui_string(row, "messageId", NULL))
+				show_message(row);
+			else
+				primary();
+		} else if (!tools.pending && key.keysym.sym == SDLK_UP)
 			step(-1);
 		else if (!tools.pending && key.keysym.sym == SDLK_DOWN)
 			step(1);
@@ -337,7 +546,12 @@ gboolean ui_chat_tools_event(SDL_Event *event)
 		} else if (inside(tools.screenshot_button, x, y)) {
 			close_tools();
 			ui_media_screenshot();
-		} else if (inside(tools.accept, x, y))
+		} else if (inside(tools.record_button, x, y)) {
+			close_tools();
+			ui_media_record_video();
+		} else if (inside(tools.view, x, y))
+			show_message(item(tools.selected));
+		else if (inside(tools.accept, x, y))
 			primary();
 		else if (inside(tools.list, x, y)) {
 			int index = (y - tools.list.y) / 48 + tools.offset;
@@ -361,7 +575,7 @@ void ui_chat_tools_draw(void)
 {
 	int w = MIN(535, ui.width - 28);
 	int h = tools.page == FORWARD || tools.page == ANNOUNCEMENTS ? 450 :
-		tools.page == MENU ? (ui.photos ? 320 : 270) :
+		tools.page == MENU ? (ui.photos || ui.files ? 320 : 270) :
 				     240;
 
 	h = MIN(h, ui.height - 32);
@@ -378,9 +592,10 @@ void ui_chat_tools_draw(void)
 
 	ui_draw_label(title, (Rect){ x + 18, y + 13, w - 36, 35 }, 22, 700,
 		      UI_HEADING, FALSE);
-	tools.field = tools.list = tools.accept = tools.announcements_button =
-		tools.shared_button = tools.search_button =
-			tools.screenshot_button = (Rect){ 0 };
+	tools.field = tools.list = tools.accept = tools.view =
+		tools.announcements_button = tools.shared_button =
+			tools.search_button = tools.screenshot_button =
+				tools.record_button = (Rect){ 0 };
 	tools.cancel = (Rect){ x + 18, foot, 100, 36 };
 	ui_draw_button(tools.cancel, _("Close"), FALSE);
 
@@ -394,11 +609,21 @@ void ui_chat_tools_draw(void)
 		tools.search_button = (Rect){ x + 18, y + 161, w - 36, 40 };
 		ui_draw_button(tools.search_button, _("Search all chats"),
 			       FALSE);
+		int capture_w = ui.photos && ui.files ? (w - 44) / 2 : w - 36;
+
 		if (ui.photos) {
 			tools.screenshot_button =
-				(Rect){ x + 18, y + 212, w - 36, 40 };
+				(Rect){ x + 18, y + 212, capture_w, 40 };
 			ui_draw_button(tools.screenshot_button,
 				       _("Take screenshot"), FALSE);
+		}
+		if (ui.files) {
+			int rx = x + w - 18 - capture_w;
+
+			tools.record_button =
+				(Rect){ rx, y + 212, capture_w, 40 };
+			ui_draw_button(tools.record_button, _("Record video"),
+				       FALSE);
 		}
 	} else if (tools.page == PUBLISH || tools.page == REMOVE) {
 		const char *description =
@@ -460,6 +685,11 @@ void ui_chat_tools_draw(void)
 				      14, 500, UI_MUTED, FALSE);
 		Json *selected = item(tools.selected);
 
+		if (tools.page == ANNOUNCEMENTS &&
+		    ui_string(selected, "messageId", NULL)) {
+			tools.view = (Rect){ x + w - 224, foot, 84, 36 };
+			ui_draw_button(tools.view, _("View"), !tools.pending);
+		}
 		if (selected && (tools.page == FORWARD ||
 				 json_object_get_boolean(
 					 ui_field(selected, "canRemove")))) {

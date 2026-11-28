@@ -3,6 +3,19 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Could not open the desktop file chooser.",
+	  "システムのファイル選択画面を開けませんでした。" },
+	{ "Voice call", "音声通話" },
+	{ "Start call", "通話を開始" },
+	{ "Attachment", "添付ファイル" },
+	{ "Send as file", "ファイルとして送信" },
+	{ "Zoom out", "縮小" },
+	{ "Zoom in", "拡大" },
+	{ "Actual size", "実際のサイズ" },
+	{ "Fit to window", "ウィンドウに合わせる" },
+	{ "Rotate clockwise", "時計回りに回転" },
+	{ "Previous image", "前の画像" },
+	{ "Next image", "次の画像" },
 	{ "Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.",
 	  "下書きをコピーしてからログアウトし、QRコードで再連携してLetter Sealingを更新してください。" },
 	{ "Accent color", "アクセントカラー" },

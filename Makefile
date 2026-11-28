@@ -14,7 +14,7 @@ endif
 ifeq ($(origin CC),default)
 CC = gcc
 endif
-PKGS = sdl2 pangocairo glib-2.0 libqrencode json-c libcurl libcrypto libturbojpeg libpng libwebp opus libsrtp2 gio-2.0 gio-unix-2.0 zlib vpx libpipewire-0.3 rnnoise libseccomp
+PKGS = sdl2 pangocairo glib-2.0 libqrencode json-c libcurl libcrypto libturbojpeg libpng libwebp opus libsrtp2 gio-2.0 gio-unix-2.0 wayland-client zlib vpx libpipewire-0.3 rnnoise libseccomp
 CPPFLAGS += -D_GNU_SOURCE -Isrc $(shell pkg-config --cflags $(PKGS))
 ifeq ($(DEBUG),1)
 CFLAGS ?= -Og -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables
@@ -75,7 +75,7 @@ endif
 CFLAGS += $(FORTIFY) $(STACK_CLASH) $(HARDEN)
 endif
 LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,separate-code,-z,noexecstack,-O1
-SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
+SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media ui_image_view video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_fec call_pdtp screencast screencast_dma live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
 SOURCES += security/ipc security/sandbox security/vault
@@ -89,13 +89,18 @@ ifeq ($(CALL_VP8_JETSON),1)
 SOURCES += call_vp8_jetson
 endif
 SOURCES += chat_lists shared_content ui_chat_lists ui_chat_tools ui_shared_content ui_notifications screenshot
-SOURCES += ui_instance ui_tray ui_logo video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
+SOURCES += ui_instance ui_tray ui_window file_chooser ui_logo video_play talk_sync flex_asset ui_flex qr_scan profile_image ui_profile rich_message clipboard_paste
 SOURCES += liff liff_url ui_liff chiptune ui_sounds call_denoise ui_gpu_scroll ui_gpu ui_theme ui_lang
 # Interface translations, one table per language (see src/ui_lang_table.h).
 UI_LANGS = ui_lang_ja ui_lang_ko ui_lang_th ui_lang_zh_hans ui_lang_zh_hant ui_lang_vi ui_lang_id ui_lang_ms ui_lang_fr ui_lang_de ui_lang_it ui_lang_es ui_lang_pt ui_lang_ru ui_lang_ar ui_lang_tr
 SOURCES += $(UI_LANGS)
 UI_LANG_OBJECTS = build/ui_lang.o $(UI_LANGS:%=build/%.o)
-OBJECTS = $(SOURCES:%=build/%.o)
+WAYLAND_SCANNER ?= wayland-scanner
+WAYLAND_PROTOCOLS ?= $(shell pkg-config --variable=pkgdatadir wayland-protocols)
+WAYLAND_NAMES = xdg-activation-v1 xdg-foreign-unstable-v1 xdg-foreign-unstable-v2
+WAYLAND_OBJECTS = $(WAYLAND_NAMES:%=build/%-code.o)
+UI_WINDOW_OBJECTS = build/ui_window.o $(WAYLAND_OBJECTS)
+OBJECTS = $(SOURCES:%=build/%.o) $(WAYLAND_OBJECTS)
 GIT_COMMIT := $(if $(wildcard .git),$(shell git rev-parse HEAD 2>/dev/null | cut -c1-7))
 COMMIT_DEFINE := \#define LINE_BUILD_COMMIT "$(or $(GIT_COMMIT),unknown commit)"
 CLANG_FORMAT ?= clang-format
@@ -115,11 +120,12 @@ CHECKPATCH_FLAGS = --no-tree --file --terse --quiet --show-types --typedefsfile 
 # Test fixtures keep long JSON and protocol strings split across lines.
 CHECKPATCH_TEST_FLAGS = $(CHECKPATCH_FLAGS) --ignore SPLIT_STRING,MISSING_SPACE
 TESTS = build/test-thrift build/test-state build/test-sealing build/test-messaging build/test-pair build/test-transport build/test-media build/test-call build/test-audio build/test-media-io build/test-obs build/test-video-record build/test-ui-motion build/test-ui-pixels build/test-emoji-message build/test-ui-apng build/test-emoji build/test-ui-emoji
+TESTS += build/test-ui-image-view build/test-ui-image-overlay
 TESTS += build/test-friends build/test-groups build/test-square build/test-ui-friends build/test-ui-read
 TESTS += build/test-stickers build/test-call-video
 TESTS += build/test-call-group build/test-pdtp
 TESTS += build/test-chat-lists build/test-shared-content build/test-ui-tray build/test-ui-instance
-TESTS += build/test-ui-notifications
+TESTS += build/test-ui-notifications build/test-file-chooser
 TESTS += build/test-video-play build/test-talk-sync build/test-live-sync
 TESTS += build/test-flex-asset build/test-ui-flex
 TESTS += build/test-ui-refresh build/test-ui-chat-refresh
@@ -252,6 +258,25 @@ build/avernella_%.inc: data/avernella-%.png | build
 build/ui_logo.o: override CPPFLAGS += -Ibuild
 build/ui_logo.o: build/avernella_mark.inc build/avernella_welcome.inc
 
+build/xdg-activation-v1-%.wayland: $(WAYLAND_PROTOCOLS)/staging/xdg-activation/xdg-activation-v1.xml | build
+	$(WAYLAND_SCANNER) $* $< $@
+
+build/xdg-foreign-unstable-v1-%.wayland: $(WAYLAND_PROTOCOLS)/unstable/xdg-foreign/xdg-foreign-unstable-v1.xml | build
+	$(WAYLAND_SCANNER) $* $< $@
+
+build/xdg-foreign-unstable-v2-%.wayland: $(WAYLAND_PROTOCOLS)/unstable/xdg-foreign/xdg-foreign-unstable-v2.xml | build
+	$(WAYLAND_SCANNER) $* $< $@
+
+.SECONDARY: $(WAYLAND_NAMES:%=build/%-client-header.wayland) $(WAYLAND_NAMES:%=build/%-private-code.wayland)
+build/%-client.h: build/%-client-header.wayland
+	cp $< $@
+
+build/%-code.o: build/%-private-code.wayland Makefile
+	$(CC) $(CPPFLAGS) $(CFLAGS) -x c -c $< -o $@
+
+build/ui_window.o: override CPPFLAGS += -Ibuild
+build/ui_window.o: $(WAYLAND_NAMES:%=build/%-client.h)
+
 build/%.o: src/%.c Makefile | build
 	@mkdir -p $(dir $@)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
@@ -339,6 +364,8 @@ build/camera_pixels.o build/screencast.o: CFLAGS += -O3
 build/screencast_dma.o build/screencast.o: CFLAGS += -Wno-pedantic
 build/qr_scan.o: CPPFLAGS += $(shell pkg-config --cflags zbar)
 build/test-ui-pixels: tests/ui_pixels.c build/ui_pixels.o build/ui_gpu_scroll.o
+build/test-ui-image-view: tests/ui_image_view.c build/ui_image_view.o
+
 build/test-ui-motion: tests/ui_motion.c build/ui_motion.o
 build/test-ui-theme: tests/ui_theme.c build/ui_theme.o
 build/test-ui-lang: tests/ui_lang.c $(UI_LANG_OBJECTS)
@@ -369,7 +396,8 @@ build/test-chat-lists: tests/chat_lists.c build/chat_lists.o
 build/test-shared-content: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
 build/test-shared-content: tests/shared_content.c build/shared_content.o build/http_tune.o
 build/test-ui-instance: tests/ui_instance.c build/ui_instance.o
-build/test-ui-tray: tests/ui_tray.c build/ui_tray.o build/ui_logo.o build/ui_pixels.o $(UI_LANG_OBJECTS)
+build/test-ui-tray: tests/ui_tray.c build/ui_tray.o build/ui_logo.o build/ui_pixels.o $(UI_WINDOW_OBJECTS) $(UI_LANG_OBJECTS)
+build/test-file-chooser: tests/file_chooser.c build/file_chooser.o
 build/test-ui-notifications: tests/ui_notifications.c build/ui_notifications.o $(UI_LANG_OBJECTS)
 build/test-ui-friends: tests/ui_friends.c build/ui_friends.o build/ui_motion.o build/ui_theme.o $(UI_LANG_OBJECTS)
 build/test-ui-read: tests/ui_read.c
@@ -392,6 +420,8 @@ $(TESTS):
 build/render-bench build/test-ui-call-fullscreen: private LDFLAGS += -Wl,--wrap=SDL_RenderPresent
 build/test-ui-call-fullscreen build/test-ui-refresh: private LDFLAGS += -Wl,--wrap=ui_rpc
 build/test-ui-refresh: tests/ui_refresh.c build/ui_gpu.o
+build/test-ui-image-overlay: private LDFLAGS += -Wl,--wrap=ui_rpc
+build/test-ui-image-overlay: tests/ui_image_overlay.c build/ui_gpu.o
 build/test-ui-call-fullscreen: tests/ui_call_fullscreen.c build/ui_gpu.o
 build/test-ui-chat-refresh: private LDFLAGS += -Wl,--wrap=SDL_PollEvent
 build/test-ui-chat-refresh: tests/ui_chat_refresh.c build/ui_gpu.o build/tune.o
@@ -404,12 +434,13 @@ build/test-ui-scroll-scene: tests/ui_scroll_scene.c
 build/test-ui-scroll-scene: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time
 build/render-bench: tests/render_bench.c build/ui_gpu.o
 UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene build/test-ui-refresh
-UI_FIXTURE_TARGETS += build/test-ui-chat-refresh
+UI_FIXTURE_TARGETS += build/test-ui-chat-refresh build/test-ui-image-overlay
 UI_FIXTURE_TARGETS += build/test-ui-worker-stop
 $(UI_FIXTURE_TARGETS): build/ui.o build/gpu_health.o build/ui_draw.o build/ui_media.o build/video_record.o build/ui_motion.o build/ui_pixels.o build/ui_emoji.o build/ui_apng.o build/ui_friends.o build/ui_groups.o build/ui_openchat.o build/ui_find.o
 $(UI_FIXTURE_TARGETS): build/ui_chat_lists.o build/chat_lists.o build/ui_chat_tools.o build/ui_shared_content.o build/ui_notifications.o build/ui_tray.o build/ui_instance.o build/video_play.o build/ui_flex.o build/flex_asset.o build/qr_scan.o
 $(filter-out build/test-ui-scroll-scene,$(UI_FIXTURE_TARGETS)): build/screenshot.o
-$(UI_FIXTURE_TARGETS): build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
+$(UI_FIXTURE_TARGETS): build/ui_image_view.o build/camera_pixels.o build/media_io.o build/ui_profile.o build/clipboard_paste.o build/ui_liff.o build/liff_url.o
+$(UI_FIXTURE_TARGETS): $(UI_WINDOW_OBJECTS) build/file_chooser.o
 $(UI_FIXTURE_TARGETS): build/ui_sounds.o build/chiptune.o build/ui_gpu_scroll.o build/ui_logo.o build/ui_theme.o build/sandbox.o build/security/sandbox.o build/security/ipc.o $(UI_LANG_OBJECTS)
 build/render-bench:
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $^ $(LDLIBS) -o $@
@@ -597,6 +628,7 @@ clean:
 	$(RM) build/test-call_denoise.o build/test-call_denoise.d
 	$(RM) build/test-call_vp8_encode.o build/test-call_vp8_encode.d build/call_vp8_jetson.o build/call_vp8_jetson.d build/call_jetson_config.h
 	$(RM) build/liff_browser.o build/liff_browser.d build/liff_browser_gtk.o build/liff_browser_gtk.d avernella-liff avernella-liff-gtk
+	$(RM) $(WAYLAND_NAMES:%=build/%-client.h) $(WAYLAND_NAMES:%=build/%-client-header.wayland) $(WAYLAND_NAMES:%=build/%-private-code.wayland)
 	$(RM) build/test-call-scheduler build/vulkan-smoke build/vulkan-preview build/vulkan-video-bench build/volk.o build/line_ui_spirv.h $(VK_SPIRV)
 	$(RM) -r $(FUZZ_DIR)/obj $(FUZZ_DIR)/seeds
 	$(RM) $(FUZZ_BINARIES) $(FUZZ_DIR)/fuzz-seeds $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h

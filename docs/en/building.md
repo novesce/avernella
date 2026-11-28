@@ -13,6 +13,7 @@ These are the `pkg-config` packages in `PKGS` at the top of the [Makefile](../..
 | Package | Used for |
 | ------- | -------- |
 | `sdl2` (sdl2-compat on SDL3 is preferred) | Window, input, audio, clipboard |
+| `wayland-client` and `wayland-protocols` plus `wayland-scanner` | Portal window parenting and tray activation |
 | `pangocairo` | Drawing (Cairo) and text layout (Pango), including Thai and emoji |
 | `glib-2.0`, `gio-2.0`, `gio-unix-2.0` | Containers, threads, D-Bus (tray, notifications, portals) |
 | `json-c` | All structured data, including the Thrift bridge |
@@ -38,12 +39,12 @@ Optional pieces, each detected automatically:
 | Hardware VP8 calls | FFmpeg development headers for `libavcodec` and `libavutil` (Ubuntu packages `libavcodec-dev libavutil-dev`, Arch package `ffmpeg`) | libvpx handles calls in software. Set `CALL_HWCODECS=0` to disable the FFmpeg call backends. The older `CALL_HWDECODE=0` switch also works. |
 | Jetson VP8 encoder | On AArch64 the build detects `gstreamer-app-1.0` and `gstreamer-video-1.0`. Jetson Nano and TX2 use the JetPack `nvvidconv` and `nvv4l2vp8enc` plugins. | The other encoders remain available. Set `CALL_VP8_JETSON=0` to omit the Jetson backend. |
 | FFmpeg | `ffmpeg`, `ffplay`, `ffprobe` executables | No camera video messages or video playback, and the recording tests fail. |
-| XDG desktop portal | `xdg-desktop-portal` with a backend for your desktop | No screenshots or screen sharing. |
+| XDG desktop portal | `xdg-desktop-portal` with a backend for your desktop | The attachment chooser, screenshots and screen sharing are unavailable. |
 
 On Arch Linux or CachyOS, the README lists the exact `pacman` commands. In short:
 
 ```sh
-sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat \
+sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat wayland wayland-protocols \
   cairo pango glib2 qrencode zbar json-c curl openssl \
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader   # Vulkan module

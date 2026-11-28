@@ -2,6 +2,7 @@
 #include "ui_tray.h"
 #include "ui_lang.h"
 #include "ui_logo.h"
+#include "ui_window.h"
 #include <gio/gio.h>
 #include <string.h>
 #include <unistd.h>
@@ -37,6 +38,7 @@
 	PROP("ItemIsMenu", "b") \
 	PROP("Menu", "o") \
 	METHOD("Activate", INPUT("i") INPUT("i")) \
+	METHOD("ProvideXdgActivationToken", INPUT("s")) \
 	METHOD("SecondaryActivate", INPUT("i") INPUT("i")) \
 	METHOD("ContextMenu", INPUT("i") INPUT("i")) \
 	METHOD("Scroll", INPUT("i") INPUT("s")) \
@@ -65,7 +67,6 @@ enum tray_action {
 	SHOW = 1,
 	HIDE,
 	QUIT,
-	TOGGLE,
 	HOST_GONE,
 	BACKGROUND_ALLOWED
 };
@@ -97,6 +98,8 @@ static struct {
 	GDBusConnection *bus;
 	GVariant *icon;
 	char *address, *name;
+	char *activation, *activation_sender;
+	gint64 activation_at;
 	Uint32 event;
 	gint available;
 	gint background;
@@ -106,16 +109,29 @@ static struct {
 	struct host hosts[2];
 } tray;
 
+/* Only the SDL main thread owns a token waiting for the first frame. */
+static char *pending_activation;
+
 static const char *const labels[] = { "", N_("Open Avernella"),
 				      N_("Hide window"), N_("Quit Avernella") };
 
-static void queue_action(enum tray_action which)
+static void queue_action(enum tray_action which, const char *sender)
 {
 	SDL_Event e = { 0 };
 
 	e.type = tray.event;
 	e.user.code = which;
-	SDL_PushEvent(&e);
+	e.user.data1 = NULL;
+	if (which == SHOW && sender && tray.activation &&
+	    !g_strcmp0(sender, tray.activation_sender)) {
+		if (g_get_monotonic_time() - tray.activation_at <
+		    15 * G_TIME_SPAN_SECOND)
+			e.user.data1 = g_steal_pointer(&tray.activation);
+		g_clear_pointer(&tray.activation, g_free);
+		g_clear_pointer(&tray.activation_sender, g_free);
+	}
+	if (SDL_PushEvent(&e) != 1)
+		g_free(e.user.data1);
 }
 
 static void availability(void)
@@ -123,7 +139,7 @@ static void availability(void)
 	gboolean active = tray.hosts[0].visible || tray.hosts[1].visible;
 
 	if (g_atomic_int_exchange(&tray.available, active) && !active)
-		queue_action(HOST_GONE);
+		queue_action(HOST_GONE, NULL);
 }
 
 static void background_response(GDBusConnection *bus, const char *sender,
@@ -150,7 +166,7 @@ static void background_response(GDBusConnection *bus, const char *sender,
 	g_atomic_int_set(&tray.background,
 			 allowed ? BACKGROUND_GRANTED : BACKGROUND_DECLINED);
 	if (allowed)
-		queue_action(BACKGROUND_ALLOWED);
+		queue_action(BACKGROUND_ALLOWED, NULL);
 }
 
 static void background_requested(GObject *source, GAsyncResult *result,
@@ -345,7 +361,7 @@ static int number(GVariant *p, guint i)
 	return v;
 }
 
-static gboolean menu_event(GVariant *p)
+static gboolean menu_event(GVariant *p, const char *sender)
 {
 	int id = number(p, 0);
 	const char *event;
@@ -354,11 +370,11 @@ static gboolean menu_event(GVariant *p)
 	if (id < SHOW || id > QUIT)
 		return FALSE;
 	if (!strcmp(event, "clicked"))
-		queue_action(id);
+		queue_action(id, sender);
 	return TRUE;
 }
 
-static GVariant *menu_call(const char *method, GVariant *p)
+static GVariant *menu_call(const char *method, GVariant *p, const char *sender)
 {
 	if (!strcmp(method, "GetLayout")) {
 		int id = number(p, 0);
@@ -399,7 +415,7 @@ static GVariant *menu_call(const char *method, GVariant *p)
 		return g_variant_new("(a(ia{sv}))", &out);
 	}
 	if (!strcmp(method, "Event"))
-		return menu_event(p) ? g_variant_new("()") : NULL;
+		return menu_event(p, sender) ? g_variant_new("()") : NULL;
 	if (!strcmp(method, "EventGroup")) {
 		g_autoptr(GVariant) events = g_variant_get_child_value(p, 0);
 		GVariantBuilder errors;
@@ -408,7 +424,7 @@ static GVariant *menu_call(const char *method, GVariant *p)
 		for (gsize i = 0; i < g_variant_n_children(events); i++) {
 			g_autoptr(GVariant) event =
 				g_variant_get_child_value(events, i);
-			if (!menu_event(event))
+			if (!menu_event(event, sender))
 				g_variant_builder_add(&errors, "i",
 						      number(event, 0));
 		}
@@ -427,11 +443,10 @@ static void method_call(GDBusConnection *bus, const char *sender,
 			GVariant *p, GDBusMethodInvocation *call, gpointer user)
 {
 	(void)bus;
-	(void)sender;
 	(void)path;
 	(void)user;
 	if (!strcmp(iface, MENU_IFACE)) {
-		GVariant *out = menu_call(method, p);
+		GVariant *out = menu_call(method, p, sender);
 
 		if (out)
 			g_dbus_method_invocation_return_value(call, out);
@@ -441,11 +456,22 @@ static void method_call(GDBusConnection *bus, const char *sender,
 				"Unknown tray menu item or property.");
 		return;
 	}
-	if (!strcmp(method, "Activate"))
-		queue_action(TOGGLE);
-	else if (!strcmp(method, "SecondaryActivate") ||
-		 !strcmp(method, "ContextMenu"))
-		queue_action(SHOW);
+	if (!strcmp(method, "ProvideXdgActivationToken")) {
+		const char *token;
+
+		g_variant_get(p, "(&s)", &token);
+		g_clear_pointer(&tray.activation, g_free);
+		g_clear_pointer(&tray.activation_sender, g_free);
+		if (*token && strlen(token) <= 4096) {
+			tray.activation = g_strdup(token);
+			tray.activation_sender = g_strdup(sender);
+			tray.activation_at = g_get_monotonic_time();
+		}
+	} else if (!strcmp(method, "Activate") ||
+		   !strcmp(method, "SecondaryActivate") ||
+		   !strcmp(method, "ContextMenu")) {
+		queue_action(SHOW, sender);
+	}
 	g_dbus_method_invocation_return_value(call, NULL);
 }
 
@@ -705,6 +731,16 @@ void ui_tray_stop(void)
 	g_clear_pointer(&tray.loop, g_main_loop_unref);
 	g_clear_pointer(&tray.context, g_main_context_unref);
 	g_clear_pointer(&tray.address, g_free);
+	if (tray.event && tray.event != (Uint32)-1) {
+		SDL_Event e;
+
+		while (SDL_PeepEvents(&e, 1, SDL_GETEVENT, tray.event,
+				      tray.event) == 1)
+			g_free(e.user.data1);
+	}
+	g_clear_pointer(&tray.activation, g_free);
+	g_clear_pointer(&tray.activation_sender, g_free);
+	g_clear_pointer(&pending_activation, g_free);
 	g_clear_pointer(&tray.name, g_free);
 	tray.event = 0;
 	tray.background = BACKGROUND_UNASKED;
@@ -715,13 +751,19 @@ void ui_tray_stop(void)
 void ui_present_window(SDL_Window *window)
 {
 	tray.close_pending = FALSE;
-	Uint32 flags = SDL_GetWindowFlags(window);
-
-	if (flags & SDL_WINDOW_HIDDEN)
-		SDL_ShowWindow(window);
-	if (flags & SDL_WINDOW_MINIMIZED)
+	SDL_ShowWindow(window);
+	if (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED)
 		SDL_RestoreWindow(window);
+	/* X11 uses the window manager; Wayland also accepts a panel token. */
 	SDL_RaiseWindow(window);
+}
+
+void ui_tray_presented(SDL_Window *window)
+{
+	g_autofree char *token = g_steal_pointer(&pending_activation);
+
+	if (token)
+		ui_window_activate(window, token);
 }
 
 gboolean ui_tray_hide(SDL_Window *window)
@@ -764,15 +806,17 @@ gboolean ui_tray_event(const SDL_Event *event, SDL_Window *window,
 
 	if (action == QUIT)
 		*quitting = TRUE;
-	else if (action == SHOW ||
-		 (action == HOST_GONE && hidden &&
-		  !g_atomic_int_get(&tray.available)) ||
-		 (action == TOGGLE &&
-		  (flags & (SDL_WINDOW_HIDDEN | SDL_WINDOW_MINIMIZED))))
+	else if (action == SHOW || (action == HOST_GONE && hidden &&
+				    !g_atomic_int_get(&tray.available))) {
+		if (event->user.data1) {
+			g_free(pending_activation);
+			pending_activation = event->user.data1;
+		}
 		ui_present_window(window);
-	else if (action == TOGGLE || action == HIDE)
+	} else if (action == HIDE) {
+		g_clear_pointer(&pending_activation, g_free);
 		ui_tray_close(window);
-	else if (action == BACKGROUND_ALLOWED && tray.close_pending) {
+	} else if (action == BACKGROUND_ALLOWED && tray.close_pending) {
 		tray.close_pending = FALSE;
 		ui_tray_hide(window);
 	}

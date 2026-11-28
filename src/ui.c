@@ -14,6 +14,7 @@
 #include "flex_asset.h"
 #include "ui_chat_lists.h"
 #include "ui_tray.h"
+#include "ui_window.h"
 #include "ui_instance.h"
 #include "ui_chat_tools.h"
 #include "ui_emoji.h"
@@ -494,7 +495,8 @@ static struct {
 	GAsyncQueue *writes;
 	GHashTable *requests;
 	guint generation, seq, newest_history, rendered_history;
-	guint history_pending;
+	guint history_pending, jump_request;
+	char *jump_message, *jump_pending;
 	gboolean history_again, chats_again, refresh_notice;
 	gint stopping;
 	GHashTable *read_marks;
@@ -1431,6 +1433,10 @@ static void reset_login(const char *message)
 	g_clear_pointer(&ui.pin, g_free);
 	g_clear_pointer(&ui.selected, g_free);
 	g_clear_pointer(&ui.name, g_free);
+	ui_chat_announcements_select(NULL);
+	g_clear_pointer(&wire.jump_message, g_free);
+	g_clear_pointer(&wire.jump_pending, g_free);
+	wire.jump_request = 0;
 	set_json(&ui.opened, NULL);
 	set_json(&ui.chats, NULL);
 	wire.notification_baseline = 0;
@@ -1807,8 +1813,10 @@ static void refresh_content(gboolean manual)
 	if (!ui.connected || ui.logging_out)
 		return;
 	ui_media_refresh();
-	if (manual)
+	if (manual) {
 		ui_media_refresh_flex();
+		ui_chat_announcements_refresh(ui.selected);
+	}
 	retry_read_receipt();
 	refresh();
 }
@@ -1827,6 +1835,78 @@ static void history_page(gboolean latest)
 		wire.newest_history = request(OLDER, ui.selected, NULL);
 	}
 	ui.dirty = TRUE;
+}
+
+void ui_history_jump_offset(int offset)
+{
+	ui.history_offset = CLAMP(offset, 0, ui.max_history_offset);
+	ui_scroll_reset(&history_scroll, ui.history_offset);
+	ui.stick_bottom = FALSE;
+}
+
+/* The renderer can use the measured row height on the next full redraw. */
+char *ui_take_message_jump(void)
+{
+	return g_steal_pointer(&wire.jump_message);
+}
+
+static gboolean display_message(const char *id)
+{
+	if (!id)
+		return FALSE;
+	for (size_t i = 0;
+	     ui.history && i < json_object_array_length(ui.history); i++) {
+		Json *row = json_object_array_get_idx(ui.history, i);
+
+		if (!g_strcmp0(id, ui_string(row, "id", NULL))) {
+			set_string(&wire.jump_message, id);
+			ui_history_jump_offset(ui.history_offset);
+			ui.dirty = TRUE;
+			return TRUE;
+		}
+	}
+	return FALSE;
+}
+
+void ui_jump_to_message(const char *id)
+{
+	guint64 target = ui_read_id(id);
+
+	if (!target || !ui.selected || display_message(id))
+		return;
+	guint64 latest = 0;
+
+	for (size_t i = 0;
+	     ui.history && i < json_object_array_length(ui.history); i++) {
+		Json *row = json_object_array_get_idx(ui.history, i);
+
+		latest = MAX(latest, ui_read_id(ui_string(row, "id", NULL)));
+	}
+	if (!ui.history && wire.history_pending) {
+		wire.jump_request = wire.history_pending;
+	} else {
+		guint before = wire.newest_history;
+
+		/* One user action fetches at most one additional page. */
+		history_page(ui.older_page && target > latest);
+		if (wire.newest_history == before) {
+			ui_status(_("No messages on this page."));
+			return;
+		}
+		wire.jump_request = wire.newest_history;
+	}
+	set_string(&wire.jump_pending, id);
+}
+
+static void finish_message_jump(guint request_id, gboolean success)
+{
+	if (wire.jump_request != request_id)
+		return;
+	wire.jump_request = 0;
+	g_autofree char *id = g_steal_pointer(&wire.jump_pending);
+
+	if (success && !display_message(id))
+		ui_status(_("No messages on this page."));
 }
 
 void ui_refilter_chats(void)
@@ -1871,6 +1951,9 @@ static void select_id(const char *id)
 		remember_draft();
 		ui_media_select_chat();
 		set_string(&ui.selected, id);
+		g_clear_pointer(&wire.jump_message, g_free);
+		g_clear_pointer(&wire.jump_pending, g_free);
+		wire.jump_request = 0;
 		retry_read_receipt();
 		ui_media_chat_shown();
 		wire.selected_summary = chat_summary(id);
@@ -1878,6 +1961,7 @@ static void select_id(const char *id)
 		set_json(&ui.history, NULL);
 		set_string(&ui.notice, _("Loading messages…"));
 		request_history();
+		ui_chat_announcements_select(ui.selected);
 		ui.stick_bottom = TRUE;
 	}
 	focus_on(F_MESSAGE);
@@ -1948,6 +2032,10 @@ static void show_chats(Json *list)
 			ui_find_reset();
 		remember_draft();
 		g_clear_pointer(&ui.selected, g_free);
+		ui_chat_announcements_select(NULL);
+		g_clear_pointer(&wire.jump_message, g_free);
+		g_clear_pointer(&wire.jump_pending, g_free);
+		wire.jump_request = 0;
 		set_json(&ui.history, NULL);
 		set_text(&ui.message, "");
 		set_string(&ui.notice, "");
@@ -2259,6 +2347,9 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			set_json(&ui.history, merged);
 			set_string(&ui.notice, "");
 		}
+		finish_message_jump(
+			id,
+			!error && json_object_is_type(result, json_type_array));
 		if (wire.history_again && !ui.older_page && !ui.logging_out)
 			request_history();
 		break;
@@ -2309,12 +2400,14 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				&ui.notice,
 				error ? error :
 					_("Could not read earlier messages."));
+			finish_message_jump(id, FALSE);
 			break;
 		}
 		ui.has_older =
 			json_object_get_boolean(ui_field(result, "more"));
 		if (!json_object_array_length(rows)) {
 			set_string(&ui.notice, _("Beginning of conversation."));
+			finish_message_jump(id, FALSE);
 			break;
 		}
 		ui.older_page = TRUE;
@@ -2322,6 +2415,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		ui_scroll_reset(&history_scroll, 0);
 		set_json(&ui.history, rows);
 		set_string(&ui.notice, "");
+		finish_message_jump(id, TRUE);
 		break;
 	}
 	case MEDIA:
@@ -2467,6 +2561,9 @@ static void handle_packet(Json *packet)
 	else if (!strcmp(event, "chat_message") && ui.connected &&
 		 !ui.logging_out)
 		chat_message(packet);
+	else if (!strcmp(event, "announcements_changed") && ui.connected &&
+		 !ui.logging_out)
+		ui_chat_announcements_refresh(ui_string(packet, "chat", NULL));
 	else if (!strcmp(event, "message_unsent") && ui.connected &&
 		 !ui.logging_out)
 		chat_message_unsent(packet);
@@ -2910,6 +3007,8 @@ static void click(int x, int y)
 	if (mp.open)
 		mention_popup_close();
 	if (ui.connected && ui.selected && ui_chat_visible()) {
+		if (ui_chat_announcements_click(x, y))
+			return;
 		if (ui.has_older && inside(ui.older_button, x, y)) {
 			history_page(FALSE);
 			return;
@@ -3181,6 +3280,83 @@ static int hover_target(int x, int y)
 
 static Uint32 activate_event;
 
+static SDL_Cursor *resize_cursor;
+static int sidebar_grab;
+
+/* There is no drag on the compact single-pane layout. */
+static gboolean sidebar_pointer(const SDL_Event *e)
+{
+	if (ui.sidebar_drag_width) {
+		if (e->type == SDL_MOUSEMOTION) {
+			if (!ui_compact()) {
+				int width = CLAMP(e->motion.x - sidebar_grab,
+						  UI_SIDEBAR_MIN,
+						  ui_sidebar_max_width());
+
+				if (width != ui.sidebar_drag_width) {
+					ui.sidebar_drag_width = width;
+					ui_layout();
+					ui.list_offset = MIN(ui.list_offset,
+							     max_list_scroll());
+					ui_scroll_reset(&list_scroll,
+							ui.list_offset);
+					ui_scroll_reset(&history_scroll,
+							ui.history_offset);
+					ui.dirty = TRUE;
+				}
+			}
+			return TRUE;
+		}
+		gboolean released = e->type == SDL_MOUSEBUTTONUP &&
+				    e->button.button == SDL_BUTTON_LEFT;
+		gboolean lost =
+			e->type == SDL_WINDOWEVENT &&
+			e->window.windowID == SDL_GetWindowID(ui.window) &&
+			(e->window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+			 e->window.event == SDL_WINDOWEVENT_HIDDEN);
+
+		if (released || lost) {
+			g_autoptr(GError) error = NULL;
+			int width = ui.sidebar_drag_width;
+
+			ui.sidebar_drag_width = 0;
+			SDL_CaptureMouse(SDL_FALSE);
+			SDL_SetCursor(SDL_GetDefaultCursor());
+			if (released && ui.connected && !ui_compact() &&
+			    !ui_theme_save_sidebar_width(width, &error))
+				ui_status(error->message);
+			ui_layout();
+			ui.dirty = TRUE;
+			return released;
+		}
+	}
+	if (e->type == SDL_MOUSEMOTION) {
+		gboolean hover =
+			ui.connected && !ui_media_layer() &&
+			inside(ui.sidebar_split, e->motion.x, e->motion.y);
+
+		if (hover && !resize_cursor)
+			resize_cursor = SDL_CreateSystemCursor(
+				SDL_SYSTEM_CURSOR_SIZEWE);
+		if (resize_cursor &&
+		    ((SDL_GetCursor() == resize_cursor) != hover)) {
+			SDL_SetCursor(hover ? resize_cursor :
+					      SDL_GetDefaultCursor());
+			ui.dirty = TRUE;
+		}
+	}
+	if (e->type != SDL_MOUSEBUTTONDOWN ||
+	    e->button.button != SDL_BUTTON_LEFT || !ui.connected ||
+	    ui_media_layer() ||
+	    !inside(ui.sidebar_split, e->button.x, e->button.y))
+		return FALSE;
+	ui.sidebar_drag_width = ui.list_box.w;
+	sidebar_grab = e->button.x - ui.sidebar_drag_width;
+	SDL_CaptureMouse(SDL_TRUE);
+	ui.dirty = TRUE;
+	return TRUE;
+}
+
 static void event(SDL_Event *e)
 {
 	if (activate_event && e->type == activate_event) {
@@ -3196,8 +3372,11 @@ static void event(SDL_Event *e)
 		ui.dirty = TRUE;
 		return;
 	}
-	if (ui_tray_event(e, ui.window, &ui.quitting))
+	if (ui_tray_event(e, ui.window, &ui.quitting)) {
+		ui_media_window_visibility(window_visible());
+		ui.dirty = TRUE;
 		return;
+	}
 	if (e->type == wire.preview_event) {
 		guint source = GPOINTER_TO_UINT(e->user.data1);
 
@@ -3280,7 +3459,10 @@ static void event(SDL_Event *e)
 		ui.quitting = TRUE;
 		return;
 	}
-	if (ui_media_event(e) || ui_liff_event(e))
+	if (ui.sidebar_drag_width && sidebar_pointer(e))
+		return;
+	if (ui_media_event(e) || ui_liff_event(e) ||
+	    (!ui.sidebar_drag_width && sidebar_pointer(e)))
 		return;
 	switch (e->type) {
 	case SDL_QUIT:
@@ -3577,6 +3759,7 @@ int line_ui(int argc, char **argv)
 							      ui.conversation);
 			else if (video_dirty)
 				ui_draw_video();
+			ui_tray_presented(ui.window);
 			visual_animation = ui_animation_deadline(now) > now;
 			/*
 			 * The driver may have spent a refresh interval presenting. Count
@@ -3607,6 +3790,9 @@ int line_ui(int argc, char **argv)
 	g_clear_pointer(&ui.qr, QRcode_free);
 	ui_media_shutdown();
 	ui_lists_reset();
+	ui_chat_announcements_select(NULL);
+	g_free(wire.jump_message);
+	g_free(wire.jump_pending);
 	g_free(ui.selected);
 	g_clear_pointer(&pending_link, g_free);
 	g_clear_pointer(&mentions, g_hash_table_unref);
@@ -3632,6 +3818,11 @@ int line_ui(int argc, char **argv)
 	ui_motion_shutdown();
 	status = 0;
 quit_sdl:
+	ui_window_shutdown();
+	if (resize_cursor) {
+		SDL_SetCursor(SDL_GetDefaultCursor());
+		SDL_FreeCursor(resize_cursor);
+	}
 	ui_sound_shutdown();
 	ui_instance_close();
 	if (ui.window)

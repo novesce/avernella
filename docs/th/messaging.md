@@ -224,6 +224,8 @@ UI แปลงอีโมจิแต่ละตัวในฉบับร�
 | สร้าง | `createChatRoomAnnouncement` | `{1: reqSeq, 2: chat, 3: 0, 4: {1: 5, 2: ข้อความ, 3: "line://nv/chatMsg?chatId=<chat>&messageId=<id>"}}` |
 | ลบ | `removeChatRoomAnnouncement` | `{1: reqSeq, 2: chat, 3: รหัสประกาศ (i64)}` |
 
+OpenChat ใช้ `getSquareChatAnnouncements`, `createSquareChatAnnouncement` และ `deleteSquareChatAnnouncement` บน SquareService แอปอ่านรหัสข้อความต้นทางจากเนื้อหาในประกาศ หรือจากลิงก์ข้อความ LINE ที่ตรงกับห้องในแชตทั่วไป Talk operation 30 และ Square event 37 จะอัปเดตแบนเนอร์ของบทสนทนาที่เปิดอยู่
+
 ## การค้นหา
 
 แชตส่วนตัวไม่มี API ค้นหาฝั่งเซิร์ฟเวอร์ การค้นหาจึงทำบนหน้าที่ worker ดึงมา

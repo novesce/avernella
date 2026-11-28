@@ -157,12 +157,12 @@ paru -S avernella-bin
 
 ## Build and test
 
-Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, and pkg-config. Development libraries include SDL2, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Screen sharing uses the running desktop portal or the Cinnamon Wayland monitor picker described below. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. On NVIDIA, video messages use H.264 NVENC when the driver and encoder initialize. Video playback and clip review use the system `ffplay` executable, with NVDEC on NVIDIA or Vulkan Video on supported AMD and Intel drivers. The recording and playback tests use generated audio and video.
+Build with GCC 12 or newer, GNU Make, GNU binutils with the BFD linker, pkg-config and wayland-scanner. Development packages include SDL2, Wayland, wayland-protocols, Cairo/Pango, GLib/GIO, libqrencode, ZBar, json-c, libcurl, OpenSSL 3, libjpeg-turbo, libpng, WebP, zlib, Opus, libvpx, libsrtp2, RNNoise for call noise suppression and PipeWire 0.3 or newer for screen sharing. Screen sharing uses the running desktop portal or the Cinnamon Wayland monitor picker described below. The in-app browser builds a helper for each installed SDK, WPE WebKit (`wpe-webkit-2.0`) and WebKitGTK (`webkitgtk-6.0`). Keep the helpers next to `avernella` or use `make install`. Build with `LIFF_BROWSER=0` to omit both. The app loads ZBar when you import a QR image. Camera messages use the system FFmpeg executable with V4L2, PulseAudio, H.264 and AAC support. On NVIDIA, video messages use H.264 NVENC when the driver and encoder initialize. Video playback and clip review use the system `ffplay` executable, with NVDEC on NVIDIA or Vulkan Video on supported AMD and Intel drivers. The recording and playback tests use generated audio and video.
 
 Install the packages on CachyOS or Arch Linux. The first command is enough to build and run the client.
 
 ```sh
-sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat \
+sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat wayland wayland-protocols \
   cairo pango glib2 qrencode zbar json-c curl openssl \
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 ```

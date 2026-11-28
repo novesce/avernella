@@ -13,6 +13,7 @@
 | แพ็กเกจ | ใช้ทำอะไร |
 | ------- | --------- |
 | `sdl2` (แนะนำ sdl2-compat บน SDL3) | หน้าต่าง อินพุต เสียง คลิปบอร์ด |
+| `wayland-client` และ `wayland-protocols` พร้อม `wayland-scanner` | ผูกกล่องโต้ตอบ portal กับหน้าต่าง และเปิดหน้าต่างจากไอคอนถาดระบบ |
 | `pangocairo` | การวาด (Cairo) และจัดวางข้อความ (Pango) รวมถึงภาษาไทยและอีโมจิ |
 | `glib-2.0`, `gio-2.0`, `gio-unix-2.0` | โครงสร้างข้อมูล เธรด D-Bus (tray การแจ้งเตือน portal) |
 | `json-c` | ข้อมูลที่มีโครงสร้างทั้งหมด รวมถึงตัวเชื่อม Thrift |
@@ -38,12 +39,12 @@
 | เข้ารหัสและถอดรหัส VP8 สำหรับวิดีโอคอลด้วยฮาร์ดแวร์ | header ของ FFmpeg สำหรับ `libavcodec` และ `libavutil` (บน Ubuntu คือ `libavcodec-dev libavutil-dev` และบน Arch คือ `ffmpeg`) | แอปใช้ libvpx บน CPU ตั้ง `CALL_HWCODECS=0` เพื่อปิดการใช้ FFmpeg สำหรับวิดีโอคอล ตัวเลือกเดิม `CALL_HWDECODE=0` ยังใช้ได้ |
 | ตัวเข้ารหัส VP8 บน Jetson | บน AArch64 ระบบบิลด์จะตรวจหา `gstreamer-app-1.0` และ `gstreamer-video-1.0` ส่วน Jetson Nano และ TX2 ต้องมีปลั๊กอิน `nvvidconv` และ `nvv4l2vp8enc` ของ JetPack | ตั้ง `CALL_VP8_JETSON=0` เพื่อบิลด์โดยปิดส่วนนี้ |
 | FFmpeg | โปรแกรม `ffmpeg`, `ffplay`, `ffprobe` | อัดคลิปจากกล้องและเล่นวิดีโอไม่ได้ และเทสต์การอัดจะล้มเหลว |
-| XDG desktop portal | `xdg-desktop-portal` พร้อม backend ของเดสก์ท็อปที่ใช้ | จับภาพหน้าจอและแชร์หน้าจอไม่ได้ |
+| XDG desktop portal | `xdg-desktop-portal` พร้อมแบ็กเอนด์ของเดสก์ท็อป | ตัวเลือกไฟล์แนบ การจับภาพหน้าจอ และการแชร์หน้าจอจะใช้ไม่ได้ |
 
 บน Arch Linux หรือ CachyOS ดูคำสั่ง `pacman` ฉบับเต็มได้ใน README โดยสรุปคือ
 
 ```sh
-sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat \
+sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat wayland wayland-protocols \
   cairo pango glib2 qrencode zbar json-c curl openssl \
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader   # โมดูล Vulkan

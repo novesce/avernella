@@ -121,6 +121,10 @@ The new-message glide runs only when the reader is at the bottom and the previou
 
 Scrolling follows the desktop's natural-scrolling setting, separately for the touchpad and the mouse if the desktop splits them (GNOME, Cinnamon and KDE all do). The desktop applies the setting through libinput before SDL sees the event, so Avernella uses the values as they arrive: `ui_wheel_y()` in [`ui_motion.h`](../../src/ui_motion.h) returns SDL's precise delta (`preciseY`) when there is one, and the whole-notch count otherwise. `SDL_MOUSEWHEEL_FLIPPED` only reports that the values were already inverted. Compositors with `wl_seat` version 9 or later (GNOME 45 and later, KDE Plasma 6) send it, and inverting such an event again would undo natural scrolling, so no view does that. Every scrolled view goes through `ui_wheel_y()`: the message history and chat list (smooth, in pixels), Find, User Settings and shared-content details (pixels), and the friend, group, folder, chat-tool, attachment-picker, call-roster and emoji lists (rows). Row lists add fractional touchpad steps up to whole rows with `ui_wheel_rows()`, which drops the remainder when the direction reverses. The monitor picker runs in its own process and reads SDL's notch count, which follows the desktop in the same way. `tests/ui_motion.c` (`/motion/wheel-direction`) checks the mapping.
 
+## Chat sidebar
+
+Drag the divider between the chat list and the conversation to resize the list. Avernella saves the width to `$XDG_CONFIG_HOME/avernella/sidebar-width` when you release it. The sidebar leaves room for the message pane and the compact single-pane layout uses the full window width.
+
 ## Themes
 
 [`ui_theme.c`](../../src/ui_theme.c) and [`ui_theme.h`](../../src/ui_theme.h) define two layouts. Under **User Settings → Appearance**, select Pink, Blue, Mint or Amber for either layout. The app saves the choice under `$XDG_CONFIG_HOME/avernella/accent` and applies it immediately.
@@ -165,7 +169,7 @@ Each feature module follows the same pattern, so once you know one you know them
 - The refresh button, **Ctrl+R**, and a recovered connection also retry failed image downloads as they come into view. Images already loaded stay cached.
 - **Filtering:** typing in the search box (Ctrl+F) filters by name (`ui_refilter_chats()`).
 - **Folders and pins:** [`ui_chat_lists.c`](../../src/ui_chat_lists.c) draws the folder selector and its menu, and [`chat_lists.c`](../../src/chat_lists.c) stores folders, pins, mutes and shortcuts per account. Right-click a chat to pin, mute or add it to a folder.
-- **Muted chats:** A crossed-out bell appears next to the name in the chat list and the header. It reflects the LINE notification setting for a group or room and any local mute. Right-click a group and toggle **Strict mute** to suppress notifications, sounds and unread badges, including for mentions and `@All`. This setting is local to the signed-in account on this device. The chat still receives messages and sends read receipts when viewed.
+- **Muted chats:** A crossed-out bell appears next to the name in the chat list and the header. Right-click a chat, including an OpenChat room, to mute or unmute it on this device. The saved local choice takes precedence over LINE’s notification setting. Both bells and the menu label update immediately. Right-click a group and toggle **Strict mute** to suppress notifications, sounds and unread badges, including for mentions and `@All`. This setting is local to the signed-in account on this device. The chat still receives messages and sends read receipts when viewed.
 - **Unread badges and read receipts:** see [Read receipts](#read-receipts) below.
 
 ### Conversation
@@ -186,13 +190,13 @@ Each feature module follows the same pattern, so once you know one you know them
 
 All in [`ui_media.c`](../../src/ui_media.c):
 
-- **Choosing a file:** **+** or Ctrl+O opens the built-in file picker (`open_picker()`, `directory()`), or drop a file on the window. `prepare_attachment()` decides between photo, video, audio and file, and the preview sends `sendPhoto` or `sendFile`.
+- **Choosing a file.** **+** or Ctrl+O opens the desktop FileChooser portal. It returns access to the chosen file in Flatpak. The dialog is attached to the app window where the compositor supports it. You can also drop a file onto the window. `prepare_attachment()` identifies the type and the preview sends `sendPhoto` or `sendFile`.
 - **Pasting:** Ctrl+V in the composer calls `ui_media_paste()`. A picture on the clipboard (PNG, WebP or JPEG up to 32 MiB) goes through [`clipboard_paste.c`](../../src/clipboard_paste.c) into a private file under `$XDG_RUNTIME_DIR/avernella` and opens the Send photo preview. A copied file opens as an attachment. Picture paste needs SDL3's clipboard through sdl2-compat. With classic SDL2 only text pastes.
 - **Copy image:** puts a PNG on the clipboard (`image_clipboard()`, again needing SDL3).
 - **Photo viewer:** `picture()` requests the full image with `photo` and shows it. JPEG EXIF orientation is honored (`exif_orientation()`).
 - **Thumbnails:** `ui_media_thumb()` with a bounded cache (`reserve_thumbnail()`, `evict_thumbnail()`).
 - **Video:** `open_video()` asks for the file with `openVideo` and plays it with `ffplay` through [`video_play.c`](../../src/video_play.c). With the native renderer, FFplay uses the selected Vulkan GPU to display the clip. On compatible drivers it also decodes video with NVDEC on NVIDIA or Vulkan Video on AMD and Intel. Video cards show a poster from `videoPoster` when LINE has one.
-- **Camera video messages:** **Record video** uses [`video_record.c`](../../src/video_record.c), which runs `ffmpeg` with V4L2 and PulseAudio to write an H.264/AAC MP4 into a private file. On NVIDIA, the recorder tests H.264 NVENC before opening the camera and falls back to the software encoder if startup fails. You review the clip and then send it.
+- **Camera video messages:** **Record video** in Chat Tools uses [`video_record.c`](../../src/video_record.c), which runs `ffmpeg` with V4L2 and PulseAudio to write an H.264/AAC MP4 into a private file. On NVIDIA, the recorder tests H.264 NVENC before opening the camera and falls back to the software encoder if startup fails. You review the clip and then send it.
 - **Screenshots:** Ctrl+Alt+S or **Take screenshot** in the chat tools. [`screenshot.c`](../../src/screenshot.c) asks the XDG Screenshot portal, and the result opens as an attachment. The client closes Chat Tools and presents the uncovered chat before asking the portal.
 - **Saving:** Save writes the downloaded bytes through `saveFile`, using `line_save_media()` in the worker, with an atomic rename.
 
@@ -212,7 +216,7 @@ All in [`ui_media.c`](../../src/ui_media.c):
 
 ### Chat tools
 
-[`ui_chat_tools.c`](../../src/ui_chat_tools.c), opened from the chat header's **⋯** or Ctrl+Shift+T: announcements (list, open, remove), shared content, screenshot. It also implements the **Forward** picker (`ui_chat_tools_forward()`) and the **Announce** confirmation (`ui_chat_tools_announce()`), which warns that announcements are stored outside Letter Sealing.
+[`ui_chat_tools.c`](../../src/ui_chat_tools.c), opened from the chat header's **⋯** or Ctrl+Shift+T: announcements (list, open, remove), shared content, screenshot. It also implements the **Forward** picker (`ui_chat_tools_forward()`) and the **Announce** confirmation (`ui_chat_tools_announce()`), which warns that announcements are stored outside Letter Sealing. Right-click a text message and select **Announce…** to start. The newest announcement appears above the open conversation. Click its preview to jump to the message, **⋯** for all announcements and permitted removal, or the caret to collapse the banner. For older announcements, each jump can load one history page.
 
 ### Shared content
 
@@ -238,6 +242,8 @@ All in [`ui_media.c`](../../src/ui_media.c):
 
 ### Calls
 
+The header’s voice and video buttons open a confirmation dialog showing the selected chat. Choose **Start call** or press Enter to call. Cancel or Esc dismisses the dialog.
+
 The call stage, dock and controls are in [`ui_media.c`](../../src/ui_media.c):
 
 - `dial()` starts a call (`callStart` with `video` false or true).
@@ -256,7 +262,7 @@ The UI decides when you have *seen* the latest message, and the worker tells LIN
 
 ### Tray
 
-[`ui_tray.c`](../../src/ui_tray.c) exports a StatusNotifierItem and an Open, Hide and Quit menu over GDBus. Closing the window hides it in the tray or minimizes it when a tray icon is unavailable. Sync and notifications continue in the background. In Flatpak, the app asks the Background portal for permission before hiding. Use Ctrl+Q or Quit in the tray menu to exit.
+[`ui_tray.c`](../../src/ui_tray.c) exports a StatusNotifierItem and an Open, Hide and Quit menu over GDBus. Closing the window hides it in the tray or minimizes it when a tray icon is unavailable. Sync and notifications continue in the background. **Open Avernella** remaps the window and redraws it before using any Wayland activation token supplied by the desktop panel. In Flatpak, the app asks the Background portal for permission before hiding. Use Ctrl+Q or Quit in the tray menu to exit.
 
 ### Notifications
 

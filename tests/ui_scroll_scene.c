@@ -970,6 +970,50 @@ static void check_strict_mute(void)
 	ui_refilter_chats();
 }
 
+static void check_openchat_mute(void)
+{
+	static const char room[] = "m00000000000000000000000000000014";
+	static const char account[] = "u00000000000000000000000000000099";
+
+	g_autoptr(J) row = obj();
+	g_autofree char *prior = ui.selected;
+	SDL_Event key = { .key = { .type = SDL_KEYDOWN,
+				   .keysym = { .sym = SDLK_F10,
+					       .mod = KMOD_SHIFT } } };
+
+	ui.selected = g_strdup(room);
+	json_object_object_add(row, "id", json_object_new_string(room));
+	json_object_object_add(row, "name", json_object_new_string("OpenChat"));
+	json_object_object_add(row, "notificationDisabled",
+			       json_object_new_boolean(TRUE));
+	json_object_array_add(ui.chats, json_object_get(row));
+	ui_lists_login(account);
+	ui_refilter_chats();
+	ui.focus = F_MESSAGE;
+	g_assert_true(ui_chat_muted(row));
+	g_assert_true(ui_lists_event(&key));
+	key.key.keysym.mod = KMOD_NONE;
+	key.key.keysym.sym = SDLK_DOWN;
+	g_assert_true(ui_lists_event(&key));
+	key.key.keysym.sym = SDLK_RETURN;
+	g_assert_true(ui_lists_event(&key));
+	g_assert_false(ui_chat_muted(row));
+	g_assert_true(ui_lists_event(&key));
+	g_assert_true(ui_chat_muted(row));
+	g_assert_true(ui_lists_event(&key));
+	g_assert_false(ui_chat_muted(row));
+
+	ui_lists_login(account);
+	g_assert_false(ui_chat_muted(row));
+	ui_lists_reset();
+	g_free(ui.selected);
+	ui.selected = g_steal_pointer(&prior);
+	ui_forget_rail();
+	json_object_array_del_idx(ui.chats,
+				  json_object_array_length(ui.chats) - 1, 1);
+	ui_refilter_chats();
+}
+
 static void check_multiline_composer(void)
 {
 	ui_draw();
@@ -1015,6 +1059,45 @@ static void check_screenshot_after_close(void)
 	ui.photos = FALSE;
 }
 
+static void check_announcement_banner(void)
+{
+	Json *target = json_object_array_get_idx(ui.history, 24);
+	Json *rows = json_tokener_parse(
+		"[{\"id\":\"12\",\"messageId\":\"25\",\"text\":\"Meeting\"}]");
+
+	json_object_object_add(target, "id", json_object_new_string("25"));
+	ui_draw();
+	int original_top = ui.conversation.y;
+
+	ui_chat_announcements_select(ui.selected);
+	g_assert_true(ui_chat_tools_reply("announcements", 1, rows, NULL));
+	ui_draw();
+	g_assert_cmpint(ui_chat_announcements_height(), ==, 50);
+	g_assert_cmpint(ui.conversation.y, ==, original_top + 50);
+
+	ui_history_jump_offset(0);
+	g_assert_true(ui_chat_announcements_click(ui.conversation.x + 24,
+						  original_top + 15));
+	ui_draw();
+	g_assert_cmpint(ui.history_offset, >, 0);
+	g_assert_cmpint(ui.history_offset, <, ui.max_history_offset);
+
+	g_assert_true(
+		ui_chat_announcements_click(ui.width - 23, original_top + 15));
+	ui_draw();
+	g_assert_cmpint(ui_chat_announcements_height(), ==, 36);
+	g_assert_cmpint(ui.conversation.y, ==, original_top + 36);
+	g_assert_true(
+		ui_chat_announcements_click(ui.width - 23, original_top + 15));
+	ui_draw();
+	g_assert_cmpint(ui_chat_announcements_height(), ==, 50);
+	ui_chat_announcements_select(NULL);
+	json_object_put(rows);
+	ui_draw();
+	g_assert_cmpint(ui.conversation.y, ==, original_top);
+	json_object_object_del(target, "id");
+}
+
 static void history(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -1038,6 +1121,17 @@ static void history(void)
 	ui.name = g_strdup("Ada");
 	ui.message.value = g_string_new("");
 	ui.search.value = g_string_new("");
+	ui_layout();
+	int original_sidebar = ui.list_box.w;
+
+	ui.sidebar_drag_width = original_sidebar + 32;
+	ui_layout();
+	g_assert_cmpint(ui.list_box.w, ==, original_sidebar + 32);
+	g_assert_cmpint(ui.conversation.x, ==, ui_content_x());
+	g_assert_cmpint(ui.sidebar_split.x + 4, ==, ui_content_x());
+	ui.sidebar_drag_width = 0;
+	ui_layout();
+	g_assert_cmpint(ui.list_box.w, ==, original_sidebar);
 	check_multiline_composer();
 	check_screenshot_after_close();
 	for (int i = 0; i < 55; i++) {
@@ -1058,6 +1152,7 @@ static void history(void)
 			json_object_new_int64(1700000000000LL + i * 60000));
 		json_object_array_add(ui.history, row);
 	}
+	check_announcement_banner();
 	/* Check both layouts, ending on LINE for the bubble checks. */
 	check_scroll_positions();
 	for (int i = 0; i < 2; i++) {
@@ -1094,6 +1189,7 @@ static void history(void)
 	check_message_receipts();
 	check_chat_event();
 	check_strict_mute();
+	check_openchat_mute();
 	check_row_animation();
 	check_history_motion();
 	/* Exercise receipt widths with RTL shaping and a compact chat pane. */

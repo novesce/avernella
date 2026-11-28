@@ -40,6 +40,10 @@ For the native client, the cryptographic design comes from LINE's public descrip
 
 In the Android 26.19.0 base APK (SHA-256 `5234750455cf0757edcc9de5c1d4e05ed7c5ee1a82405225fae99455e2adefe6`), `jm8.l9` maps 83 to `E2EE_UPDATE_SENDER_KEY` and 84 to `E2EE_UPDATE_RECEIVER_KEY`. The code-83 branch in `lh8.k.c` and `l41.a.d` clears the active identity from memory and invokes the local key registration path. `lh8.h0.c` exits before generating a key when `qa0.e0.h` identifies the device as secondary. The recipient-key branch instead clears the chat's cached peer key information. Avernella gets its own private keychain through phone-approved pairing and handles the rejection without resending the message or changing the session.
 
+### OpenChat notifications and message announcements
+
+Android 26.19.0 identifies `SquareChatMember.notificationForMessage` as boolean field 5. The membership object is in `GetJoinedSquareChatsResponse.chatMembers` (2) or `GetSquareChatResponse.squareChatMember` (2). Avernella reads those values and stores its per-chat desktop notification choices locally. In the same APK, `ge8.b.c` initializes the sequence field of a new Square announcement to zero before the request. The update is Square event 37 with payload field 37, whose first field is the chat MID. Talk uses operation 30 and the chat MID in field 10, as read by `kk8.y2`.
+
 ## Encrypted attachments
 
 In `classes12.dex`, `Lyx3/a;-><clinit>` has the file-encryption domain label `FileEncryption` at code item `0x5e2d7c`. The Thrift client in `classes5.dex` has a `determineMediaMessageFlow` call at `Ljp/naver/line/android/thrift/client/impl/m2;->a`, code item `0x2fc14c`. For the native client, the object upload/download formats and relative ordering of the main upload, preview or digest upload, and message announcement were taken from the pinned interoperability reference. [Object storage flow](https://github.com/softnetics/line-rs/blob/addf69c2e886a2364a396ce360093a62119dcb32/src/obs/e2ee.rs) · [Media integrity format](https://github.com/softnetics/line-rs/blob/addf69c2e886a2364a396ce360093a62119dcb32/src/e2ee/media.rs)

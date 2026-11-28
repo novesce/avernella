@@ -398,6 +398,15 @@ static J *make_chat_row(Line *s, J *chat, J *status, J *square, J *member)
 	return row;
 }
 
+static void square_chat_notification(J *row, J *chat_member)
+{
+	J *on = field(chat_member, "5");
+
+	if (row && json_object_is_type(on, json_type_boolean))
+		put_bool(row, "notificationDisabled",
+			 !json_object_get_boolean(on));
+}
+
 static const char *square_event_chat_mid(J *event)
 {
 	int type = json_object_get_int(field(event, "3"));
@@ -605,6 +614,7 @@ static J *square_chats_from_events(Line *s, J *squares, J *members,
 
 		if (!row)
 			continue;
+		square_chat_notification(row, chat_member);
 		g_hash_table_add(seen, g_strdup(cid));
 		json_object_array_add(rows, row);
 		put_str(chat_to_sq, cid, smid);
@@ -719,6 +729,7 @@ J *line_square_chats(Line *s, J **squares_out, J **members_out,
 				break;
 			}
 			J *chats = field(reply, "1");
+			J *chat_members = field(reply, "2");
 			J *statuses = field(reply, "3");
 
 			for (size_t i = 0; i < length(chats); i++) {
@@ -739,6 +750,8 @@ J *line_square_chats(Line *s, J **squares_out, J **members_out,
 				J *row = make_chat_row(s, chat, st, sq, mem);
 
 				if (row) {
+					square_chat_notification(
+						row, field(chat_members, cid));
 					json_object_array_add(rows, row);
 					put_str(chat_to_sq, cid, smid);
 				}
@@ -986,8 +999,17 @@ static J *format_square_message(Line *s, J *sq_msg, const char *sender_name,
 		text = alt;
 	const char *filename = nonempty(meta, "FILE_NAME");
 
-	if (filename && !line_received_filename(filename))
+	if (filename &&
+	    (strlen(filename) != (size_t)json_object_get_string_len(
+					 field(meta, "FILE_NAME")) ||
+	     !line_received_filename(filename)))
 		filename = NULL;
+	if (type == 14) {
+		guint64 size = line_message_file_size(meta);
+
+		if (size)
+			put_num(row, "fileSize", size);
+	}
 	if (type == 2) {
 		guint64 duration;
 		const char *ms = nonempty(meta, "DURATION");
@@ -1928,10 +1950,14 @@ static J *square_announcement_row(J *entry, gboolean can_manage)
 	    json_object_get_int64(seq) <= 0)
 		return NULL;
 	J *txt_contents = field(field(entry, "3"), "1");
+	const char *id = nonempty(txt_contents, "1");
 	const char *text = nonempty(txt_contents, "2");
 	J *row = obj();
 
 	put_str(row, "id", json_object_get_string(seq));
+	if (decimal_id(id))
+		put_str(row, "messageId", id);
+	put_num(row, "createdAt", json_object_get_int64(field(entry, "4")));
 	put_str(row, "text", text ? text : "OpenChat announcement");
 	put_bool(row, "canRemove", can_manage);
 	return row;
@@ -1978,6 +2004,7 @@ J *line_square_announce_message(Line *s, const char *chat,
 		put_str(txt, "3:str", sender_member_id);
 	put_num(txt, "4:i64", created_at);
 	put(contents, "1:obj", txt);
+	put_num(ann, "1:i64", 0); /* LINE assigns the announcement sequence. */
 	put_num(ann, "2:i32", 0); /* TEXT_MESSAGE */
 	put(ann, "3:obj", contents);
 	put_num(req, "1:i32", seq);
@@ -3003,6 +3030,15 @@ J *line_square_poll_events(Line *s, gint64 *subscription_id, char **sync_token,
 						field(msg, "15"))));
 			put_num(item, "time", t);
 			put_bool(item, "mine", mine);
+		} else if (type == SQ_EVT_UPDATE_ANNOUNCEMENT) {
+			const char *cid = nonempty(field(payload, "37"), "1");
+
+			if (!line_square_id(cid, 'm')) {
+				json_object_put(item);
+				continue;
+			}
+			put_str(item, "kind", "announcements");
+			put_str(item, "chat", cid);
 		} else if (type == SQ_EVT_UPDATE_CHAT_STATUS) {
 			const char *cid = nonempty(field(payload, "15"), "1");
 
@@ -3022,7 +3058,6 @@ J *line_square_poll_events(Line *s, gint64 *subscription_id, char **sync_token,
 			   type == SQ_EVT_NOTIF_SQUARE_DELETE ||
 			   type == SQ_EVT_NOTIF_CHAT_DELETE ||
 			   type == SQ_EVT_NOTIF_JOIN_REQUEST ||
-			   type == SQ_EVT_UPDATE_ANNOUNCEMENT ||
 			   type == SQ_EVT_NOTIF_REACTION ||
 			   type == SQ_EVT_MUTATE_MESSAGE ||
 			   type == SQ_EVT_DESTROY_MESSAGE) {

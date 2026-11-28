@@ -3,6 +3,19 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Could not open the desktop file chooser.",
+	  "시스템 파일 선택 창을 열 수 없습니다." },
+	{ "Voice call", "음성 통화" },
+	{ "Start call", "통화 시작" },
+	{ "Attachment", "첨부 파일" },
+	{ "Send as file", "파일로 보내기" },
+	{ "Zoom out", "축소" },
+	{ "Zoom in", "확대" },
+	{ "Actual size", "실제 크기" },
+	{ "Fit to window", "창 크기에 맞추기" },
+	{ "Rotate clockwise", "시계 방향으로 회전" },
+	{ "Previous image", "이전 이미지" },
+	{ "Next image", "다음 이미지" },
 	{ "Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.",
 	  "초안을 복사한 뒤 로그아웃하고 QR 코드로 다시 연결하여 Letter Sealing을 갱신하세요." },
 	{ "Accent color", "강조 색상" },

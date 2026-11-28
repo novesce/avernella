@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_private.h"
+#include "ui_image_view.h"
 #include "ui_gpu.h"
 #include "ui_logo.h"
 #include "line.h"
 #include "ui_chat_lists.h"
+#include "ui_chat_tools.h"
 #include "ui_emoji.h"
 #include "ui_friends.h"
 #include "ui_flex.h"
@@ -445,6 +447,7 @@ gint64 ui_animation_deadline(gint64 now_us)
 			 MAX(stage_motion.end, press.end));
 
 	end = MAX(end, MAX(follow.glide.end_us, reveal.fade.end_us));
+	end = MAX(end, ui_media_image_deadline());
 
 	for (guint i = 0; i < G_N_ELEMENTS(tracks); i++)
 		if (tracks[i].kind)
@@ -481,13 +484,22 @@ static int rail_w(void)
 	return ui_compact() ? 0 : ui_theme_is_line() ? 68 : 72;
 }
 
+int ui_sidebar_max_width(void)
+{
+	return CLAMP(ui.width - rail_w() - UI_CHAT_MIN, UI_SIDEBAR_MIN,
+		     UI_SIDEBAR_MAX);
+}
+
 static int sidebar_w(void)
 {
 	if (ui_compact())
 		return ui.width;
-	return rail_w() + (ui.width < 900     ? 220 :
-			   ui_theme_is_line() ? 284 :
-						240);
+	int width = ui.sidebar_drag_width ? ui.sidebar_drag_width :
+					    ui_theme_sidebar_width();
+
+	if (!width)
+		width = ui.width < 900 ? 220 : ui_theme_is_line() ? 284 : 240;
+	return rail_w() + CLAMP(width, UI_SIDEBAR_MIN, ui_sidebar_max_width());
 }
 
 enum {
@@ -660,6 +672,9 @@ void ui_layout(void)
 	int chat_x = ui_compact() ? 0 : s;
 	int rail = rail_w(), list_w = s - rail;
 
+	ui.sidebar_split = ui_compact() ? (Rect){ 0 } :
+					  (Rect){ s - 4, 0, 8, h };
+
 	if (!ui.connected)
 		layout_sign_in();
 	if (welcome_art && (ui.connected || !sign_portrait.w))
@@ -728,7 +743,7 @@ void ui_layout(void)
 
 	ui.list_box = (Rect){
 		rail, list_y, list_w,
-		MAX(60,
+		MAX(0,
 		    h - list_y - (nav ? 0 : USER_PANEL_H) -
 			    (ui_compact() && ui.notice && *ui.notice ? 60 : 0))
 	};
@@ -811,7 +826,8 @@ void ui_layout(void)
 	int target = ui_media_stage_height();
 	int status_h =
 		(ui.notice && *ui.notice ? 52 : 0) + (ui.reply_id ? 34 : 0);
-	int room = bottom - HEADER_H - 1 - status_h - target - 60;
+	int banner_h = ui_chat_announcements_height();
+	int room = bottom - HEADER_H - 1 - status_h - target - banner_h - 60;
 	int growth = MIN(composer_growth(ui.entry.w), MAX(0, room));
 
 	ui.entry.y -= growth;
@@ -847,6 +863,9 @@ void ui_layout(void)
 		ui.conversation.y += stage;
 		ui.conversation.h = MAX(60, ui.conversation.h - stage);
 	}
+	ui_chat_announcements_place(ui.conversation);
+	ui.conversation.y += banner_h;
+	ui.conversation.h = MAX(40, ui.conversation.h - banner_h);
 	if (ui.older_page || ui.has_older) {
 		int y = ui.conversation.y + 7;
 
@@ -1300,6 +1319,9 @@ static void draw_tooltip(Rect anchor, const char *s, gboolean right)
 				   anchor.y + anchor.h + 6, tw + 24, 34 };
 
 	tip.x = CLAMP(tip.x, 4, MAX(4, ui.width - tip.w - 4));
+	if (!right && tip.y + tip.h > ui.height - 4)
+		tip.y = anchor.y - tip.h - 6;
+	tip.y = CLAMP(tip.y, 4, MAX(4, ui.height - tip.h - 4));
 	box(tip.x, tip.y, tip.w, tip.h, 8, UI_RAIL);
 	outline(tip, 8, UI_INPUT, 1);
 	paint(t, tip.x + 12, tip.y + (tip.h - th) / 2, UI_HEADING);
@@ -2052,8 +2074,6 @@ static void chats_panel(void)
 		text(ui.notice, 20, h - 127, s - 40, 13, 500, UI_MUTED, TRUE);
 	if (!line_nav())
 		user_panel();
-	if (line_style && !ui_compact())
-		line(s - 1, 0, s - 1, h, UI_LINE, 1);
 }
 
 static void empty_chat(void)
@@ -2088,7 +2108,7 @@ struct message_layout {
 	int y, w, h, top; /* top: offset of the message below any divider */
 	int x, body_top, body_h, text_origin, reply_h;
 	gboolean mine, group, photo, video, rich, receipt, notice, has_links,
-		contact_card, location_card;
+		contact_card, location_card, file_card;
 	Json *message, *reply_target; /* borrowed from the cached history */
 };
 
@@ -2549,6 +2569,8 @@ static void prepare_bubbles(Rect area)
 					    maxw, FALSE);
 		row.photo = ui_is_photo(msg);
 		row.video = ui_is_video(msg);
+		row.file_card = ui.files &&
+				!strcmp(ui_string(msg, "type", ""), "file");
 		row.contact_card =
 			!strcmp(ui_string(msg, "type", ""), "contact") &&
 			ui_string(msg, "contactMid", NULL) != NULL;
@@ -2578,6 +2600,9 @@ static void prepare_bubbles(Rect area)
 			body_height = row.photo ? MIN(220, maxw * 2 / 3) :
 						  MAX(74, row.w * 9 / 16);
 			body_height += 4;
+		} else if (row.file_card) {
+			row.w = MIN(maxw, 320);
+			body_height = 76;
 		} else if (row.contact_card || row.location_card) {
 			row.w = MIN(maxw, 290);
 			body_height = row.location_card ? 90 : 76;
@@ -2818,7 +2843,7 @@ Json *ui_row_at(int x, int y)
 {
 	struct message_layout *row = bubble_at(x, y);
 
-	if (row && (cache.line_style || row->notice)) {
+	if (row && (cache.line_style || row->notice || row->file_card)) {
 		Rect body = message_rect(row, ui.conversation);
 
 		if (!contains_point(body, x, y) &&
@@ -3232,6 +3257,28 @@ static void draw_reply_quote(const struct message_layout *r, int qx, int qy,
 	line(qx, qy + r->reply_h - 6, qx + qw, qy + r->reply_h - 6, div_rgb, 1);
 }
 
+static void file_card_draw(Json *message, Rect r)
+{
+	const char *name = ui_string(message, "filename", _("Attachment"));
+	gint64 size = json_object_get_int64(ui_field(message, "fileSize"));
+	g_autofree char *detail = size > 0 ? g_format_size(size) : NULL;
+
+	box(r.x, r.y, r.w, r.h, 10, hovered(r) ? UI_HOVER : UI_RAISED);
+	outline(r, 10, UI_LINE, 1);
+	int x = r.x + 39, w = MAX(1, r.w - 49);
+	int ix = r.x + 20, iy = r.y + 22;
+
+	line(ix, iy - 7, ix, iy + 7, UI_ACCENT, 1.7);
+	line(ix - 4, iy + 3, ix, iy + 7, UI_ACCENT, 1.7);
+	line(ix, iy + 7, ix + 4, iy + 3, UI_ACCENT, 1.7);
+	line(ix - 7, iy + 10, ix + 7, iy + 10, UI_ACCENT, 1.7);
+	text(name, x, r.y + 10, w, 15, 650, UI_HEADING, FALSE);
+	if (detail)
+		text(detail, x, r.y + 32, w, 12, 450, UI_MUTED, FALSE);
+	text(_("Save attachment"), x, r.y + (detail ? 50 : 34), w, 12, 650,
+	     UI_ACCENT, FALSE);
+}
+
 static void text_bubble(const struct message_layout *r, Rect body)
 {
 	guint fill = r->mine ? UI_BUBBLE_OUT : UI_BUBBLE_IN;
@@ -3380,6 +3427,17 @@ static void message_rows(Rect area)
 {
 	prepare_bubbles(area);
 	ui.max_history_offset = MAX(0, cache.height - area.h);
+	g_autofree char *jump = ui_take_message_jump();
+
+	for (guint i = 0; jump && i < cache.rows->len; i++) {
+		struct message_layout *r =
+			&g_array_index(cache.rows, struct message_layout, i);
+
+		if (!g_strcmp0(jump, ui_string(r->message, "id", NULL))) {
+			ui_history_jump_offset(r->y + (r->h - area.h) / 2);
+			break;
+		}
+	}
 	int glide = follow_bottom(area);
 	double fade = reveal_history();
 
@@ -3485,6 +3543,9 @@ static void message_rows(Rect area)
 		} else if (r->video)
 			video_card(r->message,
 				   (Rect){ x, y + 2, r->w, r->body_h - 4 });
+		else if (r->file_card)
+			file_card_draw(r->message,
+				       (Rect){ x, y + 2, r->w, r->body_h - 4 });
 		else if (r->contact_card)
 			contact_card_draw(r->message, (Rect){ x, y + 2, r->w,
 							      r->body_h - 4 });
@@ -3914,6 +3975,7 @@ static void chat_view(void)
 	else {
 		Rect r = ui.conversation;
 
+		ui_chat_announcements_draw();
 		if (ui.has_older)
 			action(ui.older_button,
 			       ui.older_pending ? _("Loading…") :
@@ -4567,6 +4629,16 @@ static void draw_frame(const Rect *region)
 		}
 	} else
 		sign_in();
+	if (ui.connected && !ui_compact() &&
+	    (!partial || (region->x <= sidebar_w() &&
+			  region->x + region->w >= sidebar_w()))) {
+		int x = sidebar_w();
+		gboolean drag = ui.sidebar_drag_width ||
+				abs(ui.hover_x - x) < 4;
+
+		box(x - 1, 0, drag ? 2 : 1, ui.sidebar_split.h, 0,
+		    drag ? UI_ACCENT : UI_LINE);
+	}
 	cairo_restore(cr);
 	if (ui.connected)
 		ui_media_draw_call_dock();
@@ -4582,8 +4654,12 @@ static void draw_frame(const Rect *region)
 	if (layer) {
 		painting_layer = layer;
 		cairo_save(cr);
-		cairo_translate(cr, 0, dy);
-		ui_media_overlay();
+		if (ui_media_image_viewer())
+			ui_media_draw_image_viewer(frame_us);
+		else {
+			cairo_translate(cr, 0, dy);
+			ui_media_overlay();
+		}
 		cairo_restore(cr);
 	} else if (scrim > 0.)
 		ui_scrim();
@@ -5018,6 +5094,35 @@ static void draw_image(cairo_surface_t *image, Rect r, unsigned int angle,
 	cairo_pattern_set_filter(cairo_get_source(cr), filter);
 	cairo_paint(cr);
 	cairo_restore(cr);
+}
+
+void ui_draw_viewed_image(cairo_surface_t *image,
+			  const struct ui_image_rect *bounds, Rect clip,
+			  guint angle)
+{
+	int w = cairo_image_surface_get_width(image);
+	int h = cairo_image_surface_get_height(image);
+	double scale = bounds->w / (angle % 180 ? h : w);
+
+	cairo_save(cr);
+	cairo_rectangle(cr, clip.x, clip.y, clip.w, clip.h);
+	cairo_clip(cr);
+	cairo_translate(cr, bounds->x + bounds->w / 2.,
+			bounds->y + bounds->h / 2.);
+	if (angle)
+		cairo_rotate(cr, angle * (G_PI / 180.));
+	cairo_scale(cr, scale, scale);
+	cairo_set_source_surface(cr, image, -w / 2., -h / 2.);
+	cairo_pattern_set_filter(cairo_get_source(cr), CAIRO_FILTER_BILINEAR);
+	cairo_rectangle(cr, -w / 2., -h / 2., w, h);
+	cairo_fill(cr);
+	cairo_restore(cr);
+}
+
+void ui_draw_viewer_backdrop(void)
+{
+	cairo_set_source_rgba(cr, 0.025, 0.016, 0.024, .91);
+	cairo_paint(cr);
 }
 
 void ui_draw_rotated_image(cairo_surface_t *image, Rect r, unsigned int angle)

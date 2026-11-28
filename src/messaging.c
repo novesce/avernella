@@ -1495,9 +1495,20 @@ static J *history_rows(Line *s, J *reply, J **messages, GError **error)
 			text = event;
 		else if (alt)
 			text = alt;
-		const char *filename = nonempty(metadata, "FILE_NAME"),
+		const char *filename = exact_text(metadata, "FILE_NAME"),
 			   *related = nonempty(msg, "21");
-		/* main.c names an unsafe one "attachment" when it lists it. */
+
+		if (type == 14) {
+			guint64 size = line_message_file_size(metadata);
+
+			if (size)
+				number(row, "fileSize", size);
+			if (length(field(msg, "20")) ||
+			    field(metadata, "e2eeVersion")) {
+				decrypted = line_open_payload(s, msg, 14, NULL);
+				filename = exact_text(decrypted, "fileName");
+			}
+		}
 		if (filename && !line_received_filename(filename))
 			filename = NULL;
 		if (type == 2) {
@@ -2013,7 +2024,34 @@ J *line_message_action(Line *s, const char *id, const char *reaction,
 	return out;
 }
 
-static J *announcement_row(Line *s, J *entry)
+/* Only accept the message target within the chat that owns this list. */
+static const char *announcement_target(const char *chat, const char *link)
+{
+	static const char path[] = "://nv/chatMsg?chatId=";
+	static const char query[] = "&messageId=";
+	guint64 numeric;
+
+	if (!link || !g_str_has_prefix(link, "line"))
+		return NULL;
+	link += 4;
+	if (*link == 'b')
+		link++;
+	if (!g_str_has_prefix(link, path))
+		return NULL;
+	link += sizeof(path) - 1;
+	if (!g_str_has_prefix(link, chat))
+		return NULL;
+	link += strlen(chat);
+	if (!g_str_has_prefix(link, query))
+		return NULL;
+	link += sizeof(query) - 1;
+	return g_ascii_string_to_unsigned(link, 10, 1, G_MAXINT64, &numeric,
+					  NULL) ?
+		       link :
+		       NULL;
+}
+
+static J *announcement_row(Line *s, const char *chat, J *entry)
 {
 	J *contents = field(entry, "3");
 	const char *text = nonempty(contents, "2");
@@ -2029,7 +2067,13 @@ static J *announcement_row(Line *s, J *entry)
 			     !g_strcmp0(strfield(entry, "4"), s->mid)));
 	J *row = obj();
 
+	const char *message_id =
+		announcement_target(chat, nonempty(contents, "3"));
+
 	put(row, "id", string(json_object_get_string(id)));
+	if (message_id)
+		put(row, "messageId", string(message_id));
+	number(row, "createdAt", json_object_get_int64(field(entry, "5")));
 	put(row, "text", string(text ? text : "Shared announcement"));
 	boolean(row, "canRemove", allowed);
 	return row;
@@ -2054,7 +2098,7 @@ J *line_announcements(Line *s, const char *chat, GError **error)
 	J *rows = array();
 
 	for (size_t i = 0; i < MIN(length(result), 50); i++) {
-		J *row = announcement_row(s, at(result, i));
+		J *row = announcement_row(s, chat, at(result, i));
 
 		if (row)
 			json_object_array_add(rows, row);
@@ -2088,8 +2132,10 @@ J *line_announce_message(Line *s, const char *chat, const char *id,
 	put(contents, "3:str", string(link));
 	g_autoptr(J) result =
 		line_rpc(s, "/S4", "createChatRoomAnnouncement", args, error);
-	J *row = result ? announcement_row(s, result) : NULL;
+	J *row = result ? announcement_row(s, chat, result) : NULL;
 
+	if (row && !field(row, "messageId"))
+		put(row, "messageId", string(id));
 	if (result && !row)
 		g_set_error_literal(
 			error, LINE_ERROR, 1,

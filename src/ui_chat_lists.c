@@ -42,6 +42,7 @@ static struct {
 	enum pane pane;
 	GPtrArray *rows;
 	int first, cursor, binding;
+	gboolean server_muted;
 	char *chat, *name, *note;
 	Editor edit;
 	Rect box, rows_box, close, submit, edit_box;
@@ -270,7 +271,7 @@ static void choices(void)
 						 _("Pin chat"),
 		    NULL, 0);
 		add(MUTE,
-		    chat_muted(panel.store, panel.chat) ?
+		    chat_muted(panel.store, panel.chat, panel.server_muted) ?
 			    _("Unmute conversation") :
 			    _("Mute conversation"),
 		    NULL, 0);
@@ -363,9 +364,14 @@ static void activate(struct choice *c)
 		return;
 	}
 	case MUTE:
-		chat_mute_toggle(panel.store, panel.chat, &e);
-		if (report(e))
+		chat_set_muted(panel.store, panel.chat,
+			       !chat_muted(panel.store, panel.chat,
+					   panel.server_muted),
+			       &e);
+		if (report(e)) {
 			choices();
+			ui_forget_rail();
+		}
 		ui.dirty = TRUE;
 		return;
 	case STRICT_MUTE:
@@ -529,6 +535,8 @@ static void organize(Json *row)
 	g_free(panel.name);
 	panel.chat = g_strdup(ui_string(row, "id", ""));
 	panel.name = g_strdup(ui_string(row, "name", "Chat"));
+	panel.server_muted =
+		json_object_get_boolean(ui_field(row, "notificationDisabled"));
 	show(ORGANIZE);
 }
 
@@ -770,11 +778,11 @@ gboolean ui_chat_strict_muted(const char *chat)
 gboolean ui_chat_muted(Json *row)
 {
 	const char *id = ui_string(row, "id", NULL);
-	Json *disabled = ui_field(row, "notificationDisabled");
+	gboolean server_muted =
+		json_object_get_boolean(ui_field(row, "notificationDisabled"));
 
-	return ui_chat_strict_muted(id) || chat_muted(panel.store, id) ||
-	       (json_object_is_type(disabled, json_type_boolean) &&
-		json_object_get_boolean(disabled));
+	return ui_chat_strict_muted(id) ||
+	       chat_muted(panel.store, id, server_muted);
 }
 
 gint64 ui_chat_unread(Json *row)

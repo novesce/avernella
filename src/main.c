@@ -1550,30 +1550,6 @@ static void message_unsent(struct line_worker *w, const char *chat,
 	line_emit(event);
 }
 
-/* The latest page of a chat from LINE, with attachment names. */
-static J *fetch_history(struct line_worker *w, const char *chat, J **raw,
-			GError **error)
-{
-	J *history = recent_history(w, chat, raw, error);
-
-	for (size_t i = 0; history && i < json_object_array_length(history);
-	     i++) {
-		J *row = json_object_array_get_idx(history, i);
-
-		if (g_strcmp0(strfield(row, "type"), "file") ||
-		    strfield(row, "filename"))
-			continue;
-		g_autoptr(GError) ignored = NULL;
-		g_autofree char *name = line_attachment_filename(
-			&w->session, field(*raw, strfield(row, "id")),
-			&ignored);
-		if (name)
-			json_object_object_add(row, "filename",
-					       json_object_new_string(name));
-	}
-	return history;
-}
-
 static void show_history(struct line_worker *w, const char *chat, J *raw)
 {
 	json_object_put(w->messages);
@@ -1615,7 +1591,7 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 			return json_object_get(c->rows);
 		}
 		J *raw = NULL;
-		J *history = fetch_history(w, chat, &raw, error);
+		J *history = recent_history(w, chat, &raw, error);
 
 		if (!history)
 			return NULL;
@@ -1654,7 +1630,7 @@ static void revalidate_history(struct line_worker *w, const char *chat)
 {
 	g_autoptr(GError) error = NULL;
 	g_autoptr(J) raw = NULL;
-	g_autoptr(J) rows = fetch_history(w, chat, &raw, &error);
+	g_autoptr(J) rows = recent_history(w, chat, &raw, &error);
 	struct cached_history *c = g_hash_table_lookup(w->history_cache, chat);
 
 	if (!rows)
@@ -2676,7 +2652,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	    !strcmp(method, "sharedCommentPost") ||
 	    !strcmp(method, "sharedCommentDelete"))
 		return line_shared_content(s, method, params, error);
-	if (!strcmp(method, "sharedPhoto")) {
+	if (!strcmp(method, "sharedPhoto") ||
+	    (!strcmp(method, "saveFile") && strfield(params, "album"))) {
 		g_autoptr(GBytes) image = line_shared_photo(s, params, error);
 
 		return image ? line_media_lease(w->leases, image, error) : NULL;
@@ -3512,6 +3489,13 @@ static gboolean apply_operation(struct line_worker *w, J *op)
 		message_unsent(w, chat, id);
 		return TRUE;
 	}
+	if (json_object_get_int(field(op, "3")) == 30) {
+		/* RECEIVE_ANNOUNCEMENT param1 is the chat MID. */
+		chat = strfield(op, "10");
+		if (chat && !g_strcmp0(chat, w->history_chat))
+			line_event("announcements_changed", "chat", chat);
+		return TRUE;
+	}
 	enum peer_notice notice = line_peer_read_notice(s->mid, w->history_chat,
 							w->peer_notices, op);
 
@@ -3759,6 +3743,12 @@ static gint64 maintain_square_sync(struct line_worker *w)
 		const char *kind = strfield(ev, "kind");
 		const char *chat = strfield(ev, "chat");
 
+		if (!g_strcmp0(kind, "announcements") && chat) {
+			if (!g_strcmp0(chat, w->history_chat))
+				line_event("announcements_changed", "chat",
+					   chat);
+			continue;
+		}
 		if (!g_strcmp0(kind, "message") && chat) {
 			const char *mid = strfield(ev, "id");
 			gboolean mine =

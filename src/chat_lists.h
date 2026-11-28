@@ -36,10 +36,11 @@ gboolean chat_notifications_set(struct chat_lists *lists, gboolean on,
 /* Call and message sounds; on unless turned off. */
 gboolean chat_sounds(struct chat_lists *lists);
 gboolean chat_sounds_set(struct chat_lists *lists, gboolean on, GError **e);
-/* Muted conversations never raise a desktop notification. */
-gboolean chat_muted(struct chat_lists *lists, const char *chat);
-gboolean chat_mute_toggle(struct chat_lists *lists, const char *chat,
-			  GError **e);
+/* A saved per-chat choice overrides the remote notification preference. */
+gboolean chat_muted(struct chat_lists *lists, const char *chat,
+		    gboolean server_muted);
+gboolean chat_set_muted(struct chat_lists *lists, const char *chat,
+			gboolean muted, GError **e);
 gboolean chat_strict_muted(struct chat_lists *lists, const char *chat);
 gboolean chat_strict_mute_toggle(struct chat_lists *lists, const char *chat,
 				 GError **e);

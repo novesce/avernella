@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "ui_tray.h"
 #include "ui_logo.h"
+#include "ui_window.h"
 #include <gio/gio.h>
 #include <string.h>
 
@@ -220,16 +221,30 @@ static void tray(gconstpointer fixture)
 	gboolean sandboxed = fixture != NULL;
 	gboolean permitted = GPOINTER_TO_INT(fixture) == 1;
 	guint portal_object = 0;
+
 	g_autoptr(GVariant) properties = NULL, dict = NULL, show = NULL,
-			    menu = NULL, root = NULL, children = NULL;
+			    menu = NULL, root = NULL, children = NULL,
+			    provided = NULL;
 
 	quit = panel_host = background_requested = FALSE;
-	g_setenv("SDL_VIDEODRIVER", "dummy", TRUE);
+	const char *driver = g_getenv("AVERNELLA_TEST_TRAY_DRIVER");
+
+	g_setenv("SDL_VIDEODRIVER", driver ? driver : "dummy", TRUE);
+	g_autofree char *xdisplay = g_strdup(g_getenv("DISPLAY"));
+	g_autofree char *wdisplay = g_strdup(g_getenv("WAYLAND_DISPLAY"));
+	g_autofree char *runtime = g_strdup(g_getenv("XDG_RUNTIME_DIR"));
+
 	g_unsetenv("LINE_DISABLE_TRAY");
 	if (sandboxed)
 		g_setenv("FLATPAK_ID", APP, TRUE);
 	g_autoptr(GTestDBus) dbus = g_test_dbus_new(G_TEST_DBUS_NONE);
 	g_test_dbus_up(dbus);
+	if (driver && xdisplay)
+		g_setenv("DISPLAY", xdisplay, TRUE);
+	if (driver && wdisplay)
+		g_setenv("WAYLAND_DISPLAY", wdisplay, TRUE);
+	if (driver && runtime)
+		g_setenv("XDG_RUNTIME_DIR", runtime, TRUE);
 	g_autoptr(GError) error = NULL;
 	bus = g_dbus_connection_new_for_address_sync(
 		g_test_dbus_get_bus_address(dbus),
@@ -271,6 +286,22 @@ static void tray(gconstpointer fixture)
 	g_assert_cmpint(SDL_Init(SDL_INIT_VIDEO), ==, 0);
 	window = SDL_CreateWindow("Tray fixture", 0, 0, 160, 100, 0);
 	g_assert_nonnull(window);
+	if (driver) {
+		g_autofree char *parent = NULL;
+		struct ui_window_export *exported =
+			ui_window_export(window, &parent);
+
+		if (!strcmp(driver, "x11")) {
+			g_assert_nonnull(parent);
+			g_assert_true(g_str_has_prefix(parent, "x11:"));
+			g_assert_null(exported);
+		} else if (g_getenv("AVERNELLA_TEST_REQUIRE_WAYLAND_EXPORT")) {
+			g_assert_nonnull(parent);
+			g_assert_true(g_str_has_prefix(parent, "wayland:"));
+			g_assert_nonnull(exported);
+		}
+		ui_window_unexport(exported);
+	}
 	g_assert_false(ui_tray_hide(window));
 	ui_tray_start();
 	wait_for(REGISTERED);
@@ -308,8 +339,17 @@ static void tray(gconstpointer fixture)
 	g_assert_true(g_variant_lookup(dict, "Title", "&s", &title));
 	g_assert_cmpstr(title, ==, "Avernella");
 	check_icon(dict, sandboxed ? APP : "avernella");
+	provided = rpc(item, IPATH, ITEM, "ProvideXdgActivationToken",
+		       g_variant_new("(s)", "fixture-token"));
+	g_assert_nonnull(provided);
 	show = rpc(item, IPATH, ITEM, "Activate", g_variant_new("(ii)", 0, 0));
 	wait_for(VISIBLE);
+	ui_tray_presented(window);
+	g_clear_pointer(&show, g_variant_unref);
+	show = rpc(item, IPATH, ITEM, "Activate", g_variant_new("(ii)", 0, 0));
+	for (int i = 0; i < 20; i++)
+		pump();
+	g_assert_false(hidden());
 	menu = rpc(item, "/Menu", MENU, "GetLayout",
 		   g_variant_new("(ii@as)", 0, -1,
 				 g_variant_new_strv(NULL, 0)));
@@ -331,6 +371,7 @@ static void tray(gconstpointer fixture)
 	wait_for(QUIT_APP);
 stop:
 	ui_tray_stop();
+	ui_window_shutdown();
 	SDL_DestroyWindow(window);
 	SDL_Quit();
 	own(FALSE);
@@ -345,16 +386,26 @@ stop:
 		g_unsetenv("FLATPAK_ID");
 }
 
+static void fixture(gconstpointer data)
+{
+	if (g_test_subprocess())
+		tray(data);
+	else {
+		g_test_trap_subprocess(NULL, 20000000, 0);
+		g_test_trap_assert_passed();
+	}
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	if (!g_file_test("/.flatpak-info", G_FILE_TEST_EXISTS))
 		g_test_add_data_func(
 			"/tray/private-bus-menu-host-loss-and-fallback", NULL,
-			tray);
+			fixture);
 	g_test_add_data_func("/tray/flatpak-background-allowed",
-			     GINT_TO_POINTER(1), tray);
+			     GINT_TO_POINTER(1), fixture);
 	g_test_add_data_func("/tray/flatpak-background-denied",
-			     GINT_TO_POINTER(2), tray);
+			     GINT_TO_POINTER(2), fixture);
 	return g_test_run();
 }

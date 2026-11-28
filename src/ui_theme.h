@@ -59,6 +59,15 @@ extern enum ui_palette ui_palette;
 #define UI_BUBBLE_OUT UI_ACCENT
 #define UI_BUBBLE_OUT_INK UI_ON_ACCENT
 
+enum {
+	UI_SIDEBAR_MIN = 196,
+	UI_SIDEBAR_MAX = 480,
+	UI_CHAT_MIN = 344
+};
+
+int ui_theme_sidebar_width(void);
+gboolean ui_theme_save_sidebar_width(int width, GError **error);
+
 void ui_theme_init(void);
 gboolean ui_theme_is_line(void);
 gboolean ui_theme_toggle(GError **error);

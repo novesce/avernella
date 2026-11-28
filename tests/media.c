@@ -155,6 +155,7 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 }
 
 static int square_upload_count;
+static gboolean square_file_upload;
 
 char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 			     const char *name, const char *type,
@@ -170,8 +171,13 @@ char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 	g_assert_cmpstr(token, ==, "fixture-token");
 	g_assert_cmpstr(chat, ==, "m00000000000000000000000000000001");
 	g_assert_cmpint(seq, ==, 77);
-	g_assert_cmpstr(name, ==, "image.png");
-	g_assert_cmpstr(type, ==, "IMAGE");
+	if (square_file_upload) {
+		g_assert_true(g_str_has_suffix(name, ".zip"));
+		g_assert_cmpstr(type, ==, "FILE");
+	} else {
+		g_assert_cmpstr(name, ==, "image.png");
+		g_assert_cmpstr(type, ==, "IMAGE");
+	}
 	g_assert_cmpuint(g_bytes_get_size(body), >, 0);
 	return g_strdup("609999999999");
 }
@@ -452,6 +458,8 @@ static void attachment_case(gconstpointer value)
 		g_assert_true(g_bytes_equal(legacy_envelope, read));
 	}
 	if (type == LINE_MEDIA_FILE) {
+		g_assert_cmpuint(line_message_file_size(field(sent, "18")), ==,
+				 n);
 		g_autofree char *name =
 			line_attachment_filename(&s, sent, &err);
 		g_assert_no_error(err);
@@ -587,20 +595,29 @@ static void token_refresh(void)
 	g_assert_cmpint(s.obs_until, ==, 0);
 }
 
-static void square_image_upload(void)
+static void square_attachment_upload(gconstpointer is_file)
 {
 	Line s = { .obs_token = g_strdup("stale-token"),
 		   .obs_until = G_MAXINT64 };
 	g_autoptr(GError) error = NULL;
 	g_autofree char *path = NULL;
-	int fd = g_file_open_tmp("avernella-sq-XXXXXX.png", &path, &error);
+
+	square_file_upload = is_file != NULL;
+	int fd = g_file_open_tmp(square_file_upload ?
+					 "avernella-sq-XXXXXX.zip" :
+					 "avernella-sq-XXXXXX.png",
+				 &path, &error);
 
 	g_assert_no_error(error);
 	g_assert_cmpint(fd, >=, 0);
 	static const guint8 png[16] = { 0x89, 'P',  'N', 'G', '\r', '\n',
 					0x1a, '\n', 0,	 0,   0,    0,
 					0,    0,    0,	 0 };
-	g_assert_cmpint(write(fd, png, sizeof(png)), ==, sizeof(png));
+	static const guint8 zip[] = { 'P', 'K', 3, 4, 0, 0, 0, 0 };
+	const guint8 *bytes = square_file_upload ? zip : png;
+	size_t n = square_file_upload ? sizeof(zip) : sizeof(png);
+
+	g_assert_cmpint(write(fd, bytes, n), ==, n);
 	close(fd);
 
 	token_count = 0;
@@ -608,7 +625,8 @@ static void square_image_upload(void)
 	stale_token = TRUE;
 	g_autoptr(J) receipt = line_send_square_attachment(
 		&s, "m00000000000000000000000000000001",
-		"p00000000000000000000000000000001", path, LINE_MEDIA_IMAGE, 77,
+		"p00000000000000000000000000000001", path,
+		square_file_upload ? LINE_MEDIA_FILE : LINE_MEDIA_IMAGE, 77,
 		&error);
 	unlink(path);
 	g_assert_no_error(error);
@@ -624,7 +642,10 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/media/legacy-no-sealed-fallback", legacy);
 	g_test_add_func("/media/video-stale-obs-token-refresh", token_refresh);
-	g_test_add_func("/media/square-image-v1-upload", square_image_upload);
+	g_test_add_data_func("/media/square-image-v1-upload", NULL,
+			     square_attachment_upload);
+	g_test_add_data_func("/media/square-file-v1-upload", GINT_TO_POINTER(1),
+			     square_attachment_upload);
 	g_test_add_func("/media/independent-crypto-vector", crypto_vector);
 	g_test_add_func("/media/independent-video-chunks", chunk_vector);
 	g_test_add_data_func("/media/group-image",

@@ -113,22 +113,31 @@ static void mute_and_motion(void)
 	struct chat_lists *s = chat_lists_open(USER, &e);
 
 	g_assert_no_error(e);
-	g_assert_false(chat_muted(s, CHAT));
+	g_assert_false(chat_muted(s, CHAT, FALSE));
 	g_assert_cmpint(chat_motion(s), ==, -1);
-	g_assert_true(chat_mute_toggle(s, CHAT, &e));
+	static const char room[] = "m03030303030303030303030303030303";
+
+	g_assert_true(chat_muted(s, CHAT, TRUE));
+	g_assert_true(chat_set_muted(s, CHAT, FALSE, &e));
+	g_assert_false(chat_muted(s, CHAT, TRUE));
+	g_assert_true(chat_set_muted(s, room, TRUE, &e));
+	g_assert_true(chat_muted(s, room, FALSE));
 	g_assert_true(chat_motion_set(s, 1, &e));
-	g_assert_false(chat_mute_toggle(s, "../other", &e));
+	g_assert_false(chat_set_muted(s, "../other", TRUE, &e));
 	g_clear_error(&e);
 	chat_lists_free(s);
 	s = chat_lists_open(USER, &e);
 	g_assert_no_error(e);
-	g_assert_true(chat_muted(s, CHAT));
-	g_assert_false(chat_muted(s, PEER));
+	g_assert_false(chat_muted(s, CHAT, TRUE));
+	g_assert_true(chat_muted(s, room, FALSE));
+	g_assert_false(chat_muted(s, PEER, FALSE));
 	g_assert_false(chat_pinned(s, CHAT));
 	g_assert_cmpint(chat_motion(s), ==, 1);
-	g_assert_true(chat_mute_toggle(s, CHAT, &e));
+	g_assert_true(chat_set_muted(s, CHAT, TRUE, &e));
+	g_assert_true(chat_set_muted(s, room, FALSE, &e));
 	g_assert_true(chat_motion_set(s, -1, &e));
-	g_assert_false(chat_muted(s, CHAT));
+	g_assert_true(chat_muted(s, CHAT, FALSE));
+	g_assert_false(chat_muted(s, room, TRUE));
 	g_assert_cmpint(chat_motion(s), ==, -1);
 	chat_lists_free(s);
 	g_autofree char *file = settings_file(USER);
@@ -153,7 +162,7 @@ static void strict_mute(void)
 	g_clear_error(&e);
 	g_assert_true(chat_strict_mute_toggle(s, CHAT, &e));
 	g_assert_true(chat_strict_muted(s, CHAT));
-	g_assert_false(chat_muted(s, CHAT));
+	g_assert_false(chat_muted(s, CHAT, FALSE));
 	chat_lists_free(s);
 
 	s = chat_lists_open(OTHER, &e);

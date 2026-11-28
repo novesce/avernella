@@ -146,6 +146,21 @@ static inline const char *strfield(J *o, const char *name)
 		       NULL;
 }
 
+/* FILE_SIZE is a decimal string in LINE's content metadata. */
+static inline guint64 line_message_file_size(J *metadata)
+{
+	J *v = field(metadata, "FILE_SIZE");
+	const char *size = json_object_is_type(v, json_type_string) ?
+				   json_object_get_string(v) :
+				   NULL;
+	guint64 bytes;
+
+	if (!size || strlen(size) != (size_t)json_object_get_string_len(v) ||
+	    !g_ascii_string_to_unsigned(size, 10, 1, G_MAXINT64, &bytes, NULL))
+		return 0;
+	return bytes;
+}
+
 #define LINE_ERROR (g_quark_from_static_string("avernella"))
 
 /*

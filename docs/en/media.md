@@ -63,6 +63,8 @@ Decryption checks the tag in constant time, trying both forms, before decrypting
 
 Uploading doesn't give anyone access. Recipients can find and decrypt the object only after `sendMessage` delivers its location and key.
 
+File cards show the attachment name and the size provided by LINE. Select **Save attachment** to choose where to write it. Use **Send as file** in the preview to send a photo or clip in its original format as a general attachment. Other documents and archives go through that route automatically.
+
 ### Downloading
 
 `line_download_attachment()` (and `line_download_image()`, `line_download_video_preview()`):
@@ -88,6 +90,10 @@ Downloaded bytes reach the UI as a [media lease](architecture.md#large-data-medi
 | `videoPoster` | A video's preview picture |
 | `openVideo` | The whole video, for `ffplay` |
 | `saveFile` | Writes the attachment to a path the user chose, atomically (`line_save_media()`) |
+
+### Full-window photo viewer
+
+Open a photo to see it at the size of the window. Scroll over the image to zoom around the pointer, then drag to inspect an enlarged area. The floating toolbar provides zoom, fit or actual size, quarter-turn rotation and saving the original. Use **Left** and **Right** or the side arrows to move between photos in the current history page. **Esc** or a click in the backdrop closes the viewer. Reduced Motion applies zoom changes immediately. The anchor and edge calculations adapt Telegram Desktop’s GPL media overlay. [Upstream implementation](https://github.com/telegramdesktop/tdesktop/blob/fca0d08b6852df2195e11db91f7a4e3be2cbc4a4/Telegram/SourceFiles/media/view/media_view_overlay_widget.cpp#L7871)
 
 ### Forwarding
 

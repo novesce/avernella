@@ -4,6 +4,7 @@
 #include <string.h>
 
 static gboolean line_layout;
+static int sidebar_width;
 enum ui_palette ui_palette;
 
 const struct ui_palette_colors ui_palettes[UI_PALETTE_COUNT] = {
@@ -29,6 +30,7 @@ void ui_theme_init(void)
 {
 	g_autofree char *path = theme_path("layout");
 	g_autofree char *accent = theme_path("accent");
+	g_autofree char *sidebar = theme_path("sidebar-width");
 	g_autofree char *name = NULL;
 	gsize len = 0;
 
@@ -36,6 +38,17 @@ void ui_theme_init(void)
 	line_layout = !(g_file_get_contents(path, &name, &len, NULL) &&
 			len == sizeof("avernella\n") - 1 &&
 			!memcmp(name, "avernella\n", len));
+	sidebar_width = 0;
+	g_clear_pointer(&name, g_free);
+	if (g_file_get_contents(sidebar, &name, &len, NULL) && len &&
+	    len <= sizeof("480\n") - 1 && !memchr(name, 0, len)) {
+		guint64 width;
+
+		if (g_ascii_string_to_unsigned(g_strchomp(name), 10,
+					       UI_SIDEBAR_MIN, UI_SIDEBAR_MAX,
+					       &width, NULL))
+			sidebar_width = width;
+	}
 	ui_palette = UI_PALETTE_PINK;
 	g_clear_pointer(&name, g_free);
 	if (!g_file_get_contents(accent, &name, &len, NULL))
@@ -83,5 +96,25 @@ gboolean ui_theme_set_palette(enum ui_palette palette, GError **error)
 	if (!save("accent", palette_names[palette], error))
 		return FALSE;
 	ui_palette = palette;
+	return TRUE;
+}
+
+int ui_theme_sidebar_width(void)
+{
+	return sidebar_width;
+}
+
+gboolean ui_theme_save_sidebar_width(int width, GError **error)
+{
+	char value[16];
+
+	g_return_val_if_fail(width >= UI_SIDEBAR_MIN && width <= UI_SIDEBAR_MAX,
+			     FALSE);
+	if (width == sidebar_width)
+		return TRUE;
+	g_snprintf(value, sizeof(value), "%d\n", width);
+	if (!save("sidebar-width", value, error))
+		return FALSE;
+	sidebar_width = width;
 	return TRUE;
 }
