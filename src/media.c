@@ -159,33 +159,87 @@ static guint64 load_be64(const guint8 *p)
 	return GUINT64_FROM_BE(value);
 }
 
+struct mp4_box {
+	const guint8 *type, *data;
+	gsize len;
+};
+
+static gboolean next_box(const guint8 **cursor, gsize *remaining,
+			 struct mp4_box *box)
+{
+	const guint8 *data = *cursor;
+	gsize header = 8;
+	guint64 size;
+
+	if (*remaining < header)
+		return FALSE;
+	size = load_be32(data);
+	if (size == 1) {
+		header = 16;
+		if (*remaining < header)
+			return FALSE;
+		size = load_be64(data + 8);
+	} else if (!size) {
+		size = *remaining;
+	}
+	if (size < header || size > *remaining)
+		return FALSE;
+	box->type = data + 4;
+	box->data = data + header;
+	box->len = size - header;
+	*cursor += size;
+	*remaining -= size;
+	return TRUE;
+}
+
 static const guint8 *find_box(const guint8 *data, gsize *length,
 			      const char *fourcc)
 {
 	gsize remaining = *length;
+	struct mp4_box box;
 
-	for (guint i = 0; remaining >= 8 && i < 65536; i++) {
-		guint64 size = load_be32(data);
-		gsize header = 8;
-
-		if (size == 1) {
-			header = 16;
-			if (remaining < header)
-				break;
-			size = load_be64(data + 8);
-		} else if (!size) {
-			size = remaining;
+	for (guint i = 0; i < 65536 && next_box(&data, &remaining, &box); i++) {
+		if (!memcmp(box.type, fourcc, 4)) {
+			*length = box.len;
+			return box.data;
 		}
-		if (size < header || size > remaining)
-			break;
-		if (!memcmp(data + 4, fourcc, 4)) {
-			*length = size - header;
-			return data + header;
-		}
-		data += size;
-		remaining -= size;
 	}
 	return NULL;
+}
+
+static gboolean has_video_track(const guint8 *data, gsize len)
+{
+	struct mp4_box track;
+
+	for (guint i = 0; i < 65536 && next_box(&data, &len, &track); i++) {
+		if (memcmp(track.type, "trak", 4))
+			continue;
+		gsize n = track.len;
+		const guint8 *mdia = find_box(track.data, &n, "mdia");
+		const guint8 *hdlr = mdia ? find_box(mdia, &n, "hdlr") : NULL;
+
+		if (hdlr && n >= 12 && !memcmp(hdlr + 8, "vide", 4))
+			return TRUE;
+	}
+	return FALSE;
+}
+
+static gboolean mp4_video(GBytes *bytes)
+{
+	gsize remaining;
+	const guint8 *data = g_bytes_get_data(bytes, &remaining);
+	gboolean ftyp = FALSE, video = FALSE, mdat = FALSE;
+	struct mp4_box box;
+
+	for (guint i = 0; i < 65536 && next_box(&data, &remaining, &box); i++) {
+		if (!memcmp(box.type, "ftyp", 4))
+			ftyp = box.len >= 8 && !(box.len % 4);
+		else if (!memcmp(box.type, "moov", 4))
+			video = has_video_track(box.data, box.len);
+		else if (!memcmp(box.type, "mdat", 4))
+			mdat |= box.len > 0;
+	}
+	return !remaining && ftyp && video && mdat;
 }
 
 /* MP4 and QuickTime store the movie timebase in the top-level moov/mvhd. */
@@ -507,7 +561,9 @@ static J *open_attachment(Line *s, J *message, GError **error)
 	const char *sid = media_namespace(type);
 	J *meta = field(message, "18");
 
-	if (!sid || g_strcmp0(strfield(meta, "SID"), sid)) {
+	if (!sid || (g_strcmp0(strfield(meta, "SID"), sid) &&
+		     (type != LINE_MEDIA_VIDEO ||
+		      json_object_object_get_ex(meta, "SID", NULL)))) {
 		media_error(
 			error,
 			"This attachment does not use a supported Letter Sealing envelope.");
@@ -554,7 +610,7 @@ static gboolean plain_attachment(J *message)
 }
 
 static GBytes *download_object(Line *s, const char *sid, const char *oid,
-			       const char *id, gboolean preview, GError **error)
+			       const char *id, GError **error)
 {
 	g_autoptr(GError) failure = NULL;
 
@@ -563,11 +619,8 @@ static GBytes *download_object(Line *s, const char *sid, const char *oid,
 
 		if (!token)
 			break;
-		GBytes *bytes = preview ? line_obs_download_preview(token, sid,
-								    oid, id,
-								    &failure) :
-					  line_obs_download(token, sid, oid, id,
-							    &failure);
+		GBytes *bytes =
+			line_obs_download(token, sid, oid, id, &failure);
 
 		if (bytes)
 			return bytes;
@@ -584,57 +637,176 @@ static GBytes *download_object(Line *s, const char *sid, const char *oid,
 	return NULL;
 }
 
-static GBytes *download_sealed_object(Line *s, J *message, gboolean preview,
+struct video_reference {
+	const char *id, *sid, *oid, *pop, *url;
+	gboolean square, sealed;
+};
+
+static const char *media_string(J *record, const char *key)
+{
+	const char *str = strfield(record, key);
+
+	if (!str || !*str ||
+	    strlen(str) !=
+		    (size_t)json_object_get_string_len(field(record, key)))
+		return NULL;
+	return str;
+}
+
+static gboolean parse_video_reference(J *message, gboolean preview,
+				      struct video_reference *ref,
 				      GError **error)
+{
+	J *meta = NULL, *chunks = NULL;
+	J *type = field(message, "15");
+	const char *sid;
+
+	if (!json_object_is_type(type, json_type_int) ||
+	    json_object_get_int(type) != LINE_MEDIA_VIDEO) {
+		media_error(error, "The selected message is not a video.");
+		return FALSE;
+	}
+	ref->id = media_string(message, "4");
+	if (!ref->id || strlen(ref->id) > 24 ||
+	    ref->id[strspn(ref->id, "0123456789")] ||
+	    (json_object_object_get_ex(message, "18", &meta) &&
+	     !json_object_is_type(meta, json_type_object)) ||
+	    (json_object_object_get_ex(message, "20", &chunks) &&
+	     !json_object_is_type(chunks, json_type_array)))
+		goto invalid;
+	ref->sealed = chunks && json_object_array_length(chunks) > 0;
+	ref->square = line_is_square_chat(media_string(message, "2"));
+	sid = media_string(meta, "SID");
+	ref->sealed |= !g_strcmp0(sid, "emv");
+	if (meta) {
+		json_object_object_foreach(meta, key, value) {
+			(void)value;
+			if (!g_ascii_strncasecmp(key, "e2ee", 4) ||
+			    !g_ascii_strcasecmp(key, "keyMaterial"))
+				ref->sealed = TRUE;
+		}
+	}
+	ref->sid = ref->sealed ? "emv" : "m";
+	if (json_object_object_get_ex(meta, "SID", NULL) &&
+	    g_strcmp0(sid, ref->sid))
+		goto invalid;
+	ref->oid = media_string(meta, "OID");
+	if (!ref->oid && json_object_object_get_ex(meta, "OID", NULL))
+		goto invalid;
+	ref->pop = media_string(meta, "OBS_POP");
+	ref->url = media_string(meta, preview ? "PREVIEW_URL" : "DOWNLOAD_URL");
+	return TRUE;
+
+invalid:
+	media_error(error, "The video has an invalid LINE media reference.");
+	return FALSE;
+}
+
+static GBytes *download_video_object(Line *s, const struct video_reference *ref,
+				     gboolean preview, GError **error)
+{
+	g_autoptr(GError) failure = NULL;
+
+	for (int i = 0; i < 2; i++) {
+		g_autoptr(LineSecret) token = line_obs_token(s, &failure);
+
+		if (!token)
+			break;
+		GBytes *bytes = line_obs_download_video(
+			token, s->mid, ref->sid, ref->oid, ref->id, ref->pop,
+			ref->url, ref->square, preview, &failure);
+
+		if (bytes)
+			return bytes;
+		if (i || !g_error_matches(failure, LINE_ERROR,
+					  LINE_OBS_UNAUTHORIZED))
+			break;
+		line_secret_set(&s->obs_token, NULL);
+		s->obs_until = 0;
+		g_clear_error(&failure);
+	}
+	if (failure)
+		g_propagate_error(error, g_steal_pointer(&failure));
+	return NULL;
+}
+
+static GBytes *download_sealed_video(Line *s,
+				     const struct video_reference *video,
+				     J *payload, gboolean preview,
+				     GError **error)
+{
+	struct video_reference route = *video;
+	const char *sealed_oid = media_string(payload, "OID");
+
+	/* An object ID inside the authenticated envelope takes precedence. */
+	if (json_object_object_get_ex(payload, "OID", NULL)) {
+		if (!sealed_oid ||
+		    (route.oid && strcmp(route.oid, sealed_oid))) {
+			media_error(
+				error,
+				"The video's encrypted object ID does not match.");
+			return NULL;
+		}
+		route.oid = sealed_oid;
+	}
+	if (!route.oid && !route.url) {
+		media_error(error,
+			    "The encrypted video has no LINE media reference.");
+		return NULL;
+	}
+	return download_video_object(s, &route, preview, error);
+}
+
+static GBytes *download_sealed_object(Line *s, J *message,
+				      const struct video_reference *video,
+				      gboolean preview, GError **error)
 {
 	g_autoptr(J) payload = open_attachment(s, message, error);
 	if (!payload)
 		return NULL;
-	const char *encoded = strfield(payload, "keyMaterial");
-
-	if (!encoded || strlen(encoded) != 44 ||
-	    json_object_get_string_len(field(payload, "keyMaterial")) != 44) {
-		media_error(error,
-			    "The message has an invalid attachment key.");
-		return NULL;
-	}
 	J *meta = field(message, "18");
 	guint64 size = preview ? 0 : line_message_file_size(meta);
+	const char *encoded = media_string(payload, "keyMaterial");
+	gsize len = 0;
+
+	g_autofree guint8 *key = NULL;
+
+	GBytes *result = NULL;
+	gboolean valid = FALSE;
+
+	if (encoded && strlen(encoded) == 44) {
+		key = g_base64_decode(encoded, &len);
+		g_autoptr(LineSecret) roundtrip = g_base64_encode(key, len);
+
+		valid = len == 32 && !strcmp(encoded, roundtrip);
+	}
+	line_secret_json_wipe(field(payload, "keyMaterial"));
+	if (!valid) {
+		media_error(error,
+			    "The message has an invalid attachment key.");
+		goto done;
+	}
 
 	if (!preview && json_object_object_get_ex(meta, "FILE_SIZE", NULL) &&
 	    (!size || size > LINE_MEDIA_LIMIT)) {
 		media_error(error, "Invalid encrypted attachment size.");
-		return NULL;
+		goto done;
 	}
-	enum line_media_object object = LINE_MEDIA_BODY;
-
-	if (preview)
-		object = LINE_MEDIA_VIDEO_POSTER;
-	else if (json_object_get_int(field(message, "15")) == LINE_MEDIA_VIDEO)
-		object = LINE_MEDIA_VIDEO_BODY;
-	gsize len;
-
-	g_autofree guint8 *key = g_base64_decode(encoded, &len);
-	g_autofree char *roundtrip = g_base64_encode(key, len);
-	gboolean valid = len == 32 && !strcmp(encoded, roundtrip);
-
-	OPENSSL_cleanse(roundtrip, strlen(roundtrip));
-	g_autoptr(GBytes) result = NULL;
-	if (!valid)
-		media_error(error,
-			    "The message has an invalid attachment key.");
-	else {
-		GBytes *bytes = download_object(s, strfield(meta, "SID"),
+	enum line_media_object object = preview ? LINE_MEDIA_VIDEO_POSTER :
+					video	? LINE_MEDIA_VIDEO_BODY :
+						  LINE_MEDIA_BODY;
+	GBytes *bytes = video ? download_sealed_video(s, video, payload,
+						      preview, error) :
+				download_object(s, strfield(meta, "SID"),
 						strfield(meta, "OID"),
-						strfield(message, "4"), preview,
-						error);
+						strfield(message, "4"), error);
 
-		if (bytes)
-			result = line_media_decrypt(bytes, key, object, size,
-						    error);
-	}
-	OPENSSL_cleanse(key, len);
-	return g_steal_pointer(&result);
+	if (bytes)
+		result = line_media_decrypt(bytes, key, object, size, error);
+done:
+	if (key)
+		OPENSSL_cleanse(key, len);
+	return result;
 }
 
 static gboolean want_original_image(J *message)
@@ -657,8 +829,8 @@ static gboolean want_original_image(J *message)
 	       strfield(meta, "OBS_POP") != NULL;
 }
 
-static GBytes *download_square_object(Line *s, const char *id, int variant,
-				      GError **error)
+static GBytes *download_square_object(Line *s, const char *id,
+				      gboolean original, GError **error)
 {
 	g_autoptr(GError) failure = NULL;
 
@@ -668,10 +840,7 @@ static GBytes *download_square_object(Line *s, const char *id, int variant,
 		if (!token)
 			break;
 		GBytes *bytes =
-			variant == 1 ?
-				line_obs_download_square_preview(token, id,
-								 &failure) :
-			variant == 2 ?
+			original ?
 				line_obs_download_square_original(token, id,
 								  &failure) :
 				line_obs_download_square(token, id, &failure);
@@ -716,10 +885,34 @@ static GBytes *download_talk_original(Line *s, const char *id, GError **error)
 	return NULL;
 }
 
+static GBytes *download_video_bytes(Line *s, J *message, gboolean preview,
+				    GError **error)
+{
+	struct video_reference ref;
+
+	if (!parse_video_reference(message, preview, &ref, error))
+		return NULL;
+	g_autoptr(GBytes) bytes =
+		ref.sealed ? download_sealed_object(s, message, &ref, preview,
+						    error) :
+			     download_video_object(s, &ref, preview, error);
+	gsize limit = preview ? LINE_MEDIA_PREVIEW_LIMIT : LINE_MEDIA_LIMIT;
+
+	if (bytes &&
+	    (!g_bytes_get_size(bytes) || g_bytes_get_size(bytes) > limit)) {
+		media_error(error,
+			    "The downloaded video object has an invalid size.");
+		return NULL;
+	}
+	return g_steal_pointer(&bytes);
+}
+
 GBytes *line_download_attachment(Line *s, J *message, GError **error)
 {
+	if (json_object_get_int(field(message, "15")) == LINE_MEDIA_VIDEO)
+		return download_video_bytes(s, message, FALSE, error);
 	if (!plain_attachment(message))
-		return download_sealed_object(s, message, FALSE, error);
+		return download_sealed_object(s, message, NULL, FALSE, error);
 	const char *id = strfield(message, "4");
 	const char *to = strfield(message, "2");
 	gboolean square = line_is_square_chat(to);
@@ -728,12 +921,12 @@ GBytes *line_download_attachment(Line *s, J *message, GError **error)
 	if (want_original_image(message)) {
 		g_autoptr(GError) ignored = NULL;
 
-		bytes = square ? download_square_object(s, id, 2, &ignored) :
+		bytes = square ? download_square_object(s, id, TRUE, &ignored) :
 				 download_talk_original(s, id, &ignored);
 	}
 	if (!bytes)
-		bytes = square ? download_square_object(s, id, 0, error) :
-				 download_object(s, "m", id, id, FALSE, error);
+		bytes = square ? download_square_object(s, id, FALSE, error) :
+				 download_object(s, "m", id, id, error);
 
 	if (bytes && (!g_bytes_get_size(bytes) ||
 		      g_bytes_get_size(bytes) > LINE_MEDIA_LIMIT)) {
@@ -745,28 +938,27 @@ GBytes *line_download_attachment(Line *s, J *message, GError **error)
 
 GBytes *line_download_video_preview(Line *s, J *message, GError **error)
 {
-	if (json_object_get_int(field(message, "15")) != LINE_MEDIA_VIDEO) {
-		media_error(error, "The selected message is not a video.");
-		return NULL;
-	}
-	const char *id = strfield(message, "4");
-	const char *to = strfield(message, "2");
-	gboolean square = line_is_square_chat(to);
-
 	g_autoptr(GBytes) preview =
-		plain_attachment(message) ?
-			(square ?
-				 download_square_object(s, id, TRUE, error) :
-				 download_object(s, "m", id, id, TRUE, error)) :
-			download_sealed_object(s, message, TRUE, error);
+		download_video_bytes(s, message, TRUE, error);
 
-	if (preview && (g_bytes_get_size(preview) > LINE_MEDIA_PREVIEW_LIMIT ||
-			!image_format(preview))) {
+	if (preview && !image_format(preview)) {
 		media_error(error,
 			    "LINE has no supported thumbnail for this video.");
 		return NULL;
 	}
 	return g_steal_pointer(&preview);
+}
+
+GBytes *line_download_video(Line *s, J *message, GError **error)
+{
+	g_autoptr(GBytes) bytes =
+		download_video_bytes(s, message, FALSE, error);
+
+	if (bytes && !mp4_video(bytes)) {
+		media_error(error, "LINE did not return a complete MP4 video.");
+		return NULL;
+	}
+	return g_steal_pointer(&bytes);
 }
 
 GBytes *line_download_image(Line *s, J *message, GError **error)

@@ -3094,8 +3094,31 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		return find_friend(w, strfield(params, "query"), error);
 	if (!strcmp(method, "addFriend"))
 		return add_friend(w, strfield(params, "lookup"), error);
-	if (!strcmp(method, "friendInvite"))
-		return line_friend_invite(s, error);
+	if (!strcmp(method, "friendInvite")) {
+		J *refresh = field(params, "refresh");
+		J *expires = field(params, "expirationTime");
+		J *max_uses = field(params, "maxUseCount");
+		gint64 count = json_object_get_int64(max_uses);
+
+		if (!refresh && !expires && !max_uses)
+			return line_friend_invite(s, error);
+		if ((refresh &&
+		     !json_object_is_type(refresh, json_type_boolean)) ||
+		    (expires && !json_object_is_type(expires, json_type_int)) ||
+		    (max_uses &&
+		     !json_object_is_type(max_uses, json_type_int)) ||
+		    count < 0 || count > G_MAXINT32)
+			return problem(error,
+				       "Invalid personal QR ticket settings.");
+		struct line_friend_ticket_request request = {
+			.expiration_time = json_object_get_int64(expires),
+			.max_use_count = count,
+			.refresh = json_object_get_boolean(refresh),
+		};
+
+		/* The request ID delivers completion to the UI's callback. */
+		return line_friend_ticket(s, &request, error);
+	}
 	if (!strcmp(method, "liffView"))
 		return line_liff_view(s, w->chats, params, error);
 	if (!strcmp(method, "openFriend") || !strcmp(method, "renameFriend") ||
@@ -3594,12 +3617,20 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(
 				error,
 				"Select a video from this conversation.");
+		/* Older offline Square rows may omit the room in field 2. */
+		if (line_is_square_chat(chat) && !strfield(msg, "2"))
+			json_object_object_add(msg, "2",
+					       json_object_new_string(chat));
 		g_autoptr(GBytes) bytes =
 			video_poster ?
 				line_download_video_preview(s, msg, error) :
-				line_download_attachment(s, msg, error);
+				line_download_video(s, msg, error);
 
-		return bytes ? line_media_lease(w->leases, bytes, error) : NULL;
+		if (!bytes)
+			return NULL;
+		return video_poster ?
+			       line_media_lease(w->leases, bytes, error) :
+			       line_media_video_lease(w->leases, bytes, error);
 	}
 	if (!strcmp(method, "photo") || !strcmp(method, "saveFile")) {
 		if (!msg)

@@ -310,18 +310,60 @@ int line_media_recv_frame(int socket, struct line_preview_frame *frame)
 	return fd;
 }
 
-J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error)
+static int open_video_tmp(const char *base)
+{
+	struct stat st;
+
+	if (!base || !g_path_is_absolute(base)) {
+		errno = EINVAL;
+		return -1;
+	}
+	g_autofree char *path = g_build_filename(base, "avernella", NULL);
+
+	if (g_mkdir_with_parents(path, 0700))
+		return -1;
+	int dir = open(path, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+
+	if (dir < 0)
+		return -1;
+	int fd = -1;
+
+	if (fstat(dir, &st))
+		goto done;
+	if (st.st_uid != geteuid() || (st.st_mode & 077)) {
+		errno = EACCES;
+		goto done;
+	}
+	/* Never give decrypted playback bytes a directory entry. */
+	fd = openat(dir, ".", O_TMPFILE | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+done:
+	close(dir);
+	return fd;
+}
+
+static J *media_lease(GHashTable *leases, GBytes *bytes, gboolean video,
+		      GError **error)
 {
 	if (g_hash_table_size(leases) >= 4) {
 		g_set_error_literal(error, LINE_ERROR, 1,
 				    "Finish opening another image first.");
 		return NULL;
 	}
-	int fd = sealable_memfd("line-image");
+	int fd;
 
-	if (fd < 0 || !write_bytes(fd, bytes) || !seal(fd)) {
+	if (video) {
+		fd = open_video_tmp(g_getenv("XDG_RUNTIME_DIR"));
+		if (fd < 0)
+			fd = open_video_tmp(g_get_user_cache_dir());
+	} else {
+		fd = sealable_memfd("line-image");
+	}
+
+	if (fd < 0 || !write_bytes(fd, bytes) ||
+	    (video ? fchmod(fd, 0400) < 0 : !seal(fd))) {
 		g_set_error(error, LINE_ERROR, 1,
-			    "Could not open private image memory: %s.",
+			    video ? "Could not stage private video: %s." :
+				    "Could not open private image memory: %s.",
 			    g_strerror(errno));
 		if (fd >= 0)
 			close(fd);
@@ -334,6 +376,16 @@ J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error)
 
 	json_object_object_add(result, "lease", json_object_new_string(lease));
 	return result;
+}
+
+J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error)
+{
+	return media_lease(leases, bytes, FALSE, error);
+}
+
+J *line_media_video_lease(GHashTable *leases, GBytes *bytes, GError **error)
+{
+	return media_lease(leases, bytes, TRUE, error);
 }
 
 int line_media_lease_open(GHashTable *leases, const char *lease)

@@ -13,6 +13,12 @@ GBytes *line_obs_download_original(const char *token, const char *sid,
 GBytes *line_obs_download_preview(const char *token, const char *sid,
 				  const char *oid, const char *message_id,
 				  GError **error);
+/* A missing OID permits the explicit URL's object, or the legacy plain ID. */
+GBytes *line_obs_download_video(const char *token, const char *mid,
+				const char *sid, const char *oid,
+				const char *message_id, const char *pop,
+				const char *url, gboolean square,
+				gboolean preview, GError **error);
 gboolean line_obs_upload_profile(const char *token, const char *mid,
 				 GBytes *jpeg, GError **error);
 gboolean line_obs_upload_group_profile(const char *token, const char *chat_mid,

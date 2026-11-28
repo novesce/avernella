@@ -34,5 +34,7 @@ J *line_forward_square_attachment(Line *s, const char *chat,
  */
 GBytes *line_download_attachment(Line *s, J *message, GError **error);
 GBytes *line_download_image(Line *s, J *message, GError **error);
+/* Returns a complete MP4-family video after any required decryption. */
+GBytes *line_download_video(Line *s, J *message, GError **error);
 GBytes *line_download_video_preview(Line *s, J *message, GError **error);
 char *line_attachment_filename(Line *s, J *message, GError **error);

@@ -15,6 +15,17 @@ static gboolean upload, profile_upload, square_upload, anonymous,
 static int token_requests, preview_requests, performs;
 static long http_status = 200, timeout;
 
+struct video_hop {
+	const char *url;
+	long status;
+	const char *location;
+	gboolean auth, metadata, empty;
+};
+
+static const char video_mid[] = "u00000000000000000000000000000002";
+static const struct video_hop *video_hops, *video_reply;
+static size_t next_hop, video_hop_count;
+
 J *line_rpc(Line *s, const char *path, const char *method, J *args, GError **e)
 {
 	(void)s;
@@ -72,6 +83,9 @@ CURLcode __wrap_curl_easy_getinfo(CURL *c, CURLINFO info, ...)
 	va_start(v, info);
 	if (info == CURLINFO_RETRY_AFTER) {
 		*va_arg(v, curl_off_t *) = 0; /* none: the 30 s default */
+	} else if (info == CURLINFO_REDIRECT_URL) {
+		g_assert_nonnull(video_reply);
+		*va_arg(v, const char **) = video_reply->location;
 	} else {
 		g_assert_cmpint(info, ==, CURLINFO_RESPONSE_CODE);
 		*va_arg(v, long *) = http_status;
@@ -84,7 +98,12 @@ CURLcode __wrap_curl_easy_perform(CURL *c)
 {
 	(void)c;
 	performs++;
-	if (old_preview_path) {
+	if (video_hops) {
+		g_assert_cmpuint(next_hop, <, video_hop_count);
+		video_reply = &video_hops[next_hop++];
+		g_assert_cmpstr(url, ==, video_reply->url);
+		http_status = video_reply->status;
+	} else if (old_preview_path) {
 		g_assert_cmpstr(
 			url, ==,
 			preview_requests ?
@@ -94,11 +113,18 @@ CURLcode __wrap_curl_easy_perform(CURL *c)
 	} else {
 		g_assert_cmpstr(url, ==, expected_url);
 	}
-	gboolean auth = FALSE, meta = FALSE;
+	gboolean auth = FALSE, meta = FALSE, app = FALSE, mid = FALSE;
 
 	for (struct curl_slist *it = headers; it; it = it->next) {
 		if (!strcmp(it->data, "x-line-access: test-obs-token"))
 			auth = TRUE;
+		if (!strcmp(it->data, LINE_APP_HEADER))
+			app = TRUE;
+		if (g_str_has_prefix(it->data, "x-line-mid: ")) {
+			g_assert_cmpstr(it->data + strlen("x-line-mid: "), ==,
+					video_mid);
+			mid = TRUE;
+		}
 		const char *p = strchr(it->data, ' ');
 
 		if (!p)
@@ -147,6 +173,15 @@ CURLcode __wrap_curl_easy_perform(CURL *c)
 			}
 			meta = TRUE;
 		}
+	}
+	if (video_reply) {
+		g_assert_cmpint(auth, ==, video_reply->auth);
+		g_assert_cmpint(app, ==, video_reply->auth);
+		g_assert_cmpint(mid, ==, video_reply->auth);
+		g_assert_cmpint(meta, ==, video_reply->metadata);
+		if (!video_reply->empty)
+			write_body("abc", 1, 3, body_data);
+		return CURLE_OK;
 	}
 	g_assert_cmpint(auth, ==, !anonymous);
 	g_assert_cmpint(meta, ==, (!anonymous && !legacy_preview));
@@ -365,6 +400,219 @@ static void square_obs(void)
 	legacy_preview = FALSE;
 }
 
+static void video_script(const struct video_hop *hops, size_t count)
+{
+	video_hops = hops;
+	video_hop_count = count;
+	next_hop = 0;
+	upload = FALSE;
+}
+
+static void video_script_done(void)
+{
+	g_assert_cmpuint(next_hop, ==, video_hop_count);
+	video_hops = video_reply = NULL;
+	http_status = 200;
+}
+
+static void video_redirects(void)
+{
+	static const struct video_hop hops[] = {
+		{ "https://obs.line-apps.com/r/talk/emv/clip?p=us%2B%2F%3D",
+		  307, "https://obs-jp.line-apps.com/r/talk/emv/clip", TRUE,
+		  TRUE, FALSE },
+		{ "https://obs-jp.line-apps.com/r/talk/emv/clip", 302,
+		  "https://vos.line-scdn.net/actual?key=fixture", TRUE, TRUE,
+		  FALSE },
+		{ "https://vos.line-scdn.net/actual?key=fixture", 307,
+		  "https://obs-jp.line-apps.com/r/talk/emv/clip", FALSE, FALSE,
+		  FALSE },
+		{ "https://obs-jp.line-apps.com/r/talk/emv/clip", 200, NULL,
+		  FALSE, FALSE, FALSE },
+	};
+	g_autoptr(GError) error = NULL;
+
+	video_script(hops, G_N_ELEMENTS(hops));
+	g_autoptr(GBytes) result = line_obs_download_video(
+		"test-obs-token", video_mid, "emv", "clip", "9", "us+/=", NULL,
+		FALSE, FALSE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(result);
+	g_assert_cmpuint(g_bytes_get_size(result), ==, 3);
+	video_script_done();
+}
+
+static void video_routes(void)
+{
+	static const struct video_hop square[] = {
+		{ "https://obs.line-apps.com/r/g2/m/room-oid/preview?p=sg", 200,
+		  NULL, TRUE, FALSE, FALSE },
+	};
+	static const struct video_hop poster[] = {
+		{ "https://obs.line-apps.com/r/talk/emv/clip/ud-preview?p=hk",
+		  404, NULL, TRUE, TRUE, FALSE },
+		{ "https://obs.line-apps.com/r/talk/emv/clip__ud-preview?p=hk",
+		  200, NULL, TRUE, TRUE, FALSE },
+	};
+	static const struct video_hop stale[] = {
+		{ "https://obs.line-scdn.net/public/clip", 404, NULL, FALSE,
+		  FALSE, FALSE },
+		{ "https://obs.line-apps.com/r/talk/m/9", 200, NULL, TRUE, TRUE,
+		  FALSE },
+	};
+	static const struct video_hop public_obs[] = {
+		{ "https://obs-jp.line-apps.com/r/business/video?sig=fixture",
+		  200, NULL, FALSE, FALSE, FALSE },
+	};
+	static const struct video_hop url_only[] = {
+		{ "https://obs-jp.line-apps.com/r/talk/m/distinct-oid", 404,
+		  NULL, TRUE, TRUE, FALSE },
+		{ "https://obs.line-apps.com/r/talk/m/9", 200, NULL, TRUE, TRUE,
+		  FALSE },
+	};
+	static const struct video_hop plain_preview[] = {
+		{ "https://obs.line-apps.com/r/talk/m/9/preview", 200, NULL,
+		  TRUE, FALSE, FALSE },
+	};
+	g_autoptr(GError) error = NULL;
+
+	video_script(square, G_N_ELEMENTS(square));
+	g_autoptr(GBytes) direct = line_obs_download_video(
+		"test-obs-token", video_mid, "m", "room-oid", "9", "sg",
+		"/r/g2/m/room-oid/preview", TRUE, TRUE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(direct);
+	video_script_done();
+	video_script(poster, G_N_ELEMENTS(poster));
+	g_autoptr(GBytes) thumb = line_obs_download_video(
+		"test-obs-token", video_mid, "emv", "clip", "9", "hk", NULL,
+		FALSE, TRUE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(thumb);
+	video_script_done();
+	video_script(stale, G_N_ELEMENTS(stale));
+	g_autoptr(GBytes) fallback = line_obs_download_video(
+		"test-obs-token", video_mid, "m", "9", "9", NULL,
+		"https://obs.line-scdn.net/public/clip", FALSE, FALSE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(fallback);
+	video_script_done();
+	video_script(public_obs, G_N_ELEMENTS(public_obs));
+	g_autoptr(GBytes) public = line_obs_download_video(
+		"test-obs-token", video_mid, "m", NULL, "9", NULL,
+		"https://obs-jp.line-apps.com/r/business/video?sig=fixture",
+		FALSE, FALSE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(public);
+	video_script_done();
+	video_script(url_only, G_N_ELEMENTS(url_only));
+	g_autoptr(GBytes) url = line_obs_download_video(
+		"test-obs-token", video_mid, "m", NULL, "9", NULL,
+		"https://obs-jp.line-apps.com/r/talk/m/distinct-oid", FALSE,
+		FALSE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(url);
+	video_script_done();
+	video_script(plain_preview, G_N_ELEMENTS(plain_preview));
+	g_autoptr(GBytes) plain =
+		line_obs_download_video("test-obs-token", video_mid, "m", NULL,
+					"9", NULL, NULL, FALSE, TRUE, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(plain);
+	video_script_done();
+}
+
+static void video_explicit_fallbacks(void)
+{
+	static const struct video_hop unavailable[] = {
+		{ "https://obs.line-scdn.net/public/clip", 401, NULL, FALSE,
+		  FALSE, FALSE },
+		{ "https://obs.line-scdn.net/public/clip", 403, NULL, FALSE,
+		  FALSE, FALSE },
+		{ "https://obs-jp.line-apps.com/r/talk/m/distinct-oid", 410,
+		  NULL, TRUE, TRUE, FALSE },
+	};
+
+	for (size_t i = 0; i < G_N_ELEMENTS(unavailable); i++) {
+		struct video_hop hops[] = {
+			unavailable[i],
+			{ "https://obs.line-apps.com/r/talk/m/9", 200, NULL,
+			  TRUE, TRUE, FALSE },
+		};
+		g_autoptr(GError) error = NULL;
+
+		video_script(hops, G_N_ELEMENTS(hops));
+		g_autoptr(GBytes) result = line_obs_download_video(
+			"test-obs-token", video_mid, "m", NULL, "9", NULL,
+			hops[0].url, FALSE, FALSE, &error);
+
+		g_assert_no_error(error);
+		g_assert_nonnull(result);
+		video_script_done();
+	}
+	static const struct video_hop private[] = {
+		{ "https://obs-jp.line-apps.com/r/talk/m/distinct-oid", 401,
+		  NULL, TRUE, TRUE, FALSE },
+	};
+	g_autoptr(GError) error = NULL;
+
+	video_script(private, G_N_ELEMENTS(private));
+	g_assert_null(line_obs_download_video("test-obs-token", video_mid, "m",
+					      NULL, "9", NULL, private[0].url,
+					      FALSE, FALSE, &error));
+	g_assert_error(error, LINE_ERROR, LINE_OBS_UNAUTHORIZED);
+	video_script_done();
+}
+
+static void video_refusals(void)
+{
+	static const struct video_hop cases[] = {
+		{ "https://obs.line-apps.com/r/talk/m/9", 302,
+		  "https://obs-jp.line-apps.com.attacker.example/clip", TRUE,
+		  TRUE, FALSE },
+		{ "https://obs.line-apps.com/r/talk/m/9", 302,
+		  "http://obs-jp.line-apps.com/r/talk/m/9", TRUE, TRUE, FALSE },
+		{ "https://obs.line-apps.com/r/talk/m/9", 202, NULL, TRUE, TRUE,
+		  FALSE },
+		{ "https://obs.line-apps.com/r/talk/m/9", 206, NULL, TRUE, TRUE,
+		  FALSE },
+		{ "https://obs.line-apps.com/r/talk/m/9", 200, NULL, TRUE, TRUE,
+		  TRUE },
+	};
+
+	for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+		g_autoptr(GError) error = NULL;
+
+		video_script(&cases[i], 1);
+		g_assert_null(line_obs_download_video(
+			"test-obs-token", video_mid, "m", "9", "9", NULL, NULL,
+			FALSE, FALSE, &error));
+		g_assert_error(error, LINE_ERROR, 1);
+		video_script_done();
+	}
+	g_autoptr(GError) error = NULL;
+	int count = performs;
+
+	g_assert_null(line_obs_download_video(
+		"test-obs-token", video_mid, "emv", NULL, "9", NULL,
+		"https://obs.line-apps.com@attacker.example/clip", FALSE, FALSE,
+		&error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_null(line_obs_download_video(
+		"test-obs-token", "u123\r\nInjected", "m", "9", "9", NULL, NULL,
+		FALSE, FALSE, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_cmpint(count, ==, performs);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -374,5 +622,10 @@ int main(int argc, char **argv)
 	g_test_add_func("/obs/video-preview-paths-and-limit", previews);
 	g_test_add_func("/obs/square", square_obs);
 	g_test_add_func("/obs/cooldown", cooldown);
+	g_test_add_func("/obs/video/redirects", video_redirects);
+	g_test_add_func("/obs/video/routes", video_routes);
+	g_test_add_func("/obs/video/explicit-fallbacks",
+			video_explicit_fallbacks);
+	g_test_add_func("/obs/video/refusals", video_refusals);
 	return g_test_run();
 }

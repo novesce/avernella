@@ -48,6 +48,7 @@ int line_media_recv_frame(int socket, struct line_preview_frame *frame);
 
 GHashTable *line_leases_new(void);
 J *line_media_lease(GHashTable *leases, GBytes *bytes, GError **error);
+J *line_media_video_lease(GHashTable *leases, GBytes *bytes, GError **error);
 /*
  * A read-only descriptor for a lease, sent to the UI with the reply
  * (SCM_RIGHTS). The worker is not dumpable, so the UI cannot open the

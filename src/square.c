@@ -1397,8 +1397,11 @@ J *line_square_history(Line *s, const char *chat, const char *my_member_id,
 			json_object_put(row);
 			continue;
 		}
-		if (raw_msg && mid && *mid)
+		if (raw_msg && mid && *mid) {
+			if (!nonempty(raw_msg, "2"))
+				put_str(raw_msg, "2", chat);
 			put(raw, mid, json_object_get(raw_msg));
+		}
 		json_object_array_add(rows, row);
 	}
 	resolve_square_senders(s, square_mid, rows);

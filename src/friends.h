@@ -15,6 +15,16 @@ J *line_friend_lookup(Line *s, const char *kind, const char *value,
  */
 J *line_friend_add(Line *s, J *trusted_result, const char *kind,
 		   const char *value, gint32 reserved_seq, GError **error);
+/* Zero values use LINE's personal QR defaults. */
+struct line_friend_ticket_request {
+	gint64 expiration_time;
+	gint32 max_use_count;
+	gboolean refresh;
+};
+
+/* The session's worker owns s. Reply via the calling request's IPC ID. */
+J *line_friend_ticket(Line *s, const struct line_friend_ticket_request *request,
+		      GError **error);
 J *line_friend_invite(Line *s, GError **error);
 
 J *line_friend_favorite(Line *s, J *trusted_friend, gboolean favorite,

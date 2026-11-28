@@ -309,7 +309,6 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		return json_tokener_parse(
 			"{\"2\":[{\"2\":1700000001000,\"3\":0,\"4\":{\"1\":{\"1\":\"" CHAT_MID
 			"\",\"2\":{\"1\":{\"1\":\"" PEER_MEM
-			"\",\"2\":\"" CHAT_MID
 			"\",\"4\":\"1001\",\"5\":1700000001000,\"10\":\"Check line://ti/g2/LgnHjUWR4XpyFJ5E2a-9wq5ROBAgg62s0OBrKg\","
 			"\"15\":0}},\"3\":\"Alice\"}}},"
 			"{\"2\":1700000002000,\"3\":1,\"4\":{\"2\":{\"1\":\"" CHAT_MID
@@ -676,6 +675,7 @@ static void test_chats_and_history(void)
 	g_assert_cmpstr(strfield(m, "id"), ==, "1001");
 	g_assert_cmpstr(strfield(m, "from"), ==, "Alice");
 	g_assert_cmpstr(strfield(m, "senderId"), ==, PEER_MEM);
+	g_assert_cmpstr(strfield(field(raw, "1001"), "2"), ==, CHAT_MID);
 	json_object_put(s.pictures);
 }
 

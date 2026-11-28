@@ -365,14 +365,14 @@ static void compatibility(void)
 
 static void invite(void)
 {
-	struct rpc_step steps[] = {
+	const struct rpc_step steps[] = {
 		{ "/S4", "getUserTicket", "{}",
 		  "{\"0:obj\":{\"1:str\":\"AbC_x-9\"}}" },
 		{ "/S4", "getUserTicket", "{}",
-		  "{\"0:obj\":{\"1:str\":\"AbC_x-9\",\"10:i64\":1}}" },
-		{ "/S4", "getUserTicket", "{}", "{\"0:obj\":{}}" }
+		  "{\"0:obj\":{\"1:str\":\"AbC_x-9\",\"10:i64\":9223372036854775807,"
+		  "\"21:i32\":25}}" },
 	};
-	use(steps, 3);
+	use(steps, G_N_ELEMENTS(steps));
 	Line s = { 0 };
 
 	g_autoptr(GError) error = NULL;
@@ -380,12 +380,105 @@ static void invite(void)
 	g_assert_no_error(error);
 	g_assert_cmpstr(strfield(details, "url"), ==,
 			"https://line.me/ti/p/AbC_x-9");
-	for (int i = 0; i < 2; i++) {
+	g_assert_cmpstr(strfield(details, "id"), ==, "AbC_x-9");
+	g_assert_cmpint(json_object_get_int64(field(details, "expirationTime")),
+			==, 0);
+	g_assert_cmpint(json_object_get_int(field(details, "maxUseCount")), ==,
+			0);
+	g_clear_pointer(&details, json_object_put);
+	details = line_friend_invite(&s, &error);
+	g_assert_no_error(error);
+	g_assert_cmpint(json_object_get_int64(field(details, "expirationTime")),
+			==, G_MAXINT64);
+	g_assert_cmpint(json_object_get_int(field(details, "maxUseCount")), ==,
+			25);
+	g_assert_cmpuint(calls, ==, G_N_ELEMENTS(steps));
+}
+
+static void issue_invite(void)
+{
+	const char *const absent[] = {
+		"{\"0:obj\":{}}",
+		"{\"0:obj\":{\"1:str\":\"\"}}",
+		"{\"0:obj\":{\"1:str\":\"old\",\"10:i64\":1}}",
+		"{\"1:obj\":{\"1:i32\":5}}",
+	};
+
+	for (guint i = 0; i < G_N_ELEMENTS(absent); i++) {
+		const struct rpc_step steps[] = {
+			{ "/S4", "getUserTicket", "{}", absent[i] },
+			{ "/S4", "generateUserTicket",
+			  "{\"3\":9223372036854775807,\"4\":2147483647}",
+			  "{\"0:obj\":{\"1:str\":\"new\"}}" },
+		};
+		Line s = { 0 };
+
+		use(steps, G_N_ELEMENTS(steps));
+		g_autoptr(GError) error = NULL;
+		g_autoptr(J) details = line_friend_invite(&s, &error);
+
+		g_assert_no_error(error);
+		g_assert_cmpstr(strfield(details, "url"), ==,
+				"https://line.me/ti/p/new");
+		g_assert_cmpuint(calls, ==, G_N_ELEMENTS(steps));
+	}
+}
+
+static void refresh_invite(void)
+{
+	const struct line_friend_ticket_request request = {
+		.expiration_time = G_MAXINT64 - 1,
+		.max_use_count = 7,
+		.refresh = TRUE,
+	};
+	const struct rpc_step steps[] = {
+		{ "/S4", "generateUserTicket",
+		  "{\"3\":9223372036854775806,\"4\":7}",
+		  "{\"0:obj\":{\"1:str\":\"fresh\",\"21:i32\":7}}" },
+		{ "/S4", "generateUserTicket",
+		  "{\"3\":9223372036854775806,\"4\":7}", "{\"0:obj\":{}}" },
+	};
+	Line s = { 0 };
+
+	use(steps, G_N_ELEMENTS(steps));
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) details = line_friend_ticket(&s, &request, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpstr(strfield(details, "id"), ==, "fresh");
+	g_assert_cmpint(json_object_get_int(field(details, "maxUseCount")), ==,
+			7);
+	g_assert_null(line_friend_ticket(&s, &request, &error));
+	g_assert_nonnull(error);
+	g_clear_error(&error);
+	const struct line_friend_ticket_request invalid = { .max_use_count =
+								    -1 };
+
+	g_assert_null(line_friend_ticket(&s, &invalid, &error));
+	g_assert_nonnull(error);
+	g_assert_cmpuint(calls, ==, G_N_ELEMENTS(steps));
+}
+
+static void refuse_bad_invite(void)
+{
+	const struct rpc_step steps[] = {
+		{ "/S4", "getUserTicket", "{}", "timeout" },
+		{ "/S4", "getUserTicket", "{}", "{\"1:obj\":{\"1:i32\":44}}" },
+		{ "/S4", "getUserTicket", "{}",
+		  "{\"0:obj\":{\"1:str\":\"../bad\"}}" },
+		{ "/S4", "getUserTicket", "{}",
+		  "{\"0:obj\":{\"1:str\":\"valid\",\"10:str\":\"someday\"}}" },
+	};
+	Line s = { 0 };
+
+	use(steps, G_N_ELEMENTS(steps));
+	for (guint i = 0; i < G_N_ELEMENTS(steps); i++) {
+		g_autoptr(GError) error = NULL;
+
 		g_assert_null(line_friend_invite(&s, &error));
 		g_assert_nonnull(error);
-		g_clear_error(&error);
+		g_assert_cmpuint(calls, ==, i + 1);
 	}
-	g_assert_cmpuint(calls, ==, 3); /* no reissue */
 }
 
 static void edit_friend(void)
@@ -864,6 +957,10 @@ int main(int argc, char **argv)
 	g_test_add_func("/friends/directory-pagination", paging);
 	g_test_add_func("/friends/legacy-profile-list", compatibility);
 	g_test_add_func("/friends/existing-personal-invite", invite);
+	g_test_add_func("/friends/issue-personal-invite", issue_invite);
+	g_test_add_func("/friends/refresh-personal-invite", refresh_invite);
+	g_test_add_func("/friends/refuse-bad-personal-invite",
+			refuse_bad_invite);
 	g_test_add_func("/friends/favorite-and-personal-name", edit_friend);
 	g_test_add_func("/friends/hidden-and-blocked-rosters",
 			managed_directory);

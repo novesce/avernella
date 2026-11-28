@@ -5,10 +5,12 @@
 #include <glib/gstdio.h>
 #include <linux/udmabuf.h>
 #include <sys/ioctl.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static void anonymous_image(void)
@@ -63,6 +65,60 @@ static void lease_not_dumpable(void)
 	}
 	g_test_trap_subprocess(NULL, 0, G_TEST_SUBPROCESS_DEFAULT);
 	g_test_trap_assert_passed();
+}
+
+static void video_xdg_lease(gconstpointer data)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 0, G_TEST_SUBPROCESS_DEFAULT);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_autoptr(GError) error = NULL;
+	g_autofree char *runtime =
+		g_dir_make_tmp("avernella-lease-XXXXXX", &error);
+	g_autoptr(GHashTable) leases = line_leases_new();
+	g_autoptr(GBytes) bytes = g_bytes_new_static("video", 5);
+	struct stat st;
+
+	g_assert_no_error(error);
+	if (GPOINTER_TO_INT(data)) {
+		g_assert_true(g_setenv("XDG_RUNTIME_DIR", "invalid", TRUE));
+		g_assert_true(g_setenv("XDG_CACHE_HOME", runtime, TRUE));
+	} else {
+		g_assert_true(g_setenv("XDG_RUNTIME_DIR", runtime, TRUE));
+	}
+	g_autoptr(J) result = line_media_video_lease(leases, bytes, &error);
+
+	g_assert_no_error(error);
+	g_assert_null(strfield(result, "path"));
+	g_assert_cmpint(prctl(PR_SET_DUMPABLE, 0, 0, 0, 0), ==, 0);
+	const char *lease = strfield(result, "lease");
+	int fd = line_media_lease_open(leases, lease);
+	char proc[64], target[1024], payload[5];
+
+	g_assert_cmpint(fd, >=, 0);
+	g_assert_cmpint(fstat(fd, &st), ==, 0);
+	g_assert_cmpint(st.st_nlink, ==, 0);
+	g_assert_cmpint(st.st_mode & 0777, ==, 0400);
+	g_assert_cmpint(fcntl(fd, F_GETFL) & O_ACCMODE, ==, O_RDONLY);
+	g_snprintf(proc, sizeof(proc), "/proc/self/fd/%d", fd);
+	ssize_t n = readlink(proc, target, sizeof(target) - 1);
+
+	g_assert_cmpint(n, >, 0);
+	target[n] = '\0';
+	g_autofree char *dir = g_build_filename(runtime, "avernella", NULL);
+	g_autofree char *resolved = realpath(dir, NULL);
+
+	g_assert_nonnull(resolved);
+	g_assert_true(g_str_has_prefix(target, resolved));
+	g_assert_true(g_hash_table_remove(leases, lease));
+	g_assert_cmpint(read(fd, payload, sizeof(payload)), ==,
+			sizeof(payload));
+	g_assert_cmpmem(payload, sizeof(payload), "video", 5);
+	close(fd);
+	g_assert_cmpint(g_rmdir(dir), ==, 0);
+	g_assert_cmpint(g_rmdir(runtime), ==, 0);
 }
 
 struct wire_line {
@@ -386,6 +442,10 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/media-io/sealed-lease", anonymous_image);
 	g_test_add_func("/media-io/lease-not-dumpable", lease_not_dumpable);
+	g_test_add_data_func("/media-io/video-runtime-lease", NULL,
+			     video_xdg_lease);
+	g_test_add_data_func("/media-io/video-cache-lease", GINT_TO_POINTER(1),
+			     video_xdg_lease);
 	g_test_add_data_func("/media-io/wire-leases", GSIZE_TO_POINTER(65536),
 			     wire_leases);
 	/* Every lease line split over several reads. */

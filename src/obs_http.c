@@ -88,6 +88,12 @@ struct obs_response_body {
 	char *hash;
 };
 
+struct obs_video_request {
+	const char *mid;
+	char **redirect;
+	gboolean metadata_url;
+};
+
 static size_t receive(char *data, size_t size, size_t count, void *user)
 {
 	struct obs_response_body *body = user;
@@ -143,7 +149,9 @@ void line_obs_http_close(void)
 static GBytes *transfer_full(const char *url, const char *token,
 			     const char *metadata, const char *content_type,
 			     GBytes *upload, char **oid, char **hash,
-			     gsize limit, long timeout, GError **error)
+			     gsize limit, long timeout,
+			     const struct obs_video_request *video,
+			     GError **error)
 {
 	if (line_cooldown_check(url, error))
 		return NULL;
@@ -156,9 +164,16 @@ static GBytes *transfer_full(const char *url, const char *token,
 	}
 	g_autoptr(LineSecret) auth =
 		token ? g_strconcat("x-line-access: ", token, NULL) : NULL;
+	g_autoptr(LineSecret) mid =
+		token && video && video->mid ?
+			g_strconcat("x-line-mid: ", video->mid, NULL) :
+			NULL;
 	struct curl_slist *headers = NULL;
 	const char *const list[] = {
-		auth, metadata, token ? LINE_APP_HEADER : NULL,
+		auth,
+		metadata,
+		mid,
+		token ? LINE_APP_HEADER : NULL,
 		upload ? (content_type ?
 				  content_type :
 				  "Content-Type: application/octet-stream") :
@@ -214,19 +229,38 @@ static GBytes *transfer_full(const char *url, const char *token,
 	rc = curl_easy_perform(c);
 	if (!rc)
 		rc = curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &status);
-	if (!rc)
+	if (!rc) {
 		line_cooldown_note(url, c, status);
+		if (video && (status == 301 || status == 302 || status == 303 ||
+			      status == 307 || status == 308)) {
+			const char *location = NULL;
+
+			rc = curl_easy_getinfo(c, CURLINFO_REDIRECT_URL,
+					       &location);
+			if (!rc && location)
+				*video->redirect = g_strdup(location);
+		}
+	}
 done:
 	if (c)
 		curl_easy_reset(c);
 	line_curl_headers_free(headers);
+	if (video && *video->redirect)
+		goto failed;
 	if (rc)
 		g_set_error(error, LINE_ERROR, 1,
 			    "LINE media request failed: %s.",
 			    curl_easy_strerror(rc));
-	else if (token && status == 410)
-		g_set_error_literal(error, LINE_ERROR, 1,
-				    "This attachment has expired on LINE.");
+	else if (status == 410 && (token || (video && video->metadata_url)))
+		g_set_error_literal(
+			error, LINE_ERROR,
+			video && video->metadata_url ? LINE_ASSET_NOT_FOUND : 1,
+			"This attachment has expired on LINE.");
+	else if (video && video->metadata_url && !token &&
+		 (status == 401 || status == 403))
+		g_set_error_literal(
+			error, LINE_ERROR, LINE_ASSET_NOT_FOUND,
+			"The public video link is no longer available.");
 	else if (status < 200 || status > 299)
 		g_set_error(error, LINE_ERROR,
 			    status == 404	   ? LINE_ASSET_NOT_FOUND :
@@ -234,6 +268,12 @@ done:
 			    status == 429 || status == 503 ? LINE_RATE_LIMITED :
 							     1,
 			    "LINE media service returned HTTP %ld.", status);
+	else if (video && (status != 200 || !body.bytes->len))
+		g_set_error_literal(
+			error, LINE_ERROR, 1,
+			status == 202 ?
+				"LINE is still preparing this video." :
+				"LINE returned no complete video data.");
 	else if (oid && !body.oid)
 		g_set_error_literal(
 			error, LINE_ERROR, 1,
@@ -247,6 +287,7 @@ done:
 		g_free(body.hash);
 		return g_byte_array_free_to_bytes(body.bytes);
 	}
+failed:
 	g_free(body.oid);
 	g_free(body.hash);
 	g_byte_array_unref(body.bytes);
@@ -258,7 +299,7 @@ static GBytes *transfer(const char *url, const char *token,
 			gsize limit, long timeout, GError **error)
 {
 	return transfer_full(url, token, metadata, NULL, upload, oid, NULL,
-			     limit, timeout, error);
+			     limit, timeout, NULL, error);
 }
 
 char *line_obs_upload(const char *token, const char *sid, const char *oid,
@@ -428,6 +469,233 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 	return data;
 }
 
+static gboolean obs_host(const char *host, const char *domain)
+{
+	const char *dot = strchr(host, '.');
+
+	if (!dot || g_ascii_strcasecmp(dot + 1, domain))
+		return FALSE;
+	if (dot - host == 3 && !g_ascii_strncasecmp(host, "obs", 3))
+		return TRUE;
+	if (dot - host < 5 || dot - host > 63 ||
+	    g_ascii_strncasecmp(host, "obs-", 4) || !g_ascii_isalnum(host[4]) ||
+	    !g_ascii_isalnum(dot[-1]))
+		return FALSE;
+	for (const char *p = host + 5; p < dot; p++)
+		if (!g_ascii_isalnum(*p) && *p != '-')
+			return FALSE;
+	return TRUE;
+}
+
+static GUri *video_endpoint(const char *url, gboolean *private)
+{
+	if (!url || strnlen(url, 4097) > 4096 ||
+	    g_ascii_strncasecmp(url, "https://", 8))
+		return NULL;
+	const char *authority = url + 8;
+	const char *end = authority + strcspn(authority, "/?#");
+
+	for (const char *p = authority; p < end; p++)
+		if (!g_ascii_isalnum(*p) && !strchr(".-:", *p))
+			return NULL;
+	for (const char *p = end; *p; p++)
+		if (!g_ascii_isgraph(*p) || *p == '\\' || *p == '#')
+			return NULL;
+	g_autoptr(GUri) uri = g_uri_parse(url, G_URI_FLAGS_ENCODED, NULL);
+
+	if (!uri || g_uri_get_userinfo(uri) ||
+	    (g_uri_get_port(uri) != -1 && g_uri_get_port(uri) != 443) ||
+	    g_uri_get_path(uri)[0] != '/')
+		return NULL;
+	const char *host = g_uri_get_host(uri);
+
+	if (!host)
+		return NULL;
+	*private = obs_host(host, "line-apps.com");
+	if (!*private && !obs_host(host, "line-scdn.net") &&
+	    g_ascii_strcasecmp(host, "vos.line-scdn.net"))
+		return NULL;
+	return g_steal_pointer(&uri);
+}
+
+static gboolean video_scope(const char *path, const char *service,
+			    const char *sid, const char *oid)
+{
+	g_autofree char *prefix = g_strdup_printf("/r/%s/%s/", service, sid);
+
+	if (!g_str_has_prefix(path, prefix))
+		return FALSE;
+	const char *object = path + strlen(prefix);
+	gsize size = strcspn(object, "/");
+
+	if (size > 512)
+		return FALSE;
+	g_autofree char *name = g_strndup(object, size);
+	const char *tail = object + size;
+
+	if (!*tail && oid && strcmp(name, oid) &&
+	    g_str_has_suffix(name, "__ud-preview"))
+		name[size - strlen("__ud-preview")] = 0;
+	if (*tail && strcmp(tail, "/original") && strcmp(tail, "/preview") &&
+	    strcmp(tail, "/ud-preview"))
+		return FALSE;
+	return segment(name) && (!oid || !strcmp(name, oid));
+}
+
+static GBytes *video_get(const char *url, const char *token, const char *mid,
+			 const char *header, gsize limit, gint64 deadline,
+			 gboolean metadata_url, GError **error)
+{
+	g_autofree char *current = g_strdup(url);
+
+	for (guint hop = 0; hop < 4; hop++) {
+		gboolean private;
+
+		g_autoptr(GUri) uri = video_endpoint(current, &private);
+
+		if (!uri)
+			break;
+		const char *path = g_uri_get_path(uri);
+
+		/* A public hop cannot send account headers on a later hop. */
+		if (!private || (!g_str_has_prefix(path, "/r/talk/") &&
+				 !g_str_has_prefix(path, "/r/g2/")))
+			token = NULL;
+		gint64 left = deadline - g_get_monotonic_time();
+
+		if (left <= 0) {
+			g_set_error_literal(error, LINE_ERROR, LINE_TIMEOUT,
+					    "LINE video download timed out.");
+			return NULL;
+		}
+		g_autofree char *redirect = NULL;
+		const struct obs_video_request request = {
+			.mid = mid,
+			.redirect = &redirect,
+			.metadata_url = metadata_url,
+		};
+		GBytes *bytes = transfer_full(
+			current, token, token ? header : NULL, NULL, NULL, NULL,
+			NULL, limit,
+			(left + G_USEC_PER_SEC - 1) / G_USEC_PER_SEC, &request,
+			error);
+
+		if (!redirect)
+			return bytes;
+		g_free(current);
+		current = g_steal_pointer(&redirect);
+	}
+	g_set_error_literal(error, LINE_ERROR, 1,
+			    "LINE returned an unsupported video redirect.");
+	return NULL;
+}
+
+static gboolean visible(const char *value, gsize limit)
+{
+	if (!value || !*value || strnlen(value, limit + 1) > limit)
+		return FALSE;
+	for (const char *p = value; *p; p++)
+		if (!g_ascii_isgraph(*p))
+			return FALSE;
+	return TRUE;
+}
+
+static gboolean video_mid(const char *mid)
+{
+	if (!mid)
+		return TRUE;
+	if (strlen(mid) != 33 || mid[0] != 'u')
+		return FALSE;
+	return strspn(mid + 1, "0123456789abcdefABCDEF") == 32;
+}
+
+GBytes *line_obs_download_video(const char *token, const char *mid,
+				const char *sid, const char *oid,
+				const char *id, const char *pop,
+				const char *url, gboolean square,
+				gboolean preview, GError **error)
+{
+	if (!digits(id) || !video_mid(mid) ||
+	    (token && !visible(token, 16384)) || (oid && !segment(oid)) ||
+	    (g_strcmp0(sid, "m") && (square || g_strcmp0(sid, "emv"))) ||
+	    (pop && !visible(pop, 1024))) {
+		invalid(error);
+		return NULL;
+	}
+	const char *service = square ? "g2" : "talk";
+	gboolean sealed = !strcmp(sid, "emv");
+	const char *fallback_oid = oid ? oid : (sealed ? NULL : id);
+	g_autofree char *hdr =
+		!square && (!preview || sealed) ? download_header(id) : NULL;
+	g_autofree char *escaped = pop ? g_uri_escape_string(pop, NULL, FALSE) :
+					 NULL;
+	g_autofree char *query = escaped ? g_strconcat("?p=", escaped, NULL) :
+					   g_strdup("");
+	gint64 deadline =
+		g_get_monotonic_time() + (preview ? 6 : 90) * G_USEC_PER_SEC;
+	gsize limit = preview ? LINE_MEDIA_PREVIEW_LIMIT + (sealed ? 32 : 0) :
+				LINE_MEDIA_LIMIT + 65536;
+	const char *suffix = preview ? (sealed ? "/ud-preview" : "/preview") :
+				       "";
+	g_autofree char *fallback =
+		fallback_oid && token ?
+			g_strdup_printf(
+				"https://obs.line-apps.com/r/%s/%s/%s%s%s",
+				service, sid, fallback_oid, suffix, query) :
+			NULL;
+	g_autofree char *target = NULL;
+
+	g_autoptr(GError) failure = NULL;
+
+	GBytes *bytes = NULL;
+
+	if (url && url[0] == '/' && url[1] != '/')
+		target = g_strconcat("https://obs.line-apps.com", url, NULL);
+	else
+		target = g_strdup(url);
+	gboolean private;
+
+	g_autoptr(GUri) parsed = video_endpoint(target, &private);
+
+	if (parsed) {
+		gboolean own = private && video_scope(g_uri_get_path(parsed),
+						      service, sid, oid);
+
+		if (own && !g_uri_get_query(parsed) && escaped) {
+			char *with_query = g_strconcat(target, query, NULL);
+
+			g_free(target);
+			target = with_query;
+		}
+		bytes = video_get(target, own ? token : NULL, mid, hdr, limit,
+				  deadline, TRUE, &failure);
+		if (bytes ||
+		    !g_error_matches(failure, LINE_ERROR, LINE_ASSET_NOT_FOUND))
+			goto done;
+	}
+	if (fallback && (!parsed || g_strcmp0(target, fallback))) {
+		g_clear_error(&failure);
+		bytes = video_get(fallback, token, mid, hdr, limit, deadline,
+				  FALSE, &failure);
+	}
+	if (!bytes && fallback && sealed && preview &&
+	    g_error_matches(failure, LINE_ERROR, LINE_ASSET_NOT_FOUND)) {
+		g_autofree char *legacy = g_strdup_printf(
+			"https://obs.line-apps.com/r/talk/emv/%s__ud-preview%s",
+			oid, query);
+
+		g_clear_error(&failure);
+		bytes = video_get(legacy, token, mid, hdr, limit, deadline,
+				  FALSE, &failure);
+	}
+done:
+	if (!bytes && failure)
+		g_propagate_error(error, g_steal_pointer(&failure));
+	else if (!bytes)
+		invalid(error);
+	return bytes;
+}
+
 static const char *square_content_type(const char *name, const char *media_type)
 {
 	const char *dot = name ? strrchr(name, '.') : NULL;
@@ -516,9 +784,9 @@ char *line_obs_upload_square(const char *token, const char *chat, gint32 seq,
 	g_autofree char *hdr = g_strconcat("x-obs-params: ", b64, NULL);
 	char *oid = NULL;
 
-	g_autoptr(GBytes) reply =
-		transfer_full("https://obs.line-apps.com/r/g2/m/reqseq", token,
-			      hdr, ctype, plain, &oid, NULL, 65536, 90L, e);
+	g_autoptr(GBytes) reply = transfer_full(
+		"https://obs.line-apps.com/r/g2/m/reqseq", token, hdr, ctype,
+		plain, &oid, NULL, 65536, 90L, NULL, e);
 
 	if (!reply)
 		return NULL;
@@ -593,8 +861,8 @@ char *line_obs_upload_square_profile(const char *token, const char *scope,
 		"https://obs.line-apps.com/r/g2/%s/%s", scope, oid);
 	char *hash = NULL;
 
-	g_autoptr(GBytes) reply = transfer_full(url, token, hdr, NULL, jpeg,
-						NULL, &hash, 65536, 60L, e);
+	g_autoptr(GBytes) reply = transfer_full(
+		url, token, hdr, NULL, jpeg, NULL, &hash, 65536, 60L, NULL, e);
 
 	if (!reply) {
 		g_free(hash);

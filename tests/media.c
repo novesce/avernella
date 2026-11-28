@@ -11,9 +11,24 @@
 #define ME "uaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 #define OTHER "ubbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 #define GROUP "ccccccccccccccccccccccccccccccccc"
+#define SQUARE "m00000000000000000000000000000001"
+
+/* Well-framed MP4 boxes for checking the handoff, without codec decoding. */
+#define MP4                                                \
+	"000000146674797069736f6d0000000069736f6d"         \
+	"0000002c6d6f6f76000000247472616b0000001c6d646961" \
+	"0000001468646c72000000000000000076696465"         \
+	"0000000c6d64617461626364"
+
+struct expected_video {
+	const char *sid, *oid, *id, *pop, *url;
+	gboolean square, preview;
+	GBytes *reply;
+};
 
 static GBytes *object, *sidecar, *preview_blob;
 static J *sent;
+static const struct expected_video *video_route;
 static int sent_count, upload_count, download_count, preview_count, token_count;
 static gboolean reject_sidecar, tampered, stale_token;
 static char *namespace;
@@ -152,6 +167,32 @@ GBytes *line_obs_download_preview(const char *token, const char *sid,
 		g_assert_cmpstr(id, ==, "901");
 	}
 	return g_bytes_ref(preview_blob);
+}
+
+GBytes *line_obs_download_video(const char *token, const char *mid,
+				const char *sid, const char *oid,
+				const char *id, const char *pop,
+				const char *url, gboolean square,
+				gboolean preview, GError **error)
+{
+	if (!video_route) {
+		if (!oid && !strcmp(sid, "m"))
+			oid = id;
+		return preview ? line_obs_download_preview(token, sid, oid, id,
+							   error) :
+				 line_obs_download(token, sid, oid, id, error);
+	}
+	g_assert_cmpstr(token, ==, "fixture-token");
+	g_assert_cmpstr(mid, ==, ME);
+	g_assert_cmpstr(sid, ==, video_route->sid);
+	g_assert_cmpstr(oid, ==, video_route->oid);
+	g_assert_cmpstr(id, ==, video_route->id);
+	g_assert_cmpstr(pop, ==, video_route->pop);
+	g_assert_cmpstr(url, ==, video_route->url);
+	g_assert_cmpint(square, ==, video_route->square);
+	g_assert_cmpint(preview, ==, video_route->preview);
+	download_count++;
+	return g_bytes_ref(video_route->reply);
 }
 
 static int square_upload_count;
@@ -649,6 +690,170 @@ static void token_refresh(void)
 	g_assert_cmpint(s.obs_until, ==, 0);
 }
 
+static void video_routes(void)
+{
+	Line s = { .mid = ME };
+	struct expected_video route = { .sid = "m",
+					.oid = "object_456",
+					.id = "901",
+					.pop = "route/fixture",
+					.url = "/r/talk/m/object_456" };
+	g_autoptr(J) msg = json_tokener_parse(
+		"{\"4\":\"901\",\"15\":2,\"18\":{\"SID\":\"m\","
+		"\"OID\":\"object_456\",\"OBS_POP\":\"route/fixture\","
+		"\"DOWNLOAD_URL\":\"/r/talk/m/object_456\"}}");
+	g_autoptr(GBytes) mp4 = unhex(MP4);
+	g_autoptr(GError) error = NULL;
+
+	route.reply = mp4;
+	video_route = &route;
+	g_autoptr(GBytes) talk = line_download_video(&s, msg, &error);
+
+	g_assert_no_error(error);
+	g_assert_true(g_bytes_equal(talk, mp4));
+	J *meta = field(msg, "18");
+
+	route.square = TRUE;
+	route.oid = NULL;
+	route.url = "https://obs-sg.line-apps.com/r/g2/m/object_456";
+	json_object_object_del(meta, "OID");
+	json_object_object_add(msg, "2", json_object_new_string(SQUARE));
+	json_object_object_add(meta, "DOWNLOAD_URL",
+			       json_object_new_string(route.url));
+	g_autoptr(GBytes) openchat = line_download_video(&s, msg, &error);
+
+	g_assert_no_error(error);
+	g_assert_true(g_bytes_equal(openchat, mp4));
+	g_autoptr(GBytes) jpg = unhex("ffd8ff000000000000000000");
+
+	route.preview = TRUE;
+	route.url = "https://obs-sg.line-apps.com/r/g2/m/object_456/preview";
+	route.reply = jpg;
+	json_object_object_add(meta, "PREVIEW_URL",
+			       json_object_new_string(route.url));
+	g_autoptr(GBytes) preview =
+		line_download_video_preview(&s, msg, &error);
+
+	g_assert_no_error(error);
+	g_assert_true(g_bytes_equal(preview, jpg));
+	video_route = NULL;
+}
+
+static void video_validate(void)
+{
+	Line s = { .mid = ME };
+	struct expected_video route = { .sid = "m", .id = "901" };
+
+	g_autoptr(J) msg = json_tokener_parse("{\"4\":\"901\",\"15\":2}");
+	g_autoptr(GBytes) mp4 = unhex(MP4);
+	g_autoptr(GBytes) partial =
+		g_bytes_new_from_bytes(mp4, 0, g_bytes_get_size(mp4) - 1);
+	g_autoptr(GBytes) html = g_bytes_new_static("<html>", 6);
+	g_autoptr(GBytes) audio =
+		unhex("000000146674797069736f6d0000000069736f6d"
+		      "0000002c6d6f6f76000000247472616b0000001c6d646961"
+		      "0000001468646c720000000000000000736f756e"
+		      "0000000c6d64617461626364");
+	GBytes *const invalid[] = { partial, html, audio };
+
+	video_route = &route;
+	for (gsize i = 0; i < G_N_ELEMENTS(invalid); i++) {
+		g_autoptr(GError) error = NULL;
+
+		route.reply = invalid[i];
+		g_assert_null(line_download_video(&s, msg, &error));
+		g_assert_error(error, LINE_ERROR, 1);
+	}
+	video_route = NULL;
+}
+
+static void sealed_video_routing(gconstpointer data)
+{
+	gboolean sealed_oid = data != NULL;
+	Line s = session();
+	struct expected_video route = {
+		.sid = "emv",
+		.id = "902",
+		.pop = "fixture",
+		.url = "https://obs-sg.line-apps.com/r/talk/emv/video-object"
+	};
+	static const guint8 material[32] = { 5 };
+
+	g_autofree char *key = g_base64_encode(material, sizeof(material));
+
+	g_autoptr(J) payload = obj();
+	g_autoptr(GError) error = NULL;
+
+	json_object_object_add(payload, "keyMaterial",
+			       json_object_new_string(key));
+	if (sealed_oid) {
+		route.oid = "sealed-object";
+		route.url = NULL;
+		json_object_object_add(payload, "OID",
+				       json_object_new_string(route.oid));
+	}
+	J *chunks =
+		line_seal_payload(&s, GROUP, LINE_MEDIA_VIDEO, payload, &error);
+
+	g_assert_no_error(error);
+	g_assert_nonnull(chunks);
+	g_autoptr(J) msg = obj();
+	J *meta = obj();
+
+	json_object_object_add(msg, "1", json_object_new_string(ME));
+	json_object_object_add(msg, "2", json_object_new_string(GROUP));
+	json_object_object_add(msg, "4", json_object_new_string(route.id));
+	json_object_object_add(msg, "15",
+			       json_object_new_int(LINE_MEDIA_VIDEO));
+	json_object_object_add(msg, "18", meta);
+	json_object_object_add(msg, "20", chunks);
+	json_object_object_add(meta, "OBS_POP",
+			       json_object_new_string(route.pop));
+	if (route.url)
+		json_object_object_add(meta, "DOWNLOAD_URL",
+				       json_object_new_string(route.url));
+	g_autoptr(GBytes) mp4 = unhex(MP4);
+	g_autoptr(GBytes) hashes = NULL;
+	g_autoptr(GBytes) encrypted =
+		line_media_encrypt(g_bytes_ref(mp4), material, &hashes, &error);
+
+	g_assert_no_error(error);
+	route.reply = encrypted;
+	video_route = &route;
+	g_autoptr(GBytes) video = line_download_video(&s, msg, &error);
+
+	g_assert_no_error(error);
+	g_assert_true(g_bytes_equal(video, mp4));
+
+	/* A sealed message must authenticate a response before checking its type. */
+	route.reply = mp4;
+	g_assert_null(line_download_video(&s, msg, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+
+	if (sealed_oid) {
+		int previous = download_count;
+
+		json_object_object_add(meta, "OID",
+				       json_object_new_string("wrong"));
+		g_assert_null(line_download_video(&s, msg, &error));
+		g_assert_error(error, LINE_ERROR, 1);
+		g_assert_cmpint(download_count, ==, previous);
+		g_clear_error(&error);
+	}
+
+	/* Public route metadata may not relabel a sealed message as plaintext. */
+	json_object_object_add(meta, "SID", json_object_new_string("m"));
+	int previous = download_count;
+
+	g_assert_null(line_download_video(&s, msg, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_cmpint(download_count, ==, previous);
+	video_route = NULL;
+	g_clear_pointer(&s.history_secrets, g_array_unref);
+	json_object_put(s.keys);
+}
+
 static void square_attachment_upload(gconstpointer is_file)
 {
 	Line s = { .obs_token = g_strdup("stale-token"),
@@ -696,6 +901,12 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/media/legacy-no-sealed-fallback", legacy);
 	g_test_add_func("/media/video-stale-obs-token-refresh", token_refresh);
+	g_test_add_func("/media/video-talk-and-square-routes", video_routes);
+	g_test_add_func("/media/video-container-validation", video_validate);
+	g_test_add_data_func("/media/video-sealed-url", NULL,
+			     sealed_video_routing);
+	g_test_add_data_func("/media/video-sealed-oid", GINT_TO_POINTER(1),
+			     sealed_video_routing);
 	g_test_add_data_func("/media/square-image-v1-upload", NULL,
 			     square_attachment_upload);
 	g_test_add_data_func("/media/square-file-v1-upload", GINT_TO_POINTER(1),

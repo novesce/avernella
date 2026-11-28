@@ -645,25 +645,98 @@ J *line_friend_add(Line *s, J *result, const char *kind, const char *value,
 	return added(s, args, result, error);
 }
 
-J *line_friend_invite(Line *s, GError **error)
+static J *ticket_details(J *reply, gboolean *inactive, GError **error)
 {
-	g_autoptr(J) reply = line_rpc(s, "/S4", "getUserTicket", NULL, error);
-	if (!reply)
-		return NULL;
-	const char *ticket = clean_string(field(reply, "1"), 256);
-	gint64 expires = json_object_get_int64(field(reply, "10"));
+	const char *invalid = "LINE returned an invalid personal QR ticket.";
+	J *id = field(reply, "1"), *expiration = field(reply, "10"),
+	  *max_uses = field(reply, "21");
 
-	if (!valid_ticket(ticket) ||
-	    (expires > 0 && expires <= g_get_real_time() / 1000))
-		return fail(
-			error,
-			"Open My QR code on your phone to get a current personal link.");
+	*inactive = FALSE;
+	if (!json_object_is_type(reply, json_type_object) ||
+	    (id && !json_object_is_type(id, json_type_string)) ||
+	    (expiration && !json_object_is_type(expiration, json_type_int)) ||
+	    (max_uses && !json_object_is_type(max_uses, json_type_int)))
+		return fail(error, invalid);
+	gint64 expires = json_object_get_int64(expiration);
+	gint64 uses = json_object_get_int64(max_uses);
+	const char *ticket = clean_string(id, 256);
+
+	if (expires < 0 || uses < 0 || uses > G_MAXINT32 ||
+	    (id && json_object_get_string_len(id) &&
+	     (!valid_ticket(ticket) || !strcmp(ticket, ".") ||
+	      !strcmp(ticket, ".."))))
+		return fail(error, invalid);
+	if (!ticket || (expires && expires <= g_get_real_time() / 1000)) {
+		*inactive = TRUE;
+		return NULL;
+	}
 	g_autofree char *url =
 		g_strconcat("https://line.me/ti/p/", ticket, NULL);
 	J *result = obj();
 
+	put_string(result, "id", ticket);
 	put_string(result, "url", url);
+	json_object_object_add(result, "expirationTime",
+			       json_object_new_int64(expires));
+	json_object_object_add(result, "maxUseCount",
+			       json_object_new_int(uses));
 	return result;
+}
+
+J *line_friend_ticket(Line *s, const struct line_friend_ticket_request *request,
+		      GError **error)
+{
+	/* Ticket fields 1, 10 and 21. TalkException NOT_FOUND is 5. */
+	gint64 expires = request ? request->expiration_time : 0;
+	gint32 uses = request ? request->max_use_count : 0;
+	gboolean inactive;
+
+	if (expires < 0 || uses < 0)
+		return fail(error, "Choose a valid personal QR ticket limit.");
+	if (!request || !request->refresh) {
+		g_autoptr(GError) lookup_error = NULL;
+		g_autoptr(J) reply = line_rpc(s, "/S4", "getUserTicket", NULL,
+					      &lookup_error);
+
+		if (reply) {
+			J *ticket = ticket_details(reply, &inactive, error);
+
+			if (ticket || !inactive)
+				return ticket;
+		} else if (s->denied || s->service_code != 5) {
+			if (!lookup_error)
+				return fail(
+					error,
+					"LINE did not return a personal QR ticket.");
+			g_propagate_error(error,
+					  g_steal_pointer(&lookup_error));
+			return NULL;
+		}
+	}
+	/* The TalkService RPC is generateUserTicket in LINE's Android client. */
+	g_autoptr(J) args = obj();
+
+	json_object_object_add(args, "3:i64",
+			       json_object_new_int64(expires ? expires :
+							       G_MAXINT64));
+	json_object_object_add(args, "4:i32",
+			       json_object_new_int(uses ? uses : G_MAXINT32));
+	g_autoptr(J) reply =
+		line_rpc(s, "/S4", "generateUserTicket", args, error);
+
+	if (!reply)
+		return NULL;
+	J *ticket = ticket_details(reply, &inactive, error);
+
+	if (inactive)
+		return fail(error,
+			    "LINE did not issue an active personal QR ticket.");
+	return ticket;
+}
+
+J *line_friend_invite(Line *s, GError **error)
+{
+	return line_friend_ticket(s, NULL, error);
 }
 
 enum friend_setting {
