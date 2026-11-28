@@ -7,6 +7,7 @@
 #define LINE_STATE_SESSION_FILE "session.json"
 
 gboolean line_store_start(const guint8 *key);
+gboolean line_store_offline_key(const char *mid, guint8 *key);
 void line_store_stop(void);
 gboolean line_store_temporary(void);
 int line_store_session_fd(int dir);
@@ -22,8 +23,9 @@ gboolean line_store_forget(int dir, GError **error);
 /*
  * Removes the saved session without reading it, under the same lock, for
  * signing out when the session file cannot be read. TRUE if none exists.
+ * If requested, return the still-locked directory for further cleanup.
  */
-gboolean line_store_discard(GError **error);
+gboolean line_store_discard(int *dir_out, GError **error);
 J *line_store_read_unsent(int dir, const char *mid);
 void line_store_write_unsent(const char *mid, J *rows);
 void line_session_clear(Line *s);

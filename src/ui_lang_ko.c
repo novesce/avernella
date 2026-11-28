@@ -3,6 +3,20 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Some offline chat data could not be deleted.",
+	  "일부 오프라인 채팅 데이터를 삭제하지 못했습니다." },
+	{ "Check delivery", "전달 확인" },
+	{ "Delivery unconfirmed", "전달 확인 안 됨" },
+	{ "Message queued", "메시지 전송 대기 중" },
+	{ "Offline. Showing saved chats.",
+	  "오프라인입니다. 저장된 채팅을 표시합니다." },
+	{ "Stop tracking", "확인 중단" },
+	{ "Stop tracking this message?",
+	  "이 메시지의 전달 확인을 중단할까요?" },
+	{ "This clears the pending entry on this device. "
+	  "If LINE already received the message, sending it "
+	  "again may create a duplicate.",
+	  "이 기기에서 대기 항목을 삭제합니다. LINE이 이미 메시지를 받았다면 다시 보낼 때 중복될 수 있습니다." },
 	{ "Could not open the desktop file chooser.",
 	  "시스템 파일 선택 창을 열 수 없습니다." },
 	{ "Voice call", "음성 통화" },

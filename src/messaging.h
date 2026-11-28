@@ -44,6 +44,18 @@ J *line_send_emoji(Line *s, const char *chat, const char *text,
 J *line_send_decorated(Line *s, const char *chat, const char *text,
 		       const char *reply_to, J *emojis, J *mentions,
 		       GError **error);
+/* The callback can journal the fingerprint or stop the send before the RPC. */
+typedef gboolean (*LineBeforeTextSend)(const char *fingerprint, void *data,
+				       GError **error);
+J *line_send_decorated_tracked(Line *s, const char *chat, const char *text,
+			       const char *reply_to, J *emojis, J *mentions,
+			       LineBeforeTextSend before_send, void *data,
+			       GError **error);
+/* Caller owns the SHA-256 fingerprint of a raw message's encrypted chunks. */
+char *line_message_fingerprint(J *raw);
+/* Caller owns the receipt when this is the same outgoing text message. */
+J *line_sent_receipt(const char *self, const char *chat,
+		     const char *fingerprint, J *raw);
 J *line_send_reply(Line *s, const char *chat, const char *text,
 		   const char *reply_to, GError **error);
 

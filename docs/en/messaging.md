@@ -149,6 +149,8 @@ Rows are sorted by time, then ID. The raw Messages are also kept, keyed by ID, i
 
 The worker keeps recently opened chats' pages in an LRU cache (`history_cache` in `struct line_worker`). Reopening a chat answers from memory at once and then **revalidates** with LINE right after (`revalidate_history()`), emitting a `history` event if anything changed. A new message in a chat marks its cache entry stale, or drops it if the chat isn't open.
 
+Avernella also keeps a bounded history of messages it has loaded for each account, including OpenChat. This encrypted cache lets you read previously opened chats when you start Avernella offline with a saved session. Reopening the cache after quitting requires the original unlocked [desktop keyring](sign-in.md#the-session-file). Avernella refreshes the chat list and history when the connection returns. Fetching uncached attachments requires a connection.
+
 ## Sending text
 
 `send` with `{chat, text, replyTo?, emojis?, mentions?}` reaches `line_send_decorated()`:
@@ -166,7 +168,15 @@ The worker keeps recently opened chats' pages in an LRU cache (`history_cache` i
         21: replyTo, 22: 3, 24: 1 (replies only)}}
    ```
 
-6. **Read the reply**: the new message ID is in field 4 and its time in field 5. No ID means "Check the chat before resending": the message may or may not have been delivered, so the client doesn't retry on its own.
+6. **Read the reply.** LINE returns the new message ID in field 4 and its time in field 5. The ID confirms the send. A timeout, broken connection or missing ID can leave the outcome uncertain.
+
+### Offline sending and delivery recovery
+
+You can queue one text message per direct or group chat while offline, including in Keep Memo. The desktop keyring protects the queue across restarts. OpenChat sends and attachments require a connection.
+
+Before sending, Avernella records a SHA-256 fingerprint of the encrypted Letter Sealing chunks. If the reply goes missing, Avernella compares that fingerprint with your own messages from chat history and sync. The random salt and nonce distinguish two sends with identical text. When Avernella finds the exact message, it clears the pending entry and shows the message once.
+
+Avernella can retry on reconnect when it knows the earlier request never went out. If the request may have reached LINE, the message stays pending for **Check delivery** or **Stop tracking**. **Check delivery** looks for the original message again. **Stop tracking** removes the local pending entry.
 
 ### LINE emoji in text
 

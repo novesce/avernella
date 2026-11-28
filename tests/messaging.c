@@ -13,6 +13,7 @@ static gboolean reject_key, repeat_cursor, older_contacts_service;
 static unsigned int sends, pages, profiles, group_profiles;
 static gboolean group_unmuted;
 static gboolean reject_read;
+static gboolean omit_send_receipt;
 static unsigned int read_requests;
 static const char *expected_body, *expected_chat, *expected_mention;
 static J *recent_fixture, *previous_fixture;
@@ -209,6 +210,8 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 		g_assert_cmpstr(strfield(field(msg, "18:map:str:str"),
 					 "MENTION"),
 				==, expected_mention);
+		if (omit_send_receipt)
+			return obj();
 		return json_tokener_parse("{\"4\":\"321\"}");
 	}
 	if (!strcmp(method, "getChatRoomAnnouncements")) {
@@ -444,6 +447,135 @@ static void encrypted_send(void)
 	g_assert_null(line_send(&s, "not-a-chat", "Hello", &error));
 	g_assert_cmpuint(sends, ==, 1);
 	g_assert_cmpint(s.seq, ==, 42);
+}
+
+struct tracking_fixture {
+	const char *expected;
+	guint sends_before;
+	gboolean save;
+	gboolean ran;
+};
+
+static gboolean journal_send(const char *fingerprint, void *data,
+			     GError **error)
+{
+	struct tracking_fixture *fixture = data;
+
+	g_assert_cmpuint(sends, ==, fixture->sends_before);
+	g_assert_cmpstr(fingerprint, ==, fixture->expected);
+	fixture->ran = TRUE;
+	if (!fixture->save)
+		g_set_error_literal(error, LINE_ERROR, 1,
+				    "Fixture journal full.");
+	return fixture->save;
+}
+
+static void tracked_send(void)
+{
+	Line session = { .mid = SELF, .seq = 41 };
+
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) raw = json_tokener_parse(
+		"{\"20\":[\"salt\",\"ciphertext\",\"nonce\",\"sender\",\"recipient\"]}");
+	g_autofree char *fingerprint = line_message_fingerprint(raw);
+	struct tracking_fixture fixture = {
+		.expected = fingerprint,
+		.sends_before = sends,
+	};
+
+	g_assert_nonnull(fingerprint);
+	g_assert_cmpuint(strlen(fingerprint), ==, 64);
+	g_assert_null(line_send_decorated_tracked(
+		&session, ALICE, "Hello", NULL, NULL, NULL, journal_send,
+		&fixture, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_true(fixture.ran);
+	g_assert_cmpuint(sends, ==, fixture.sends_before);
+	g_assert_cmpint(session.seq, ==, 41);
+	g_clear_error(&error);
+
+	fixture.ran = FALSE;
+	fixture.save = TRUE;
+	omit_send_receipt = TRUE;
+	g_assert_null(line_send_decorated_tracked(
+		&session, ALICE, "Hello", NULL, NULL, NULL, journal_send,
+		&fixture, &error));
+	omit_send_receipt = FALSE;
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_true(fixture.ran);
+	g_assert_cmpuint(sends, ==, fixture.sends_before + 1);
+	g_assert_cmpint(session.seq, ==, 42);
+}
+
+static void nonce_fingerprint(void)
+{
+	g_autoptr(J) raw = json_tokener_parse(
+		"{\"20\":[\"ab\",\"c\",\"a\\u0000b\",\"1\",\"2\"]}");
+	J *chunks = field(raw, "20");
+	g_autofree char *first = line_message_fingerprint(raw);
+
+	g_assert_nonnull(first);
+	json_object_array_put_idx(chunks, 0, json_object_new_string("a"));
+	json_object_array_put_idx(chunks, 1, json_object_new_string("bc"));
+	g_autofree char *boundary = line_message_fingerprint(raw);
+
+	g_assert_nonnull(boundary);
+	g_assert_cmpstr(first, !=, boundary);
+	json_object_array_put_idx(chunks, 2, json_object_new_string("a"));
+	g_autofree char *nonce = line_message_fingerprint(raw);
+
+	g_assert_nonnull(nonce);
+	g_assert_cmpstr(nonce, !=, boundary);
+	json_object_array_put_idx(chunks, 4, json_object_new_int(2));
+	g_assert_null(line_message_fingerprint(raw));
+}
+
+static void confirmed_send_echo(void)
+{
+	g_autoptr(J) raw = json_tokener_parse(
+		"{\"1\":\"" SELF "\",\"2\":\"" GROUP "\","
+		"\"4\":\"12345\",\"5\":98765,\"15\":0,"
+		"\"20\":[\"c2FsdA==\",\"Y2lwaGVydGV4dA==\",\"bm9uY2U=\","
+		"\"AAAAAQ==\",\"AAAAAg==\"]}");
+	g_autofree char *fingerprint = line_message_fingerprint(raw);
+
+	g_autoptr(J) echoed = line_sent_receipt(SELF, GROUP, fingerprint, raw);
+
+	g_assert_nonnull(fingerprint);
+	g_assert_cmpstr(strfield(echoed, "id"), ==, "12345");
+	g_assert_cmpint(json_object_get_int64(field(echoed, "sentAt")), ==,
+			98765);
+	g_assert_null(line_sent_receipt(BOB, GROUP, fingerprint, raw));
+	g_assert_null(line_sent_receipt(SELF, ALICE, fingerprint, raw));
+
+	json_object_object_add(raw, "15", json_object_new_int(7));
+	g_assert_null(line_sent_receipt(SELF, GROUP, fingerprint, raw));
+	json_object_object_add(raw, "15", json_object_new_string("0"));
+	g_assert_null(line_sent_receipt(SELF, GROUP, fingerprint, raw));
+	json_object_object_del(raw, "15");
+	json_object_object_add(raw, "4", json_object_new_string("0"));
+	g_assert_null(line_sent_receipt(SELF, GROUP, fingerprint, raw));
+	json_object_object_add(raw, "4",
+			       json_object_new_string_len("123\0x", 5));
+	g_assert_null(line_sent_receipt(SELF, GROUP, fingerprint, raw));
+	json_object_object_add(raw, "4", json_object_new_string("12345"));
+
+	size_t bytes;
+	const char *text = json_object_to_json_string_length(
+		raw, JSON_C_TO_STRING_PLAIN, &bytes);
+	struct json_tokener *parser = json_tokener_new();
+
+	json_tokener_set_flags(parser, JSON_TOKENER_STRICT);
+	g_autoptr(J) restored = json_tokener_parse_ex(parser, text, bytes);
+
+	g_assert_cmpint(json_tokener_get_error(parser), ==,
+			json_tokener_success);
+	g_assert_cmpuint(json_tokener_get_parse_end(parser), ==, bytes);
+	json_tokener_free(parser);
+	g_autoptr(J) archived =
+		line_sent_receipt(SELF, GROUP, fingerprint, restored);
+
+	g_assert_true(json_object_equal(archived, echoed));
 }
 
 static void previous_messages(void)
@@ -1063,6 +1195,9 @@ int main(int argc, char **argv)
 	g_test_add_func("/messaging/recover-empty-recent",
 			recover_empty_recent);
 	g_test_add_func("/messaging/send", encrypted_send);
+	g_test_add_func("/messaging/tracked-send", tracked_send);
+	g_test_add_func("/messaging/nonce-fingerprint", nonce_fingerprint);
+	g_test_add_func("/messaging/confirmed-send-echo", confirmed_send_echo);
 	g_test_add_func("/messaging/profile-reuse", profile_reuse);
 	g_test_add_func("/messaging/mentions-and-forwarding",
 			mention_and_forward);

@@ -3,6 +3,19 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Some offline chat data could not be deleted.",
+	  "Sebagian data obrolan luring tidak dapat dihapus." },
+	{ "Check delivery", "Periksa pengiriman" },
+	{ "Delivery unconfirmed", "Pengiriman belum terkonfirmasi" },
+	{ "Message queued", "Pesan dalam antrean" },
+	{ "Offline. Showing saved chats.",
+	  "Luring. Menampilkan obrolan tersimpan." },
+	{ "Stop tracking", "Hentikan pelacakan" },
+	{ "Stop tracking this message?", "Hentikan pelacakan pesan ini?" },
+	{ "This clears the pending entry on this device. "
+	  "If LINE already received the message, sending it "
+	  "again may create a duplicate.",
+	  "Tindakan ini menghapus entri tertunda dari perangkat ini. Jika LINE sudah menerima pesan, mengirimkannya lagi dapat membuat duplikat." },
 	{ "Could not open the desktop file chooser.",
 	  "Tidak dapat membuka pemilih berkas desktop." },
 	{ "Voice call", "Panggilan suara" },

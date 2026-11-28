@@ -3,6 +3,18 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Some offline chat data could not be deleted.",
+	  "無法刪除部分離線聊天資料。" },
+	{ "Check delivery", "檢查送達狀態" },
+	{ "Delivery unconfirmed", "送達狀態未確認" },
+	{ "Message queued", "訊息等待傳送" },
+	{ "Offline. Showing saved chats.", "離線。正在顯示已儲存的聊天室。" },
+	{ "Stop tracking", "停止追蹤" },
+	{ "Stop tracking this message?", "停止追蹤這則訊息？" },
+	{ "This clears the pending entry on this device. "
+	  "If LINE already received the message, sending it "
+	  "again may create a duplicate.",
+	  "這會清除這部裝置上的待處理記錄。若 LINE 已收到這則訊息，再次傳送可能會產生重複訊息。" },
 	{ "Could not open the desktop file chooser.",
 	  "無法開啟系統檔案選擇器。" },
 	{ "Voice call", "語音通話" },

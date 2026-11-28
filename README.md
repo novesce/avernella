@@ -85,6 +85,8 @@ Your outgoing messages show **Sent** once LINE accepts them and **Read** when LI
 
 When your connection comes back, Avernella refreshes the chat list and the latest messages in the open conversation. Visible images that failed to download, including pictures in Flex cards, retry automatically. You can also click the refresh arrow above the chat list or press **Ctrl+R**. If you’re reading an earlier page, it stays open.
 
+With a desktop keyring available, Avernella encrypts and caches the chat list and the history it loads, so you can read those messages offline after restarting. Text in direct and group chats can queue until LINE is reachable. If a send is unconfirmed, **Check delivery** looks for the original encrypted message in LINE history. An uncertain send stays pending until confirmed or you choose **Stop tracking…**. [Offline history and send recovery](docs/en/messaging.md)
+
 Incoming text supports Letter Sealing v1 and v2. A message encrypted to a key generation that this device lacks displays a separate missing-key notice. [LINE Encryption Overview](https://www.lycorp.co.jp/en/privacy-security/line-encryption-whitepaper-ver2.2.pdf)
 
 - Use the smiley in the message bar to browse LINE emoji and insert them inline. The picker contains an index of 9,175 items from 45 public packs and also checks for packs owned by the signed-in account. Artwork and individual emoji labels load from LINE on demand. Search by pack, item number, or a loaded label. The sender preserves an accessible text label, pack ID and item ID inside the encrypted message. Animated PNGs play inline. With reduced motion enabled, the client shows a still. [LINE emoji list](https://developers.line.biz/en/docs/messaging-api/emoji-list/)

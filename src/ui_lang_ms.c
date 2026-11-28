@@ -3,6 +3,19 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Some offline chat data could not be deleted.",
+	  "Sesetengah data sembang luar talian tidak dapat dipadamkan." },
+	{ "Check delivery", "Semak penghantaran" },
+	{ "Delivery unconfirmed", "Penghantaran belum disahkan" },
+	{ "Message queued", "Mesej dalam giliran" },
+	{ "Offline. Showing saved chats.",
+	  "Luar talian. Memaparkan sembang yang disimpan." },
+	{ "Stop tracking", "Henti penjejakan" },
+	{ "Stop tracking this message?", "Hentikan penjejakan mesej ini?" },
+	{ "This clears the pending entry on this device. "
+	  "If LINE already received the message, sending it "
+	  "again may create a duplicate.",
+	  "Ini membuang entri belum selesai daripada peranti ini. Jika LINE sudah menerima mesej itu, penghantaran semula boleh menghasilkan pendua." },
 	{ "Could not open the desktop file chooser.",
 	  "Pemilih fail desktop tidak dapat dibuka." },
 	{ "Voice call", "Panggilan suara" },

@@ -90,7 +90,7 @@ LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,
 SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media ui_image_view video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_fec call_pdtp screencast screencast_dma live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
-SOURCES += security/ipc security/sandbox security/vault state_crypto
+SOURCES += security/ipc security/sandbox security/vault state_crypto offline_store
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
 # Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
 JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
@@ -132,7 +132,7 @@ CHECKPATCH_FLAGS = --no-tree --file --terse --quiet --show-types --typedefsfile 
 # Test fixtures keep long JSON and protocol strings split across lines.
 CHECKPATCH_TEST_FLAGS = $(CHECKPATCH_FLAGS) --ignore SPLIT_STRING,MISSING_SPACE
 TESTS = build/test-thrift build/test-state build/test-sealing build/test-messaging build/test-pair build/test-transport build/test-media build/test-call build/test-audio build/test-media-io build/test-obs build/test-video-record build/test-ui-motion build/test-ui-pixels build/test-emoji-message build/test-ui-apng build/test-emoji build/test-ui-emoji
-TESTS += build/test-ui-image-view build/test-ui-image-overlay build/test-state-crypto
+TESTS += build/test-ui-image-view build/test-ui-image-overlay build/test-state-crypto build/test-offline-store
 TESTS += build/test-friends build/test-groups build/test-square build/test-ui-friends build/test-ui-read
 TESTS += build/test-stickers build/test-call-video
 TESTS += build/test-call-group build/test-pdtp
@@ -405,6 +405,7 @@ build/test-obs: tests/obs_http.c build/obs_http.o build/http_tune.o
 build/test-thrift: tests/thrift.c build/thrift.o
 build/test-state: tests/state.c build/state.o build/state_crypto.o
 build/test-state-crypto: tests/state_crypto.c build/state_crypto.o
+build/test-offline-store: tests/offline_store.c build/offline_store.o build/state_crypto.o
 build/test-messaging: tests/messaging.c build/messaging.o build/rich_message.o build/liff_url.o
 build/test-friends: tests/friends.c build/friends.o build/thrift.o
 build/test-liff: tests/liff.c build/liff.o build/liff_url.o build/thrift.o

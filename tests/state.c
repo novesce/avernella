@@ -418,6 +418,7 @@ static void unreadable_session_discarded(void)
 		g_build_filename(sandbox, "avernella", "session.json", NULL);
 	g_autoptr(GError) error = NULL;
 	Line broken = { 0 };
+	int cleanup;
 
 	g_assert_true(g_file_set_contents_full(file, "{not json", -1,
 					       G_FILE_SET_CONTENTS_CONSISTENT,
@@ -426,11 +427,16 @@ static void unreadable_session_discarded(void)
 	g_assert_cmpint(line_store_open(&broken, &error), ==, -1);
 	g_assert_nonnull(error);
 	g_clear_error(&error);
-	g_assert_true(line_store_discard(&error));
+	g_assert_true(line_store_discard(&cleanup, &error));
 	g_assert_no_error(error);
+	g_assert_cmpint(cleanup, >=, 0);
 	g_assert_false(line_store_has_session());
+	g_assert_cmpint(line_store_open(&broken, &error), ==, -1);
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_cmpint(close(cleanup), ==, 0);
 	/* Nothing to remove is not an error either. */
-	g_assert_true(line_store_discard(&error));
+	g_assert_true(line_store_discard(NULL, &error));
 	g_assert_no_error(error);
 	line_session_clear(&broken);
 }

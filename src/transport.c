@@ -140,6 +140,7 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 {
 	s->service_code = -1;
 	s->http_status = 0;
+	s->rpc_may_have_run = FALSE;
 	/*
 	 * Once LINE has refused this session's credentials, nothing more goes
 	 * out with them, as in LINE's own client, until the user pairs again.
@@ -249,7 +250,17 @@ static J *exchange(Line *s, const char *path, const char *method, J *args,
 	SET(CURLOPT_HEADERFUNCTION, read_header);
 	SET(CURLOPT_HEADERDATA, &response);
 #undef SET
+	s->rpc_may_have_run = TRUE;
 	result = curl_easy_perform(client);
+	gboolean connect_failed = result == CURLE_COULDNT_CONNECT ||
+				  result == CURLE_COULDNT_RESOLVE_HOST ||
+				  result == CURLE_COULDNT_RESOLVE_PROXY;
+	long request_size = 0;
+
+	if (connect_failed &&
+	    !curl_easy_getinfo(client, CURLINFO_REQUEST_SIZE, &request_size) &&
+	    !request_size)
+		s->rpc_may_have_run = FALSE;
 	if (result == CURLE_OK)
 		result = curl_easy_getinfo(client, CURLINFO_RESPONSE_CODE,
 					   &status);
@@ -262,9 +273,15 @@ cleanup:
 	g_autoptr(LineSecret) next = response.next_token;
 
 	if (result != CURLE_OK) {
-		g_set_error(error, LINE_ERROR,
-			    result == CURLE_OPERATION_TIMEDOUT ? LINE_TIMEOUT :
-								 1,
+		int code = result == CURLE_OPERATION_TIMEDOUT ? LINE_TIMEOUT :
+								1;
+
+		if (!s->rpc_may_have_run &&
+		    (result == CURLE_COULDNT_CONNECT ||
+		     result == CURLE_COULDNT_RESOLVE_HOST ||
+		     result == CURLE_COULDNT_RESOLVE_PROXY))
+			code = LINE_CONNECT_FAILED;
+		g_set_error(error, LINE_ERROR, code,
 			    "LINE HTTPS request failed: %s.",
 			    curl_easy_strerror(result));
 		return NULL;
@@ -487,6 +504,8 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			GError *refresh_error = NULL;
 
 			if (!refresh_access(s, &refresh_error)) {
+				/* Only the refresh request may have reached LINE. */
+				s->rpc_may_have_run = FALSE;
 				/*
 				 * Only refresh code 1000 ends the session. Other refresh
 				 * codes come from a different enum than TalkException, so

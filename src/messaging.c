@@ -1839,9 +1839,78 @@ static J *mention_metadata(const char *text, J *mentions)
 	return g_steal_pointer(&meta);
 }
 
-J *line_send_decorated(Line *s, const char *chat, const char *text,
-		       const char *reply_to, J *emojis, J *mentions,
-		       GError **error)
+/*
+ * Letter Sealing already gives every send a random salt and nonce. Hash the
+ * length and bytes of each chunk so the same send can be recognized in history
+ * without comparing text or adding new wire metadata.
+ */
+static char *chunk_fingerprint(J *chunks)
+{
+	if (length(chunks) != 5)
+		return NULL;
+	g_autoptr(GChecksum) hash = g_checksum_new(G_CHECKSUM_SHA256);
+	guint available = 256 * 1024;
+
+	for (guint i = 0; i < 5; i++) {
+		J *value = at(chunks, i);
+		guint n = json_object_get_string_len(value);
+
+		if (!json_object_is_type(value, json_type_string) || !n ||
+		    n > available)
+			return NULL;
+		available -= n;
+		guint32 encoded = GUINT32_TO_BE(n);
+
+		g_checksum_update(hash, (const guint8 *)&encoded,
+				  sizeof(encoded));
+		g_checksum_update(
+			hash, (const guint8 *)json_object_get_string(value), n);
+	}
+	return g_strdup(g_checksum_get_string(hash));
+}
+
+char *line_message_fingerprint(J *raw)
+{
+	return chunk_fingerprint(field(raw, "20"));
+}
+
+static J *delivery_receipt(J *message, const char *id)
+{
+	J *receipt = obj();
+	J *time = field(message, "5");
+
+	put(receipt, "id", string(id));
+	if (json_object_is_type(time, json_type_int))
+		put(receipt, "sentAt", json_object_get(time));
+	return receipt;
+}
+
+J *line_sent_receipt(const char *self, const char *chat,
+		     const char *fingerprint, J *raw)
+{
+	const char *id = exact_text(raw, "4");
+	J *type = field(raw, "15");
+
+	if (!self || !chat || !fingerprint || !message_id(id) ||
+	    g_strcmp0(self, exact_text(raw, "1")) ||
+	    g_strcmp0(chat, exact_text(raw, "2")) ||
+	    (type && (!json_object_is_type(type, json_type_int) ||
+		      json_object_get_int64(type) != 0)))
+		return NULL;
+	g_autofree char *actual = line_message_fingerprint(raw);
+
+	return !g_strcmp0(fingerprint, actual) ? delivery_receipt(raw, id) :
+						 NULL;
+}
+
+static J *send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
+		      const char *reply_to, LineBeforeTextSend before_send,
+		      void *data, GError **error);
+
+J *line_send_decorated_tracked(Line *s, const char *chat, const char *text,
+			       const char *reply_to, J *emojis, J *mentions,
+			       LineBeforeTextSend before_send, void *data,
+			       GError **error)
 {
 	if (reply_to && (!*reply_to || strlen(reply_to) > 32 ||
 			 reply_to[strspn(reply_to, "0123456789")])) {
@@ -1903,7 +1972,16 @@ J *line_send_decorated(Line *s, const char *chat, const char *text,
 	put(meta, "e2eeVersion", string("2"));
 	put(meta, "contentType", string("0"));
 	put(meta, "e2eeMark", string("2"));
-	return line_send_sealed(s, chat, 0, meta, chunks, reply_to, error);
+	return send_sealed(s, chat, 0, meta, chunks, reply_to, before_send,
+			   data, error);
+}
+
+J *line_send_decorated(Line *s, const char *chat, const char *text,
+		       const char *reply_to, J *emojis, J *mentions,
+		       GError **error)
+{
+	return line_send_decorated_tracked(s, chat, text, reply_to, emojis,
+					   mentions, NULL, NULL, error);
 }
 
 J *line_send_emoji(Line *s, const char *chat, const char *text,
@@ -1924,8 +2002,9 @@ J *line_send(Line *s, const char *chat, const char *text, GError **error)
 	return line_send_reply(s, chat, text, NULL, error);
 }
 
-J *line_send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
-		    const char *reply_to, GError **error)
+static J *send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
+		      const char *reply_to, LineBeforeTextSend before_send,
+		      void *data, GError **error)
 {
 	if (length(chunks) != 5 || s->seq < 0 || s->seq >= G_MAXINT32) {
 		g_set_error_literal(
@@ -1936,7 +2015,7 @@ J *line_send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
 	g_autoptr(J) args = obj();
 	J *msg = obj();
 
-	number(args, "1:i32", ++s->seq);
+	number(args, "1:i32", s->seq + 1);
 	put(args, "2:obj", msg);
 	put(msg, "2:str", string(chat));
 	number(msg, "5:i64", 0);
@@ -1951,25 +2030,39 @@ J *line_send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
 		number(msg, "22:i32", 3);
 		number(msg, "24:i32", 1);
 	}
+	if (before_send) {
+		g_autofree char *fingerprint = chunk_fingerprint(chunks);
+
+		if (!fingerprint) {
+			g_set_error_literal(
+				error, LINE_ERROR, 1,
+				"Unable to track this encrypted send.");
+			return NULL;
+		}
+		if (!before_send(fingerprint, data, error))
+			return NULL;
+	}
+	s->seq++;
 	g_autoptr(J) reply = line_rpc(s, "/S4", "sendMessage", args, error);
 	if (!reply)
 		return NULL;
-	const char *id = nonempty(reply, "4");
+	const char *id = before_send ? exact_text(reply, "4") :
+				       nonempty(reply, "4");
 
-	if (!id) {
+	if (!id || (before_send && !message_id(id))) {
 		g_set_error_literal(
 			error, LINE_ERROR, 1,
 			"LINE returned no message ID. Check the chat before resending.");
 		return NULL;
 	}
-	J *receipt = obj();
+	return delivery_receipt(reply, id);
+}
 
-	put(receipt, "id", string(id));
-	J *sent_at = field(reply, "5");
-
-	if (json_object_is_type(sent_at, json_type_int))
-		put(receipt, "sentAt", json_object_get(sent_at));
-	return receipt;
+J *line_send_sealed(Line *s, const char *chat, int type, J *meta, J *chunks,
+		    const char *reply_to, GError **error)
+{
+	return send_sealed(s, chat, type, meta, chunks, reply_to, NULL, NULL,
+			   error);
 }
 
 J *line_history(Line *s, const char *chat, GError **error)

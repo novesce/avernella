@@ -37,8 +37,15 @@ typedef enum {
 	F_OPENCHAT,
 	F_GROUP_NEW,
 	F_MEMBERS,
-	F_FIND_TEXT
+	F_FIND_TEXT,
+	F_STOP_TRACKING
 } Focus;
+
+enum ui_delivery {
+	UI_DELIVERY_NONE,
+	UI_DELIVERY_QUEUED,
+	UI_DELIVERY_UNCERTAIN,
+};
 
 typedef struct {
 	GString *value;
@@ -58,7 +65,7 @@ typedef struct {
 	enum ui_scrollbar_pane scrollbar_drag;
 	gboolean dirty, active, connected, authenticating, logging_out,
 		getting_chats, quitting;
-	gboolean video_dirty;
+	gboolean video_dirty, offline;
 	gboolean email_login;
 	/*
 	 * A session is saved on this computer but isn't signed in: the
@@ -71,6 +78,8 @@ typedef struct {
 		mute_calls;
 	char *self_id, *reply_id, *reply_chat;
 	char *name, *notice, *selected, *pin, *composition;
+	enum ui_delivery delivery;
+	const char *delivery_text; /* Borrowed from this chat's pending send. */
 	QRcode *qr;
 	Json *chats, *history, *opened;
 	GArray *visible; /* indexes into chats */
@@ -82,6 +91,7 @@ typedef struct {
 	gboolean stick_bottom;
 	gboolean older_page, older_pending, has_older;
 	Rect older_button, latest_button, folders_button, sidebar_split;
+	Rect stop_tracking;
 	Rect login_mode, email_box, password_box;
 	Rect chat_tools, find_button, friends_button, openchat_button,
 		new_group, members, emoji, attach, call, video, login, back,
@@ -187,9 +197,10 @@ static inline gboolean ui_compact(void)
 static inline gboolean ui_chat_visible(void)
 {
 	return !ui_compact() ||
-	       (ui.selected && (ui.focus == F_MESSAGE || ui.focus == F_SEND ||
-				ui.focus == F_BACK || ui.focus == F_MEMBERS ||
-				ui.focus == F_FIND_TEXT));
+	       (ui.selected &&
+		(ui.focus == F_MESSAGE || ui.focus == F_SEND ||
+		 ui.focus == F_BACK || ui.focus == F_MEMBERS ||
+		 ui.focus == F_FIND_TEXT || ui.focus == F_STOP_TRACKING));
 }
 
 static inline gboolean ui_list_visible(void)

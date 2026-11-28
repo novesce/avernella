@@ -51,7 +51,9 @@ enum ui_request_method {
 	LOGOUT,
 	MEDIA,
 	OLDER,
-	MARK_READ
+	MARK_READ,
+	RECOVER_SEND,
+	DISCARD_SEND,
 };
 
 struct ui_request {
@@ -500,6 +502,7 @@ static struct {
 	GThread *thread;
 	GAsyncQueue *writes;
 	GHashTable *requests;
+	GHashTable *outbox;
 	guint generation, seq, newest_history, rendered_history;
 	guint history_pending, jump_request;
 	char *jump_message, *jump_pending;
@@ -527,6 +530,69 @@ static struct pending_preview previews[LINE_PREVIEW_COUNT] = {
 };
 
 static void set_string(char **dest, const char *s);
+static void focus_on(Focus focus);
+
+static void free_pending_send(gpointer pending)
+{
+	json_object_put(pending);
+}
+
+static Json *pending_send(const char *chat)
+{
+	return wire.outbox && chat ? g_hash_table_lookup(wire.outbox, chat) :
+				     NULL;
+}
+
+static void update_delivery(void)
+{
+	Json *pending = pending_send(ui.selected);
+
+	ui.delivery_text = ui_string(ui_field(pending, "params"), "text", NULL);
+	ui.delivery = UI_DELIVERY_NONE;
+	if (pending)
+		ui.delivery = !g_strcmp0(ui_string(pending, "status", NULL),
+					 "queued") ?
+				      UI_DELIVERY_QUEUED :
+				      UI_DELIVERY_UNCERTAIN;
+	if (!ui.delivery && ui.focus == F_STOP_TRACKING)
+		focus_on(F_MESSAGE);
+	ui.dirty = TRUE;
+}
+
+static void remember_send(const char *chat, Json *result, Json *params)
+{
+	const char *intent = ui_string(result, "intentId", NULL);
+
+	if (!chat || !*chat || !intent || !*intent ||
+	    !json_object_is_type(params, json_type_object))
+		return;
+	if (!wire.outbox)
+		wire.outbox = g_hash_table_new_full(g_str_hash, g_str_equal,
+						    g_free, free_pending_send);
+	Json *pending = json_object_new_object();
+	const char *status = ui_string(result, "status", "uncertain");
+
+	json_object_object_add(pending, "intentId",
+			       json_object_new_string(intent));
+	json_object_object_add(pending, "status",
+			       json_object_new_string(status));
+	json_object_object_add(pending, "params", json_object_get(params));
+	g_hash_table_replace(wire.outbox, g_strdup(chat), pending);
+	if (!g_strcmp0(ui.selected, chat))
+		update_delivery();
+}
+
+static void remember_outbox(Json *rows)
+{
+	if (!json_object_is_type(rows, json_type_array))
+		return;
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		Json *row = json_object_array_get_idx(rows, i);
+
+		remember_send(ui_string(row, "chat", NULL), row,
+			      ui_field(row, "params"));
+	}
+}
 
 /*
  * Sign-in pacing that outlives each attempt's worker: the wait LINE asked
@@ -1251,8 +1317,8 @@ void ui_conversation_presented(gboolean covered)
 {
 	Json *summary = wire.selected_summary;
 
-	if (!wire.pid || !summary || !ui.history || !ui.selected ||
-	    !g_strcmp0(ui.selected, ui.self_id))
+	if (!wire.pid || ui.offline || !summary || !ui.history ||
+	    !ui.selected || !g_strcmp0(ui.selected, ui.self_id))
 		return;
 	UiReadCursor *cursor =
 		wire.read_marks ?
@@ -1335,8 +1401,11 @@ void ui_rpc(const char *name, Json *args, guint tag)
 
 static void set_string(char **dest, const char *s)
 {
-	if (dest == &ui.notice)
+	if (dest == &ui.notice) {
 		wire.refresh_notice = FALSE;
+		if ((!s || !*s) && ui.offline && ui.connected)
+			s = _("Offline. Showing saved chats.");
+	}
 	if (!g_strcmp0(*dest, s))
 		return;
 	char *copy = g_strdup(s);
@@ -1350,6 +1419,14 @@ static void set_refresh_notice(const char *s)
 {
 	set_string(&ui.notice, s);
 	wire.refresh_notice = TRUE;
+}
+
+static void set_offline(gboolean offline)
+{
+	if (offline == ui.offline)
+		return;
+	ui.offline = offline;
+	set_string(&ui.notice, "");
 }
 
 static gboolean set_json(Json **dest, Json *value)
@@ -1440,9 +1517,12 @@ static void reset_login(const char *message)
 	ui_forget_labels();
 	ui.authenticating = ui.connected = ui.logging_out = ui.getting_chats =
 		FALSE;
+	ui.offline = FALSE;
 	g_clear_pointer(&ui.qr, QRcode_free);
 	g_clear_pointer(&ui.pin, g_free);
 	g_clear_pointer(&ui.selected, g_free);
+	g_clear_pointer(&wire.outbox, g_hash_table_unref);
+	update_delivery();
 	g_clear_pointer(&ui.name, g_free);
 	ui_chat_announcements_select(NULL);
 	g_clear_pointer(&wire.jump_message, g_free);
@@ -1824,10 +1904,12 @@ static void refresh_content(gboolean manual)
 {
 	if (!ui.connected || ui.logging_out)
 		return;
-	ui_media_refresh();
-	if (manual) {
-		ui_media_refresh_flex();
-		ui_chat_announcements_refresh(ui.selected);
+	if (!ui.offline) {
+		ui_media_refresh();
+		if (manual) {
+			ui_media_refresh_flex();
+			ui_chat_announcements_refresh(ui.selected);
+		}
 	}
 	retry_read_receipt();
 	refresh();
@@ -1964,6 +2046,7 @@ static void select_id(const char *id)
 		remember_draft();
 		ui_media_select_chat();
 		set_string(&ui.selected, id);
+		update_delivery();
 		g_clear_pointer(&wire.jump_message, g_free);
 		g_clear_pointer(&wire.jump_pending, g_free);
 		wire.jump_request = 0;
@@ -2045,6 +2128,7 @@ static void show_chats(Json *list)
 			ui_find_reset();
 		remember_draft();
 		g_clear_pointer(&ui.selected, g_free);
+		update_delivery();
 		ui_chat_announcements_select(NULL);
 		g_clear_pointer(&wire.jump_message, g_free);
 		g_clear_pointer(&wire.jump_pending, g_free);
@@ -2163,7 +2247,7 @@ void ui_select_chat_id(const char *id)
 
 static gboolean can_send(void)
 {
-	if (!ui.selected || ui.logging_out ||
+	if (!ui.selected || ui.logging_out || pending_send(ui.selected) ||
 	    g_hash_table_contains(ui.sending, ui.selected))
 		return FALSE;
 	for (const char *ch = ui.message.value->str; *ch;
@@ -2173,8 +2257,65 @@ static gboolean can_send(void)
 	return FALSE;
 }
 
+static void send_recovery(enum ui_request_method method)
+{
+	Json *pending = pending_send(ui.selected);
+	const char *intent = ui_string(pending, "intentId", NULL);
+
+	if (!intent || !wire.pid || ui.logging_out ||
+	    g_hash_table_contains(ui.sending, ui.selected))
+		return;
+	struct ui_request *saved = g_new0(struct ui_request, 1);
+	Json *args = json_object_new_object();
+
+	saved->method = method;
+	saved->chat = g_strdup(ui.selected);
+	saved->text = g_strdup(intent);
+	json_object_object_add(args, "chat",
+			       json_object_new_string(ui.selected));
+	json_object_object_add(args, "intentId",
+			       json_object_new_string(intent));
+	g_hash_table_add(ui.sending, g_strdup(ui.selected));
+	submit(saved, method == DISCARD_SEND ? "discardSend" : "recoverSend",
+	       args);
+	set_string(&ui.notice, "");
+	ui.dirty = TRUE;
+}
+
+static void stop_tracking(void)
+{
+	if (!ui.delivery || g_hash_table_contains(ui.sending, ui.selected))
+		return;
+	const SDL_MessageBoxButtonData buttons[] = {
+		{ SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT |
+			  SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,
+		  0, _("Cancel") },
+		{ 0, 1, _("Stop tracking") },
+	};
+	const SDL_MessageBoxData dialog = {
+		.flags = SDL_MESSAGEBOX_WARNING,
+		.window = ui.window,
+		.title = _("Stop tracking this message?"),
+		.message = _("This clears the pending entry on this device. "
+			     "If LINE already received the message, sending it "
+			     "again may create a duplicate."),
+		.numbuttons = G_N_ELEMENTS(buttons),
+		.buttons = buttons,
+	};
+	int answer = 0;
+
+	if (SDL_ShowMessageBox(&dialog, &answer) < 0)
+		ui_status(SDL_GetError());
+	else if (answer == 1)
+		send_recovery(DISCARD_SEND);
+}
+
 static void send_message(void)
 {
+	if (ui.delivery) {
+		send_recovery(RECOVER_SEND);
+		return;
+	}
 	if (!can_send())
 		return;
 	g_hash_table_add(ui.sending, g_strdup(ui.selected));
@@ -2195,6 +2336,7 @@ static void rich_action(Json *area, Json *message)
 		ui_liff_open_link(value);
 	} else if (!strcmp(kind, "message")) {
 		if (!ui.selected || ui.logging_out ||
+		    pending_send(ui.selected) ||
 		    g_hash_table_contains(ui.sending, ui.selected))
 			return;
 		g_hash_table_add(ui.sending, g_strdup(ui.selected));
@@ -2222,10 +2364,10 @@ static void report_foreground(void)
 		line_trim_memory();
 }
 
-static void show_sent(const struct ui_request *saved, Json *receipt)
+static void show_sent(Json *params, Json *receipt)
 {
 	const char *id = ui_string(receipt, "id", NULL);
-	const char *text = ui_string(saved->params, "text", NULL);
+	const char *text = ui_string(params, "text", NULL);
 
 	if (!ui.history || ui.older_page || ui.older_pending ||
 	    !ui_read_id(id) || !text)
@@ -2239,9 +2381,9 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 			return;
 	Json *row = json_object_new_object();
 	gint64 sent = json_object_get_int64(ui_field(receipt, "sentAt"));
-	Json *emojis = ui_field(saved->params, "emojis");
-	Json *mentions_sent = ui_field(saved->params, "mentions");
-	Json *reply = ui_field(saved->params, "replyTo");
+	Json *emojis = ui_field(params, "emojis");
+	Json *mentions_sent = ui_field(params, "mentions");
+	Json *reply = ui_field(params, "replyTo");
 
 	json_object_object_add(row, "id", json_object_new_string(id));
 	json_object_object_add(row, "text", json_object_new_string(text));
@@ -2276,6 +2418,84 @@ static void show_sent(const struct ui_request *saved, Json *receipt)
 	ui.dirty = TRUE;
 }
 
+static void send_confirmed(const char *chat, Json *params, Json *receipt)
+{
+	if (!g_strcmp0(ui.reply_id, ui_string(params, "replyTo", NULL)))
+		ui_media_reply_sent(chat);
+	if (!g_strcmp0(ui.selected, chat)) {
+		show_sent(params, receipt);
+		if (same_draft(chat, ui.message.value->str, params)) {
+			ui_emoji_forget(chat);
+			forget_mentions(chat);
+			set_text(&ui.message, "");
+		}
+		ui_show_latest();
+	} else if (same_draft(chat, g_hash_table_lookup(ui.drafts, chat),
+			      params)) {
+		ui_emoji_forget(chat);
+		forget_mentions(chat);
+		g_hash_table_remove(ui.drafts, chat);
+	}
+}
+
+static void finish_pending_send(const char *chat, const char *status,
+				Json *params, Json *receipt, const char *error)
+{
+	gboolean sent = !g_strcmp0(status, "sent");
+	gboolean failed = !g_strcmp0(status, "failed");
+
+	if (!sent && !failed && g_strcmp0(status, "discarded"))
+		return;
+	if (sent && !ui_read_id(ui_string(receipt, "id", NULL)))
+		return;
+	g_hash_table_remove(wire.outbox, chat);
+	if (!g_strcmp0(ui.selected, chat))
+		update_delivery();
+	if (sent)
+		send_confirmed(chat, params, receipt);
+	else if (failed) {
+		const char *text = ui_string(params, "text", NULL);
+
+		/* Preserve a recovered draft after a definitive rejection. */
+		if (text && *text) {
+			if (!g_strcmp0(ui.selected, chat)) {
+				if (!ui.message.value->len)
+					set_text(&ui.message, text);
+			} else if (!g_hash_table_contains(ui.drafts, chat)) {
+				g_hash_table_insert(ui.drafts, g_strdup(chat),
+						    g_strdup(text));
+			}
+		}
+		set_string(&ui.notice,
+			   error ? _(error) :
+				   _("The message was not confirmed."));
+	}
+}
+
+static void send_outcome(Json *packet)
+{
+	const char *chat = ui_string(packet, "chat", NULL);
+	const char *intent = ui_string(packet, "intentId", NULL);
+	const char *status = ui_string(packet, "status", NULL);
+	Json *pending = pending_send(chat);
+	Json *params = ui_field(packet, "params");
+
+	if (!intent ||
+	    (pending &&
+	     g_strcmp0(intent, ui_string(pending, "intentId", NULL))))
+		return;
+	if (!params)
+		params = ui_field(pending, "params");
+	g_autoptr(J) kept = json_object_get(params);
+
+	if (!g_strcmp0(status, "queued") || !g_strcmp0(status, "uncertain"))
+		remember_send(chat, packet, kept);
+	else if (pending)
+		finish_pending_send(chat, status, kept,
+				    ui_field(packet, "receipt"),
+				    ui_string(packet, "error", NULL));
+}
+
 static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			 const char *error)
 {
@@ -2294,6 +2514,9 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		sign_in.shown = 0;
 		ui.authenticating = FALSE;
 		ui.connected = TRUE;
+		set_offline(
+			json_object_get_boolean(ui_field(result, "offline")));
+		remember_outbox(ui_field(result, "outbox"));
 		ui.email_login = FALSE;
 		set_text(&ui.login_email, "");
 		wire.login_failures = 0;
@@ -2321,7 +2544,11 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		else {
 			if (wire.refresh_notice)
 				set_string(&ui.notice, "");
-			notify_unread(result);
+			if (!ui.offline)
+				notify_unread(result);
+			else if (!wire.notification_baseline)
+				wire.notification_baseline =
+					g_get_real_time() / 1000;
 			show_chats(result);
 			if (wire.temporary_session_notice) {
 				const char *notice = _(
@@ -2330,7 +2557,8 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				wire.temporary_session_notice = FALSE;
 				set_string(&ui.notice, notice);
 			}
-			if (pending_link && ui.connected && !ui.logging_out) {
+			if (pending_link && ui.connected && !ui.offline &&
+			    !ui.logging_out) {
 				g_autofree char *url =
 					g_steal_pointer(&pending_link);
 
@@ -2459,33 +2687,49 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				       result, error);
 		break;
 	case SEND:
-		if (!error && json_object_is_type(result, json_type_object) &&
-		    !g_strcmp0(ui.reply_id,
-			       ui_string(saved->params, "replyTo", NULL)))
-			ui_media_reply_sent(saved->chat);
 		g_hash_table_remove(ui.sending, saved->chat);
 		if (error || !json_object_is_type(result, json_type_object))
 			set_string(&ui.notice,
 				   error ? error :
 					   _("The message was not confirmed."));
-		else if (!g_strcmp0(ui.selected, saved->chat)) {
-			show_sent(saved, result);
-			if (same_draft(saved->chat, ui.message.value->str,
-				       saved->params)) {
-				ui_emoji_forget(saved->chat);
-				forget_mentions(saved->chat);
-				set_text(&ui.message, "");
-			}
-			ui_show_latest();
-		} else if (same_draft(saved->chat,
-				      g_hash_table_lookup(ui.drafts,
-							  saved->chat),
-				      saved->params)) {
-			ui_emoji_forget(saved->chat);
-			forget_mentions(saved->chat);
-			g_hash_table_remove(ui.drafts, saved->chat);
+		else if (json_object_get_boolean(ui_field(result, "pending"))) {
+			Json *original = ui_field(result, "params");
+
+			remember_send(saved->chat, result,
+				      original ? original : saved->params);
+			set_string(&ui.notice, "");
+		} else {
+			set_string(&ui.notice, "");
+			send_confirmed(saved->chat, saved->params, result);
 		}
+		ui.dirty = TRUE;
 		break;
+	case RECOVER_SEND:
+	case DISCARD_SEND: {
+		g_hash_table_remove(ui.sending, saved->chat);
+		ui.dirty = TRUE;
+		Json *pending = pending_send(saved->chat);
+
+		if (!pending || g_strcmp0(saved->text,
+					  ui_string(pending, "intentId", NULL)))
+			break;
+		if (error) {
+			set_string(&ui.notice, _(error));
+			break;
+		}
+		g_autoptr(J) params =
+			json_object_get(ui_field(pending, "params"));
+
+		if (json_object_get_boolean(ui_field(result, "pending")))
+			remember_send(saved->chat, result, params);
+		else if (saved->method == DISCARD_SEND)
+			finish_pending_send(saved->chat, "discarded", params,
+					    NULL, NULL);
+		else if (ui_read_id(ui_string(result, "id", NULL)))
+			finish_pending_send(saved->chat, "sent", params, result,
+					    NULL);
+		break;
+	}
 	case LOGOUT:
 		if (error) {
 			ui.logging_out = FALSE;
@@ -2494,10 +2738,23 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			gboolean confirmed = json_object_get_boolean(
 				ui_field(result, "confirmed"));
 
-			reset_login(
+			const char *notice =
 				confirmed ?
 					_("Signed out.") :
-					_("Signed out on this computer. LINE did not confirm it, so check linked devices on your phone."));
+					_("Signed out on this computer. "
+					  "LINE did not confirm it, so check "
+					  "linked devices on your phone.");
+			gboolean incomplete = json_object_get_boolean(
+				ui_field(result, "archiveCleanupFailed"));
+			g_autofree char *warning =
+				incomplete ?
+					g_strconcat(
+						notice, " ",
+						_("Some offline chat data could not be deleted."),
+						NULL) :
+					NULL;
+
+			reset_login(warning ? warning : notice);
 		}
 		break;
 	}
@@ -2574,12 +2831,19 @@ static void handle_packet(Json *packet)
 			   _("Enter this code in LINE on your phone."));
 	} else if (!strcmp(event, "status"))
 		set_string(&ui.notice, ui_string(packet, "message", ""));
-	else if (!strcmp(event, "sync_unavailable") && ui.connected)
+	else if (!strcmp(event, "offline") && ui.connected)
+		set_offline(TRUE);
+	else if (!strcmp(event, "sync_unavailable") && ui.connected) {
+		set_offline(TRUE);
 		set_refresh_notice(ui_string(packet, "message", ""));
-	else if (!strcmp(event, "changed") && ui.connected && !ui.logging_out)
+	} else if (!strcmp(event, "changed") && ui.connected && !ui.logging_out)
 		refresh();
-	else if (!strcmp(event, "reconnected"))
+	else if (!strcmp(event, "reconnected") && ui.connected) {
+		set_offline(FALSE);
 		refresh_content(FALSE);
+	} else if (!strcmp(event, "send_outcome") && ui.connected &&
+		   !ui.logging_out)
+		send_outcome(packet);
 	else if (!strcmp(event, "chat_message") && ui.connected &&
 		 !ui.logging_out)
 		chat_message(packet);
@@ -2774,13 +3038,14 @@ static void tab_focus(gboolean backwards)
 		focus_on(controls[(i + (backwards ? -1 : 1) + n) % n]);
 		return;
 	}
-	const Focus all[] = { F_FRIENDS,   F_OPENCHAT, F_GROUP_NEW, F_MEMBERS,
-			      F_FIND_TEXT, F_SEARCH,   F_LIST,	    F_MESSAGE,
-			      F_SEND,	   F_RELOAD,   F_LOGOUT };
+	const Focus all[] = { F_FRIENDS, F_OPENCHAT,  F_GROUP_NEW,
+			      F_MEMBERS, F_FIND_TEXT, F_SEARCH,
+			      F_LIST,	 F_MESSAGE,   F_STOP_TRACKING,
+			      F_SEND,	 F_RELOAD,    F_LOGOUT };
 	const Focus list[] = { F_FRIENDS, F_OPENCHAT, F_GROUP_NEW, F_SEARCH,
 			       F_LIST,	  F_RELOAD,   F_LOGOUT };
-	const Focus thread[] = { F_BACK, F_MEMBERS, F_FIND_TEXT, F_MESSAGE,
-				 F_SEND };
+	const Focus thread[] = { F_BACK,    F_MEMBERS,	     F_FIND_TEXT,
+				 F_MESSAGE, F_STOP_TRACKING, F_SEND };
 	const Focus *cycle = all;
 	int n = G_N_ELEMENTS(all), i = 0;
 
@@ -2798,6 +3063,7 @@ static void tab_focus(gboolean backwards)
 	       (cycle[i] == F_FRIENDS && !ui.friends) ||
 	       (cycle[i] == F_OPENCHAT && !ui.openchats) ||
 	       (cycle[i] == F_GROUP_NEW && !ui.groups) ||
+	       (cycle[i] == F_STOP_TRACKING && !ui.delivery) ||
 	       (cycle[i] == F_MEMBERS &&
 		(!ui.selected || !((ui.groups && *ui.selected == 'c') ||
 				   (ui.openchats && *ui.selected == 'm')))) ||
@@ -2948,6 +3214,8 @@ static void key(SDL_KeyboardEvent k)
 			focus_on(F_LIST);
 		else if (ui.focus == F_SEND || ui.focus == F_MESSAGE)
 			send_message();
+		else if (ui.focus == F_STOP_TRACKING)
+			stop_tracking();
 		else if (ui.focus == F_RELOAD)
 			refresh_content(TRUE);
 		else if (ui.focus == F_LOGOUT)
@@ -3029,6 +3297,11 @@ static void click(int x, int y)
 	if (mp.open)
 		mention_popup_close();
 	if (ui.connected && ui.selected && ui_chat_visible()) {
+		if (ui.delivery && inside(ui.stop_tracking, x, y)) {
+			focus_on(F_STOP_TRACKING);
+			stop_tracking();
+			return;
+		}
 		if (ui_chat_announcements_click(x, y))
 			return;
 		if (ui.has_older && inside(ui.older_button, x, y)) {
@@ -3394,6 +3667,8 @@ static int hover_target(int x, int y)
 		return 2;
 	if (ui_chat_visible() && ui.selected && inside(ui.send, x, y))
 		return 3;
+	if (ui_chat_visible() && ui.delivery && inside(ui.stop_tracking, x, y))
+		return -2003;
 	if (ui_list_visible() && inside(ui.list_box, x, y)) {
 		int row = (y - ui.list_box.y + ui.list_offset) /
 			  ui_chat_row_height();
@@ -3946,6 +4221,7 @@ int line_ui(int argc, char **argv)
 	g_free(ui.selected);
 	g_clear_pointer(&pending_link, g_free);
 	g_clear_pointer(&mentions, g_hash_table_unref);
+	g_clear_pointer(&wire.outbox, g_hash_table_unref);
 	json_object_put(ui.opened);
 	g_free(ui.name);
 	g_free(ui.notice);

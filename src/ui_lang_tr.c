@@ -3,6 +3,20 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Some offline chat data could not be deleted.",
+	  "Bazı çevrimdışı sohbet verileri silinemedi." },
+	{ "Check delivery", "Teslimatı kontrol et" },
+	{ "Delivery unconfirmed", "Teslimat doğrulanmadı" },
+	{ "Message queued", "Mesaj sıraya alındı" },
+	{ "Offline. Showing saved chats.",
+	  "Çevrimdışı. Kayıtlı sohbetler gösteriliyor." },
+	{ "Stop tracking", "Takibi bırak" },
+	{ "Stop tracking this message?",
+	  "Bu mesajı takip etmeyi bırakmak istiyor musunuz?" },
+	{ "This clears the pending entry on this device. "
+	  "If LINE already received the message, sending it "
+	  "again may create a duplicate.",
+	  "Bu cihazdaki bekleyen kayıt silinir. LINE mesajı zaten aldıysa tekrar göndermek yinelenen bir mesaj oluşturabilir." },
 	{ "Could not open the desktop file chooser.",
 	  "Masaüstünün dosya seçicisi açılamadı." },
 	{ "Voice call", "Sesli arama" },

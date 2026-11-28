@@ -77,6 +77,7 @@ typedef struct {
 	gint64 refresh_at;
 	int service_code; /* logical error code from the last RPC, -1 otherwise */
 	long http_status; /* HTTP status of the last RPC, 0 without a response */
+	gboolean rpc_may_have_run; /* The request could have reached LINE. */
 	/*
 	 * LINE refused this session's credentials. As in LINE's own client, no
 	 * further request goes out with them; the worker signs out.
@@ -210,7 +211,8 @@ enum {
 	LINE_ACCESS_DENIED = 10,
 	/* LINE did not accept the email address and password. */
 	LINE_CREDENTIALS_REJECTED = 11,
-	LINE_LETTER_SEALING_RELINK = 12
+	LINE_LETTER_SEALING_RELINK = 12,
+	LINE_CONNECT_FAILED = 13
 };
 
 static inline void line_letter_sealing_relink(GError **error)

@@ -18,6 +18,8 @@ static int refresh_code, requests;
 static gint64 refresh_duration, refresh_issued;
 static long http_code = 200;
 static curl_off_t retry_after;
+static CURLcode transfer_error;
+static long request_size;
 static gboolean reject_replay;
 static GPtrArray *sent_headers;
 /* When nonnegative, every reply is this TalkException code. */
@@ -68,6 +70,8 @@ CURLcode __wrap_curl_easy_getinfo(CURL *easy, CURLINFO info, ...)
 	va_start(values, info);
 	if (info == CURLINFO_RETRY_AFTER)
 		*va_arg(values, curl_off_t *) = retry_after;
+	else if (info == CURLINFO_REQUEST_SIZE)
+		*va_arg(values, long *) = request_size;
 	else {
 		g_assert_cmpint(info, ==, CURLINFO_RESPONSE_CODE);
 		*va_arg(values, long *) = http_code;
@@ -80,6 +84,8 @@ CURLcode __wrap_curl_easy_perform(CURL *easy)
 {
 	(void)easy;
 	requests++;
+	if (transfer_error)
+		return transfer_error;
 	gboolean refresh = requests == 2 && forced_code < 0;
 
 	if (refresh && refresh_code < 0)
@@ -219,6 +225,7 @@ static void refresh_failure_keeps_session(void)
 		g_assert_false(g_error_matches(error, LINE_ERROR,
 					       LINE_SESSION_EXPIRED));
 		g_assert_cmpint(s.service_code, ==, -1);
+		g_assert_false(s.rpc_may_have_run);
 		/* The saved tokens are untouched for the next attempt. */
 		g_assert_cmpstr(s.access, ==, "old");
 		g_assert_cmpstr(s.refresh, ==, "refresh");
@@ -415,6 +422,40 @@ static void access_denied(void)
 	line_transport_release();
 }
 
+static void uncertain_transport(void)
+{
+	static const struct {
+		CURLcode transfer;
+		long bytes;
+		int error;
+		gboolean uncertain;
+	} cases[] = {
+		{ CURLE_COULDNT_CONNECT, 0, LINE_CONNECT_FAILED, FALSE },
+		{ CURLE_COULDNT_RESOLVE_HOST, 0, LINE_CONNECT_FAILED, FALSE },
+		{ CURLE_COULDNT_CONNECT, 155, 1, TRUE },
+		{ CURLE_RECV_ERROR, 0, 1, TRUE },
+		{ CURLE_OPERATION_TIMEDOUT, 0, LINE_TIMEOUT, TRUE },
+	};
+	Line client = { .access = (char *)"fixture" };
+
+	for (size_t i = 0; i < G_N_ELEMENTS(cases); i++) {
+		g_autoptr(GError) error = NULL;
+
+		transfer_error = cases[i].transfer;
+		request_size = cases[i].bytes;
+		requests = 0;
+		g_assert_null(
+			line_rpc(&client, "/S4", "sendMessage", NULL, &error));
+		g_assert_error(error, LINE_ERROR, cases[i].error);
+		g_assert_cmpint(client.rpc_may_have_run, ==,
+				cases[i].uncertain);
+		g_assert_cmpint(requests, ==, 1);
+	}
+	transfer_error = CURLE_OK;
+	request_size = 0;
+	line_transport_release();
+}
+
 /*
  * After NOT_AUTHORIZED_DEVICE nothing more goes out with that token, as in
  * LINE's own client; other tokens (a pairing session) are unaffected.
@@ -598,6 +639,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/transport/qr-poll-timeout", poll_timeout);
 	g_test_add_func("/transport/identity-headers", identity_headers);
 	g_test_add_func("/transport/access-denied", access_denied);
+	g_test_add_func("/transport/uncertain-send", uncertain_transport);
 	g_test_add_func("/transport/denial-latch", denial_latch);
 	g_test_add_func("/transport/busy-cooldown", busy_cooldown);
 	g_test_add_func("/transport/persist-cooldown", persist_cooldown);

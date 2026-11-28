@@ -3,6 +3,7 @@
 #include "state_crypto.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <string.h>
 #include <sys/file.h>
@@ -47,6 +48,20 @@ gboolean line_store_start(const guint8 *key)
 		return FALSE;
 	key_store_started = TRUE;
 	return TRUE;
+}
+
+gboolean line_store_offline_key(const char *mid, guint8 *key)
+{
+	if (!keyring_available || !mid || !*mid)
+		return FALSE;
+	g_autofree char *context =
+		g_strconcat("Avernella offline v1/", mid, NULL);
+	size_t length = 0;
+
+	return EVP_Q_mac(NULL, "HMAC", NULL, "SHA256", NULL, store_key,
+			 sizeof(store_key), (const guint8 *)context,
+			 strlen(context), key, LINE_STATE_KEY_SIZE, &length) &&
+	       length == LINE_STATE_KEY_SIZE;
 }
 
 void line_store_stop(void)
@@ -639,17 +654,22 @@ gboolean line_store_forget(int dir, GError **error)
 	return !sync_error || io_failure("sync", error);
 }
 
-gboolean line_store_discard(GError **error)
+gboolean line_store_discard(int *dir_out, GError **error)
 {
 	g_autofree char *path =
 		g_build_filename(g_get_user_state_dir(), LINE_STATE_DIR, NULL);
 	int dir = open(path, STORE_DIR_FLAGS);
 
+	if (dir_out)
+		*dir_out = -1;
 	if (dir < 0)
 		return errno == ENOENT || io_failure("open", error);
 	gboolean ok = lock_store(dir, LINE_STATE_DIR, error) &&
 		      line_store_forget(dir, error);
 
-	close(dir);
+	if (ok && dir_out)
+		*dir_out = dir;
+	else
+		close(dir);
 	return ok;
 }

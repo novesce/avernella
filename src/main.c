@@ -13,6 +13,7 @@
 #include "media.h"
 #include "media_io.h"
 #include "obs_http.h"
+#include "offline_store.h"
 #include "profile_image.h"
 #include "shared_content.h"
 #include "state.h"
@@ -65,6 +66,12 @@ struct line_worker {
 	LineStickers *stickers;
 	int dir, timer, renewal_timer, credentials_fd;
 	gboolean ready, latest_history, foreground;
+	gboolean offline, verify_on_reconnect, online_chats, archived_page;
+	gboolean archive_cleanup_failed;
+	LineOffline *archive;
+	J *outbox;
+	GHashTable *checked_sends;
+	gint64 outbox_due;
 	struct line_talk_sync sync;
 	/* Long-poll sync thread; the timer polls only while it fails. */
 	struct line_live_sync *live;
@@ -113,7 +120,7 @@ struct line_worker {
 	gint64 lookup_until;
 	/* Friend searches and adds, paced so they never look automated. */
 	struct line_pace lookup_pace, add_pace;
-	char *name, *history_chat;
+	char *name, *history_chat, *history_first;
 	/*
 	 * Recently opened chats, newest last, as in Discord: reopening one
 	 * answers from memory and revalidates with LINE right after.
@@ -180,6 +187,9 @@ static void wake_after(struct line_worker *w, int seconds)
 }
 
 static void cache_clear(struct line_worker *w);
+static void open_archive(struct line_worker *w);
+static void reconcile_page(struct line_worker *w, const char *chat, J *raw);
+static J *send_entry(J *intent, const char *status, const char *fingerprint);
 
 static J *problem(GError **error, const char *message)
 {
@@ -220,6 +230,7 @@ static void clear_view(struct line_worker *w)
 	line_shared_clear(&w->session);
 	g_clear_pointer(&w->stickers, line_stickers_free);
 	g_clear_pointer(&w->history_chat, g_free);
+	g_clear_pointer(&w->history_first, g_free);
 	g_clear_pointer(&w->messages, json_object_put);
 	g_clear_pointer(&w->announcements, json_object_put);
 	g_clear_pointer(&w->announcement_chat, g_free);
@@ -252,6 +263,12 @@ static void clear_view(struct line_worker *w)
 	g_clear_pointer(&w->unread_heads, json_object_put);
 	g_clear_pointer(&w->read_acks, json_object_put);
 	g_clear_pointer(&w->unsent, json_object_put);
+	g_clear_pointer(&w->outbox, json_object_put);
+	g_clear_pointer(&w->archive, line_offline_close);
+	g_hash_table_remove_all(w->checked_sends);
+	w->offline = w->verify_on_reconnect = w->online_chats =
+		w->archived_page = FALSE;
+	w->outbox_due = 0;
 	g_clear_pointer(&w->peer_ranges, json_object_put);
 	g_clear_pointer(&w->peer_notices, json_object_put);
 	w->need_ranges = w->publish_reads = FALSE;
@@ -399,6 +416,15 @@ static void sync_vault_session(struct line_worker *w)
 	scrub_worker_own_keys(w->session.keys);
 }
 
+static void purge_archive(struct line_worker *w, int dir)
+{
+	g_autoptr(GError) error = NULL;
+
+	w->archive_cleanup_failed = !line_offline_clear_all(dir, &error);
+	if (error)
+		g_printerr("Avernella: %s\n", error->message);
+}
+
 static gboolean forget(struct line_worker *w, GError **error)
 {
 	/* Wait for the old Vault before unlinking its session file. */
@@ -412,6 +438,7 @@ static gboolean forget(struct line_worker *w, GError **error)
 				    "Could not close the Key Vault session.");
 		return FALSE;
 	}
+	purge_archive(w, w->dir);
 	clear_view(w);
 	w->vault_has_keys = FALSE;
 	w->vault_retry_at = 0;
@@ -441,6 +468,66 @@ static gboolean transient_failure(const Line *s, const GError *error)
 	    g_error_matches(error, LINE_ERROR, LINE_ACCESS_DENIED))
 		return FALSE;
 	return !status || status == 408 || status == 429 || status >= 500;
+}
+
+static void went_offline(struct line_worker *w)
+{
+	if (w->offline)
+		return;
+	w->offline = TRUE;
+	w->online_chats = FALSE;
+	line_event("offline", NULL, NULL);
+	wake_after(w, 1);
+}
+
+static void open_archive(struct line_worker *w)
+{
+	guint8 key[LINE_STATE_KEY_SIZE];
+
+	if (w->archive)
+		return;
+	if (line_store_offline_key(w->session.mid, key))
+		w->archive = line_offline_open(w->dir, w->session.mid, key);
+	explicit_bzero(key, sizeof(key));
+}
+
+static void archive_profile(struct line_worker *w, const char *name,
+			    const char *picture)
+{
+	if (!w->archive)
+		return;
+	g_autoptr(J) profile = obj();
+
+	json_object_object_add(profile, "name", json_object_new_string(name));
+	if (picture)
+		json_object_object_add(profile, "picture",
+				       json_object_new_string(picture));
+	line_offline_save_profile(w->archive, profile);
+}
+
+static gboolean valid_outbox(J *rows)
+{
+	if (!rows || json_object_array_length(rows) > 32)
+		return FALSE;
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		J *row = json_object_array_get_idx(rows, i);
+		const char *chat = strfield(row, "chat"),
+			   *id = strfield(row, "intentId"),
+			   *status = strfield(row, "status"),
+			   *fingerprint = strfield(row, "fingerprint");
+
+		if (!chat || !*chat || line_is_square_chat(chat) || !id ||
+		    !g_uuid_string_is_valid(id) ||
+		    !strfield(field(row, "params"), "text"))
+			return FALSE;
+		if (!g_strcmp0(status, "queued") && !fingerprint)
+			continue;
+		if (g_strcmp0(status, "uncertain") || !fingerprint ||
+		    strlen(fingerprint) != 64 ||
+		    fingerprint[strspn(fingerprint, "0123456789abcdef")])
+			return FALSE;
+	}
+	return TRUE;
 }
 
 /*
@@ -478,6 +565,8 @@ static void end_session(struct line_worker *w)
 		"signed_out", "message",
 		removal ?
 			removal->message :
+		w->archive_cleanup_failed ?
+			"LINE ended the session. The local chat archive could not be removed." :
 			"LINE ended this desktop session. Choose sign in to pair again.");
 }
 
@@ -573,6 +662,8 @@ static J *login(struct line_worker *w, GError **error)
 			close(w->credentials_fd);
 			w->credentials_fd = -1;
 		}
+		open_archive(w);
+		g_autoptr(J) saved = NULL;
 		g_autoptr(J) profile = checked_profile(s, error);
 
 		if (!profile) {
@@ -589,16 +680,28 @@ static J *login(struct line_worker *w, GError **error)
 			 * know: keep it and let the UI retry. LINE's own refusals keep
 			 * it too, but end the attempt so nothing retries by itself.
 			 */
-			if (*error && transient_failure(s, *error))
-				(*error)->code = LINE_RETRY;
-			else if (*error)
+			if (*error && transient_failure(s, *error)) {
+				if (w->archive && s->mid)
+					saved = line_offline_load_profile(
+						w->archive);
+				if (strfield(saved, "name")) {
+					g_clear_error(error);
+					w->offline = w->verify_on_reconnect =
+						TRUE;
+				} else {
+					(*error)->code = LINE_RETRY;
+					return NULL;
+				}
+			} else if (*error) {
 				g_prefix_error(
 					error,
 					"LINE refused this desktop session. Choose sign in to try again. ");
-			return NULL;
+				return NULL;
+			}
 		}
-		const char *mid = strfield(profile, "1"),
-			   *name = strfield(profile, "20");
+		const char *mid = saved ? s->mid : strfield(profile, "1"),
+			   *name = saved ? strfield(saved, "name") :
+					   strfield(profile, "20");
 		if (!mid || !*mid || !name || !g_utf8_validate(name, -1, NULL))
 			return problem(error,
 				       "LINE returned an incomplete profile.");
@@ -615,7 +718,8 @@ static J *login(struct line_worker *w, GError **error)
 		}
 		if (!s->pictures)
 			s->pictures = obj();
-		const char *picture = strfield(profile, "33");
+		const char *picture = saved ? strfield(saved, "picture") :
+					      strfield(profile, "33");
 
 		if (picture)
 			json_object_object_add(s->pictures, mid,
@@ -625,6 +729,14 @@ static J *login(struct line_worker *w, GError **error)
 		w->opened_chats = obj();
 		w->read_acks = obj();
 		w->unsent = line_store_read_unsent(w->dir, s->mid);
+		open_archive(w);
+		if (!saved)
+			archive_profile(w, name, picture);
+		w->outbox = w->archive ?
+				    line_offline_load_outbox(w->archive, NULL) :
+				    json_object_new_array();
+		if (!valid_outbox(w->outbox))
+			g_clear_pointer(&w->outbox, json_object_put);
 		w->ready = TRUE;
 		/*
 		 * Move Letter Sealing private keys into the memfd_secret() Key
@@ -641,6 +753,23 @@ static J *login(struct line_worker *w, GError **error)
 
 	json_object_object_add(who, "name", json_object_new_string(w->name));
 	json_object_object_add(who, "selfId", json_object_new_string(s->mid));
+	if (w->offline)
+		json_object_object_add(who, "offline",
+				       json_object_new_boolean(TRUE));
+	if (w->outbox && json_object_array_length(w->outbox)) {
+		J *list = json_object_new_array();
+
+		for (size_t i = 0; i < json_object_array_length(w->outbox);
+		     i++) {
+			J *entry = json_object_array_get_idx(w->outbox, i);
+
+			json_object_array_add(
+				list,
+				send_entry(entry, strfield(entry, "status"),
+					   NULL));
+		}
+		json_object_object_add(who, "outbox", list);
+	}
 	if (line_store_temporary())
 		json_object_object_add(who, "temporarySession",
 				       json_object_new_boolean(TRUE));
@@ -1273,11 +1402,72 @@ static int merged_chat_order(const void *a, const void *b)
 			  (lt > rt ? -1 : 1);
 }
 
+static void redact_directory(struct line_worker *w, J *rows)
+{
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		J *row = json_object_array_get_idx(rows, i);
+		const char *id = strfield(row, "id"),
+			   *last = strfield(row, "lastId");
+
+		if (!id || !last || !field(field(w->unsent, id), last))
+			continue;
+		json_object_object_del(row, "preview");
+		json_object_object_add(row, "lastUnsent",
+				       json_object_new_boolean(TRUE));
+	}
+}
+
+static J *offline_directory(struct line_worker *w)
+{
+	if (w->chat_snapshot)
+		return json_object_get(w->chat_snapshot);
+	J *rows = w->archive ? line_offline_load_chats(w->archive) : NULL;
+
+	if (!rows)
+		return json_object_new_array();
+	redact_directory(w, rows);
+	for (size_t i = 0; i < json_object_array_length(rows); i++) {
+		J *row = json_object_array_get_idx(rows, i);
+		const char *id = strfield(row, "id");
+
+		if (id)
+			g_hash_table_insert(w->chats, g_strdup(id), row);
+	}
+	w->chat_snapshot = json_object_get(rows);
+	return rows;
+}
+
+static void drop_chat_archive(struct line_worker *w, const char *chat)
+{
+	g_hash_table_remove(w->history_cache, chat);
+	if (w->archive)
+		line_offline_drop_history(w->archive, chat);
+	for (size_t i = 0;
+	     w->chat_snapshot && i < json_object_array_length(w->chat_snapshot);
+	     i++) {
+		J *row = json_object_array_get_idx(w->chat_snapshot, i);
+
+		if (g_strcmp0(chat, strfield(row, "id")))
+			continue;
+		json_object_array_del_idx(w->chat_snapshot, i, 1);
+		if (w->archive)
+			line_offline_save_chats(w->archive, w->chat_snapshot);
+		break;
+	}
+}
+
 static J *chat_directory(struct line_worker *w, GError **error)
 {
 	Line *s = &w->session;
+	if (w->offline)
+		return offline_directory(w);
 	J *rows = line_chats(s, error);
 
+	if (!rows && *error && transient_failure(s, *error)) {
+		g_clear_error(error);
+		went_offline(w);
+		return offline_directory(w);
+	}
 	if (!rows)
 		return NULL;
 	if (!w->square_disabled) {
@@ -1311,6 +1501,19 @@ static J *chat_directory(struct line_worker *w, GError **error)
 		} else if (g_error_matches(sq_err, LINE_ERROR,
 					   LINE_METHOD_UNAVAILABLE)) {
 			w->square_disabled = TRUE;
+		}
+	}
+	if (w->archive) {
+		for (size_t i = 0; i < json_object_array_length(rows); i++) {
+			J *row = json_object_array_get_idx(rows, i);
+			const char *id = strfield(row, "id");
+			guint64 floor = json_object_get_uint64(
+				field(row, "clearThrough"));
+
+			if (id && floor > history_clear_id(w, id)) {
+				line_offline_drop_history(w->archive, id);
+				g_hash_table_remove(w->history_cache, id);
+			}
 		}
 	}
 	g_hash_table_remove_all(w->chats);
@@ -1347,8 +1550,14 @@ static J *chat_directory(struct line_worker *w, GError **error)
 		g_hash_table_insert(w->chats, g_strdup(id), row);
 		json_object_array_add(rows, json_object_get(row));
 	}
+	if (w->archive && !json_object_equal(rows, w->chat_snapshot))
+		line_offline_save_chats(w->archive, rows);
 	json_object_put(w->chat_snapshot);
 	w->chat_snapshot = json_object_get(rows);
+	if (!w->online_chats) {
+		w->online_chats = TRUE;
+		w->outbox_due = g_get_monotonic_time();
+	}
 	return rows;
 }
 
@@ -1549,6 +1758,8 @@ static void message_unsent(struct line_worker *w, const char *chat,
 	}
 	if (changed)
 		line_store_write_unsent(w->session.mid, w->unsent);
+	if (w->archive)
+		line_offline_unsend(w->archive, chat, id, time);
 
 	g_autoptr(J) event = obj();
 
@@ -1559,8 +1770,19 @@ static void message_unsent(struct line_worker *w, const char *chat,
 	line_emit(event);
 }
 
-static void show_history(struct line_worker *w, const char *chat, J *raw)
+static void history_position(struct line_worker *w, J *rows, gboolean archived)
 {
+	J *first = json_object_array_get_idx(rows, 0);
+
+	g_free(w->history_first);
+	w->history_first = g_strdup(strfield(first, "id"));
+	w->archived_page = archived;
+}
+
+static void show_history(struct line_worker *w, const char *chat, J *rows,
+			 J *raw, gboolean archived)
+{
+	history_position(w, rows, archived);
 	json_object_put(w->messages);
 	w->messages = json_object_get(raw);
 	w->latest_history = TRUE;
@@ -1575,6 +1797,32 @@ static void show_history(struct line_worker *w, const char *chat, J *raw)
 		w->need_ranges = TRUE;
 		w->ranges_retry_at = 0;
 	}
+}
+
+static J *archived_history(struct line_worker *w, const char *chat,
+			   const char *before, J **raw, gboolean *more)
+{
+	J *rows = w->archive ? line_offline_load_history(w->archive, chat,
+							 before, raw, more) :
+			       NULL;
+	if (!rows)
+		return NULL;
+	guint64 floor = history_clear_id(w, chat);
+
+	for (size_t i = 0; floor && i < json_object_array_length(rows);) {
+		J *row = json_object_array_get_idx(rows, i);
+		const char *id = strfield(row, "id");
+
+		if (!id || json_object_get_uint64(field(row, "id")) > floor) {
+			i++;
+			continue;
+		}
+		if (*raw)
+			json_object_object_del(*raw, id);
+		json_object_array_del_idx(rows, i, 1);
+	}
+	line_redact_unsent(field(w->unsent, chat), rows, *raw, floor, !before);
+	return rows;
 }
 
 static J *history_page(struct line_worker *w, const char *chat, gboolean older,
@@ -1593,36 +1841,87 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
 
 		if (c && c->cleared_through == history_clear_id(w, chat)) {
 			/* Answer from memory now; check LINE after replying. */
-			show_history(w, chat, c->raw);
+			show_history(w, chat, c->rows, c->raw, FALSE);
 			cache_touch(w, chat);
-			g_free(w->revalidate);
-			w->revalidate = g_strdup(chat);
+			if (!w->offline) {
+				g_free(w->revalidate);
+				w->revalidate = g_strdup(chat);
+			}
 			return json_object_get(c->rows);
 		}
-		J *raw = NULL;
-		J *history = recent_history(w, chat, &raw, error);
+		g_autoptr(J) raw = NULL;
+		J *history = archived_history(w, chat, NULL, &raw, NULL);
 
+		if (history) {
+			show_history(w, chat, history, raw, TRUE);
+			if (!w->offline) {
+				g_free(w->revalidate);
+				w->revalidate = g_strdup(chat);
+			}
+			return history;
+		}
+		if (w->offline)
+			history = json_object_new_array();
+		else
+			history = recent_history(w, chat, &raw, error);
+		if (!history && *error &&
+		    transient_failure(&w->session, *error)) {
+			g_clear_error(error);
+			went_offline(w);
+			history = json_object_new_array();
+		}
 		if (!history)
 			return NULL;
-		show_history(w, chat, raw);
-		cache_store(w, chat, history, raw);
-		json_object_put(raw);
+		show_history(w, chat, history, raw, w->offline);
+		if (!w->offline) {
+			cache_store(w, chat, history, raw);
+			if (w->archive)
+				line_offline_save_history(w->archive, chat,
+							  history, raw);
+			reconcile_page(w, chat, raw);
+		}
 		return history;
 	}
 	J *raw = NULL;
 	gboolean more = FALSE;
+	gboolean archived = w->offline ||
+			    (w->archived_page && line_is_square_chat(chat));
+	J *history = NULL;
 
-	g_autoptr(J) boundary = line_history_cursor(w->messages);
-	J *history = previous_history(w, chat, boundary, &raw, &more, error);
+	if (!archived) {
+		g_autoptr(J) boundary = line_history_cursor(w->messages);
+
+		history =
+			previous_history(w, chat, boundary, &raw, &more, error);
+		if (!history && *error &&
+		    transient_failure(&w->session, *error)) {
+			g_clear_error(error);
+			went_offline(w);
+			archived = TRUE;
+		}
+	}
+	if (archived) {
+		history = w->history_first ?
+				  archived_history(w, chat, w->history_first,
+						   &raw, &more) :
+				  NULL;
+		if (!history)
+			history = json_object_new_array();
+	}
 	if (!history)
 		return NULL;
 	if (json_object_array_length(history)) {
+		history_position(w, history, archived);
 		json_object_put(w->messages);
 		w->messages = raw;
 		w->latest_history = FALSE;
 		w->publish_reads = TRUE;
 	} else
 		json_object_put(raw);
+	if (!archived && w->archive && json_object_array_length(history))
+		line_offline_save_history(w->archive, chat, history, raw);
+	if (!archived && json_object_array_length(history))
+		reconcile_page(w, chat, raw);
 	J *page = obj();
 
 	json_object_object_add(page, "messages", history);
@@ -1637,22 +1936,30 @@ static J *history_page(struct line_worker *w, const char *chat, gboolean older,
  */
 static void revalidate_history(struct line_worker *w, const char *chat)
 {
+	if (w->offline)
+		return;
 	g_autoptr(GError) error = NULL;
 	g_autoptr(J) raw = NULL;
 	g_autoptr(J) rows = recent_history(w, chat, &raw, &error);
 	struct cached_history *c = g_hash_table_lookup(w->history_cache, chat);
 
-	if (!rows)
+	if (!rows) {
+		if (error && transient_failure(&w->session, error))
+			went_offline(w);
 		return;
+	}
 	gboolean same = c && json_object_equal(c->rows, rows);
 
+	if (w->archive && !same)
+		line_offline_save_history(w->archive, chat, rows, raw);
+	reconcile_page(w, chat, raw);
 	if (!g_hash_table_contains(w->history_cache, chat) &&
 	    g_strcmp0(chat, w->history_chat))
 		return;
 	cache_store(w, chat, rows, raw);
 	if (g_strcmp0(chat, w->history_chat) || !w->latest_history)
 		return;
-	show_history(w, chat, raw);
+	show_history(w, chat, rows, raw, FALSE);
 	if (same)
 		return;
 	g_autoptr(J) event = obj();
@@ -1662,6 +1969,392 @@ static void revalidate_history(struct line_worker *w, const char *chat)
 	json_object_object_add(event, "chat", json_object_new_string(chat));
 	json_object_object_add(event, "messages", json_object_get(rows));
 	line_emit(event);
+}
+
+static J *pending_send(struct line_worker *w, const char *chat)
+{
+	for (size_t i = 0; w->outbox && i < json_object_array_length(w->outbox);
+	     i++) {
+		J *entry = json_object_array_get_idx(w->outbox, i);
+
+		if (!g_strcmp0(chat, strfield(entry, "chat")))
+			return entry;
+	}
+	return NULL;
+}
+
+static J *send_entry(J *intent, const char *status, const char *fingerprint)
+{
+	J *entry = obj();
+	const char *const names[] = { "chat", "intentId", "params" };
+
+	for (guint i = 0; i < G_N_ELEMENTS(names); i++)
+		json_object_object_add(
+			entry, names[i],
+			json_object_get(field(intent, names[i])));
+	json_object_object_add(entry, "status", json_object_new_string(status));
+	if (fingerprint)
+		json_object_object_add(entry, "fingerprint",
+				       json_object_new_string(fingerprint));
+	return entry;
+}
+
+static gboolean save_send(struct line_worker *w, const char *chat, J *entry,
+			  GError **error)
+{
+	if (!w->outbox) {
+		problem(error, "The saved message outbox could not be opened.");
+		return FALSE;
+	}
+	g_autoptr(J) rows = json_object_new_array();
+
+	for (size_t i = 0; i < json_object_array_length(w->outbox); i++) {
+		J *old = json_object_array_get_idx(w->outbox, i);
+
+		if (g_strcmp0(chat, strfield(old, "chat")))
+			json_object_array_add(rows, json_object_get(old));
+	}
+	if (entry)
+		json_object_array_add(rows, json_object_get(entry));
+	if (json_object_array_length(rows) > 32) {
+		problem(error,
+			"The outbox is full. Check an older pending send first.");
+		return FALSE;
+	}
+	if (w->archive && !line_offline_save_outbox(w->archive, rows, error))
+		return FALSE;
+	json_object_put(w->outbox);
+	w->outbox = g_steal_pointer(&rows);
+	return TRUE;
+}
+
+static J *pending_result(J *entry)
+{
+	J *result = send_entry(entry, strfield(entry, "status"), NULL);
+
+	json_object_object_add(result, "pending",
+			       json_object_new_boolean(TRUE));
+	return result;
+}
+
+static void send_outcome(J *entry, const char *status, J *receipt,
+			 const GError *error)
+{
+	g_autoptr(J) event = send_entry(entry, status, NULL);
+
+	json_object_object_add(event, "event",
+			       json_object_new_string("send_outcome"));
+	if (receipt)
+		json_object_object_add(event, "receipt",
+				       json_object_get(receipt));
+	if (error)
+		json_object_object_add(event, "error",
+				       json_object_new_string(error->message));
+	line_emit(event);
+}
+
+static void archive_send(struct line_worker *w, J *entry, J *receipt)
+{
+	const char *chat = strfield(entry, "chat"),
+		   *id = strfield(receipt, "id");
+	J *params = field(entry, "params");
+	gint64 time = json_object_get_int64(field(receipt, "sentAt"));
+
+	if (!id)
+		return;
+	if (time <= 0)
+		time = g_get_real_time() / 1000;
+	if (w->archive) {
+		g_autoptr(J) rows = json_object_new_array();
+		g_autoptr(J) raw = obj();
+		J *row = obj(), *message = obj();
+		const char *const fields[] = { "text", "emojis", "mentions",
+					       "replyTo" };
+
+		for (guint i = 0; i < G_N_ELEMENTS(fields); i++) {
+			J *value = field(params, fields[i]);
+
+			if (value)
+				json_object_object_add(row, fields[i],
+						       json_object_get(value));
+		}
+		json_object_object_add(row, "id", json_object_new_string(id));
+		json_object_object_add(row, "from",
+				       json_object_new_string("You"));
+		json_object_object_add(row, "senderId",
+				       json_object_new_string(w->session.mid));
+		json_object_object_add(row, "type",
+				       json_object_new_string("text"));
+		json_object_object_add(row, "time",
+				       json_object_new_int64(time));
+		json_object_object_add(row, "own",
+				       json_object_new_boolean(TRUE));
+		json_object_object_add(message, "1",
+				       json_object_new_string(w->session.mid));
+		json_object_object_add(message, "2",
+				       json_object_new_string(chat));
+		json_object_object_add(message, "4",
+				       json_object_new_string(id));
+		json_object_object_add(message, "5",
+				       json_object_new_int64(time));
+		json_object_object_add(raw, id, message);
+		json_object_array_add(rows, row);
+		line_offline_save_history(w->archive, chat, rows, raw);
+	}
+	g_hash_table_remove(w->history_cache, chat);
+	if (w->messages && !g_strcmp0(chat, w->history_chat) &&
+	    !field(w->messages, id)) {
+		J *stub = obj();
+
+		json_object_object_add(stub, "1",
+				       json_object_new_string(w->session.mid));
+		json_object_object_add(stub, "4", json_object_new_string(id));
+		json_object_object_add(w->messages, id, stub);
+		w->publish_reads = TRUE;
+	}
+}
+
+static J *matched_send(struct line_worker *w, J *entry, J *message)
+{
+	return line_sent_receipt(w->session.mid, strfield(entry, "chat"),
+				 strfield(entry, "fingerprint"), message);
+}
+
+static gboolean finish_send(struct line_worker *w, J *entry, J *receipt,
+			    gboolean archive_receipt)
+{
+	const char *chat = strfield(entry, "chat");
+
+	if (archive_receipt)
+		archive_send(w, entry, receipt);
+	if (!save_send(w, chat, NULL, NULL))
+		return FALSE;
+	g_hash_table_remove(w->checked_sends, strfield(entry, "intentId"));
+	return TRUE;
+}
+
+static void reconcile_message(struct line_worker *w, const char *chat,
+			      J *message)
+{
+	g_autoptr(J) entry = json_object_get(pending_send(w, chat));
+	g_autoptr(J) receipt = matched_send(w, entry, message);
+
+	if (receipt && finish_send(w, entry, receipt, FALSE))
+		send_outcome(entry, "sent", receipt, NULL);
+}
+
+static void reconcile_page(struct line_worker *w, const char *chat, J *raw)
+{
+	g_autoptr(J) entry = json_object_get(pending_send(w, chat));
+
+	if (!raw || !strfield(entry, "fingerprint"))
+		return;
+	json_object_object_foreach(raw, id, message) {
+		g_autoptr(J) receipt = matched_send(w, entry, message);
+
+		(void)id;
+		if (receipt && finish_send(w, entry, receipt, FALSE)) {
+			send_outcome(entry, "sent", receipt, NULL);
+			return;
+		}
+	}
+}
+
+struct outgoing_attempt {
+	struct line_worker *worker;
+	J *entry;
+	gboolean started;
+};
+
+static gboolean record_attempt(const char *fingerprint, void *data,
+			       GError **error)
+{
+	struct outgoing_attempt *attempt = data;
+
+	g_autoptr(J) entry =
+		send_entry(attempt->entry, "uncertain", fingerprint);
+
+	attempt->started = save_send(attempt->worker, strfield(entry, "chat"),
+				     entry, error);
+	return attempt->started;
+}
+
+static gboolean send_must_wait(const GError *error)
+{
+	return g_error_matches(error, LINE_ERROR, LINE_CONNECT_FAILED) ||
+	       g_error_matches(error, LINE_ERROR, LINE_RATE_LIMITED);
+}
+
+static gboolean send_rejected(const Line *s, const GError *error)
+{
+	return !s->rpc_may_have_run || line_auth_rejected(s->service_code) ||
+	       s->http_status == 401 || s->http_status == 403 ||
+	       g_error_matches(error, LINE_ERROR, LINE_LETTER_SEALING_RELINK) ||
+	       g_error_matches(error, LINE_ERROR, LINE_SESSION_EXPIRED) ||
+	       g_error_matches(error, LINE_ERROR, LINE_METHOD_UNAVAILABLE);
+}
+
+static J *deliver_send(struct line_worker *w, J *entry, GError **error)
+{
+	Line *s = &w->session;
+	const char *chat = strfield(entry, "chat");
+	J *params = field(entry, "params");
+	const char *reply = strfield(params, "replyTo");
+
+	g_autoptr(J) ack = NULL;
+
+	struct outgoing_attempt attempt = { .worker = w, .entry = entry };
+
+	if (w->offline || !w->online_chats)
+		return pending_result(entry);
+	int wait = line_transport_retry_after();
+
+	if (wait) {
+		w->outbox_due =
+			g_get_monotonic_time() + (gint64)wait * G_USEC_PER_SEC;
+		return pending_result(entry);
+	}
+	if ((!g_hash_table_contains(w->chats, chat) &&
+	     g_strcmp0(chat, w->session.mid)) ||
+	    (reply && field(field(w->unsent, chat), reply))) {
+		problem(error,
+			"This conversation or reply is no longer available.");
+		goto failed;
+	}
+	gint32 seq = reserve_sequence(w, error);
+
+	if (seq) {
+		s->seq--;
+		ack = line_send_decorated_tracked(
+			s, chat, strfield(params, "text"), reply,
+			field(params, "emojis"), field(params, "mentions"),
+			record_attempt, &attempt, error);
+		s->seq = seq;
+	}
+	if (ack && finish_send(w, entry, ack, TRUE))
+		return g_steal_pointer(&ack);
+	if (attempt.started && (ack || !send_rejected(s, *error))) {
+		if (!s->http_status &&
+		    g_error_matches(*error, LINE_ERROR, LINE_TIMEOUT))
+			went_offline(w);
+		g_clear_error(error);
+		w->outbox_due = g_get_monotonic_time() + 4 * G_USEC_PER_SEC;
+		return pending_result(pending_send(w, chat));
+	}
+	if ((!attempt.started || !s->rpc_may_have_run) &&
+	    send_must_wait(*error)) {
+		gboolean disconnected = g_error_matches(*error, LINE_ERROR,
+							LINE_CONNECT_FAILED);
+
+		g_clear_error(error);
+		if (!attempt.started || save_send(w, chat, entry, NULL)) {
+			if (disconnected)
+				went_offline(w);
+			else
+				w->outbox_due =
+					g_get_monotonic_time() +
+					MAX(1, line_transport_retry_after()) *
+						G_USEC_PER_SEC;
+		}
+		return pending_result(pending_send(w, chat));
+	}
+failed:
+	if (save_send(w, chat, NULL, NULL))
+		return NULL;
+	g_clear_error(error);
+	return pending_result(pending_send(w, chat));
+}
+
+static J *submit_send(struct line_worker *w, const char *chat, J *params,
+		      GError **error)
+{
+	J *existing = pending_send(w, chat);
+
+	if (existing)
+		return pending_result(existing);
+	g_autofree char *intent = g_uuid_string_random();
+
+	g_autoptr(J) entry = obj();
+	g_autoptr(J) payload = obj();
+	const char *const names[] = { "text", "replyTo", "emojis", "mentions" };
+
+	for (guint i = 0; i < G_N_ELEMENTS(names); i++) {
+		J *value = field(params, names[i]);
+
+		if (value)
+			json_object_object_add(payload, names[i],
+					       json_object_get(value));
+	}
+	json_object_object_add(entry, "chat", json_object_new_string(chat));
+	json_object_object_add(entry, "intentId",
+			       json_object_new_string(intent));
+	json_object_object_add(entry, "status",
+			       json_object_new_string("queued"));
+	json_object_object_add(entry, "params", json_object_get(payload));
+	if (!save_send(w, chat, entry, error))
+		return NULL;
+	return deliver_send(w, entry, error);
+}
+
+static J *check_send(struct line_worker *w, J *entry, GError **error)
+{
+	const char *chat = strfield(entry, "chat");
+
+	if (w->offline || !w->online_chats)
+		return pending_result(entry);
+	if (!g_strcmp0(strfield(entry, "status"), "queued"))
+		return deliver_send(w, entry, error);
+	g_autoptr(J) raw = NULL;
+	g_autoptr(J) rows = recent_history(w, chat, &raw, error);
+
+	if (rows && raw) {
+		if (w->archive)
+			line_offline_save_history(w->archive, chat, rows, raw);
+		json_object_object_foreach(raw, id, message) {
+			J *receipt = matched_send(w, entry, message);
+
+			(void)id;
+			if (!receipt)
+				continue;
+			if (finish_send(w, entry, receipt, FALSE))
+				return receipt;
+			json_object_put(receipt);
+			break;
+		}
+	}
+	if (*error && transient_failure(&w->session, *error))
+		went_offline(w);
+	g_clear_error(error);
+	return pending_result(entry);
+}
+
+static J *outbox_action(struct line_worker *w, J *params, gboolean discard,
+			GError **error)
+{
+	const char *chat = strfield(params, "chat"),
+		   *id = strfield(params, "intentId");
+	g_autoptr(J) entry =
+		json_object_get(chat ? pending_send(w, chat) : NULL);
+
+	if (!entry || !id || g_strcmp0(id, strfield(entry, "intentId")))
+		return problem(error, "This send is no longer pending.");
+	if (discard) {
+		if (!save_send(w, chat, NULL, error))
+			return NULL;
+		g_hash_table_remove(w->checked_sends, id);
+		send_outcome(entry, "discarded", NULL, NULL);
+		return obj();
+	}
+	g_autoptr(GError) failure = NULL;
+	g_autoptr(J) result = check_send(w, entry, &failure);
+
+	if (!result)
+		send_outcome(entry, "failed", NULL, failure);
+	else if (!field(result, "pending"))
+		send_outcome(entry, "sent", result, NULL);
+	else
+		send_outcome(result, strfield(result, "status"), NULL, NULL);
+	return result ? json_object_get(result) : obj();
 }
 
 static J *forward_message(struct line_worker *w, const char *destination,
@@ -1945,8 +2638,16 @@ static J *sign_out(struct line_worker *w, GError **error)
 		if (w->dir >= 0)
 			line_cooldown_use_store(w->dir);
 		/* A session file this version cannot read is removed unread. */
-		if (w->dir < 0 && !line_store_discard(error))
-			return NULL;
+		if (w->dir < 0) {
+			int discarded = -1;
+
+			if (!line_store_discard(&discarded, error))
+				return NULL;
+			if (discarded >= 0) {
+				purge_archive(w, discarded);
+				close(discarded);
+			}
+		}
 	}
 	if (w->dir >= 0) {
 		g_autoptr(GError) revoke_error = NULL;
@@ -1965,6 +2666,9 @@ static J *sign_out(struct line_worker *w, GError **error)
 
 	json_object_object_add(reply, "confirmed",
 			       json_object_new_boolean(confirmed));
+	if (w->archive_cleanup_failed)
+		json_object_object_add(reply, "archiveCleanupFailed",
+				       json_object_new_boolean(TRUE));
 	return reply;
 }
 
@@ -2244,7 +2948,7 @@ static J *square_dispatch(struct line_worker *w, const char *method, J *params,
 				g_hash_table_remove(w->chats, chat);
 				json_object_object_del(w->opened_chats, chat);
 				json_object_object_del(w->unread_heads, chat);
-				g_hash_table_remove(w->history_cache, chat);
+				drop_chat_archive(w, chat);
 			}
 			clear_global_search(w);
 		}
@@ -2257,7 +2961,7 @@ static J *square_dispatch(struct line_worker *w, const char *method, J *params,
 			g_hash_table_remove(w->chats, chat);
 			json_object_object_del(w->opened_chats, chat);
 			json_object_object_del(w->unread_heads, chat);
-			g_hash_table_remove(w->history_cache, chat);
+			drop_chat_archive(w, chat);
 			clear_global_search(w);
 		}
 		return res;
@@ -2322,6 +3026,9 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	}
 	if (!strcmp(method, "chats"))
 		return chat_directory(w, error);
+	if (!strcmp(method, "recoverSend") || !strcmp(method, "discardSend"))
+		return outbox_action(w, params, !strcmp(method, "discardSend"),
+				     error);
 	if (!strcmp(method, "friends"))
 		return friend_directory(w, params, error);
 	if (!strcmp(method, "openKeepMemo")) {
@@ -2704,6 +3411,7 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			g_hash_table_add(w->left_groups, g_strdup(chat));
 			json_object_object_del(w->opened_chats, chat);
 			json_object_object_del(w->unread_heads, chat);
+			drop_chat_archive(w, chat);
 			clear_global_search(w);
 		}
 		return left;
@@ -2838,6 +3546,10 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		return ack;
 	}
 	if (!strcmp(method, "markRead")) {
+		if (w->offline)
+			return problem(
+				error,
+				"Reconnect to LINE to mark messages as read.");
 		if (!msg || !w->latest_history ||
 		    g_strcmp0(id, strfield(w->unread_heads, chat)))
 			return problem(
@@ -2960,6 +3672,12 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 			return problem(error, "Choose a reaction.");
 		if ((photo || file) && (!path || !g_path_is_absolute(path)))
 			return problem(error, "Choose an attachment.");
+		if (text_send && !line_is_square_chat(chat))
+			return submit_send(w, chat, params, error);
+		if (w->offline)
+			return problem(
+				error,
+				"Reconnect to LINE to complete this action.");
 		if (line_is_square_chat(chat)) {
 			const char *my_mid = my_square_member_id(w, chat);
 			J *ack;
@@ -3001,6 +3719,8 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 								error);
 			}
 			if (ack) {
+				if (unsend)
+					message_unsent(w, chat, id);
 				g_hash_table_remove(w->history_cache, chat);
 				if (!unsend && !react && w->messages &&
 				    !g_strcmp0(chat, w->history_chat)) {
@@ -3040,12 +3760,7 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 		s->seq--;
 		J *ack;
 
-		if (text_send)
-			ack = line_send_decorated(s, chat, text, reply_to,
-						  field(params, "emojis"),
-						  field(params, "mentions"),
-						  error);
-		else if (photo)
+		if (photo)
 			ack = line_send_image(s, chat, path, error);
 		else if (file) {
 			const char *kind = strfield(params, "type");
@@ -3179,7 +3894,7 @@ static gboolean background_ready(struct line_worker *w, GError **error)
 /* Run once after each event batch; the visible history has already been sent. */
 static void update_peer_reads(struct line_worker *w)
 {
-	if (!w->publish_reads)
+	if (w->offline || !w->publish_reads)
 		return;
 	w->publish_reads = FALSE;
 	Line *s = &w->session;
@@ -3518,7 +4233,14 @@ static gboolean apply_operation(struct line_worker *w, J *op)
 
 static void poll_operation(J *op, gpointer data)
 {
-	apply_operation(data, op);
+	struct line_worker *w = data;
+	J *message = field(op, "20");
+	const char *chat = strfield(message, "2");
+
+	if (apply_operation(w, op))
+		return;
+	if (chat && json_object_get_int(field(op, "3")) == 25)
+		reconcile_message(w, chat, message);
 }
 
 static gboolean poll_call_operations(struct line_worker *w, gboolean *reload)
@@ -3848,14 +4570,62 @@ static gint64 maintain_square_sync(struct line_worker *w)
 	return w->square_poll_due;
 }
 
+static gint64 maintain_outbox(struct line_worker *w)
+{
+	if (!w->ready || w->offline || !w->online_chats || !w->outbox ||
+	    !w->outbox_due)
+		return 0;
+	gint64 now = g_get_monotonic_time();
+
+	if (now < w->outbox_due)
+		return w->outbox_due;
+	int cooldown = line_transport_retry_after();
+
+	if (cooldown) {
+		w->outbox_due = now + (gint64)cooldown * G_USEC_PER_SEC;
+		return w->outbox_due;
+	}
+	for (size_t i = 0; i < json_object_array_length(w->outbox); i++) {
+		g_autoptr(J) entry = json_object_get(
+			json_object_array_get_idx(w->outbox, i));
+		const char *id = strfield(entry, "intentId");
+		gboolean queued =
+			!g_strcmp0(strfield(entry, "status"), "queued");
+
+		if (!queued &&
+		    !g_hash_table_add(w->checked_sends, g_strdup(id)))
+			continue;
+		w->outbox_due = now + G_USEC_PER_SEC;
+		g_autoptr(GError) error = NULL;
+		g_autoptr(J) receipt = check_send(w, entry, &error);
+
+		if (!receipt)
+			send_outcome(entry, "failed", NULL, error);
+		else if (!field(receipt, "pending"))
+			send_outcome(entry, "sent", receipt, NULL);
+		else if (queued)
+			send_outcome(receipt, strfield(receipt, "status"), NULL,
+				     NULL);
+		if (w->session.denied) {
+			end_session(w);
+			return 0;
+		}
+		return w->offline ? 0 : w->outbox_due;
+	}
+	w->outbox_due = 0;
+	return 0;
+}
+
 static int maintenance_wait(struct line_worker *w)
 {
 	Line *s = &w->session;
 	gint64 next = line_voice_tick(), renewal = 0;
 
 	next = earlier_deadline(next, maintain_group_roster(w));
-	next = earlier_deadline(next, maintain_square_sync(w));
-	if (w->live && !w->live_failing && s->access) {
+	if (!w->offline)
+		next = earlier_deadline(next, maintain_square_sync(w));
+	next = earlier_deadline(next, maintain_outbox(w));
+	if (!w->offline && w->live && !w->live_failing && s->access) {
 		gint64 now = g_get_monotonic_time();
 		gint64 wall = g_get_real_time() / G_USEC_PER_SEC;
 
@@ -3907,6 +4677,8 @@ static gboolean message_operation(struct line_worker *w, J *op,
 
 	if (field(field(w->unsent, chat), id))
 		return TRUE;
+	if (mine && type == 25)
+		reconcile_message(w, chat, msg);
 	g_autoptr(J) event = obj();
 
 	json_object_object_add(event, "event",
@@ -4016,6 +4788,9 @@ static void reconnected(struct line_worker *w)
 	w->recovered_at = g_get_monotonic_time();
 	w->route_probe = FALSE;
 	w->sync_failures = 0;
+	w->offline = FALSE;
+	g_hash_table_remove_all(w->checked_sends);
+	w->outbox_due = g_get_monotonic_time();
 	line_event("reconnected", NULL, NULL);
 }
 
@@ -4125,7 +4900,7 @@ static void sync_revision(struct line_worker *w)
 
 	if (!w->ready || read(w->timer, &tick, sizeof(tick)) != sizeof(tick))
 		return;
-	if (w->live && !w->live_failing && !w->route_probe)
+	if (w->live && !w->offline && !w->live_failing && !w->route_probe)
 		return;
 	Line *s = &w->session;
 	int wait = line_transport_retry_after();
@@ -4138,6 +4913,18 @@ static void sync_revision(struct line_worker *w)
 	g_autoptr(GError) error = NULL;
 	g_autoptr(J) revision =
 		line_rpc(s, "/S4", "getLastOpRevision", NULL, &error);
+	if (revision && w->verify_on_reconnect) {
+		g_autoptr(J) profile = checked_profile(s, &error);
+
+		if (profile) {
+			if (g_strcmp0(s->mid, strfield(profile, "1"))) {
+				end_session(w);
+				return;
+			}
+			w->verify_on_reconnect = FALSE;
+		} else
+			g_clear_pointer(&revision, json_object_put);
+	}
 	if (json_object_is_type(revision, json_type_int) &&
 	    json_object_get_int64(revision) >= 0) {
 		gint64 current = json_object_get_int64(revision);
@@ -4162,7 +4949,7 @@ static void sync_revision(struct line_worker *w)
 		if (!w->live && s->access)
 			w->live =
 				line_live_sync_start(&w->sync, s->access, NULL);
-		if (w->route_probe || w->sync_failures)
+		if (w->offline || w->route_probe || w->sync_failures)
 			reconnected(w);
 		else if (reload || (w->displayed_revision >= 0 &&
 				    current > w->displayed_revision))
@@ -4173,6 +4960,8 @@ static void sync_revision(struct line_worker *w)
 	} else if (session_rejected(s, error)) {
 		end_session(w);
 	} else {
+		if (error && transient_failure(s, error))
+			went_offline(w);
 		if (w->displayed_revision != -2)
 			line_event(
 				"sync_unavailable", "message",
@@ -4181,7 +4970,7 @@ static void sync_revision(struct line_worker *w)
 		w->sync_failures = MIN(w->sync_failures + 1, 5u);
 		wake_after(w, MIN(3 << (w->sync_failures - 1), 30));
 	}
-	if (w->ready && s->access)
+	if (w->ready && !w->offline && s->access)
 		maintain_tokens(w);
 	save_rotated_token(w);
 }
@@ -4281,6 +5070,8 @@ static int worker(int credentials_fd)
 	w.chats = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	w.history_cache = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
 						cached_history_free);
+	w.checked_sends =
+		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
 	g_queue_init(&w.history_lru);
 	w.left_groups =
 		g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
@@ -4377,6 +5168,7 @@ static int worker(int credentials_fd)
 	line_session_clear(&w.session);
 	line_store_stop();
 	g_hash_table_unref(w.chats);
+	g_hash_table_unref(w.checked_sends);
 	g_hash_table_unref(w.left_groups);
 	g_hash_table_unref(w.square_history_tokens);
 	g_free(w.name);

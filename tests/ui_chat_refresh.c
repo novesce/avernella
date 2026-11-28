@@ -10,6 +10,18 @@ int __real_SDL_PollEvent(SDL_Event *ev);
 
 static const char chat[] = "u00000000000000000000000000000001";
 static const char draft[] = "Still composing…\n";
+static const char group[] = "c00000000000000000000000000000002";
+static const char pending_text[] = "Timed-out text";
+static const char intent[] = "e20b4cb9-7071-4521-b115-2a6f23c1dc83";
+static gboolean testing_delivery;
+static enum {
+	OPEN_SAVED_GROUP,
+	CHECK_CACHED_HISTORY,
+	WAIT_FOR_DELIVERY,
+	CHECK_RECEIPT,
+	CHECK_SIGN_OUT,
+	DONE_DELIVERY
+} delivery_step;
 static enum {
 	OPEN_CHAT,
 	WAIT_FOR_NEWLINE,
@@ -85,9 +97,121 @@ static int worker(void)
 	return 0;
 }
 
+static int delivery_worker(void)
+{
+	g_autofree char *line = NULL;
+	size_t size = 0;
+	gboolean checking = FALSE, confirmed = FALSE;
+
+	while (getline(&line, &size, stdin) >= 0) {
+		g_autoptr(J) req = json_tokener_parse(line);
+		const char *method = ui_string(req, "method", "");
+		int id = json_object_get_int(ui_field(req, "id"));
+		J *args = ui_field(req, "params");
+
+		g_assert_cmpstr(method, !=, "send");
+		if (!strcmp(method, "login")) {
+			printf("{\"id\":%d,\"result\":{\"offline\":true,"
+			       "\"outbox\":[{\"chat\":\"%s\",\"intentId\":\"%s\","
+			       "\"status\":\"uncertain\",\"params\":"
+			       "{\"text\":\"%s\",\"chat\":\"%s\"}}]}}\n",
+			       id, group, intent, pending_text, group);
+		} else if (!strcmp(method, "chats")) {
+			printf("{\"id\":%d,\"result\":[{\"id\":\"%s\","
+			       "\"name\":\"Cached group\",\"lastId\":\"1\","
+			       "\"unread\":1}]}\n",
+			       id, group);
+		} else if (!strcmp(method, "history")) {
+			g_assert_cmpstr(ui_string(args, "chat", NULL), ==,
+					group);
+			printf("{\"id\":%d,\"result\":[{\"id\":\"1\","
+			       "\"text\":\"Cached message\"}]}\n",
+			       id);
+			if (checking && !confirmed) {
+				printf("{\"event\":\"send_outcome\",\"chat\":\"%s\","
+				       "\"intentId\":\"%s\",\"status\":\"sent\","
+				       "\"receipt\":{\"id\":\"2\"}}\n",
+				       group, intent);
+				confirmed = TRUE;
+			}
+		} else if (!strcmp(method, "recoverSend")) {
+			g_assert_false(checking);
+			g_assert_cmpstr(ui_string(args, "chat", NULL), ==,
+					group);
+			g_assert_cmpstr(ui_string(args, "intentId", NULL), ==,
+					intent);
+			g_assert_null(ui_field(args, "text"));
+			printf("{\"id\":%d,\"result\":{\"pending\":true,"
+			       "\"status\":\"uncertain\",\"intentId\":\"%s\"}}\n",
+			       id, intent);
+			puts("{\"event\":\"reconnected\"}");
+			checking = TRUE;
+		} else if (!strcmp(method, "logout")) {
+			printf("{\"id\":%d,\"result\":{\"confirmed\":true,"
+			       "\"archiveCleanupFailed\":true}}\n",
+			       id);
+		} else {
+			printf("{\"id\":%d,\"result\":{}}\n", id);
+		}
+		fflush(stdout);
+	}
+	g_assert_true(confirmed);
+	return 0;
+}
+
+static int delivery_poll(SDL_Event *event)
+{
+	Json *room = ui.chats ? json_object_array_get_idx(ui.chats, 0) : NULL;
+	Json *row = ui.history ? json_object_array_get_idx(ui.history, 0) :
+				 NULL;
+
+	if (delivery_step == OPEN_SAVED_GROUP && room) {
+		g_assert_true(ui.offline);
+		ui_open_conversation(room);
+		g_assert_cmpint(ui.delivery, ==, UI_DELIVERY_UNCERTAIN);
+		g_assert_cmpstr(ui.delivery_text, ==, pending_text);
+		delivery_step++;
+	} else if (delivery_step == CHECK_CACHED_HISTORY && row) {
+		g_assert_cmpstr(ui_string(row, "text", NULL), ==,
+				"Cached message");
+		g_assert_cmpstr(ui.notice, ==, "Offline. Showing saved chats.");
+		ui_insert(&ui.message, pending_text);
+		*event = (SDL_Event){
+			.key = { .type = SDL_KEYDOWN,
+				 .keysym = { .sym = SDLK_RETURN } },
+		};
+		delivery_step++;
+		return 1;
+	} else if (delivery_step == WAIT_FOR_DELIVERY && !ui.offline) {
+		g_assert_cmpint(ui.delivery, ==, UI_DELIVERY_UNCERTAIN);
+		ui_insert(&ui.message, draft);
+		delivery_step++;
+	} else if (delivery_step == CHECK_RECEIPT && !ui.delivery) {
+		g_assert_cmpuint(json_object_array_length(ui.history), ==, 2);
+		Json *sent = json_object_array_get_idx(ui.history, 1);
+
+		g_assert_cmpstr(ui_string(sent, "id", NULL), ==, "2");
+		g_assert_cmpstr(ui_string(sent, "text", NULL), ==,
+				pending_text);
+		g_assert_true(g_str_has_suffix(ui.message.value->str, draft));
+		ui_sign_out();
+		delivery_step++;
+	} else if (delivery_step == CHECK_SIGN_OUT && !ui.connected) {
+		g_assert_cmpstr(
+			ui.notice, ==,
+			"Signed out. Some offline chat data could not be deleted.");
+		*event = (SDL_Event){ .type = SDL_QUIT };
+		delivery_step++;
+		return 1;
+	}
+	return __real_SDL_PollEvent(event);
+}
+
 /* Run on the UI thread after each input or worker event is consumed. */
 int __wrap_SDL_PollEvent(SDL_Event *ev)
 {
+	if (testing_delivery)
+		return delivery_poll(ev);
 	Json *room = ui.chats ? json_object_array_get_idx(ui.chats, 0) : NULL;
 	Json *row = ui.history ? json_object_array_get_idx(ui.history, 0) :
 				 NULL;
@@ -173,15 +297,32 @@ static void refresh_chat(void)
 	g_assert_cmpint(step, ==, FINISHED);
 }
 
+static void recover_group_delivery(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 20 * G_USEC_PER_SEC, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	g_setenv("AVERNELLA_TEST_OUTBOX", "1", TRUE);
+	g_setenv("LANGUAGE", "en", TRUE);
+	testing_delivery = TRUE;
+	g_assert_cmpint(line_ui(0, NULL), ==, 0);
+	g_assert_cmpint(delivery_step, ==, DONE_DELIVERY);
+}
+
 int main(int argc, char **argv)
 {
 	if (argc == 2 && !strcmp(argv[1], "--worker"))
-		return worker();
+		return g_getenv("AVERNELLA_TEST_OUTBOX") ? delivery_worker() :
+							   worker();
 	g_setenv("SDL_VIDEODRIVER", "dummy", TRUE);
 	g_setenv("SDL_AUDIODRIVER", "dummy", TRUE);
 	g_setenv("AVERNELLA_VULKAN", "sdl", TRUE);
 	g_setenv("LINE_DISABLE_TRAY", "1", TRUE);
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
 	g_test_add_func("/ui/chat/refresh", refresh_chat);
+	g_test_add_func("/ui/chat/recover-group-delivery",
+			recover_group_delivery);
 	return g_test_run();
 }

@@ -3,6 +3,19 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Some offline chat data could not be deleted.",
+	  "No se pudieron eliminar algunos datos de chats sin conexión." },
+	{ "Check delivery", "Comprobar entrega" },
+	{ "Delivery unconfirmed", "Entrega sin confirmar" },
+	{ "Message queued", "Mensaje en cola" },
+	{ "Offline. Showing saved chats.",
+	  "Sin conexión. Se muestran los chats guardados." },
+	{ "Stop tracking", "Dejar de seguir" },
+	{ "Stop tracking this message?", "¿Dejar de seguir este mensaje?" },
+	{ "This clears the pending entry on this device. "
+	  "If LINE already received the message, sending it "
+	  "again may create a duplicate.",
+	  "Esto elimina la entrada pendiente de este dispositivo. Si LINE ya recibió el mensaje, volver a enviarlo puede crear un duplicado." },
 	{ "Could not open the desktop file chooser.",
 	  "No se pudo abrir el selector de archivos del sistema." },
 	{ "Voice call", "Llamada de voz" },

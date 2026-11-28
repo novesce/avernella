@@ -864,11 +864,12 @@ void ui_layout(void)
 
 	ui.attach = (Rect){ c.x + 6, c.y + 6, 32, 32 };
 	ui.send = (Rect){ c.x + c.w - 38, c.y + 6, 32, 32 };
-	ui.emoji = (Rect){
-		c.x + c.w -
-			((ui.message.value && ui.message.value->len) ? 76 : 38),
-		c.y + 6, 32, 32
-	};
+	ui.emoji = (Rect){ c.x + c.w -
+				   ((ui.delivery || (ui.message.value &&
+						     ui.message.value->len)) ?
+					    76 :
+					    38),
+			   c.y + 6, 32, 32 };
 	int entry_x = c.x + ((ui.photos || ui.files) ? 44 : 4);
 	int entry_right = (ui.emojis || ui.stickers) ? ui.emoji.x - 4 :
 						       ui.send.x - 4;
@@ -890,12 +891,21 @@ void ui_layout(void)
 			tool_x += 38;
 		}
 		ui.attach = (Rect){ tool_x, tool_y, 32, 32 };
-		ui.send = (Rect){ c.x + c.w - 90, tool_y - 1, 74, 34 };
+		int send_w = ui.delivery ?
+				     CLAMP(ui_text_width(_("Check delivery"),
+							 13, 650) +
+						   24,
+					   74, 180) :
+				     74;
+
+		ui.send = (Rect){ c.x + c.w - send_w - 16, tool_y - 1, send_w,
+				  34 };
 		bottom = c.y;
 	}
 	int target = ui_media_stage_height();
-	int status_h =
+	int notices =
 		(ui.notice && *ui.notice ? 52 : 0) + (ui.reply_id ? 34 : 0);
+	int status_h = notices + (ui.delivery ? 48 : 0);
 	int banner_h = ui_chat_announcements_height();
 	int room = bottom - HEADER_H - 1 - status_h - target - banner_h - 60;
 	int growth = MIN(composer_growth(ui.entry.w), MAX(0, room));
@@ -905,6 +915,14 @@ void ui_layout(void)
 	ui.composer.y -= growth;
 	ui.composer.h += growth;
 	bottom -= growth;
+	ui.stop_tracking = (Rect){ 0 };
+	if (ui.delivery) {
+		int bw = CLAMP(ui_text_width(_("Stop tracking"), 14, 600) + 22,
+			       84, MAX(84, c.w / 2));
+
+		ui.stop_tracking = (Rect){ c.x + c.w - bw - 12,
+					   bottom - status_h + 6, bw, 34 };
+	}
 	ui.conversation = (Rect){ chat_x, HEADER_H + 1, w - chat_x,
 				  MAX(80, bottom - HEADER_H - 1 - status_h) };
 	/* A call in this chat sits above its messages, as in Discord. */
@@ -3862,7 +3880,7 @@ static void line_composer(void)
 				_("Upload a File"), FALSE);
 	}
 	gboolean sending = g_hash_table_contains(ui.sending, ui.selected);
-	gboolean ready = ui.message.value->len && !sending;
+	gboolean ready = (ui.delivery || ui.message.value->len) && !sending;
 	Rect r = ui.send;
 	double hv = strength(HOVER, r, ready && hovered(r));
 	double depth = ready ? button_depth(r) : 0.;
@@ -3872,8 +3890,11 @@ static void line_composer(void)
 	    ready ? blend(UI_ACCENT, UI_ACCENT_HOVER, hv) : UI_INPUT);
 	if (ui.focus == F_SEND)
 		active_ring(r);
-	centered(sending ? _("Sending…") : _("Send"), r, 13, 650,
-		 ready ? UI_ON_ACCENT : UI_SUBTLE);
+	const char *label = ui.delivery ? _("Check delivery") :
+			    sending	? _("Sending…") :
+					  _("Send");
+
+	centered(label, r, 13, 650, ready ? UI_ON_ACCENT : UI_SUBTLE);
 }
 
 /* Discord's composer: one rounded bar with attach, text, emoji and send. */
@@ -3950,7 +3971,17 @@ static void composer(int s, int w)
 	}
 	gboolean sending = g_hash_table_contains(ui.sending, ui.selected);
 
-	if (ui.message.value->len || sending || ui.focus == F_SEND) {
+	if (ui.delivery) {
+		Rect r = ui.send;
+		guint ink = sending ? UI_SUBTLE : UI_ACCENT;
+
+		if (ui.focus == F_SEND)
+			active_ring(r);
+		icon_reload(r.x + r.w / 2., r.y + r.h / 2., ink);
+		if (hovered(r))
+			tooltip((Rect){ r.x, r.y - 82, r.w, 34 },
+				_("Check delivery"), FALSE);
+	} else if (ui.message.value->len || sending || ui.focus == F_SEND) {
 		Rect r = ui.send;
 		double depth = sending ? 0. : button_depth(r);
 		/* Pressing nudges the arrow forward, the way it will travel. */
@@ -3975,6 +4006,26 @@ static void composer(int s, int w)
 	}
 	(void)s;
 	(void)w;
+}
+
+static void delivery_notice(void)
+{
+	Rect r = ui.stop_tracking;
+	int x = ui.composer.x + 12;
+	int w = MAX(1, r.x - x - 12);
+	const char *status = ui.delivery == UI_DELIVERY_QUEUED ?
+				     _("Message queued") :
+				     _("Delivery unconfirmed");
+
+	text(status, x, r.y, w, 13, 650, UI_HEADING, FALSE);
+	if (ui.delivery_text)
+		text(ui.delivery_text, x, r.y + 20, w, 13, 450, UI_MUTED,
+		     FALSE);
+	if (g_hash_table_contains(ui.sending, ui.selected))
+		centered(_("Stop tracking"), r, 14, 600, UI_SUBTLE);
+	else
+		action(r, _("Stop tracking"), FALSE,
+		       ui.focus == F_STOP_TRACKING);
 }
 
 /* A one-to-one chat header opens the peer's profile, as in Discord. */
@@ -4082,6 +4133,8 @@ static void chat_view(void)
 			draw_scrollbar(UI_SCROLLBAR_HISTORY, track, thumb, bg);
 		}
 		composer(s, w);
+		if (ui.delivery)
+			delivery_notice();
 		ui_mentions_draw();
 	}
 	if (ui.notice && *ui.notice)
