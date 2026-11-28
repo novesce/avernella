@@ -213,6 +213,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Padam folder semasa…" },
 	{ "Delete folder", "Padam folder" },
 	{ "Delete folder?", "Padam folder?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Gelang kunci desktop tidak tersedia. Sesi ini tamat apabila aplikasi ditutup." },
 	{ "Desktop notifications · Off", "Pemberitahuan desktop · Mati" },
 	{ "Desktop notifications · On", "Pemberitahuan desktop · Hidup" },
 	{ "Direct Messages", "Mesej Terus" },

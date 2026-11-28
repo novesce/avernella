@@ -208,6 +208,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Eliminar carpeta actual…" },
 	{ "Delete folder", "Eliminar carpeta" },
 	{ "Delete folder?", "¿Eliminar la carpeta?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "El llavero del sistema no está disponible. Seguirás en sesión hasta cerrar la aplicación." },
 	{ "Desktop notifications · Off",
 	  "Notificaciones de escritorio · Desactivadas" },
 	{ "Desktop notifications · On",

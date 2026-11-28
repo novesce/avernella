@@ -217,6 +217,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Удалить текущую папку…" },
 	{ "Delete folder", "Удалить папку" },
 	{ "Delete folder?", "Удалить папку?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Хранилище ключей недоступно. Сеанс завершится при выходе из приложения." },
 	{ "Desktop notifications · Off",
 	  "Уведомления на рабочем столе · Выкл." },
 	{ "Desktop notifications · On", "Уведомления на рабочем столе · Вкл." },

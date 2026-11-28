@@ -207,6 +207,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "현재 폴더 삭제…" },
 	{ "Delete folder", "폴더 삭제" },
 	{ "Delete folder?", "폴더를 삭제할까요?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "데스크톱 키링을 사용할 수 없습니다. 앱을 종료할 때까지 로그인 상태가 유지됩니다." },
 	{ "Desktop notifications · Off", "데스크톱 알림 · 끔" },
 	{ "Desktop notifications · On", "데스크톱 알림 · 켬" },
 	{ "Direct Messages", "다이렉트 메시지" },

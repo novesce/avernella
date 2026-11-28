@@ -34,6 +34,7 @@ Optional pieces, each detected automatically:
 | ----- | -------- | ------------------- |
 | WPE WebKit browser | `wpe-webkit-2.0 wpe-platform-wayland-2.0` | No `avernella-liff` |
 | WebKitGTK browser | `webkitgtk-6.0` | No `avernella-liff-gtk`. With neither browser, links open in the system browser. |
+| Desktop keyring | `libsecret-1` (Ubuntu `libsecret-1-dev`, Fedora `libsecret-devel`, Arch `libsecret`) | Desktop keyring protection for saved sessions is unavailable. |
 | Native Vulkan renderer | `glslangValidator`, `spirv-val`, Vulkan headers that declare `VK_EXT_descriptor_heap`, and volk (`/usr/include/volk.c` or `-lvolk`) | No `avernella-vulkan.so`. The app draws through SDL instead. |
 | ZBar | `libzbar.so.0` at run time, loaded by `dlopen` in [`qr_scan.c`](../../src/qr_scan.c) | **Read QR image** is unavailable. |
 | Hardware VP8 calls | FFmpeg development headers for `libavcodec` and `libavutil` (Ubuntu packages `libavcodec-dev libavutil-dev`, Arch package `ffmpeg`) | libvpx handles calls in software. Set `CALL_HWCODECS=0` to disable the FFmpeg call backends. The older `CALL_HWDECODE=0` switch also works. |
@@ -49,11 +50,14 @@ sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat wayland wayland-pr
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader   # Vulkan module
 sudo pacman -S --needed wpewebkit webkitgtk-6.0                                     # in-app browser
+sudo pacman -S --needed libsecret                                                   # desktop keyring
 sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-xapp ffmpeg           # Cinnamon Wayland, video
 sudo pacman -S --needed clang linux-headers xorg-server-xvfb                        # development tools
 ```
 
 Use the portal backend for the active desktop. GNOME uses `xdg-desktop-portal-gnome`, Plasma uses `xdg-desktop-portal-kde`, and Hyprland uses `xdg-desktop-portal-hyprland`. With Cinnamon Wayland and XApp, Avernella can ask the user to choose a monitor and share it through Muffin.
+
+Native keyring-backed session storage uses an unlocked Secret Service provider, such as GNOME Keyring or KWallet with Secret Service enabled. Flatpak uses the desktop's per-app Secret portal.
 
 On other distributions, install the development packages with the same `pkg-config` names.
 
@@ -98,6 +102,7 @@ Pass them on the command line, as in `make DEBUG=1`.
 | ------ | ------ |
 | `DEBUG=1` | Unstripped `-Og -g3` build with frame pointers and unwind tables, for `gdb`. Run `make clean` when you switch between debug and release builds, because objects aren't rebuilt for a flag change. |
 | `LIFF_BROWSER=0` | Leaves out both browser helpers |
+| `KEYRING=1` / `0` | Requires desktop keyring support or disables it. The default `auto` enables it when `libsecret-1` is available. |
 | `NATIVE_VULKAN=1` / `0` | Require the Vulkan module, or never build it. The default `auto` builds it when the tools are found. |
 | `VOLK_DIR=…`, `VK_HEADERS=…` | Build volk from a checkout, or use a specific Vulkan-Headers include directory |
 | `GLSLANG=…`, `SPIRV_VAL=…` | Shader compiler and validator to use |

@@ -251,7 +251,7 @@ static bool valid_token_bytes(const char *tok)
 	return true;
 }
 
-/* The worker passes its already-locked state directory, never a pathname. */
+/* The worker passes its locked state directory or anonymous session file. */
 static int restore_session(struct avernella_vault *vault, int dirfd, J *req,
 			   GError **error)
 {
@@ -262,7 +262,8 @@ static int restore_session(struct avernella_vault *vault, int dirfd, J *req,
 	struct stat st;
 	int rc = -EINVAL;
 
-	if (dirfd < 0 || fstat(dirfd, &st) < 0 || !S_ISDIR(st.st_mode) ||
+	if (dirfd < 0 || fstat(dirfd, &st) < 0 ||
+	    (!S_ISDIR(st.st_mode) && !line_store_is_memory_file(dirfd, &st)) ||
 	    st.st_uid != geteuid() || (st.st_mode & 077) || !mid || !*mid ||
 	    !valid_token_bytes(access) ||
 	    (refresh && !valid_token_bytes(refresh)))

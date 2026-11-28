@@ -15,6 +15,18 @@ ifeq ($(origin CC),default)
 CC = gcc
 endif
 PKGS = sdl2 pangocairo glib-2.0 libqrencode json-c libcurl libcrypto libturbojpeg libpng libwebp opus libsrtp2 gio-2.0 gio-unix-2.0 wayland-client zlib vpx libpipewire-0.3 rnnoise libseccomp
+KEYRING ?= auto
+ifeq ($(KEYRING),auto)
+HAVE_KEYRING := $(shell pkg-config --exists libsecret-1 && echo 1)
+else
+HAVE_KEYRING := $(KEYRING)
+endif
+ifeq ($(HAVE_KEYRING),1)
+KEYRING_OBJECT = build/state_keyring.o
+build/state_keyring.o: override CPPFLAGS += $(shell pkg-config --cflags libsecret-1)
+avernella: LDLIBS += $(shell pkg-config --libs libsecret-1)
+endif
+KEYRING_DEFINE := \#define LINE_HAVE_LIBSECRET $(if $(KEYRING_OBJECT),1,0)
 CPPFLAGS += -D_GNU_SOURCE -Isrc $(shell pkg-config --cflags $(PKGS))
 ifeq ($(DEBUG),1)
 CFLAGS ?= -Og -g3 -fno-omit-frame-pointer -fasynchronous-unwind-tables
@@ -78,7 +90,7 @@ LINK_FLAGS = -fuse-ld=bfd -pie -Wl,--gc-sections,--as-needed,-z,relro,-z,now,-z,
 SOURCES = main pair password_login state thrift transport messaging friends groups square square_search sealing media media_crypto obs_http media_io call call_schema call_wire call_audio ui ui_draw ui_media ui_image_view video_record ui_motion ui_pixels emoji ui_emoji ui_apng ui_friends ui_groups ui_openchat
 SOURCES += ui_find stickers camera camera_pixels call_video call_srtp call_fec call_pdtp screencast screencast_dma live_sync net_route tune http_tune
 SOURCES += call_group call_vp8 call_vp8_device call_vp8_encode udp_batch sandbox gpu_health
-SOURCES += security/ipc security/sandbox security/vault
+SOURCES += security/ipc security/sandbox security/vault state_crypto
 SOURCES += screencast_cinnamon monitor_picker ui_monitor_picker
 # Older NVIDIA Tegra boards expose VP8 through their JetPack GStreamer plugin.
 JETSON_PKGS = gstreamer-app-1.0 gstreamer-video-1.0
@@ -120,7 +132,7 @@ CHECKPATCH_FLAGS = --no-tree --file --terse --quiet --show-types --typedefsfile 
 # Test fixtures keep long JSON and protocol strings split across lines.
 CHECKPATCH_TEST_FLAGS = $(CHECKPATCH_FLAGS) --ignore SPLIT_STRING,MISSING_SPACE
 TESTS = build/test-thrift build/test-state build/test-sealing build/test-messaging build/test-pair build/test-transport build/test-media build/test-call build/test-audio build/test-media-io build/test-obs build/test-video-record build/test-ui-motion build/test-ui-pixels build/test-emoji-message build/test-ui-apng build/test-emoji build/test-ui-emoji
-TESTS += build/test-ui-image-view build/test-ui-image-overlay
+TESTS += build/test-ui-image-view build/test-ui-image-overlay build/test-state-crypto
 TESTS += build/test-friends build/test-groups build/test-square build/test-ui-friends build/test-ui-read
 TESTS += build/test-stickers build/test-call-video
 TESTS += build/test-call-group build/test-pdtp
@@ -192,7 +204,7 @@ analyze: avernella
 		$(CC) $(CPPFLAGS) -Ibuild -std=c17 -O1 -fanalyzer \
 		-Wno-analyzer-too-complex -c {} -o /dev/null
 
-avernella: $(OBJECTS)
+avernella: $(OBJECTS) $(KEYRING_OBJECT)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $(RO_SEGMENT) $(PACKED_RELOCS) $(STRIP_RELEASE) -o build/$@ $^ $(LDLIBS)
 	mv -f build/$@ $@
 
@@ -253,6 +265,17 @@ build/line_build_commit.h: | build
 build/ui.o: override CPPFLAGS += -Ibuild
 build/ui.o: build/line_build_commit.h
 
+ifneq ($(file <build/state_keyring_config.h),$(KEYRING_DEFINE))
+.PHONY: force-keyring-header
+build/state_keyring_config.h: force-keyring-header
+endif
+build/state_keyring_config.h: | build
+	@printf '%s\n' '$(KEYRING_DEFINE)' > $@.tmp
+	mv -f $@.tmp $@
+
+build/main.o: override CPPFLAGS += -Ibuild
+build/main.o: build/state_keyring_config.h
+
 build/avernella_%.inc: data/avernella-%.png | build
 	@od -An -v -t u1 $< | awk '{for (i = 1; i <= NF; i++) printf "%s,", $$i; print ""}' > $@.tmp
 	mv -f $@.tmp $@
@@ -295,7 +318,7 @@ build/test-call-fec: tests/call_fec.c build/call_fec.o build/call_srtp.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/security/sandbox.o build/security/ipc.o build/udp_batch.o
-build/test-security-sandbox: tests/test_sandbox.c build/security/liff_filter.o build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/thrift.o
+build/test-security-sandbox: tests/test_sandbox.c build/security/liff_filter.o build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/state_crypto.o build/thrift.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_dma.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
 build/test-call build/test-call-video: build/call_fec.o
@@ -380,7 +403,8 @@ build/test-media-io: tests/media_io.c build/media_io.o
 build/test-obs: LDFLAGS += -Wl,--wrap=curl_easy_setopt,--wrap=curl_easy_perform,--wrap=curl_easy_getinfo
 build/test-obs: tests/obs_http.c build/obs_http.o build/http_tune.o
 build/test-thrift: tests/thrift.c build/thrift.o
-build/test-state: tests/state.c build/state.o
+build/test-state: tests/state.c build/state.o build/state_crypto.o
+build/test-state-crypto: tests/state_crypto.c build/state_crypto.o
 build/test-messaging: tests/messaging.c build/messaging.o build/rich_message.o build/liff_url.o
 build/test-friends: tests/friends.c build/friends.o build/thrift.o
 build/test-liff: tests/liff.c build/liff.o build/liff_url.o build/thrift.o
@@ -628,6 +652,7 @@ fuzz-clean:
 
 clean:
 	$(RM) avernella-vulkan.so build/avernella-vulkan.so
+	$(RM) build/state_keyring.o build/state_keyring.d build/state_keyring_config.h
 	$(RM) $(OBJECTS) $(OBJECTS:.o=.d) $(TESTS) build/call_vp8_dma.o build/call_vp8_dma.d build/render-bench build/line_build_commit.h build/avernella_mark.inc build/avernella_welcome.inc avernella
 	$(RM) build/test-call_denoise.o build/test-call_denoise.d
 	$(RM) build/test-call_vp8_encode.o build/test-call_vp8_encode.d build/call_vp8_jetson.o build/call_vp8_jetson.d build/call_jetson_config.h
@@ -637,5 +662,5 @@ clean:
 	$(RM) -r $(FUZZ_DIR)/obj $(FUZZ_DIR)/seeds
 	$(RM) $(FUZZ_BINARIES) $(FUZZ_DIR)/fuzz-seeds $(FUZZ_DIR)/call_hwdecode_config.h $(FUZZ_DIR)/call_jetson_config.h
 
--include build/call_vp8_dma.d $(OBJECTS:.o=.d) build/test-call_denoise.d build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
+-include $(KEYRING_OBJECT:.o=.d) build/call_vp8_dma.d $(OBJECTS:.o=.d) build/test-call_denoise.d build/test-call_vp8_encode.d build/liff_browser.d build/liff_browser_gtk.d
 -include $(wildcard $(FUZZ_DIR)/obj/*.d)

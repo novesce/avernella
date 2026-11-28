@@ -209,6 +209,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Xóa thư mục hiện tại…" },
 	{ "Delete folder", "Xóa thư mục" },
 	{ "Delete folder?", "Xóa thư mục?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Không dùng được kho khóa hệ thống. Phiên đăng nhập sẽ kết thúc khi bạn thoát ứng dụng." },
 	{ "Desktop notifications · Off", "Thông báo trên máy tính · Tắt" },
 	{ "Desktop notifications · On", "Thông báo trên máy tính · Bật" },
 	{ "Direct Messages", "Tin nhắn trực tiếp" },

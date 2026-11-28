@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #include "state.h"
+#include "state_crypto.h"
+#include <errno.h>
 #include <glib/gstdio.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -231,6 +233,115 @@ static void remove_legacy(const char *name)
 	g_assert_cmpint(g_rmdir(dir), ==, 0);
 }
 
+static void encrypted_legacy_migration(void)
+{
+	g_autoptr(GError) error = NULL;
+	g_autofree char *data = NULL;
+	static const guint8 key[LINE_STATE_KEY_SIZE] = { 1 };
+	static const guint8 wrong_key[LINE_STATE_KEY_SIZE] = { 2 };
+	const guint8 *unavailable[] = { wrong_key, NULL };
+	g_autofree char *current =
+		g_build_filename(sandbox, LINE_STATE_DIR, NULL);
+	g_autofree char *previous = g_build_filename(sandbox, "kitatide", NULL);
+	g_autofree char *file = g_build_filename(current, "session.json", NULL);
+	g_autofree char *preferences =
+		g_build_filename(current, "lists-fixture.json", NULL);
+	Line restored = { 0 };
+	struct stat st;
+	gsize size;
+
+	if (g_rmdir(current) < 0)
+		g_assert_cmpint(errno, ==, ENOENT);
+	write_legacy(
+		"kitatide",
+		"{\"access\":\"old-token-fixture\",\"refresh\":\"refresh-fixture\","
+		"\"keys\":{\"own\":\"key-fixture\"},\"seq\":42}");
+	g_assert_true(line_store_start(key));
+	int dir = line_store_open(&restored, &error);
+
+	g_assert_no_error(error);
+	g_assert_cmpint(dir, >=, 0);
+	g_assert_cmpstr(restored.access, ==, "old-token-fixture");
+	g_assert_cmpstr(restored.refresh, ==, "refresh-fixture");
+	g_assert_cmpstr(strfield(restored.keys, "own"), ==, "key-fixture");
+	g_assert_cmpint(restored.seq, ==, 42);
+	g_assert_cmpint(stat(file, &st), ==, 0);
+	g_assert_cmpint(st.st_mode & 0777, ==, 0600);
+	g_assert_true(g_file_get_contents(file, &data, &size, &error));
+	g_assert_true(line_state_is_encrypted(data, size));
+	g_assert_null(memmem(data, size, "fixture", sizeof("fixture") - 1));
+	g_assert_true(g_file_test(preferences, G_FILE_TEST_IS_REGULAR));
+	g_assert_false(g_file_test(previous, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(close(dir), ==, 0);
+	line_session_clear(&restored);
+	line_store_stop();
+
+	for (gsize i = 0; i < G_N_ELEMENTS(unavailable); i++) {
+		g_assert_true(line_store_start(unavailable[i]));
+		g_assert_cmpint(line_store_open(&restored, &error), ==, -1);
+		g_assert_error(error, LINE_ERROR, 1);
+		g_assert_null(restored.access);
+		g_assert_true(line_store_has_session());
+		g_clear_error(&error);
+		line_store_stop();
+	}
+
+	g_assert_true(line_store_start(key));
+	dir = line_store_open(&restored, &error);
+	g_assert_no_error(error);
+	g_assert_cmpint(dir, >=, 0);
+	g_assert_cmpstr(restored.access, ==, "old-token-fixture");
+	g_assert_true(line_store_forget(dir, &error));
+	g_assert_false(line_store_has_session());
+	g_assert_cmpint(g_remove(preferences), ==, 0);
+	g_assert_cmpint(close(dir), ==, 0);
+	line_session_clear(&restored);
+	line_store_stop();
+}
+
+static void temporary_session(void)
+{
+	g_autoptr(GError) error = NULL;
+	Line saved = { 0 }, restored = { 0 };
+	struct stat st;
+	int dir, vault;
+
+	g_assert_true(line_store_start(NULL));
+	dir = line_store_open(&saved, &error);
+	g_assert_no_error(error);
+	g_assert_cmpint(dir, >=, 0);
+	g_assert_null(saved.access);
+	saved.access = g_strdup("temporary-token-fixture");
+	saved.keys = obj();
+	saved.seq = 41;
+	g_assert_true(line_store_save(dir, &saved, &error));
+	g_assert_true(line_store_temporary());
+	g_assert_false(line_store_has_session());
+	/* The Vault receives another descriptor for the same anonymous file. */
+	vault = dup(line_store_session_fd(dir));
+	g_assert_cmpint(vault, >=, 0);
+	g_assert_cmpint(fstat(vault, &st), ==, 0);
+	g_assert_true(line_store_is_memory_file(vault, &st));
+	g_assert_true(line_store_load(vault, &restored, &error));
+	g_assert_cmpstr(restored.access, ==, "temporary-token-fixture");
+	g_assert_cmpint(restored.seq, ==, 41);
+	g_assert_cmpint(line_store_sequence(vault, &restored, &error), ==, 42);
+	line_session_clear(&restored);
+	g_assert_true(
+		line_store_load(line_store_session_fd(dir), &restored, &error));
+	g_assert_cmpint(restored.seq, >, 42);
+	line_session_clear(&restored);
+	g_assert_true(line_store_forget(dir, &error));
+	g_assert_true(line_store_load(vault, &restored, &error));
+	g_assert_null(restored.access);
+	g_assert_false(line_store_has_session());
+	g_assert_cmpint(close(vault), ==, 0);
+	g_assert_cmpint(close(dir), ==, 0);
+	line_session_clear(&saved);
+	line_session_clear(&restored);
+	line_store_stop();
+}
+
 /* Opens the store, checks the restored session, then cleans up. */
 static void expect_restored(const char *access, gint64 seq)
 {
@@ -407,6 +518,9 @@ int main(int argc, char **argv)
 			unreadable_session_discarded);
 	g_test_add_func("/state/oversized-cache", large_cache);
 	g_test_add_func("/state/unsent-index", unsent_index);
+	g_test_add_func("/state/encrypted-legacy-migration",
+			encrypted_legacy_migration);
+	g_test_add_func("/state/temporary-session", temporary_session);
 	int result = g_test_run();
 	g_autofree char *sub = g_build_filename(sandbox, "avernella", NULL);
 

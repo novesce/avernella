@@ -179,6 +179,12 @@ Add WPE WebKit for the in-app browser on Wayland, and WebKitGTK for fallback or 
 sudo pacman -S --needed wpewebkit webkitgtk-6.0
 ```
 
+Install `libsecret` before compiling to enable desktop keyring protection for saved sessions.
+
+```sh
+sudo pacman -S --needed libsecret
+```
+
 Install the portal backend for the session where you run Avernella. On Cinnamon Wayland, use the following command. XApp supplies the screenshot portal. When ScreenCast is missing, Avernella can share one monitor through Cinnamon’s Muffin compositor and PipeWire.
 
 ```sh
@@ -225,7 +231,9 @@ The client prefers native Wayland in a Wayland session and falls back to X11 if 
 
 Profile and emoji downloads run independently of message sends. The image worker passes sealed Linux memory files to the UI. Decode workers can map those bytes directly. The optimized PNG pixel loop produces exact premultiplied colors and lets GCC vectorize across pixels. Letter Sealing caches recently verified shared secrets in session memory. The chat UI starts the network worker on the first sign-in attempt. The two processes communicate through a Unix socket pair. glibc starts the worker with `posix_spawn`. Linux `eventfd` wakes the I/O thread when there is outbound data. During healthy long polling, the worker sleeps until input arrives, a call invitation expires, or token maintenance is due. Separate one-shot timers track token renewal and fallback revision checks. On glibc 2.34 and newer, the spawn file actions close inherited descriptors above stderr.
 
-The state directory is `$XDG_STATE_HOME/avernella` or `~/.local/state/avernella` by default. On first use, if this directory is absent, Avernella moves in the data of the app it came from: a `kitatide` state directory, or else a `line-linux` one, along with its in-app browser cookies and cache. The move carries over the sign-in and chat preferences. If Avernella already has its own data, nothing is moved. If an older build is running, close it before starting Avernella. The session file contains the local device's tokens and Letter Sealing keys in plaintext. The directory is mode 0700 and the file is mode 0600. An exclusive directory lock, durable rename and reserved message sequence numbers protect against concurrent writers and interrupted sends. Messages and drafts stay in memory.
+The state directory is `$XDG_STATE_HOME/avernella` or `~/.local/state/avernella` by default. On first use, if this directory is absent, Avernella moves in a `kitatide` state directory or a `line-linux` one along with its in-app browser cookies and cache. The move carries over the sign-in and chat preferences. Close an older build before starting Avernella. The directory is mode 0700 and the session file is mode 0600. An exclusive directory lock, durable rename and reserved message sequence numbers protect against concurrent writers and interrupted sends. Messages and drafts stay in memory.
+
+When the desktop keyring is available, Avernella stores the session tokens and Letter Sealing keys in an AES-256-GCM-encrypted session file. Existing plaintext sessions are migrated in place. An encrypted session needs the original keyring to reopen and a build that supports the format. A new sign-in without a keyring lasts until the app exits. See [session storage](docs/en/sign-in.md#the-session-file) for native and Flatpak details.
 
 The [Android build analysis](analysis/portability.md) identifies the packaged architectures, startup activity, message RPC and Letter Sealing components. The C protocol implementation also draws on [the desktop companion reference](https://github.com/softnetics/line-rs/tree/addf69c2e886a2364a396ce360093a62119dcb32). Its [MIT notice](analysis/protocol-reference-LICENSE) is included.
 

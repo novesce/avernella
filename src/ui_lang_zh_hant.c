@@ -186,6 +186,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "刪除目前資料夾…" },
 	{ "Delete folder", "刪除資料夾" },
 	{ "Delete folder?", "要刪除資料夾嗎？" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "桌面金鑰圈無法使用。結束應用程式後需要重新登入。" },
 	{ "Desktop notifications · Off", "桌面通知 · 關" },
 	{ "Desktop notifications · On", "桌面通知 · 開" },
 	{ "Direct Messages", "私訊" },

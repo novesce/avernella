@@ -217,6 +217,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Elimina cartella corrente…" },
 	{ "Delete folder", "Elimina cartella" },
 	{ "Delete folder?", "Eliminare la cartella?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Il portachiavi di sistema non è disponibile. La sessione termina alla chiusura dell’app." },
 	{ "Desktop notifications · Off", "Notifiche desktop · No" },
 	{ "Desktop notifications · On", "Notifiche desktop · Sì" },
 	{ "Direct Messages", "Messaggi diretti" },

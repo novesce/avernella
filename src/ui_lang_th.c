@@ -188,6 +188,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "ลบโฟลเดอร์นี้…" },
 	{ "Delete folder", "ลบโฟลเดอร์" },
 	{ "Delete folder?", "ลบโฟลเดอร์ใช่ไหม" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "ไม่สามารถใช้ที่เก็บกุญแจของระบบได้ การเข้าสู่ระบบนี้จะสิ้นสุดเมื่อปิดแอป" },
 	{ "Desktop notifications · Off", "การแจ้งเตือนบนเดสก์ท็อป · ปิด" },
 	{ "Desktop notifications · On", "การแจ้งเตือนบนเดสก์ท็อป · เปิด" },
 	{ "Direct Messages", "ข้อความส่วนตัว" },

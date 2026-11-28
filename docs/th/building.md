@@ -34,6 +34,7 @@
 | ---- | ------- | ------------ |
 | เบราว์เซอร์ WPE WebKit | `wpe-webkit-2.0 wpe-platform-wayland-2.0` | ไม่มี `avernella-liff` |
 | เบราว์เซอร์ WebKitGTK | `webkitgtk-6.0` | ไม่มี `avernella-liff-gtk` ถ้าไม่มีเบราว์เซอร์เลย ลิงก์จะเปิดในเบราว์เซอร์ของระบบ |
+| พวงกุญแจของเดสก์ท็อป | `libsecret-1` (Ubuntu ใช้ `libsecret-1-dev`, Fedora ใช้ `libsecret-devel`, Arch ใช้ `libsecret`) | เซสชันที่บันทึกไว้จะไม่มีการป้องกันจากพวงกุญแจของเดสก์ท็อป |
 | ตัววาด Vulkan แบบเนทีฟ | `glslangValidator`, `spirv-val`, header ของ Vulkan ที่ประกาศ `VK_EXT_descriptor_heap` และ volk (`/usr/include/volk.c` หรือ `-lvolk`) | ไม่มี `avernella-vulkan.so` แอปจะวาดผ่าน SDL แทน |
 | ZBar | `libzbar.so.0` ตอนรัน โหลดด้วย `dlopen` ใน [`qr_scan.c`](../../src/qr_scan.c) | ใช้ **Read QR image** ไม่ได้ |
 | เข้ารหัสและถอดรหัส VP8 สำหรับวิดีโอคอลด้วยฮาร์ดแวร์ | header ของ FFmpeg สำหรับ `libavcodec` และ `libavutil` (บน Ubuntu คือ `libavcodec-dev libavutil-dev` และบน Arch คือ `ffmpeg`) | แอปใช้ libvpx บน CPU ตั้ง `CALL_HWCODECS=0` เพื่อปิดการใช้ FFmpeg สำหรับวิดีโอคอล ตัวเลือกเดิม `CALL_HWDECODE=0` ยังใช้ได้ |
@@ -49,11 +50,14 @@ sudo pacman -S --needed gcc binutils make pkgconf sdl2-compat wayland wayland-pr
   libjpeg-turbo libpng libwebp opus libsrtp libvpx pipewire rnnoise
 sudo pacman -S --needed vulkan-headers volk glslang spirv-tools vulkan-icd-loader   # โมดูล Vulkan
 sudo pacman -S --needed wpewebkit webkitgtk-6.0                                     # เบราว์เซอร์ในแอป
+sudo pacman -S --needed libsecret                                                   # พวงกุญแจของเดสก์ท็อป
 sudo pacman -S --needed xdg-desktop-portal xdg-desktop-portal-xapp ffmpeg           # Cinnamon Wayland และวิดีโอ
 sudo pacman -S --needed clang linux-headers xorg-server-xvfb                        # เครื่องมือพัฒนา
 ```
 
 เลือก backend ของ portal ให้ตรงกับเดสก์ท็อปที่กำลังใช้งาน GNOME ใช้ `xdg-desktop-portal-gnome`, Plasma ใช้ `xdg-desktop-portal-kde` และ Hyprland ใช้ `xdg-desktop-portal-hyprland` ถ้าใช้ Cinnamon Wayland กับ XApp แอปสามารถให้ผู้ใช้เลือกจอภาพแล้วแชร์ผ่าน Muffin ได้
+
+การบันทึกเซสชันในแอปแบบเนทีฟใช้ตัวให้บริการ Secret Service ที่ปลดล็อกแล้ว เช่น GNOME Keyring หรือ KWallet ที่เปิดใช้ Secret Service ส่วน Flatpak ใช้ Secret portal ของเดสก์ท็อปซึ่งแยกกุญแจตามแอป
 
 บนดิสทริบิวชันอื่น ให้ติดตั้งแพ็กเกจสำหรับพัฒนาที่มีชื่อ `pkg-config` ตรงกัน
 
@@ -98,6 +102,7 @@ GNU Make 4.3 ขึ้นไปจะรันงานพร้อมกัน�
 | -------- | -- |
 | `DEBUG=1` | build แบบ `-Og -g3` ไม่ strip มี frame pointer และ unwind table สำหรับใช้กับ `gdb` ต้องรัน `make clean` ทุกครั้งที่สลับระหว่าง debug กับ release เพราะไฟล์ object ไม่ถูก build ใหม่เมื่อเปลี่ยนแค่แฟล็ก |
 | `LIFF_BROWSER=0` | ไม่ build เบราว์เซอร์ทั้งสองตัว |
+| `KEYRING=1` / `0` | บังคับให้รองรับพวงกุญแจของเดสก์ท็อป หรือปิดการรองรับ ค่าเริ่มต้น `auto` จะเปิดใช้เมื่อพบ `libsecret-1` |
 | `NATIVE_VULKAN=1` / `0` | บังคับให้ต้องมีโมดูล Vulkan หรือไม่ build เลย ค่าเริ่มต้น `auto` จะ build เมื่อพบเครื่องมือ |
 | `VOLK_DIR=…`, `VK_HEADERS=…` | build volk จากโค้ดที่ checkout มา หรือใช้ไดเรกทอรี include ของ Vulkan-Headers ที่กำหนด |
 | `GLSLANG=…`, `SPIRV_VAL=…` | ตัวคอมไพล์และตัวตรวจ shader ที่จะใช้ |

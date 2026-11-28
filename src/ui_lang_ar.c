@@ -197,6 +197,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "حذف المجلد الحالي…" },
 	{ "Delete folder", "حذف المجلد" },
 	{ "Delete folder?", "حذف المجلد؟" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "مخزن مفاتيح سطح المكتب غير متاح. يستمر تسجيل الدخول حتى إغلاق التطبيق." },
 	{ "Desktop notifications · Off", "إشعارات سطح المكتب · متوقفة" },
 	{ "Desktop notifications · On", "إشعارات سطح المكتب · مفعّلة" },
 	{ "Direct Messages", "الرسائل المباشرة" },

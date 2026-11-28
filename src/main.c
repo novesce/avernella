@@ -16,6 +16,11 @@
 #include "profile_image.h"
 #include "shared_content.h"
 #include "state.h"
+#include "state_crypto.h"
+#include "state_keyring_config.h"
+#if LINE_HAVE_LIBSECRET
+#include "state_keyring.h"
+#endif
 #include "stickers.h"
 #include "talk_sync.h"
 #include "live_sync.h"
@@ -289,8 +294,9 @@ static gboolean ensure_vault(struct line_worker *w, GError **error)
 		w->vault_retry_at = g_get_monotonic_time() + G_USEC_PER_SEC;
 		if (fd >= 0) {
 			if (!avernella_vault_client_ping(fd) &&
-			    avernella_vault_client_restore(fd, &w->session,
-							   w->dir, error)) {
+			    avernella_vault_client_restore(
+				    fd, &w->session,
+				    line_store_session_fd(w->dir), error)) {
 				w->vault_fd = fd;
 				w->vault_retry_at = 0;
 				return TRUE;
@@ -635,6 +641,9 @@ static J *login(struct line_worker *w, GError **error)
 
 	json_object_object_add(who, "name", json_object_new_string(w->name));
 	json_object_object_add(who, "selfId", json_object_new_string(s->mid));
+	if (line_store_temporary())
+		json_object_object_add(who, "temporarySession",
+				       json_object_new_boolean(TRUE));
 	J *caps = obj();
 	const char *const enabled[] = {
 		"photos",	"files",	 "calls",	 "avatars",
@@ -4220,6 +4229,23 @@ static int worker(int credentials_fd)
 			g_strerror(-err));
 		return 1;
 	}
+	/* The keyring helper exits before the worker and Vault are confined. */
+	guint8 key[LINE_STATE_KEY_SIZE];
+	gboolean have_key = FALSE;
+
+	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0)) {
+		g_printerr("Avernella could not disable worker dumps: %s\n",
+			   g_strerror(errno));
+		return 1;
+	}
+#if LINE_HAVE_LIBSECRET
+	have_key = line_keyring_key(key);
+#endif
+	gboolean store_ready = line_store_start(have_key ? key : NULL);
+
+	explicit_bzero(key, sizeof(key));
+	if (!store_ready)
+		return 1;
 	/*
 	 * Spawn the isolated Key Vault broker BEFORE installing
 	 * the worker's Landlock/seccomp sandbox and before any thread starts.
@@ -4349,6 +4375,7 @@ static int worker(int credentials_fd)
 	if (w.renewal_timer >= 0)
 		close(w.renewal_timer);
 	line_session_clear(&w.session);
+	line_store_stop();
 	g_hash_table_unref(w.chats);
 	g_hash_table_unref(w.left_groups);
 	g_hash_table_unref(w.square_history_tokens);

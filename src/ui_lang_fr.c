@@ -210,6 +210,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Supprimer le dossier actuel…" },
 	{ "Delete folder", "Supprimer le dossier" },
 	{ "Delete folder?", "Supprimer le dossier ?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Le trousseau système est indisponible. La session prend fin à la fermeture de l’application." },
 	{ "Desktop notifications · Off",
 	  "Notifications de bureau · Désactivées" },
 	{ "Desktop notifications · On", "Notifications de bureau · Activées" },

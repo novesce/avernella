@@ -18,6 +18,7 @@
 #include "security/sandbox.h"
 #include "security/vault.h"
 #include "state.h"
+#include "state_crypto.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -1099,9 +1100,17 @@ static void test_vault_spawned_child_ecdh(void)
 	g_assert_cmpint(unlink(outside), ==, 0);
 }
 
-static void test_vault_reconnect(void)
+enum vault_storage {
+	VAULT_LEGACY,
+	VAULT_KEYRING,
+	VAULT_TEMPORARY,
+};
+
+static void test_vault_reconnect(gconstpointer data)
 {
 	struct avernella_worker_proc broker;
+	const guint8 key[LINE_STATE_KEY_SIZE] = { 1 };
+	enum vault_storage mode = GPOINTER_TO_UINT(data);
 
 	g_autoptr(GError) error = NULL;
 	g_autofree char *root =
@@ -1120,15 +1129,21 @@ static void test_vault_reconnect(void)
 
 	g_assert_cmpint(dir, >=, 0);
 	g_assert_cmpint(flock(dir, LOCK_EX | LOCK_NB), ==, 0);
+	if (mode != VAULT_LEGACY)
+		g_assert_true(
+			line_store_start(mode == VAULT_KEYRING ? key : NULL));
 	g_assert_true(line_store_save(dir, &session, &error));
 	g_assert_no_error(error);
+	int session_fd = line_store_session_fd(dir);
+
+	g_assert_cmpint(session_fd != dir, ==, mode == VAULT_TEMPORARY);
 	g_assert_cmpint(avernella_vault_broker_start(&broker, root), ==, 0);
 	int fd = avernella_vault_reconnect(broker.ctrl_fd);
 
 	g_assert_cmpint(fd, >=, 0);
 	g_assert_cmpint(avernella_vault_client_ping(fd), ==, 0);
-	g_assert_true(
-		avernella_vault_client_restore(fd, &session, dir, &error));
+	g_assert_true(avernella_vault_client_restore(fd, &session, session_fd,
+						     &error));
 	g_assert_no_error(error);
 	g_assert_true(avernella_vault_client_own_public(fd, 1, pub, &error));
 	g_assert_no_error(error);
@@ -1147,8 +1162,8 @@ static void test_vault_reconnect(void)
 
 	fd = avernella_vault_reconnect(broker.ctrl_fd);
 	g_assert_cmpint(fd, >=, 0);
-	g_assert_true(
-		avernella_vault_client_restore(fd, &session, dir, &error));
+	g_assert_true(avernella_vault_client_restore(fd, &session, session_fd,
+						     &error));
 	g_assert_no_error(error);
 	g_assert_true(avernella_vault_client_own_public(fd, 1, pub, &error));
 	g_assert_no_error(error);
@@ -1168,19 +1183,23 @@ static void test_vault_reconnect(void)
 	g_assert_no_error(error);
 	g_assert_cmpint(next, >, first);
 	/* A failed atomic save must reach the caller and leave the old file. */
-	g_assert_cmpint(mkdirat(dir, "session.new", 0700), ==, 0);
-	g_assert_false(avernella_vault_client_rotate_token(
-		fd, "updated-fixture-token", session.refresh, 5678, &error));
-	g_assert_nonnull(error);
-	g_assert_false(avernella_vault_disconnected(error));
-	g_clear_error(&error);
-	g_assert_cmpint(unlinkat(dir, "session.new", AT_REMOVEDIR), ==, 0);
+	if (mode != VAULT_TEMPORARY) {
+		g_assert_cmpint(mkdirat(dir, "session.new", 0700), ==, 0);
+		g_assert_false(avernella_vault_client_rotate_token(
+			fd, "updated-fixture-token", session.refresh, 5678,
+			&error));
+		g_assert_nonnull(error);
+		g_assert_false(avernella_vault_disconnected(error));
+		g_clear_error(&error);
+		g_assert_cmpint(unlinkat(dir, "session.new", AT_REMOVEDIR), ==,
+				0);
+	}
 	g_assert_true(avernella_vault_client_rotate_token(
 		fd, "updated-fixture-token", session.refresh, 5678, &error));
 	g_assert_no_error(error);
 	Line saved = { .service_code = -1 };
 
-	g_assert_true(line_store_load(dir, &saved, &error));
+	g_assert_true(line_store_load(session_fd, &saved, &error));
 	g_assert_no_error(error);
 	g_assert_cmpstr(saved.access, ==, "updated-fixture-token");
 	g_assert_cmpint(saved.refresh_at, ==, 5678);
@@ -1193,6 +1212,7 @@ static void test_vault_reconnect(void)
 	avernella_worker_close(&broker);
 	g_assert_true(line_store_forget(dir, &error));
 	g_assert_no_error(error);
+	line_store_stop();
 	close(dir);
 	g_assert_cmpint(rmdir(root), ==, 0);
 }
@@ -1221,7 +1241,14 @@ int main(int argc, char **argv)
 			test_vault_seccomp_no_new_peers);
 	g_test_add_func("/security/vault-spawned-child-ecdh",
 			test_vault_spawned_child_ecdh);
-	g_test_add_func("/security/vault-reconnect", test_vault_reconnect);
+	g_test_add_data_func("/security/vault-reconnect", NULL,
+			     test_vault_reconnect);
+	g_test_add_data_func("/security/vault-reconnect-keyring",
+			     GUINT_TO_POINTER(VAULT_KEYRING),
+			     test_vault_reconnect);
+	g_test_add_data_func("/security/vault-reconnect-temporary",
+			     GUINT_TO_POINTER(VAULT_TEMPORARY),
+			     test_vault_reconnect);
 	g_test_add_func("/security/supervisor-respawn-after-sigsys",
 			test_supervisor_respawn_after_sigsys);
 	return g_test_run();

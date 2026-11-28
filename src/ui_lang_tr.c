@@ -200,6 +200,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Geçerli klasörü sil…" },
 	{ "Delete folder", "Klasörü sil" },
 	{ "Delete folder?", "Klasör silinsin mi?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Masaüstü anahtarlığı kullanılamıyor. Oturum uygulamadan çıkınca sona erer." },
 	{ "Desktop notifications · Off", "Masaüstü bildirimleri · Kapalı" },
 	{ "Desktop notifications · On", "Masaüstü bildirimleri · Açık" },
 	{ "Direct Messages", "Doğrudan Mesajlar" },

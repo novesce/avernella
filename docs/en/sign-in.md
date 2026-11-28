@@ -95,7 +95,7 @@ Signing out doesn't need a running session. When a session is saved but isn't si
 
 ## The session file
 
-[`state.c`](../../src/state.c) stores one JSON object in `$XDG_STATE_HOME/avernella/session.json`:
+[`state.c`](../../src/state.c) serializes the session as JSON. The payload has the following fields.
 
 ```json
 {
@@ -124,7 +124,11 @@ Signing out doesn't need a running session. When a session is saved but isn't si
 | `keys.groups` | A cache of unwrapped group keys, keyed `<chat>/<key id>` |
 | `seq` | The highest request sequence number that may have been used |
 
-`load()` rejects the file unless it is a regular file owned by you, not readable by group or others, between 1 byte and 8 MiB, valid JSON with a non-empty `access`, an object `keys` and an integer `seq` from 0 to 2³¹−1. The buffer holding the file and the parsed token strings are wiped after parsing.
+Avernella saves the payload in `$XDG_STATE_HOME/avernella/session.json` using AES-256-GCM when keyring support is available. Native builds use an unlocked desktop Secret Service. Flatpak uses the per-app Secret portal. Restoring an encrypted session requires its original keyring key and a build that supports the encrypted format.
+
+A valid legacy plaintext session can resume and is migrated atomically in place when a keyring becomes available. A fresh sign-in without a keyring keeps the encrypted session in an anonymous Linux `memfd` for the life of the app. Sign in again after quitting a session started this way.
+
+The loader requires a regular file owned by you with no group or other read access. It bounds the input and validates the JSON payload, including a non-empty `access`, an object `keys` and an integer `seq` from 0 to 2³¹−1. It wipes the file buffer and the parsed token strings after parsing.
 
 If a save is interrupted, the next worker that acquires the exclusive session lock removes the incomplete `session.new` before restoring the saved session. A failed save also attempts to remove its staged credentials.
 
@@ -137,7 +141,7 @@ The worker re-saves the session whenever `s->token_changed` is set: after pairin
 Every state-changing RPC carries a request sequence number (`reqSeq`), and LINE expects them never to repeat for a device. `line_store_sequence()` hands out numbers from a reserved range:
 
 - `s->seq` is the last number used, `s->seq_reserved` the end of the range saved on disk.
-- When the range is used up, it reserves 32 more and **saves the file before returning** the next number.
+- When the range is used up, it reserves 32 more and **saves the state before returning** the next number.
 - On restart, `seq` is loaded as the saved high-water mark, so the whole previously reserved range counts as used.
 
 `dispatch()` in `main.c` calls `reserve_sequence()` before each mutating request, then decrements `s->seq` so the sending function's own `++s->seq` lands on the reserved number. Functions that take `reserved_seq` as an argument use it directly.

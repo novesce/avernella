@@ -221,6 +221,8 @@ static const char *const strings[][2] = {
 	{ "Delete current folder…", "Aktuellen Ordner löschen…" },
 	{ "Delete folder", "Ordner löschen" },
 	{ "Delete folder?", "Ordner löschen?" },
+	{ "Keyring unavailable. Sign-in lasts until you quit.",
+	  "Der Schlüsselbund ist nicht verfügbar. Du bleibst bis zum Beenden angemeldet." },
 	{ "Desktop notifications · Off", "Desktop-Benachrichtigungen · Aus" },
 	{ "Desktop notifications · On", "Desktop-Benachrichtigungen · Ein" },
 	{ "Direct Messages", "Direktnachrichten" },

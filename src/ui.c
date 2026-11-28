@@ -504,6 +504,7 @@ static struct {
 	guint history_pending, jump_request;
 	char *jump_message, *jump_pending;
 	gboolean history_again, chats_again, refresh_notice;
+	gboolean temporary_session_notice;
 	gint stopping;
 	GHashTable *read_marks;
 	Json *selected_summary; /* borrowed from ui.chats; rebound when the list changes */
@@ -1450,6 +1451,7 @@ static void reset_login(const char *message)
 	set_json(&ui.opened, NULL);
 	set_json(&ui.chats, NULL);
 	wire.notification_baseline = 0;
+	wire.temporary_session_notice = FALSE;
 	set_json(&ui.history, NULL);
 	g_hash_table_remove_all(ui.drafts);
 	g_clear_pointer(&mentions, g_hash_table_unref);
@@ -2300,6 +2302,8 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		g_clear_pointer(&ui.qr, QRcode_free);
 		g_clear_pointer(&ui.pin, g_free);
 		set_string(&ui.name, ui_string(result, "name", "LINE"));
+		wire.temporary_session_notice = json_object_get_boolean(
+			ui_field(result, "temporarySession"));
 		set_refresh_notice(_("Loading chats…"));
 		ui_lists_login(ui.self_id);
 		ui_profile_login();
@@ -2319,6 +2323,13 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				set_string(&ui.notice, "");
 			notify_unread(result);
 			show_chats(result);
+			if (wire.temporary_session_notice) {
+				const char *notice = _(
+					"Keyring unavailable. Sign-in lasts until you quit.");
+
+				wire.temporary_session_notice = FALSE;
+				set_string(&ui.notice, notice);
+			}
 			if (pending_link && ui.connected && !ui.logging_out) {
 				g_autofree char *url =
 					g_steal_pointer(&pending_link);

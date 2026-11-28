@@ -1,8 +1,16 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 #pragma once
 #include "line.h"
+#include <sys/stat.h>
 
 #define LINE_STATE_DIR "avernella"
+#define LINE_STATE_SESSION_FILE "session.json"
+
+gboolean line_store_start(const guint8 *key);
+void line_store_stop(void);
+gboolean line_store_temporary(void);
+int line_store_session_fd(int dir);
+gboolean line_store_is_memory_file(int fd, const struct stat *st);
 
 gboolean line_store_has_session(void);
 int line_store_open(Line *s, GError **error);
