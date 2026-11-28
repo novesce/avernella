@@ -15,6 +15,9 @@
 #define TRAY_BUS APP_ID ".StatusNotifierItem"
 #define MENU_PATH "/Menu"
 #define MENU_IFACE "com.canonical.dbusmenu"
+#define MAX_MENU_ARGS 32
+#define MAX_ACTIVATIONS 16
+#define ACTIVATION_TIMEOUT (15 * G_TIME_SPAN_SECOND)
 #define INPUT(t) "<arg type='" t "' direction='in'/>"
 #define OUTPUT(t) "<arg type='" t "' direction='out'/>"
 #define METHOD(n, a) "<method name='" n "'>" a "</method>"
@@ -90,6 +93,11 @@ struct registration {
 	guint generation;
 };
 
+struct activation {
+	char *token;
+	gint64 received;
+};
+
 static struct {
 	GMainContext *context;
 	GMainLoop *loop;
@@ -97,12 +105,12 @@ static struct {
 	GCancellable *cancel;
 	GDBusConnection *bus;
 	GVariant *icon;
+	GHashTable *activations;
 	char *address, *name;
-	char *activation, *activation_sender;
-	gint64 activation_at;
 	Uint32 event;
 	gint available;
 	gint background;
+	gint confirming_quit;
 	gboolean flatpak, close_pending;
 	guint background_signal;
 	guint pending;
@@ -115,23 +123,66 @@ static char *pending_activation;
 static const char *const labels[] = { "", N_("Open Avernella"),
 				      N_("Hide window"), N_("Quit Avernella") };
 
+static void free_activation(gpointer data)
+{
+	struct activation *activation = data;
+
+	g_free(activation->token);
+	g_free(activation);
+}
+
+static gboolean activation_expired(gpointer key, gpointer value, gpointer now)
+{
+	struct activation *activation = value;
+
+	(void)key;
+	return *(const gint64 *)now - activation->received >=
+	       ACTIVATION_TIMEOUT;
+}
+
+static void save_activation(const char *sender, const char *token)
+{
+	if (!sender || strlen(token) > 4096)
+		return;
+	gint64 now = g_get_monotonic_time();
+
+	g_hash_table_foreach_remove(tray.activations, activation_expired, &now);
+	g_hash_table_remove(tray.activations, sender);
+	if (!*token || g_hash_table_size(tray.activations) >= MAX_ACTIVATIONS)
+		return;
+	struct activation *activation = g_new(struct activation, 1);
+
+	*activation = (struct activation){ g_strdup(token), now };
+	g_hash_table_insert(tray.activations, g_strdup(sender), activation);
+}
+
 static void queue_action(enum tray_action which, const char *sender)
 {
 	SDL_Event e = { 0 };
 
+	if (which == QUIT &&
+	    !g_atomic_int_compare_and_exchange(&tray.confirming_quit, 0, 1))
+		return;
 	e.type = tray.event;
 	e.user.code = which;
 	e.user.data1 = NULL;
-	if (which == SHOW && sender && tray.activation &&
-	    !g_strcmp0(sender, tray.activation_sender)) {
-		if (g_get_monotonic_time() - tray.activation_at <
-		    15 * G_TIME_SPAN_SECOND)
-			e.user.data1 = g_steal_pointer(&tray.activation);
-		g_clear_pointer(&tray.activation, g_free);
-		g_clear_pointer(&tray.activation_sender, g_free);
+	if (which == SHOW && sender) {
+		struct activation *activation =
+			g_hash_table_lookup(tray.activations, sender);
+
+		if (activation &&
+		    g_get_monotonic_time() - activation->received <
+			    ACTIVATION_TIMEOUT) {
+			e.user.data1 = activation->token;
+			activation->token = NULL;
+		}
+		g_hash_table_remove(tray.activations, sender);
 	}
-	if (SDL_PushEvent(&e) != 1)
+	if (SDL_PushEvent(&e) != 1) {
 		g_free(e.user.data1);
+		if (which == QUIT)
+			g_atomic_int_set(&tray.confirming_quit, 0);
+	}
 }
 
 static void availability(void)
@@ -300,8 +351,12 @@ enum menu_property {
 static int requested(GVariant *p, guint index)
 {
 	g_autoptr(GVariant) names = g_variant_get_child_value(p, index);
-	if (!g_variant_n_children(names))
+	gsize n = g_variant_n_children(names);
+
+	if (!n)
 		return ALL;
+	if (n > MAX_MENU_ARGS)
+		return 0;
 	GVariantIter it;
 	const char *name;
 	int mask = 0;
@@ -400,11 +455,12 @@ static GVariant *menu_call(const char *method, GVariant *p, const char *sender)
 	if (!strcmp(method, "GetGroupProperties")) {
 		g_autoptr(GVariant) ids = g_variant_get_child_value(p, 0);
 		GVariantBuilder out;
-
-		g_variant_builder_init(&out, G_VARIANT_TYPE("a(ia{sv})"));
 		gsize n = g_variant_n_children(ids);
 		int mask = requested(p, 1);
 
+		if (n > MAX_MENU_ARGS)
+			return NULL;
+		g_variant_builder_init(&out, G_VARIANT_TYPE("a(ia{sv})"));
 		for (gsize i = 0; i < (n ? n : G_N_ELEMENTS(labels)); i++) {
 			int id = n ? number(ids, i) : (int)i;
 
@@ -419,9 +475,12 @@ static GVariant *menu_call(const char *method, GVariant *p, const char *sender)
 	if (!strcmp(method, "EventGroup")) {
 		g_autoptr(GVariant) events = g_variant_get_child_value(p, 0);
 		GVariantBuilder errors;
+		gsize n = g_variant_n_children(events);
 
+		if (n > MAX_MENU_ARGS)
+			return NULL;
 		g_variant_builder_init(&errors, G_VARIANT_TYPE("ai"));
-		for (gsize i = 0; i < g_variant_n_children(events); i++) {
+		for (gsize i = 0; i < n; i++) {
 			g_autoptr(GVariant) event =
 				g_variant_get_child_value(events, i);
 			if (!menu_event(event, sender))
@@ -460,13 +519,7 @@ static void method_call(GDBusConnection *bus, const char *sender,
 		const char *token;
 
 		g_variant_get(p, "(&s)", &token);
-		g_clear_pointer(&tray.activation, g_free);
-		g_clear_pointer(&tray.activation_sender, g_free);
-		if (*token && strlen(token) <= 4096) {
-			tray.activation = g_strdup(token);
-			tray.activation_sender = g_strdup(sender);
-			tray.activation_at = g_get_monotonic_time();
-		}
+		save_activation(sender, token);
 	} else if (!strcmp(method, "Activate") ||
 		   !strcmp(method, "SecondaryActivate") ||
 		   !strcmp(method, "ContextMenu")) {
@@ -488,7 +541,8 @@ static void check_host(struct host *h)
 			h->proxy, "org.freedesktop.DBus.Properties.GetAll",
 			args, G_DBUS_CALL_FLAGS_NO_AUTO_START, 800, tray.cancel,
 			NULL);
-		if (reply) {
+		if (reply &&
+		    g_variant_is_of_type(reply, G_VARIANT_TYPE("(a{sv})"))) {
 			g_autoptr(GVariant) props =
 				g_variant_get_child_value(reply, 0);
 			gboolean has_host = FALSE;
@@ -706,6 +760,8 @@ void ui_tray_start(void)
 	tray.context = g_main_context_new();
 	tray.loop = g_main_loop_new(tray.context, FALSE);
 	tray.cancel = g_cancellable_new();
+	tray.activations = g_hash_table_new_full(g_str_hash, g_str_equal,
+						 g_free, free_activation);
 	tray.thread = g_thread_try_new("line-tray", service, NULL, NULL);
 	if (!tray.thread)
 		ui_tray_stop();
@@ -738,12 +794,12 @@ void ui_tray_stop(void)
 				      tray.event) == 1)
 			g_free(e.user.data1);
 	}
-	g_clear_pointer(&tray.activation, g_free);
-	g_clear_pointer(&tray.activation_sender, g_free);
+	g_clear_pointer(&tray.activations, g_hash_table_unref);
 	g_clear_pointer(&pending_activation, g_free);
 	g_clear_pointer(&tray.name, g_free);
 	tray.event = 0;
 	tray.background = BACKGROUND_UNASKED;
+	tray.confirming_quit = 0;
 	tray.close_pending = FALSE;
 	memset(tray.hosts, 0, sizeof(tray.hosts));
 }
@@ -760,10 +816,10 @@ void ui_present_window(SDL_Window *window)
 
 void ui_tray_presented(SDL_Window *window)
 {
-	g_autofree char *token = g_steal_pointer(&pending_activation);
-
-	if (token)
-		ui_window_activate(window, token);
+	if (pending_activation) {
+		ui_window_activate(window, pending_activation);
+		g_clear_pointer(&pending_activation, g_free);
+	}
 }
 
 gboolean ui_tray_hide(SDL_Window *window)
@@ -775,6 +831,29 @@ gboolean ui_tray_hide(SDL_Window *window)
 		return FALSE;
 	SDL_HideWindow(window);
 	return TRUE;
+}
+
+/* StatusNotifierWatcher does not identify the host that forwards a click. */
+static gboolean confirm_quit(SDL_Window *window)
+{
+	const SDL_MessageBoxButtonData buttons[] = {
+		{ SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT |
+			  SDL_MESSAGEBOX_BUTTON_ESCAPEKEY_DEFAULT,
+		  0, _("Cancel") },
+		{ 0, 1, _("Quit Avernella") },
+	};
+	const SDL_MessageBoxData dialog = {
+		.flags = SDL_MESSAGEBOX_INFORMATION,
+		.window = window,
+		.title = _("Confirm action"),
+		.message = _("Quit Avernella"),
+		.numbuttons = G_N_ELEMENTS(buttons),
+		.buttons = buttons,
+	};
+	int chosen = 0;
+
+	ui_present_window(window);
+	return SDL_ShowMessageBox(&dialog, &chosen) == 0 && chosen == 1;
 }
 
 void ui_tray_close(SDL_Window *window)
@@ -804,10 +883,12 @@ gboolean ui_tray_event(const SDL_Event *event, SDL_Window *window,
 	Uint32 flags = SDL_GetWindowFlags(window);
 	gboolean hidden = flags & SDL_WINDOW_HIDDEN;
 
-	if (action == QUIT)
-		*quitting = TRUE;
-	else if (action == SHOW || (action == HOST_GONE && hidden &&
-				    !g_atomic_int_get(&tray.available))) {
+	if (action == QUIT) {
+		if (!*quitting && confirm_quit(window))
+			*quitting = TRUE;
+		g_atomic_int_set(&tray.confirming_quit, 0);
+	} else if (action == SHOW || (action == HOST_GONE && hidden &&
+				      !g_atomic_int_get(&tray.available))) {
 		if (event->user.data1) {
 			g_free(pending_activation);
 			pending_activation = event->user.data1;

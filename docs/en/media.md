@@ -129,7 +129,7 @@ Changing your own picture (`updateMyPicture`, [`profile_image.c`](../../src/prof
 | POPUP | `P` | `sticker_popup.png` |
 | POPUP_SOUND | `PS` | `sticker_popup.png` |
 
-Artwork URLs are `https://stickershop.line-scdn.net/stickershop/v1/sticker/<id>/android/<file>`, or `…/v2/sticker/<id>/<hash>/android/<file>` when the pack has a hash. `line_sticker_fetch()` accepts only URLs under that origin. Sound stickers show their picture; the sound isn't played.
+Artwork URLs are `https://stickershop.line-scdn.net/stickershop/v1/sticker/<id>/android/<file>`, or `…/v2/sticker/<id>/<hash>/android/<file>` when the pack has a hash. `line_sticker_fetch()` accepts only URLs under that origin. Click a sound sticker to play its M4A clip. The player uses only the supplied file descriptor and disables MOV external track references.
 
 **Sending** (`sendSticker`, `line_send_sticker()`): `sendMessage` with content type 7, **no encryption** and metadata `STKID`, `STKPKGID`, `STKVER`, `STKTXT` (the pack name), `STKOPT` and `STKHASH` when they apply. A reply adds the usual fields 21, 22 and 24.
 
@@ -144,7 +144,7 @@ Artwork URLs are `https://stickershop.line-scdn.net/stickershop/v1/sticker/<id>/
 1. **The offline index** `emoji_pack_index.inc`: the 45 public packs from LINE's published emoji list, with product IDs, names, versions and item counts (9,175 items in total).
 2. **Owned packs**: `getOwnedProductSummaries` on `/TSHOP4` with shop type `"sticonshop"`, 100 per page, stopping on an empty or repeated page.
 
-For a pack's real item list and labels, it fetches the pack manifest at `https://stickershop.line-scdn.net/sticonshop/v1/product/<product>/android/meta.json`. Pages of the catalog are returned to the picker with `{productId, emojiId, label, pack, version, resourceType}` entries, and search matches pack names, item numbers and loaded labels.
+For a pack's real item list and labels, it fetches the pack manifest at `https://stickershop.line-scdn.net/sticonshop/v1/product/<product>/android/meta.json`. The client accepts one complete UTF-8 JSON document and checks that its full product ID matches the requested pack. Pages of the catalog are returned to the picker with `{productId, emojiId, label, pack, version, resourceType}` entries, and search matches pack names, item numbers and loaded labels.
 
 **Pictures:** `https://stickershop.line-scdn.net/sticonshop/v1/sticon/<product>/android/<item>.png` for the still image, and `<item>_animation.png` for the animated PNG. When the animation returns 404, the still is used. The UI asks with `emoji` (with `resourceType: "ANIMATION"` for animated ones).
 

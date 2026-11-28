@@ -17,8 +17,20 @@ static GDBusConnection *bus;
 static char *item;
 static gboolean panel_host;
 static SDL_Window *window;
-static gboolean quit;
+static gboolean quit, allow_quit;
+static unsigned int quit_dialogs;
 static gboolean background_requested;
+
+int SDL_ShowMessageBox(const SDL_MessageBoxData *data, int *buttonid)
+{
+	g_assert_true(data->window == window);
+	g_assert_cmpint(data->numbuttons, ==, 2);
+	g_assert_true(data->buttons[0].flags &
+		      SDL_MESSAGEBOX_BUTTON_RETURNKEY_DEFAULT);
+	quit_dialogs++;
+	*buttonid = allow_quit ? 1 : 0;
+	return 0;
+}
 static const char xml[] =
 	"<node><interface name='" WATCH "'>"
 	"<method name='RegisterStatusNotifierItem'><arg type='s' direction='in'/></method>"
@@ -224,9 +236,10 @@ static void tray(gconstpointer fixture)
 
 	g_autoptr(GVariant) properties = NULL, dict = NULL, show = NULL,
 			    menu = NULL, root = NULL, children = NULL,
-			    provided = NULL;
+			    provided = NULL, other_token = NULL;
 
-	quit = panel_host = background_requested = FALSE;
+	quit = panel_host = background_requested = allow_quit = FALSE;
+	quit_dialogs = 0;
 	const char *driver = g_getenv("AVERNELLA_TEST_TRAY_DRIVER");
 
 	g_setenv("SDL_VIDEODRIVER", driver ? driver : "dummy", TRUE);
@@ -251,6 +264,13 @@ static void tray(gconstpointer fixture)
 		G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION |
 			G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT,
 		NULL, NULL, &error);
+	g_assert_no_error(error);
+	g_autoptr(GDBusConnection) peer =
+		g_dbus_connection_new_for_address_sync(
+			g_test_dbus_get_bus_address(dbus),
+			G_DBUS_CONNECTION_FLAGS_MESSAGE_BUS_CONNECTION |
+				G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT,
+			NULL, NULL, &error);
 	g_assert_no_error(error);
 	g_autoptr(GDBusNodeInfo) info =
 		g_dbus_node_info_new_for_xml(xml, &error);
@@ -342,7 +362,24 @@ static void tray(gconstpointer fixture)
 	provided = rpc(item, IPATH, ITEM, "ProvideXdgActivationToken",
 		       g_variant_new("(s)", "fixture-token"));
 	g_assert_nonnull(provided);
+	/* Concurrent callers' tokens are kept independently. */
+	other_token = g_dbus_connection_call_sync(
+		peer, item, IPATH, ITEM, "ProvideXdgActivationToken",
+		g_variant_new("(s)", "unrelated-fixture-token"),
+		G_VARIANT_TYPE_UNIT, G_DBUS_CALL_FLAGS_NONE, 1500, NULL,
+		&error);
+	g_assert_no_error(error);
 	show = rpc(item, IPATH, ITEM, "Activate", g_variant_new("(ii)", 0, 0));
+	SDL_Event queued[16];
+	int count = SDL_PeepEvents(queued, G_N_ELEMENTS(queued), SDL_PEEKEVENT,
+				   SDL_USEREVENT, SDL_LASTEVENT);
+	gboolean has_token = FALSE;
+
+	for (int i = 0; i < count; i++)
+		if (queued[i].user.data1 &&
+		    !strcmp(queued[i].user.data1, "fixture-token"))
+			has_token = TRUE;
+	g_assert_true(has_token);
 	wait_for(VISIBLE);
 	ui_tray_presented(window);
 	g_clear_pointer(&show, g_variant_unref);
@@ -368,7 +405,15 @@ static void tray(gconstpointer fixture)
 	own(TRUE);
 	wait_for(HIDDEN_BY_CLOSE);
 	action(3);
+	action(3);
+	for (int i = 0; i < 20; i++)
+		pump();
+	g_assert_false(quit);
+	g_assert_cmpuint(quit_dialogs, ==, 1);
+	allow_quit = TRUE;
+	action(3);
 	wait_for(QUIT_APP);
+	g_assert_cmpuint(quit_dialogs, ==, 2);
 stop:
 	ui_tray_stop();
 	ui_window_shutdown();
@@ -378,6 +423,7 @@ stop:
 	if (portal_object)
 		g_dbus_connection_unregister_object(bus, portal_object);
 	g_dbus_connection_unregister_object(bus, object);
+	g_dbus_connection_close_sync(peer, NULL, NULL);
 	g_dbus_connection_close_sync(bus, NULL, NULL);
 	g_clear_object(&bus);
 	g_clear_pointer(&item, g_free);

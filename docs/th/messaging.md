@@ -191,7 +191,7 @@ UI แปลงอีโมจิแต่ละตัวในฉบับร�
 
 - **การ์ดรายชื่อ** (`contentType = 13`) ดึง `contactMid` และ `contactName` จาก `contentMetadata` และแสดงเป็นการ์ดที่คลิกเพื่อเปิดการ์ดโปรไฟล์ได้ (`ui_profile_open()`)
 - **การ์ดตำแหน่ง** (`contentType = 15`) ดึง `location: {title, address, lat, lon, phone}` จากฟิลด์ Thrift `11` และคลิกเปิดพิกัดบน OpenStreetMap ผ่าน `SDL_OpenURL()`
-- **ข้อความเสียงและสติกเกอร์มีเสียง** เล่นภายในแอปผ่าน `ffplay -nodisp -autoexit -i /dev/fd/3` โดยส่งข้อมูลผ่านไฟล์หน่วยความจำปิดผนึก (`openAudio` และ `stickerSound` ซึ่งดึง `stickershop/v1/sticker/<id>/android/sticker_sound.m4a` พร้อมตรวจส่วนหัว ISO BMFF `ftyp`)
+- **ข้อความเสียงและสติกเกอร์มีเสียง** เล่นภายในแอปผ่าน `ffplay` โดยส่งข้อมูลผ่านไฟล์หน่วยความจำปิดผนึก (`openAudio` และ `stickerSound` ซึ่งดึง `stickershop/v1/sticker/<id>/android/sticker_sound.m4a` พร้อมตรวจส่วนหัว ISO BMFF `ftyp`) ตัวเล่นรับเฉพาะรูปแบบเสียงจากไฟล์ในเครื่อง และใช้ตัวแยกสตรีม MOV สำหรับสติกเกอร์โดยปิดการโหลดแทร็กภายนอก
 
 ## รีแอ็กชันและการยกเลิกส่ง
 

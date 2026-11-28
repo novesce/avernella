@@ -191,7 +191,7 @@ It is stored as the `MENTION` metadata value. **Note:** metadata isn't encrypted
 
 - **Contact cards** (`contentType = 13`) expose `contactMid` and `contactName` from `contentMetadata` and render as clickable cards that open the person's profile card (`ui_profile_open()`).
 - **Location cards** (`contentType = 15`) expose `location: {title, address, lat, lon, phone}` from Thrift field `11` and open coordinates on OpenStreetMap via `SDL_OpenURL()`.
-- **Voice messages and sound stickers** play in-app via `ffplay -nodisp -autoexit -i /dev/fd/3` over sealed memory-file leases (`openAudio` and `stickerSound`, fetching `stickershop/v1/sticker/<id>/android/sticker_sound.m4a` and verifying ISO BMFF `ftyp` headers).
+- **Voice messages and sound stickers** play in-app via `ffplay` over sealed memory-file leases (`openAudio` and `stickerSound`, fetching `stickershop/v1/sticker/<id>/android/sticker_sound.m4a` and verifying ISO BMFF `ftyp` headers). Playback accepts local audio formats and uses the MOV demuxer with external track loading disabled for sticker sounds.
 
 ## Reactions and unsend
 

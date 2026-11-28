@@ -111,7 +111,8 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-ui-emoji` | `ui_emoji.c` | Draft tokens and export ranges |
 | `test-ui-flex` | `ui_flex.c` | Flex layout |
 | `test-ui-friends` | `ui_friends.c` | Friends screen behavior |
-| `test-ui-tray` | `ui_tray.c` | Tray item properties and menu |
+| `test-ui-tray` | `ui_tray.c` | Tray properties, menu, separate activation tokens, quit confirmation and background permission on a private bus |
+| `test-ui-notifications` | `ui_notifications.c` | Markup handling across service owner changes, also checked through a filtered D-Bus proxy when available |
 | `test-ui-read` | `ui_read.c` | The read-receipt rules in `ui_private.h` |
 | `test-ui-theme` | `ui_theme.c` | Theme file reading and toggling |
 | `test-ui-scroll-scene` | `ui_scroll_scene.c` | Scroll reuse against full redraws; the new-message glide and chat fade-in, with and without reduced motion |

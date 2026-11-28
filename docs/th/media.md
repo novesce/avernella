@@ -129,7 +129,7 @@
 | POPUP | `P` | `sticker_popup.png` |
 | POPUP_SOUND | `PS` | `sticker_popup.png` |
 
-URL ของภาพคือ `https://stickershop.line-scdn.net/stickershop/v1/sticker/<id>/android/<file>` หรือ `…/v2/sticker/<id>/<hash>/android/<file>` เมื่อชุดนั้นมี hash `line_sticker_fetch()` ยอมรับเฉพาะ URL ใต้ต้นทางนั้น สติกเกอร์มีเสียงจะแสดงภาพ แต่ไม่เล่นเสียง
+URL ของภาพคือ `https://stickershop.line-scdn.net/stickershop/v1/sticker/<id>/android/<file>` หรือ `…/v2/sticker/<id>/<hash>/android/<file>` เมื่อชุดนั้นมี hash `line_sticker_fetch()` ยอมรับเฉพาะ URL ใต้ต้นทางนั้น คลิกสติกเกอร์มีเสียงเพื่อเล่นคลิป M4A ตัวเล่นใช้เฉพาะ file descriptor ที่ได้รับและปิดการอ้างอิงแทร็กภายนอกของ MOV
 
 **การส่ง** (`sendSticker`, `line_send_sticker()`): `sendMessage` ด้วยชนิดเนื้อหา 7 **ไม่เข้ารหัส** และ metadata `STKID`, `STKPKGID`, `STKVER`, `STKTXT` (ชื่อชุด) และ `STKOPT` กับ `STKHASH` เมื่อมี การตอบกลับเพิ่มฟิลด์ 21, 22 และ 24 ตามปกติ
 
@@ -144,7 +144,7 @@ URL ของภาพคือ `https://stickershop.line-scdn.net/stickershop/v
 1. **ดัชนีออฟไลน์** `emoji_pack_index.inc`: ชุดสาธารณะ 45 ชุดจากรายการอีโมจิที่ LINE เผยแพร่ พร้อมรหัสผลิตภัณฑ์ ชื่อ เวอร์ชัน และจำนวนรายการ (รวม 9,175 รายการ)
 2. **ชุดที่เป็นเจ้าของ**: `getOwnedProductSummaries` บน `/TSHOP4` ด้วยชนิดร้าน `"sticonshop"` หน้าละ 100 หยุดเมื่อได้หน้าว่างหรือหน้าซ้ำ
 
-รายการจริงและป้ายของแต่ละชุดดึงจาก manifest ที่ `https://stickershop.line-scdn.net/sticonshop/v1/product/<product>/android/meta.json` หน้าของแค็ตตาล็อกส่งให้ตัวเลือกเป็นรายการ `{productId, emojiId, label, pack, version, resourceType}` และการค้นหาจับคู่ชื่อชุด หมายเลขรายการ และป้ายที่โหลดมาแล้ว
+รายการจริงและป้ายของแต่ละชุดดึงจาก manifest ที่ `https://stickershop.line-scdn.net/sticonshop/v1/product/<product>/android/meta.json` ไคลเอนต์รับเอกสาร JSON แบบ UTF-8 ที่สมบูรณ์เพียงรายการเดียว และตรวจรหัสผลิตภัณฑ์ทั้งหมดให้ตรงกับชุดที่ขอ หน้าของแค็ตตาล็อกส่งให้ตัวเลือกเป็นรายการ `{productId, emojiId, label, pack, version, resourceType}` และการค้นหาจับคู่ชื่อชุด หมายเลขรายการ และป้ายที่โหลดมาแล้ว
 
 **รูป:** `https://stickershop.line-scdn.net/sticonshop/v1/sticon/<product>/android/<item>.png` สำหรับภาพนิ่ง และ `<item>_animation.png` สำหรับ PNG เคลื่อนไหว ถ้าแอนิเมชันได้ 404 จะใช้ภาพนิ่งแทน UI ขอด้วย `emoji` (พร้อม `resourceType: "ANIMATION"` สำหรับแบบเคลื่อนไหว)
 

@@ -8,6 +8,7 @@
 static int rpc_count, manifest_count, builtin_fetches, downloads, missing;
 static gboolean shop_unavailable;
 static char *last_url;
+static const char *manifest;
 
 J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	    GError **error)
@@ -34,7 +35,8 @@ GBytes *line_public_asset(const char *url, gsize limit, GError **error)
 {
 	static const char meta[] =
 		"{\"productId\":\"" OWN
-		"\",\"orders\":[\"009\",\"001\",\"009\",\"001/illegal\"],\"altTexts\":{\"009\":\"Crème, CAT!\",\"001\":\"Moon\"}}";
+		"\",\"orders\":[\"009\",\"001\",\"009\",\"001/illegal\"],"
+		"\"altTexts\":{\"009\":\"Crème, CAT!\",\"001\":\"Moon\"}}\n";
 	static const guint8 png[33] = "\x89PNG\r\n\x1a\n\0\0\0\rIHDR";
 
 	g_free(last_url);
@@ -58,7 +60,9 @@ GBytes *line_public_asset(const char *url, gsize limit, GError **error)
 			"https://stickershop.line-scdn.net/sticonshop/v1/product/" OWN
 			"/android/meta.json");
 		g_assert_cmpuint(limit, <=, 256 * 1024);
-		return g_bytes_new_static(meta, sizeof(meta) - 1);
+		return manifest ?
+			       g_bytes_new_static(manifest, strlen(manifest)) :
+			       g_bytes_new_static(meta, sizeof(meta) - 1);
 	}
 	downloads++;
 	if (missing && g_str_has_suffix(url, "_animation.png")) {
@@ -167,6 +171,30 @@ static void search_starts_offline(void)
 	g_ptr_array_unref(s.emoji_packs);
 }
 
+static void catalog_manifest(void)
+{
+	static const char *const bad[] = {
+		"{\"productId\":\"" OWN "\",\"orders\":[\"001\"]}{}",
+		"{\"productId\":\"" OWN "\\u0000suffix\",\"orders\":[\"001\"]}",
+		"{\"productId\":\"" OWN
+		"\",\"orders\":[\"001\"],\"altTexts\":{\"001\":\"\xff\"}}",
+	};
+
+	manifest_count = 0;
+	for (guint i = 0; i < G_N_ELEMENTS(bad); i++) {
+		Line s = { .access = "fixture" };
+
+		manifest = bad[i];
+		g_autoptr(J) page =
+			line_emoji_catalog_page(&s, 0, 5, "My Pack", NULL);
+
+		g_assert_cmpuint(json_object_array_length(page), ==, 0);
+		g_ptr_array_unref(s.emoji_packs);
+	}
+	g_assert_cmpuint(manifest_count, ==, G_N_ELEMENTS(bad));
+	manifest = NULL;
+}
+
 static void shop_fallback(void)
 {
 	Line s = { .access = "fixture" };
@@ -228,6 +256,7 @@ int main(int argc, char **argv)
 	g_test_add_func("/emoji/catalog/default-and-pages", defaults_only);
 	g_test_add_func("/emoji/catalog/owned", ownership);
 	g_test_add_func("/emoji/catalog/cold-search", search_starts_offline);
+	g_test_add_func("/emoji/catalog/manifest", catalog_manifest);
 	g_test_add_func("/emoji/catalog/shop-fallback", shop_fallback);
 	g_test_add_func("/emoji/cdn/images", images);
 	return g_test_run();

@@ -2,6 +2,8 @@
 #include "ui_gpu.h"
 #include "ui_motion.h"
 #include "ui_private.h"
+#include <fcntl.h>
+#include <glib/gstdio.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -203,9 +205,60 @@ static void viewer(void)
 	SDL_Quit();
 }
 
+static void sticker_sound_policy(void)
+{
+	if (!g_test_subprocess()) {
+		g_test_trap_subprocess(NULL, 5 * G_USEC_PER_SEC, 0);
+		g_test_trap_assert_passed();
+		return;
+	}
+	static const char player_script[] =
+		"#!/bin/sh\n"
+		"[ -r /proc/self/fd/3 ] || exit 1\n"
+		"printf '%s\\n' \"$@\" > \"$AVERNELLA_TEST_PLAYER_LOG\"\n"
+		": > \"$AVERNELLA_TEST_PLAYER_LOG.done\"\n";
+	g_autofree char *dir = g_dir_make_tmp("avernella-player-XXXXXX", NULL);
+
+	g_assert_nonnull(dir);
+	g_autofree char *player = g_build_filename(dir, "ffplay", NULL);
+	g_autofree char *log = g_build_filename(dir, "args", NULL);
+	g_autofree char *done = g_strconcat(log, ".done", NULL);
+	g_autofree char *args = NULL;
+	int fd = memfd_create("audio-fixture", MFD_CLOEXEC | MFD_ALLOW_SEALING);
+	Json *lease = json_object_new_object();
+
+	g_assert_true(g_file_set_contents(player, player_script, -1, NULL));
+	g_assert_cmpint(g_chmod(player, 0700), ==, 0);
+	g_assert_true(g_setenv("PATH", dir, TRUE));
+	g_assert_true(g_setenv("AVERNELLA_TEST_PLAYER_LOG", log, TRUE));
+	g_assert_cmpint(fd, >=, 0);
+	g_assert_cmpint(write(fd, "fixture", 7), ==, 7);
+	g_assert_cmpint(fcntl(fd, F_ADD_SEALS,
+			      F_SEAL_WRITE | F_SEAL_GROW | F_SEAL_SHRINK),
+			==, 0);
+	json_object_object_add(lease, "fd", json_object_new_int(fd));
+	ui_media_reply("stickerSound", NULL, 0, lease, NULL);
+	json_object_put(lease);
+	while (!g_file_test(done, G_FILE_TEST_IS_REGULAR))
+		g_usleep(1000);
+	g_assert_true(g_file_get_contents(log, &args, NULL, NULL));
+	g_assert_nonnull(strstr(args, "-protocol_whitelist\nfile\n"));
+	g_assert_nonnull(strstr(args, "-format_whitelist\nmov\n-f\nmov\n"));
+	g_assert_nonnull(
+		strstr(args, "-enable_drefs\n0\n-use_absolute_path\n0\n"));
+	g_assert_nonnull(strstr(args, "-i\n/proc/self/fd/3\n"));
+	ui_media_shutdown();
+	g_assert_cmpint(g_remove(done), ==, 0);
+	g_assert_cmpint(g_remove(log), ==, 0);
+	g_assert_cmpint(g_remove(player), ==, 0);
+	g_assert_cmpint(g_rmdir(dir), ==, 0);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/image-overlay/interaction", viewer);
+	g_test_add_func("/image-overlay/sticker-sound-policy",
+			sticker_sound_policy);
 	return g_test_run();
 }

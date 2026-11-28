@@ -1322,7 +1322,7 @@ static void stop_audio_clip(void)
 	g_clear_object(&m.audio_clip);
 }
 
-static void play_audio_lease(int fd)
+static void play_audio_lease(int fd, gboolean sticker)
 {
 	stop_audio_clip();
 	if (fd < 0)
@@ -1339,9 +1339,34 @@ static void play_audio_lease(int fd)
 					  G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
 					  G_SUBPROCESS_FLAGS_STDERR_SILENCE);
 	g_subprocess_launcher_take_fd(launcher, fd, 3);
-	const char *const argv[] = { ffplay,	  "-nodisp", "-autoexit",
-				     "-loglevel", "quiet",   "-i",
-				     "/dev/fd/3", NULL };
+	const char *const common[] = {
+		ffplay,
+		"-nodisp",
+		"-autoexit",
+		"-vn",
+		"-sn",
+		"-loglevel",
+		"quiet",
+		"-protocol_whitelist",
+		"file",
+		"-format_whitelist",
+		sticker ? "mov" :
+			  "aac,amr,caf,flac,matroska,webm,mov,mp3,ogg,wav",
+	};
+	/* Sticker sounds are M4A files. The clip must be self-contained. */
+	static const char *const mov[] = {
+		"-f", "mov", "-enable_drefs", "0", "-use_absolute_path", "0"
+	};
+	const char *argv[G_N_ELEMENTS(common) + G_N_ELEMENTS(mov) + 3] = { 0 };
+	guint n = G_N_ELEMENTS(common);
+
+	memcpy(argv, common, sizeof(common));
+	if (sticker) {
+		memcpy(argv + n, mov, sizeof(mov));
+		n += G_N_ELEMENTS(mov);
+	}
+	argv[n++] = "-i";
+	argv[n] = "/proc/self/fd/3";
 
 	g_autoptr(GError) err = NULL;
 
@@ -4278,7 +4303,9 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 	}
 	if (!strcmp(method, "releaseMedia"))
 		return;
-	if (!strcmp(method, "stickerSound") || !strcmp(method, "openAudio")) {
+	gboolean sticker_sound = !strcmp(method, "stickerSound");
+
+	if (sticker_sound || !strcmp(method, "openAudio")) {
 		Json *lease = ui_field(result, "lease");
 		int fd = !error ? lease_fd(result, LINE_MEDIA_LIMIT) : -1;
 
@@ -4290,7 +4317,7 @@ void ui_media_reply(const char *method, Json *p, guint tag, Json *result,
 			ui_rpc("releaseMedia", a, 0);
 		}
 		if (fd >= 0)
-			play_audio_lease(fd);
+			play_audio_lease(fd, sticker_sound);
 		else if (error)
 			ui_status(error);
 		return;

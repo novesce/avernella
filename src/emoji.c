@@ -46,6 +46,19 @@ static const struct default_emoji_pack *find_default(const char *id)
 	return NULL;
 }
 
+static const char *catalog_string(J *item, const char *key)
+{
+	J *value = field(item, key);
+
+	if (!json_object_is_type(value, json_type_string))
+		return NULL;
+	const char *text = json_object_get_string(value);
+
+	if (strlen(text) != (size_t)json_object_get_string_len(value))
+		return NULL;
+	return text;
+}
+
 static struct emoji_pack *add_pack(GPtrArray *packs, GHashTable *seen,
 				   const char *id, const char *name,
 				   int version, gboolean animated)
@@ -121,8 +134,8 @@ static void load_owned(Line *s, GPtrArray *packs, GHashTable *seen)
 		if (!count)
 			break;
 		const char *first =
-			strfield(json_object_array_get_idx(list, 0), "1");
-		const char *last = strfield(
+			catalog_string(json_object_array_get_idx(list, 0), "1");
+		const char *last = catalog_string(
 			json_object_array_get_idx(list, count - 1), "1");
 		if (offset && !g_strcmp0(first, previous_first) &&
 		    !g_strcmp0(last, previous_last))
@@ -133,14 +146,14 @@ static void load_owned(Line *s, GPtrArray *packs, GHashTable *seen)
 		previous_last = g_strdup(last);
 		for (int i = 0; i < count; i++) {
 			J *summary = json_object_array_get_idx(list, i);
-			const char *id = strfield(summary, "1");
+			const char *id = catalog_string(summary, "1");
 			J *sticon = field(field(summary, "93"), "3");
 			gint64 expires_ms =
 				json_object_get_int64(field(summary, "94"));
 			if (expires_ms > 0 &&
 			    expires_ms <= g_get_real_time() / 1000)
 				continue;
-			add_pack(packs, seen, id, strfield(summary, "11"),
+			add_pack(packs, seen, id, catalog_string(summary, "11"),
 				 json_object_get_int(field(summary, "21")),
 				 json_object_get_int(field(sticon, "3")) == 2);
 		}
@@ -217,13 +230,17 @@ static gboolean load_manifest(struct emoji_pack *p)
 	const char *bytes = g_bytes_get_data(data, &n);
 	struct json_tokener *parser = json_tokener_new();
 
+	json_tokener_set_flags(parser, JSON_TOKENER_STRICT |
+					       JSON_TOKENER_VALIDATE_UTF8);
 	g_autoptr(J) meta = json_tokener_parse_ex(parser, bytes, (int)n);
-	gboolean valid = json_tokener_get_error(parser) == json_tokener_success;
+	gboolean valid = json_tokener_get_error(parser) ==
+				 json_tokener_success &&
+			 json_tokener_get_parse_end(parser) == n;
 
 	json_tokener_free(parser);
 	J *order = field(meta, "orders");
 
-	if (!valid || g_strcmp0(strfield(meta, "productId"), p->id) ||
+	if (!valid || g_strcmp0(catalog_string(meta, "productId"), p->id) ||
 	    !json_object_is_type(order, json_type_array) ||
 	    json_object_array_length(order) > 999)
 		return FALSE;
@@ -247,7 +264,7 @@ static gboolean load_manifest(struct emoji_pack *p)
 		if (seen[index])
 			continue;
 		seen[index] = TRUE;
-		const char *label = strfield(alt, id);
+		const char *label = catalog_string(alt, id);
 
 		if (!label || !*label || strlen(label) > 200 ||
 		    !g_utf8_validate(label, -1, NULL))

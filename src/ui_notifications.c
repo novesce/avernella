@@ -3,14 +3,18 @@
 #include "ui_lang.h"
 #include <gio/gio.h>
 
+#define NOTIFICATIONS "org.freedesktop.Notifications"
+#define NOTIFICATIONS_PATH "/org/freedesktop/Notifications"
+
 struct notice {
 	char *name, *body;
 	gboolean call;
 };
 
 static gint in_flight;
-/* 0 until the server answers GetCapabilities, then 1 plain or 2 markup. */
-static gint markup_known;
+/* Only the in-flight notification thread accesses this cache. */
+static char *markup_owner, *markup_bus;
+static gboolean markup;
 
 char *ui_notification_text(const char *text, gboolean markup)
 {
@@ -18,31 +22,32 @@ char *ui_notification_text(const char *text, gboolean markup)
 }
 
 /*
- * Servers that announce body-markup read <a href>, <img> and the like in
- * the body, which carries other people's names. Escape for those, and
- * when the question goes unanswered.
+ * Desktop services can change owners. Both calls go to the same unique
+ * name, and only that peer's capabilities apply to its notification.
  */
-static gboolean body_markup(GDBusConnection *bus)
+static gboolean body_markup(GDBusConnection *bus, const char *owner)
 {
-	gint known = g_atomic_int_get(&markup_known);
+	const char *guid = g_dbus_connection_get_guid(bus);
 
-	if (known)
-		return known == 2;
+	if (markup_owner && !g_strcmp0(guid, markup_bus) &&
+	    !strcmp(owner, markup_owner))
+		return markup;
 	g_autoptr(GVariant) reply = g_dbus_connection_call_sync(
-		bus, "org.freedesktop.Notifications",
-		"/org/freedesktop/Notifications",
-		"org.freedesktop.Notifications", "GetCapabilities", NULL,
-		G_VARIANT_TYPE("(as)"), G_DBUS_CALL_FLAGS_NO_AUTO_START, 1200,
-		NULL, NULL);
+		bus, owner, NOTIFICATIONS_PATH, NOTIFICATIONS,
+		"GetCapabilities", NULL, G_VARIANT_TYPE("(as)"),
+		G_DBUS_CALL_FLAGS_NO_AUTO_START, 1200, NULL, NULL);
 
 	if (!reply)
 		return TRUE;
 	g_autofree const char **caps = NULL;
 
 	g_variant_get(reply, "(^a&s)", &caps);
-	known = caps && g_strv_contains(caps, "body-markup") ? 2 : 1;
-	g_atomic_int_set(&markup_known, known);
-	return known == 2;
+	g_free(markup_bus);
+	markup_bus = g_strdup(guid);
+	g_free(markup_owner);
+	markup_owner = g_strdup(owner);
+	markup = caps && g_strv_contains(caps, "body-markup");
+	return markup;
 }
 
 static gpointer notify(gpointer data)
@@ -51,14 +56,28 @@ static gpointer notify(gpointer data)
 
 	g_autoptr(GDBusConnection) bus =
 		g_bus_get_sync(G_BUS_TYPE_SESSION, NULL, NULL);
+	if (bus)
+		g_dbus_connection_set_exit_on_close(bus, FALSE);
+	g_autoptr(GVariant) target =
+		bus ? g_dbus_connection_call_sync(
+			      bus, "org.freedesktop.DBus",
+			      "/org/freedesktop/DBus", "org.freedesktop.DBus",
+			      "GetNameOwner",
+			      g_variant_new("(s)", NOTIFICATIONS),
+			      G_VARIANT_TYPE("(s)"), G_DBUS_CALL_FLAGS_NONE,
+			      1200, NULL, NULL) :
+		      NULL;
 
-	if (bus) {
+	if (target) {
+		const char *owner;
 		const char *summary = notice->name;
+
+		g_variant_get(target, "(&s)", &owner);
 		g_autofree char *body = ui_notification_text(
 			notice->body ? notice->body :
 			notice->call ? _("Incoming LINE call") :
 				       _("New LINE message"),
-			body_markup(bus));
+			body_markup(bus, owner));
 		GVariantBuilder hints;
 
 		g_variant_builder_init(&hints, G_VARIANT_TYPE_VARDICT);
@@ -71,9 +90,7 @@ static gpointer notify(gpointer data)
 		g_variant_builder_add(&hints, "{sv}", "transient",
 				      g_variant_new_boolean(TRUE));
 		g_autoptr(GVariant) reply = g_dbus_connection_call_sync(
-			bus, "org.freedesktop.Notifications",
-			"/org/freedesktop/Notifications",
-			"org.freedesktop.Notifications", "Notify",
+			bus, owner, NOTIFICATIONS_PATH, NOTIFICATIONS, "Notify",
 			g_variant_new("(susss^asa{sv}i)", "Avernella", 0u,
 				      "avernella", summary, body,
 				      (const char *[]){ NULL }, &hints, -1),
