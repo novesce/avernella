@@ -3,6 +3,8 @@
 #include "ui_lang_table.h"
 
 static const char *const strings[][2] = {
+	{ "Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.",
+	  "下書きをコピーしてからログアウトし、QRコードで再連携してLetter Sealingを更新してください。" },
 	{ "Accent color", "アクセントカラー" },
 	{ "Pink", "ピンク" },
 	{ "Blue", "ブルー" },

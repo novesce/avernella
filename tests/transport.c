@@ -22,6 +22,7 @@ static gboolean reject_replay;
 static GPtrArray *sent_headers;
 /* When nonnegative, every reply is this TalkException code. */
 static int forced_code = -1;
+static const char *forced_method;
 
 CURLcode __wrap_curl_easy_setopt(CURL *easy, CURLoption option, ...)
 {
@@ -105,9 +106,13 @@ CURLcode __wrap_curl_easy_perform(CURL *easy)
 		json_object_object_add(value, "5:str",
 				       json_object_new_string("next-refresh"));
 	}
+	const char *method = refresh ? "refresh" : "getProfile";
+
+	if (forced_method)
+		method = forced_method;
 	g_autoptr(GError) error = NULL;
-	g_autoptr(GBytes) frame = line_encode_call(
-		refresh ? "refresh" : "getProfile", fields, &error);
+	g_autoptr(GBytes) frame = line_encode_call(method, fields, &error);
+
 	g_assert_no_error(error);
 	gsize size;
 	const guint8 *bytes = g_bytes_get_data(frame, &size);
@@ -220,6 +225,46 @@ static void refresh_failure_keeps_session(void)
 		g_free(s.access);
 		g_free(s.refresh);
 	}
+	line_transport_release();
+}
+
+static void rejected_sender_key(void)
+{
+	Line s = { .access = g_strdup("old"), .refresh = g_strdup("refresh") };
+
+	g_autoptr(GError) error = NULL;
+
+	requests = 0;
+	forced_code = 83;
+	forced_method = "sendMessage";
+	g_assert_null(line_rpc(&s, "/S4", forced_method, NULL, &error));
+	g_assert_error(error, LINE_ERROR, LINE_LETTER_SEALING_RELINK);
+	g_assert_nonnull(strstr(error->message, "pair again by QR"));
+	g_assert_cmpint(s.service_code, ==, 83);
+	g_assert_false(s.denied);
+	g_assert_cmpint(line_transport_retry_after(), ==, 0);
+	g_assert_cmpint(requests, ==, 1);
+	g_assert_cmpstr(s.access, ==, "old");
+	g_assert_cmpstr(s.refresh, ==, "refresh");
+
+	g_clear_error(&error);
+	forced_method = "getProfile";
+	g_assert_null(line_rpc(&s, "/S4", forced_method, NULL, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+
+	g_clear_error(&error);
+	forced_code = 0;
+	g_autoptr(J) profile = line_rpc(&s, "/S4", forced_method, NULL, &error);
+
+	g_assert_nonnull(profile);
+	g_assert_no_error(error);
+	g_assert_false(s.denied);
+	g_assert_cmpint(requests, ==, 3);
+
+	forced_method = NULL;
+	forced_code = -1;
+	g_free(s.access);
+	g_free(s.refresh);
 	line_transport_release();
 }
 
@@ -546,6 +591,7 @@ int main(int argc, char **argv)
 	g_test_init(&argc, &argv, NULL);
 	g_test_add_func("/transport/refresh-classification", refresh_errors);
 	g_test_add_func("/transport/scheduled-refresh", scheduled_refresh);
+	g_test_add_func("/transport/rejected-sender-key", rejected_sender_key);
 	g_test_add_func("/transport/refresh-failure-keeps-session",
 			refresh_failure_keeps_session);
 	g_test_add_func("/transport/renewal-schedule", renewal_schedule);

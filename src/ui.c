@@ -2398,6 +2398,10 @@ static void handle_packet(Json *packet)
 		if (saved) {
 			const char *error = ui_string(packet, "error", NULL);
 
+			if (error &&
+			    json_object_get_int(ui_field(packet, "code")) ==
+				    LINE_LETTER_SEALING_RELINK)
+				error = _(error);
 			g_hash_table_steal(wire.requests, GUINT_TO_POINTER(id));
 			if (saved->method == LOGIN && error)
 				note_sign_in_failure(packet);

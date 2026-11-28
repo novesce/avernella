@@ -512,6 +512,18 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 			return NULL;
 		}
 	}
+	/*
+	 * E2EE_UPDATE_SENDER_KEY. A companion gets its private keychain
+	 * during phone-approved sign-in. Refreshing the token or resending
+	 * the message with the rejected sender generation cannot supply it.
+	 */
+	if (s->service_code == 83 && !strcmp(path, "/S4") &&
+	    !strcmp(method, "sendMessage")) {
+		g_set_error_literal(
+			error, LINE_ERROR, LINE_LETTER_SEALING_RELINK,
+			"Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.");
+		return NULL;
+	}
 	if (first_error)
 		g_propagate_error(error, g_steal_pointer(&first_error));
 	return NULL;
