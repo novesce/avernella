@@ -213,6 +213,13 @@ enum {
 	LINE_LETTER_SEALING_RELINK = 12
 };
 
+static inline void line_letter_sealing_relink(GError **error)
+{
+	g_set_error_literal(
+		error, LINE_ERROR, LINE_LETTER_SEALING_RELINK,
+		"Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.");
+}
+
 /*
  * TalkException codes that mean LINE no longer accepts this desktop's
  * session. LINE for Android signs a linked device out on the first of

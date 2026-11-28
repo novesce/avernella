@@ -39,9 +39,9 @@ During sign-in ([QR](sign-in.md#qr-code-pairing) or [email](sign-in.md#email-and
 
 For email sign-in, the MAC is also returned as the 16-byte **proof** sent with `confirmE2EELogin`. All intermediate secrets are wiped with `OPENSSL_cleanse`.
 
-## When LINE rejects the sender key
+## When the sending key is missing or rejected
 
-When TalkService declines `sendMessage` with code 83 (`E2EE_UPDATE_SENDER_KEY`), copy your draft, sign out of Avernella, then sign in with the QR code and approve the link in LINE on your main phone. Pairing supplies the current Letter Sealing key chain. Until you sign out, Avernella keeps your session and the failed text stays in the composer. [LINE Help Center on verifying a secondary device](https://help.line.me/line/desktop/?contentId=50000087)
+If Avernella cannot find the key generation needed to send, or TalkService declines `sendMessage` with code 83 (`E2EE_UPDATE_SENDER_KEY`), copy your draft, sign out of Avernella, then sign in with the QR code and approve the link in LINE on your main phone. Pairing supplies the current Letter Sealing key chain. Until you sign out, Avernella keeps your session and the failed text stays in the composer. Reading each older message still requires the key generation it was encrypted with. [LINE Help Center on verifying a secondary device](https://help.line.me/line/desktop/?contentId=50000087)
 
 ## Getting other people's public keys
 

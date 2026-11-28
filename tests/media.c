@@ -493,6 +493,20 @@ static void attachment_case(gconstpointer value)
 		g_assert_cmpint(sent_count, ==, 1);
 		reject_sidecar = FALSE;
 	}
+	if (type == LINE_MEDIA_FILE) {
+		int tokens = token_count;
+
+		json_object_object_del(field(s.keys, "own"), "20");
+		g_assert_null(line_send_attachment(&s, to, path, type, &err));
+		g_assert_error(err, LINE_ERROR, LINE_LETTER_SEALING_RELINK);
+		g_clear_error(&err);
+		json_object_object_del(s.keys, "active");
+		g_assert_null(line_send_attachment(&s, to, path, type, &err));
+		g_assert_error(err, LINE_ERROR, LINE_LETTER_SEALING_RELINK);
+		g_assert_cmpint(sent_count, ==, 1);
+		g_assert_cmpint(upload_count, ==, 1);
+		g_assert_cmpint(token_count, ==, tokens);
+	}
 	g_assert_cmpint(g_unlink(path), ==, 0);
 	g_assert_cmpint(g_rmdir(dir), ==, 0);
 	g_clear_pointer(&s.history_secrets, g_array_unref);

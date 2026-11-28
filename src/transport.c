@@ -519,9 +519,7 @@ J *line_rpc(Line *s, const char *path, const char *method, J *args,
 	 */
 	if (s->service_code == 83 && !strcmp(path, "/S4") &&
 	    !strcmp(method, "sendMessage")) {
-		g_set_error_literal(
-			error, LINE_ERROR, LINE_LETTER_SEALING_RELINK,
-			"Copy your draft, then sign out and pair again by QR to refresh Letter Sealing.");
+		line_letter_sealing_relink(error);
 		return NULL;
 	}
 	if (first_error)

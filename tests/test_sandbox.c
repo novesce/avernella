@@ -971,7 +971,7 @@ static void test_vault_reconnect(void)
 			 .refresh_at = 1234,
 			 .keys = make_self_key_fixture(),
 			 .service_code = -1 };
-	guint8 pub[32];
+	guint8 pub[32], shared[32];
 
 	g_assert_no_error(error);
 	g_assert_nonnull(root);
@@ -1012,6 +1012,16 @@ static void test_vault_reconnect(void)
 	g_assert_true(avernella_vault_client_own_public(fd, 1, pub, &error));
 	g_assert_no_error(error);
 	g_assert_cmpmem(pub, sizeof(pub), test_self_pub, sizeof(test_self_pub));
+	g_assert_false(avernella_vault_client_own_public(fd, 2, pub, &error));
+	g_assert_error(error, LINE_ERROR, LINE_OWN_KEY_MISSING);
+	g_clear_error(&error);
+	g_assert_false(avernella_vault_client_ecdh(fd, 2, test_self_pub, shared,
+						   &error));
+	g_assert_error(error, LINE_ERROR, LINE_OWN_KEY_MISSING);
+	g_clear_error(&error);
+	g_assert_true(avernella_vault_client_ecdh(fd, 1, test_self_pub, shared,
+						  &error));
+	g_assert_no_error(error);
 	gint32 next = avernella_vault_client_reserve_seq(fd, &error);
 
 	g_assert_no_error(error);

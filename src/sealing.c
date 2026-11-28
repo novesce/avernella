@@ -708,8 +708,7 @@ J *line_seal_payload(Line *s, const char *chat, int type, J *payload,
 		return NULL;
 	}
 	if (!read_id(field(s->keys, "active"), &sender)) {
-		fail(error,
-		     "Link this device with Letter Sealing before sending.");
+		line_letter_sealing_relink(error);
 		return NULL;
 	}
 	guint8 salt[16], nonce[12], aad[82], key[32], tag[16];
@@ -726,11 +725,17 @@ J *line_seal_payload(Line *s, const char *chat, int type, J *payload,
 		fail(error, "Message is too large.");
 		return NULL;
 	}
+	g_autoptr(GError) key_error = NULL;
 	guint8 shared[32];
 
 	if (!message_shared_secret(s, chat, s->mid, sender, &receiver, TRUE,
-				   type, shared, error)) {
+				   type, shared, &key_error)) {
 		OPENSSL_cleanse(shared, sizeof(shared));
+		if (g_error_matches(key_error, LINE_ERROR,
+				    LINE_OWN_KEY_MISSING))
+			line_letter_sealing_relink(error);
+		else if (key_error)
+			g_propagate_error(error, g_steal_pointer(&key_error));
 		return NULL;
 	}
 	digest(shared, 32, salt, 16, "Key", key);

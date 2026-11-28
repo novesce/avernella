@@ -572,8 +572,13 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		}
 		if (!line_own_ecdh(&vault->session, key_id, peer_pub, shared,
 				   &error)) {
+			int status = -EACCES;
+
+			if (g_error_matches(error, LINE_ERROR,
+					    LINE_OWN_KEY_MISSING))
+				status = -ENOKEY;
 			g_free(peer_pub);
-			err = reply_error(client_fd, hdr.req_id, -EACCES,
+			err = reply_error(client_fd, hdr.req_id, status,
 					  error ? error->message :
 						  "Vault ECDH failed");
 			goto out;
@@ -595,8 +600,13 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		guint8 pub[32];
 
 		if (!line_own_public(&vault->session, key_id, pub, &error)) {
+			int status = -EACCES;
+
+			if (g_error_matches(error, LINE_ERROR,
+					    LINE_OWN_KEY_MISSING))
+				status = -ENOKEY;
 			err = reply_error(
-				client_fd, hdr.req_id, -EACCES,
+				client_fd, hdr.req_id, status,
 				error ? error->message :
 					"Vault own public key failed");
 			goto out;
@@ -720,7 +730,12 @@ static J *vault_rpc_fd(int vault_fd, enum avernella_ipc_op op, J *req,
 		goto out;
 	}
 	if (rx.op != IPC_OP_REPLY_OK) {
-		g_set_error(error, LINE_ERROR, 1, "%s",
+		int code = 1;
+
+		if (rx.op == IPC_OP_REPLY_ERR && rx.status == -ENOKEY &&
+		    (op == IPC_OP_VAULT_ECDH || op == IPC_OP_VAULT_OWN_PUBLIC))
+			code = LINE_OWN_KEY_MISSING;
+		g_set_error(error, LINE_ERROR, code, "%s",
 			    rx.payload_len ? rx_buf :
 					     "Vault rejected request.");
 		goto out;
