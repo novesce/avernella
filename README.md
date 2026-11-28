@@ -77,7 +77,7 @@ The [Windows and Mac feature comparison](analysis/desktop-features.md) tracks su
 
 ## In a conversation
 
-The sidebar shows LINE contact and group photos and unread counts. Open a conversation to see up to 50 recent messages. Its unread badge clears when the newest message is visible at the bottom of the focused chat. While you read an older page or keep the app in the tray, new arrivals keep their unread badge. Choose **Earlier messages** to page back or **Back to latest** to return.
+The sidebar shows LINE contact and group photos and unread counts. Drag the divider to change the sidebar width. Scrollbars appear when the chat list or message history has more content to scroll. Open a conversation to see up to 50 recent messages. Its unread badge clears when the newest message is visible at the bottom of the focused chat. While you read an older page or keep the app in the tray, new arrivals keep their unread badge. Choose **Earlier messages** to page back or **Back to latest** to return.
 
 Your outgoing messages show **Sent** once LINE accepts them and **Read** when LINE reports that someone else has read them. In a group, **Read** means at least one other member has read that message. If a receipt is unavailable, the message continues to show **Sent**.
 

@@ -44,6 +44,7 @@ static struct {
 } history_scroll;
 static struct {
 	SDL_Rect bands[4];
+	SDL_Rect gutter;
 	int count;
 } history_damage;
 
@@ -505,8 +506,77 @@ static int sidebar_w(void)
 enum {
 	HEADER_H = 48,
 	USER_PANEL_H = 52,
-	RAIL_ITEMS = 6
+	RAIL_ITEMS = 6,
+	SCROLLBAR_WIDTH = 10,
+	SCROLLBAR_INSET = 4,
+	SCROLLBAR_MIN_THUMB = 24,
+	LIST_SCROLLBAR_GUTTER = SCROLLBAR_WIDTH + 5,
+	HISTORY_SCROLLBAR_GUTTER = SCROLLBAR_WIDTH + 2
 };
+
+gboolean ui_scrollbar_geometry(enum ui_scrollbar_pane pane, Rect *track,
+			       Rect *thumb, int *maximum)
+{
+	Rect view;
+	int offset, gutter;
+
+	if (!ui.connected)
+		return FALSE;
+	switch (pane) {
+	case UI_SCROLLBAR_LIST:
+		if (!ui_list_visible() || !ui.visible ||
+		    (ui_compact() && ui_friends_active()))
+			return FALSE;
+		view = ui.list_box;
+		gutter = LIST_SCROLLBAR_GUTTER;
+		*maximum = ui_max_list_scroll();
+		offset = ui.list_offset;
+		break;
+	case UI_SCROLLBAR_HISTORY:
+		if (!ui_chat_visible() || !ui.selected || !ui.history ||
+		    ui_friends_active())
+			return FALSE;
+		view = ui.conversation;
+		gutter = HISTORY_SCROLLBAR_GUTTER;
+		*maximum = ui.max_history_offset;
+		offset = ui.history_offset;
+		break;
+	default:
+		return FALSE;
+	}
+	int height = view.h - 2 * SCROLLBAR_INSET;
+
+	if (*maximum <= 0 || height <= SCROLLBAR_MIN_THUMB || view.w <= gutter)
+		return FALSE;
+	*track = (Rect){ view.x + view.w - gutter, view.y + SCROLLBAR_INSET,
+			 SCROLLBAR_WIDTH, height };
+	int length =
+		CLAMP((gint64)height * view.h / ((gint64)view.h + *maximum),
+		      SCROLLBAR_MIN_THUMB, height - 1);
+	int range = height - length;
+
+	*thumb = *track;
+	thumb->h = length;
+	thumb->y +=
+		((gint64)CLAMP(offset, 0, *maximum) * range + *maximum / 2) /
+		*maximum;
+	return TRUE;
+}
+
+static void draw_scrollbar(enum ui_scrollbar_pane pane, Rect track, Rect thumb,
+			   guint bg)
+{
+	gboolean dragging = ui.scrollbar_drag == pane;
+	gboolean hot = dragging || hovered(track);
+	int width = hot ? 6 : 4;
+	guint ink = dragging ? UI_ACCENT :
+			       ui_blend(bg, UI_MUTED, hot ? .92 : .66);
+
+	box(track.x + (track.w - 2) / 2, track.y, 2, track.h, 1,
+	    blend(bg, UI_MUTED, .22));
+	box(thumb.x + (thumb.w - width) / 2, thumb.y, width, thumb.h, width / 2,
+	    ink);
+}
 
 /* Unread chats are pinned to the rail like Discord's direct-message pills. */
 static struct {
@@ -1985,8 +2055,13 @@ static void chats_panel(void)
 		sidebar_icon_button(ui.new_group, 0, _("New group"),
 				    ui.focus == F_GROUP_NEW);
 	sidebar_icon_button(ui.reload, 1, _("Refresh"), ui.focus == F_RELOAD);
-	Rect r = ui.list_box;
+	Rect r = ui.list_box, track, thumb;
+	int maximum;
+	gboolean scrolling = ui_scrollbar_geometry(UI_SCROLLBAR_LIST, &track,
+						   &thumb, &maximum);
 
+	if (scrolling)
+		r.w -= LIST_SCROLLBAR_GUTTER;
 	cairo_save(cr);
 	cairo_rectangle(cr, r.x, r.y, r.w, r.h);
 	cairo_clip(cr);
@@ -2008,9 +2083,8 @@ static void chats_panel(void)
 			ui.chats, g_array_index(ui.visible, guint, i));
 		const char *id = ui_string(c, "id", ""),
 			   *name = ui_string(c, "name", id);
-		Rect row = line_style ?
-				   (Rect){ rail, y, s - rail, row_h } :
-				   (Rect){ rail + 8, y + 1, s - rail - 16, 42 };
+		Rect row = line_style ? (Rect){ rail, y, r.w, row_h } :
+					(Rect){ rail + 8, y + 1, r.w - 16, 42 };
 		gboolean selected = ui_compact() && ui.focus == F_LIST ?
 					    (int)i == ui.list_cursor :
 					    !friends_open &&
@@ -2070,6 +2144,8 @@ static void chats_panel(void)
 			   16, unread > 0 ? 600 : 500, ink);
 	}
 	cairo_restore(cr);
+	if (scrolling)
+		draw_scrollbar(UI_SCROLLBAR_LIST, track, thumb, UI_SIDEBAR);
 	if (ui_compact() && ui.notice && *ui.notice)
 		text(ui.notice, 20, h - 127, s - 40, 13, 500, UI_MUTED, TRUE);
 	if (!line_nav())
@@ -2753,10 +2829,16 @@ static guint first_row_at(int pos)
 static struct message_layout *bubble_at(int x, int y)
 {
 	Rect area = ui.conversation;
+	Rect track, thumb;
+	int maximum;
 
 	if (!ui_chat_visible() || !ui.selected || !cache.rows ||
 	    cache.source != ui.history || x < area.x || x >= area.x + area.w ||
 	    y < area.y || y >= area.y + area.h)
+		return NULL;
+	if (x >= area.x + area.w - HISTORY_SCROLLBAR_GUTTER &&
+	    ui_scrollbar_geometry(UI_SCROLLBAR_HISTORY, &track, &thumb,
+				  &maximum))
 		return NULL;
 	int pos = y - area.y + ui.history_offset;
 
@@ -3989,6 +4071,16 @@ static void chat_view(void)
 		cairo_clip(cr);
 		message_rows(r);
 		cairo_restore(cr);
+		Rect track, thumb;
+		int maximum;
+
+		if (ui_scrollbar_geometry(UI_SCROLLBAR_HISTORY, &track, &thumb,
+					  &maximum)) {
+			guint bg = line_style ? UI_CHAT_BG : UI_BG;
+
+			box(track.x, r.y, HISTORY_SCROLLBAR_GUTTER, r.h, 0, bg);
+			draw_scrollbar(UI_SCROLLBAR_HISTORY, track, thumb, bg);
+		}
 		composer(s, w);
 		ui_mentions_draw();
 	}
@@ -4145,6 +4237,10 @@ static int history_uploads(struct ui_scroll_copy spans[8])
 					  history_scroll.origin,
 					  history_damage.bands[i],
 					  spans + count);
+	if (!SDL_RectEmpty(&history_damage.gutter))
+		spans[count++] =
+			(struct ui_scroll_copy){ history_damage.gutter,
+						 history_damage.gutter };
 	return count;
 }
 
@@ -4286,7 +4382,12 @@ static gboolean reusable_history(SDL_Surface *target, SDL_Rect *pixels)
 			return FALSE;
 	}
 	int sx = target->w / ui.width, sy = target->h / ui.height;
+	Rect track, thumb;
+	int maximum;
 
+	if (ui_scrollbar_geometry(UI_SCROLLBAR_HISTORY, &track, &thumb,
+				  &maximum))
+		r.w -= HISTORY_SCROLLBAR_GUTTER;
 	*pixels = (SDL_Rect){ r.x * sx, r.y * sy, r.w * sx, r.h * sy };
 	return TRUE;
 }
@@ -4341,10 +4442,11 @@ static void merge_history_bands(void)
 static gboolean advance_history(SDL_Surface *target, SDL_Rect pixels)
 {
 	SDL_Rect area;
+	int width = ui.conversation.w * (target->w / ui.width);
 
 	if (!history_scroll.reusable || !reusable_history(target, &area) ||
-	    !SDL_RectEquals(&pixels, &area) ||
-	    !SDL_RectEquals(&history_scroll.area, &area))
+	    pixels.x != area.x || pixels.y != area.y || pixels.h != area.h ||
+	    pixels.w != width || !SDL_RectEquals(&history_scroll.area, &area))
 		return FALSE;
 	int dy = (ui.history_offset - history_scroll.offset) *
 		 history_scroll.scale;
@@ -4367,6 +4469,9 @@ static gboolean advance_history(SDL_Surface *target, SDL_Rect pixels)
 	history_damage.bands[0] = exposed;
 	history_damage.bands[1] = edge;
 	history_damage.count = 2;
+	/* The scrollbar keeps fixed texture coordinates during row copies. */
+	history_damage.gutter = (SDL_Rect){ area.x + area.w, area.y,
+					    pixels.w - area.w, area.h };
 	int hover = ui_message_at(ui.hover_x, ui.hover_y);
 
 	if (hover != history_scroll.hover) {
@@ -4514,6 +4619,7 @@ static void draw_frame(const Rect *region)
 		}
 	}
 	history_damage.count = 0;
+	history_damage.gutter = (SDL_Rect){ 0 };
 	gboolean sparse = partial && gpu && advance_history(target, pixels);
 
 	if (!sparse) {
@@ -4532,14 +4638,19 @@ static void draw_frame(const Rect *region)
 	double sx = (double)target->w / ui.width,
 	       sy = (double)target->h / ui.height;
 	if (partial) {
-		if (sparse)
+		if (sparse) {
 			for (int i = 0; i < history_damage.count; i++) {
 				SDL_Rect band = history_damage.bands[i];
 
 				cairo_rectangle(cr, band.x, band.y, band.w,
 						band.h);
 			}
-		else
+			SDL_Rect gutter = history_damage.gutter;
+
+			if (!SDL_RectEmpty(&gutter))
+				cairo_rectangle(cr, gutter.x, gutter.y,
+						gutter.w, gutter.h);
+		} else
 			cairo_rectangle(cr, pixels.x, pixels.y, pixels.w,
 					pixels.h);
 		cairo_clip(cr);
@@ -4632,12 +4743,19 @@ static void draw_frame(const Rect *region)
 	if (ui.connected && !ui_compact() &&
 	    (!partial || (region->x <= sidebar_w() &&
 			  region->x + region->w >= sidebar_w()))) {
+		Rect split = ui.sidebar_split;
 		int x = sidebar_w();
-		gboolean drag = ui.sidebar_drag_width ||
-				abs(ui.hover_x - x) < 4;
+		gboolean hover = ui.hover_x >= split.x &&
+				 ui.hover_x < split.x + split.w &&
+				 ui.hover_y >= split.y &&
+				 ui.hover_y < split.y + split.h;
+		gboolean active = ui.sidebar_drag_width ||
+				  (hover && !ui_media_layer());
 
-		box(x - 1, 0, drag ? 2 : 1, ui.sidebar_split.h, 0,
-		    drag ? UI_ACCENT : UI_LINE);
+		box(x - (active ? 2 : 1), 0, active ? 2 : 1, split.h, 0,
+		    active ? UI_ACCENT : UI_LINE);
+		box(x - 4, (split.h - 24) / 2, 4, 24, 2,
+		    active ? UI_ACCENT : ui_blend(UI_LINE, UI_SUBTLE, .5));
 	}
 	cairo_restore(cr);
 	if (ui.connected)
@@ -4705,6 +4823,7 @@ finish_canvas:
 		history_scroll.reusable = TRUE;
 	}
 	history_damage.count = 0;
+	history_damage.gutter = (SDL_Rect){ 0 };
 	if (presented && painted_chat && !layer && scrim <= 0. && p == 0.)
 		ui_media_screenshot_presented();
 	if (painted_chat && presented)

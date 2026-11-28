@@ -434,7 +434,7 @@ build/test-ui-worker-stop: tests/ui_worker_stop.c build/ui_gpu.o build/tune.o
 build/test-monitor-picker: private LDFLAGS += -Wl,--wrap=SDL_WaitEvent
 build/test-monitor-picker: tests/monitor_picker.c build/monitor_picker.o build/ui_monitor_picker.o build/ui_theme.o $(UI_LANG_OBJECTS)
 build/test-screencast-cinnamon: tests/screencast_cinnamon.c build/screencast_cinnamon.o
-build/test-ui-scroll-scene: tests/ui_scroll_scene.c
+build/test-ui-scroll-scene: tests/ui_scroll_scene.c build/tune.o
 build/test-ui-scroll-scene: private LDFLAGS += -Wl,--wrap=g_get_monotonic_time
 build/render-bench: tests/render_bench.c build/ui_gpu.o
 UI_FIXTURE_TARGETS = build/render-bench build/test-ui-call-fullscreen build/test-ui-scroll-scene build/test-ui-refresh

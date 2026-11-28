@@ -17,6 +17,8 @@ A chat is identified by a MID (see [Overview](overview.md#words-you-will-meet-ev
 
 ## The chat list
 
+Drag the divider between the chat list and conversation to resize the sidebar. Its width is saved for the next launch. Drag either scrollbar to move through the current chat list or the messages already loaded. Use **Earlier messages** to load older pages.
+
 `line_chats()` builds the list from **message boxes**, LINE's per-chat delivery state, not from the full chat objects.
 
 **Request.** `getMessageBoxes` on `/S4`, with `{2: {1: cursor, 3: true (activeOnly), 4: 100 (count), 5: true (withUnreadCount), 6: 0, 7: false}, 3: 7}`. The cursor is omitted on the first page and is the last box's chat ID afterwards. If the reply's field 2 ("has more") is true it fetches the next page. A cursor that repeats is an error ("LINE did not advance the chat list").

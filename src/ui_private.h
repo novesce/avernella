@@ -15,6 +15,12 @@ typedef struct {
 	int x, y, w, h;
 } Rect;
 
+enum ui_scrollbar_pane {
+	UI_SCROLLBAR_NONE,
+	UI_SCROLLBAR_LIST,
+	UI_SCROLLBAR_HISTORY
+};
+
 typedef enum {
 	F_LOGIN,
 	F_LOGIN_MODE,
@@ -49,6 +55,7 @@ typedef struct {
 	/* Animated height of the call stage above the messages. */
 	int stage_h;
 	int sidebar_drag_width;
+	enum ui_scrollbar_pane scrollbar_drag;
 	gboolean dirty, active, connected, authenticating, logging_out,
 		getting_chats, quitting;
 	gboolean video_dirty;
@@ -272,7 +279,11 @@ static inline gboolean ui_is_chat_event(Json *row)
 gboolean ui_draw_init(void);
 void ui_draw(void);
 void ui_draw_region(Rect logical);
+int ui_max_list_scroll(void);
+gboolean ui_scrollbar_geometry(enum ui_scrollbar_pane pane, Rect *track,
+			       Rect *thumb, int *maximum);
 void ui_draw_animation(void);
+void ui_event(SDL_Event *event);
 void ui_draw_pointer(const SDL_Event *event);
 void ui_draw_video(void);
 void ui_draw_reset_renderer(void);

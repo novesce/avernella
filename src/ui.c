@@ -65,6 +65,10 @@ struct ui_request {
 Interface ui;
 static UiFrameClock frame_clock;
 static UiScroll list_scroll, history_scroll;
+static gboolean list_pointer_scroll, history_pointer_scroll;
+static int scrollbar_grab, scrollbar_y;
+
+static void scrollbar_stop(void);
 
 struct draft_mention {
 	int start, end;
@@ -333,10 +337,11 @@ static gboolean same_draft(const char *chat, const char *text, Json *sent)
 	return equal;
 }
 
-static int max_list_scroll(void)
+int ui_max_list_scroll(void)
 {
-	return MAX(0,
-		   (int)ui.visible->len * ui_chat_row_height() - ui.list_box.h);
+	return CLAMP((gint64)ui.visible->len * ui_chat_row_height() -
+			     ui.list_box.h,
+		     0, G_MAXINT);
 }
 
 void ui_language_changed(void)
@@ -353,9 +358,9 @@ void ui_theme_changed(int old_row_height)
 	ui_forget_history();
 	ui_forget_rail();
 	ui_layout();
-	ui.list_offset = MIN(max_list_scroll(), (gint64)ui.list_offset *
-							ui_chat_row_height() /
-							old_row_height);
+	ui.list_offset = MIN(ui_max_list_scroll(),
+			     (gint64)ui.list_offset * ui_chat_row_height() /
+				     old_row_height);
 	ui_scroll_reset(&list_scroll, ui.list_offset);
 	ui_scroll_reset(&history_scroll, ui.history_offset);
 	ui.dirty = TRUE;
@@ -406,8 +411,8 @@ static void scroll_history(double distance)
 
 static void sample_scroll(gint64 now)
 {
-	ui_scroll_sample(&list_scroll, &ui.list_offset, max_list_scroll(), now,
-			 ui_reduce_motion());
+	ui_scroll_sample(&list_scroll, &ui.list_offset, ui_max_list_scroll(),
+			 now, ui_reduce_motion());
 	if (ui.stick_bottom) {
 		ui_scroll_reset(&history_scroll, ui.history_offset);
 		return;
@@ -448,7 +453,8 @@ static int frame_wait(gint64 now, gboolean visual_animation)
 	if (emoji && emoji <= now)
 		ui.dirty = TRUE;
 	gboolean requested = ui.dirty || ui.video_dirty || visual_animation ||
-			     history_scroll.end_us || list_scroll.end_us;
+			     history_scroll.end_us || list_scroll.end_us ||
+			     list_pointer_scroll || history_pointer_scroll;
 	int wait = ui_frame_wait_ms(&frame_clock, now, requested);
 	int screenshot = ui_media_screenshot_wait(now);
 
@@ -1422,6 +1428,7 @@ static void clear_password(void)
 
 static void reset_login(const char *message)
 {
+	scrollbar_stop();
 	ui_liff_close();
 	if (ui.connected)
 		g_clear_pointer(&pending_link, g_free);
@@ -1915,7 +1922,7 @@ static void finish_message_jump(guint request_id, gboolean success)
 void ui_refilter_chats(void)
 {
 	ui_lists_rebuild();
-	ui.list_offset = CLAMP(ui.list_offset, 0, max_list_scroll());
+	ui.list_offset = CLAMP(ui.list_offset, 0, ui_max_list_scroll());
 	ui.dirty = TRUE;
 }
 
@@ -1941,10 +1948,11 @@ static void highlight(int pos)
 	ui.list_cursor = pos;
 	if (top < view)
 		scroll_to(&list_scroll, &ui.list_offset, top,
-			  max_list_scroll());
+			  ui_max_list_scroll());
 	else if (top + row_height > view + ui.list_box.h)
 		scroll_to(&list_scroll, &ui.list_offset,
-			  top + row_height - ui.list_box.h, max_list_scroll());
+			  top + row_height - ui.list_box.h,
+			  ui_max_list_scroll());
 	ui.dirty = TRUE;
 }
 
@@ -3201,6 +3209,117 @@ static void click(int x, int y)
 	ui.dirty = TRUE;
 }
 
+static enum ui_scrollbar_pane scrollbar_at(int x, int y, Rect *track,
+					   Rect *thumb, int *maximum)
+{
+	for (enum ui_scrollbar_pane pane = UI_SCROLLBAR_LIST;
+	     pane <= UI_SCROLLBAR_HISTORY; pane++)
+		if (ui_scrollbar_geometry(pane, track, thumb, maximum) &&
+		    inside(*track, x, y))
+			return pane;
+	return UI_SCROLLBAR_NONE;
+}
+
+static void scrollbar_to(Rect track, Rect thumb, int maximum, int y)
+{
+	int travel = track.h - thumb.h;
+	int grab = MIN(scrollbar_grab, thumb.h - 1);
+	int at = CLAMP((gint64)y - track.y - grab, 0, travel);
+	int offset = (int)(((gint64)at * maximum + travel / 2) / travel);
+
+	if (ui.scrollbar_drag == UI_SCROLLBAR_LIST) {
+		list_pointer_scroll |= ui.list_offset != offset;
+		ui.list_offset = offset;
+		ui_scroll_reset(&list_scroll, offset);
+	} else {
+		history_pointer_scroll |= ui.history_offset != offset;
+		ui.history_offset = offset;
+		ui_scroll_reset(&history_scroll, offset);
+		ui.stick_bottom = offset == maximum;
+	}
+}
+
+static void scrollbar_stop(void)
+{
+	if (!ui.scrollbar_drag)
+		return;
+	ui.scrollbar_drag = UI_SCROLLBAR_NONE;
+	SDL_CaptureMouse(SDL_FALSE);
+	ui.dirty = TRUE;
+}
+
+/* A captured thumb owns mouse events even outside its original pane. */
+static gboolean scrollbar_pointer(const SDL_Event *e)
+{
+	Rect track, thumb;
+	int maximum;
+
+	if (ui.scrollbar_drag) {
+		gboolean motion = e->type == SDL_MOUSEMOTION;
+		gboolean release = e->type == SDL_MOUSEBUTTONUP &&
+				   e->button.button == SDL_BUTTON_LEFT;
+		gboolean lost =
+			e->type == SDL_WINDOWEVENT &&
+			e->window.windowID == SDL_GetWindowID(ui.window) &&
+			(e->window.event == SDL_WINDOWEVENT_FOCUS_LOST ||
+			 e->window.event == SDL_WINDOWEVENT_HIDDEN ||
+			 e->window.event == SDL_WINDOWEVENT_MINIMIZED);
+
+		if (lost || (motion && !(e->motion.state & SDL_BUTTON_LMASK))) {
+			scrollbar_stop();
+			return FALSE;
+		}
+		if (motion || release) {
+			ui.hover_x = motion ? e->motion.x : e->button.x;
+			ui.hover_y = motion ? e->motion.y : e->button.y;
+			if (!ui_scrollbar_geometry(ui.scrollbar_drag, &track,
+						   &thumb, &maximum)) {
+				scrollbar_stop();
+				return TRUE;
+			}
+			if (ui.hover_y != scrollbar_y) {
+				scrollbar_to(track, thumb, maximum, ui.hover_y);
+				scrollbar_y = ui.hover_y;
+			}
+			if (release)
+				scrollbar_stop();
+			return TRUE;
+		}
+		return e->type == SDL_MOUSEBUTTONDOWN ||
+		       e->type == SDL_MOUSEBUTTONUP ||
+		       e->type == SDL_MOUSEWHEEL;
+	}
+	if (e->type != SDL_MOUSEBUTTONDOWN || !ui.connected)
+		return FALSE;
+	int x = e->button.x, y = e->button.y;
+	enum ui_scrollbar_pane pane =
+		scrollbar_at(x, y, &track, &thumb, &maximum);
+
+	if (!pane)
+		return FALSE;
+	/* The gutter belongs to the scrollbar, including right-clicks. */
+	if (e->button.button != SDL_BUTTON_LEFT)
+		return TRUE;
+	ui.scrollbar_drag = pane;
+	ui.hover_x = x;
+	ui.hover_y = scrollbar_y = y;
+	if (pane == UI_SCROLLBAR_LIST)
+		ui_scroll_reset(&list_scroll, ui.list_offset);
+	else {
+		ui_scroll_reset(&history_scroll, ui.history_offset);
+		ui.stick_bottom = ui.history_offset == maximum;
+	}
+	if (inside(thumb, x, y))
+		scrollbar_grab = y - thumb.y;
+	else {
+		scrollbar_grab = thumb.h / 2;
+		scrollbar_to(track, thumb, maximum, y);
+	}
+	SDL_CaptureMouse(SDL_TRUE);
+	ui.dirty = TRUE;
+	return TRUE;
+}
+
 /* Inputs with a visual hover state. Movement within one target never repaints. */
 static int hover_target(int x, int y)
 {
@@ -3216,6 +3335,13 @@ static int hover_target(int x, int y)
 
 	if (panel)
 		return panel;
+	Rect track, thumb;
+	int maximum;
+	enum ui_scrollbar_pane pane =
+		scrollbar_at(x, y, &track, &thumb, &maximum);
+
+	if (pane)
+		return -2010 - pane;
 	if (ui_chat_visible() && ui.selected && ui.find_messages &&
 	    inside(ui.find_button, x, y))
 		return -9;
@@ -3299,8 +3425,9 @@ static gboolean sidebar_pointer(const SDL_Event *e)
 				if (width != ui.sidebar_drag_width) {
 					ui.sidebar_drag_width = width;
 					ui_layout();
-					ui.list_offset = MIN(ui.list_offset,
-							     max_list_scroll());
+					ui.list_offset =
+						MIN(ui.list_offset,
+						    ui_max_list_scroll());
 					ui_scroll_reset(&list_scroll,
 							ui.list_offset);
 					ui_scroll_reset(&history_scroll,
@@ -3360,7 +3487,7 @@ static gboolean sidebar_pointer(const SDL_Event *e)
 	return TRUE;
 }
 
-static void event(SDL_Event *e)
+void ui_event(SDL_Event *e)
 {
 	if (activate_event && e->type == activate_event) {
 		g_autofree char *url = e->user.data1;
@@ -3454,6 +3581,11 @@ static void event(SDL_Event *e)
 		}
 		return;
 	}
+	if (ui.scrollbar_drag && scrollbar_pointer(e))
+		return;
+	if (!ui.sidebar_drag_width && e->type == SDL_MOUSEBUTTONDOWN &&
+	    !ui_media_layer() && !ui_friends_active() && scrollbar_pointer(e))
+		return;
 	if (e->type == SDL_MOUSEBUTTONDOWN || e->type == SDL_MOUSEBUTTONUP ||
 	    e->type == SDL_WINDOWEVENT)
 		ui_draw_pointer(e);
@@ -3568,7 +3700,7 @@ static void event(SDL_Event *e)
 
 		if (ui_list_visible() && inside(ui.list_box, x, y)) {
 			scroll_by(&list_scroll, &ui.list_offset, distance,
-				  max_list_scroll());
+				  ui_max_list_scroll());
 		} else if (ui_chat_visible() && inside(ui.conversation, x, y)) {
 			scroll_history(distance);
 		}
@@ -3740,10 +3872,14 @@ int line_ui(int argc, char **argv)
 			int old_list = ui.list_offset,
 			    old_history = ui.history_offset;
 			sample_scroll(now);
-			gboolean list_changed = old_list != ui.list_offset,
-				 history_changed = old_history !=
-						   ui.history_offset;
+			gboolean list_changed = list_pointer_scroll ||
+						old_list != ui.list_offset;
+			gboolean history_changed = history_pointer_scroll ||
+						   old_history !=
+							   ui.history_offset;
 			gboolean scrolled = list_changed || history_changed;
+
+			list_pointer_scroll = history_pointer_scroll = FALSE;
 			gboolean full = ui.dirty ||
 					(visual_animation &&
 					 (scrolled || ui.video_dirty)) ||
@@ -3781,7 +3917,7 @@ int line_ui(int argc, char **argv)
 			 * event draining so continuous pointer input cannot starve paint.
 			 */
 			for (int budget = 64;;) {
-				event(&e);
+				ui_event(&e);
 				if (ui.quitting || --budget == 0 ||
 				    !SDL_PollEvent(&e))
 					break;

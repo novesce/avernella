@@ -2,6 +2,7 @@
 #include "camera.h"
 #include "media_io.h"
 #include "screenshot.h"
+#include "state.h"
 #include "ui_private.h"
 #include "ui_gpu.h"
 #include "ui_chat_lists.h"
@@ -29,6 +30,11 @@ static struct gpu_rect dirty;
 G_MODULE_EXPORT gint64 __wrap_g_get_monotonic_time(void)
 {
 	return scene_time;
+}
+
+gboolean line_store_has_session(void)
+{
+	return FALSE;
 }
 
 char *line_desktop_screenshot(const char *parent, GCancellable *cancel,
@@ -1098,6 +1104,103 @@ static void check_announcement_banner(void)
 	json_object_object_del(target, "id");
 }
 
+static void mouse(Uint32 type, int x, int y)
+{
+	SDL_Event event = { .type = type };
+	Uint32 window = SDL_GetWindowID(ui.window);
+
+	if (type == SDL_MOUSEMOTION) {
+		event.motion.windowID = window;
+		event.motion.state = SDL_BUTTON_LMASK;
+		event.motion.x = x;
+		event.motion.y = y;
+	} else {
+		event.button.windowID = window;
+		event.button.button = SDL_BUTTON_LEFT;
+		event.button.x = x;
+		event.button.y = y;
+	}
+	ui_event(&event);
+}
+
+static void check_sidebar_resize(void)
+{
+	int x = ui_content_x(), y = ui.sidebar_split.h / 2;
+	int width = ui.list_box.w;
+
+	mouse(SDL_MOUSEBUTTONDOWN, x, y);
+	mouse(SDL_MOUSEMOTION, x + 32, y);
+	g_assert_cmpint(ui.list_box.w, ==, width + 32);
+	g_assert_cmpint(ui.conversation.x, ==, ui_content_x());
+	mouse(SDL_MOUSEBUTTONUP, x + 32, y);
+	g_assert_cmpint(ui.sidebar_drag_width, ==, 0);
+	ui_theme_init();
+	ui_layout();
+	g_assert_cmpint(ui.list_box.w, ==, width + 32);
+
+	g_autofree char *path = g_build_filename(
+		g_get_user_config_dir(), "avernella", "sidebar-width", NULL);
+
+	g_assert_cmpint(unlink(path), ==, 0);
+	ui_theme_init();
+	ui_layout();
+	g_assert_cmpint(ui.list_box.w, ==, width);
+}
+
+static void check_scrollbar(enum ui_scrollbar_pane pane, int *offset)
+{
+	Rect track, thumb;
+	int maximum;
+
+	g_assert_true(ui_scrollbar_geometry(pane, &track, &thumb, &maximum));
+	g_assert_cmpint(thumb.y, ==, track.y);
+	int x = thumb.x + thumb.w / 2;
+	int y = thumb.y + thumb.h / 2;
+
+	mouse(SDL_MOUSEBUTTONDOWN, x, y);
+	g_assert_cmpint(ui.scrollbar_drag, ==, pane);
+	mouse(SDL_MOUSEMOTION, x, track.y + track.h);
+	mouse(SDL_MOUSEBUTTONUP, x, track.y + track.h);
+	g_assert_cmpint(*offset, ==, maximum);
+	g_assert_cmpint(ui.scrollbar_drag, ==, UI_SCROLLBAR_NONE);
+	g_assert_true(ui_scrollbar_geometry(pane, &track, &thumb, &maximum));
+	g_assert_cmpint(thumb.y + thumb.h, ==, track.y + track.h);
+
+	/* Clicking the empty track scrolls without selecting a chat row. */
+	mouse(SDL_MOUSEBUTTONDOWN, x, track.y);
+	mouse(SDL_MOUSEBUTTONUP, x, track.y);
+	g_assert_cmpint(*offset, ==, 0);
+	g_assert_cmpstr(ui.selected, ==, "contact");
+}
+
+static void check_scrollbars(void)
+{
+	Rect track, thumb;
+	int maximum;
+
+	g_assert_false(ui_scrollbar_geometry(UI_SCROLLBAR_LIST, &track, &thumb,
+					     &maximum));
+	for (int i = 0; i < 25; i++) {
+		Json *row = json_object_new_object();
+		g_autofree char *id = g_strdup_printf("fixture-%d", i);
+
+		json_object_object_add(row, "id", json_object_new_string(id));
+		json_object_object_add(row, "name",
+				       json_object_new_string("Fixture chat"));
+		json_object_array_add(ui.chats, row);
+		g_array_append_val(ui.visible, i);
+	}
+
+	ui.history_offset = 0;
+	ui.stick_bottom = FALSE;
+	ui_draw();
+	check_scrollbar(UI_SCROLLBAR_LIST, &ui.list_offset);
+	check_scrollbar(UI_SCROLLBAR_HISTORY, &ui.history_offset);
+	g_array_set_size(ui.visible, 0);
+	json_object_array_del_idx(ui.chats, 0, 25);
+	ui_forget_rail();
+}
+
 static void history(void)
 {
 	g_autoptr(GError) error = NULL;
@@ -1122,16 +1225,7 @@ static void history(void)
 	ui.message.value = g_string_new("");
 	ui.search.value = g_string_new("");
 	ui_layout();
-	int original_sidebar = ui.list_box.w;
-
-	ui.sidebar_drag_width = original_sidebar + 32;
-	ui_layout();
-	g_assert_cmpint(ui.list_box.w, ==, original_sidebar + 32);
-	g_assert_cmpint(ui.conversation.x, ==, ui_content_x());
-	g_assert_cmpint(ui.sidebar_split.x + 4, ==, ui_content_x());
-	ui.sidebar_drag_width = 0;
-	ui_layout();
-	g_assert_cmpint(ui.list_box.w, ==, original_sidebar);
+	check_sidebar_resize();
 	check_multiline_composer();
 	check_screenshot_after_close();
 	for (int i = 0; i < 55; i++) {
@@ -1153,6 +1247,7 @@ static void history(void)
 		json_object_array_add(ui.history, row);
 	}
 	check_announcement_banner();
+	check_scrollbars();
 	/* Check both layouts, ending on LINE for the bubble checks. */
 	check_scroll_positions();
 	for (int i = 0; i < 2; i++) {
