@@ -99,7 +99,9 @@ Incoming text supports Letter Sealing v1 and v2. A message encrypted to a key ge
 
 ## Experimental group calls
 
-Open a group chat and click the handset or camera to start or join a call. The call stage shows the participant roster and lets you keep browsing chats. In a video call, select a participant to focus their camera. Group calls are enabled by default. Set `LINE_EXPERIMENTAL_GROUP_VIDEO=0` to hide the group camera button or `LINE_EXPERIMENTAL_GROUP_CALLS=0` to disable group calls. Group video uses LINE’s EVS3 VP8 format. Live group tests with the official Android app confirmed voice in both directions and Android camera video on Linux. Display of the Linux camera on Android is still unconfirmed. A local relay fixture also exercises camera transmission and switching between two remote cameras.
+Open a group chat and click the handset or camera to start or join a call. The call stage shows the participant roster and lets you keep browsing chats. In a video call, select a participant to focus their camera. Group calls are enabled by default. Set `LINE_EXPERIMENTAL_GROUP_VIDEO=0` to hide the group camera button or `LINE_EXPERIMENTAL_GROUP_CALLS=0` to disable group calls. Group video uses LINE’s EVS3 VP8 format.
+
+Live group calls with the official LINE Android app confirmed voice and camera video in both directions. A local relay fixture also exercises camera transmission and switching between two remote cameras. [Group call test results](docs/en/calls.md#group-calls)
 
 ## Experimental video calls
 
