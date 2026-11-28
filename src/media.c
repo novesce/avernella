@@ -598,6 +598,20 @@ static GBytes *download_sealed_object(Line *s, J *message, gboolean preview,
 			    "The message has an invalid attachment key.");
 		return NULL;
 	}
+	J *meta = field(message, "18");
+	guint64 size = preview ? 0 : line_message_file_size(meta);
+
+	if (!preview && json_object_object_get_ex(meta, "FILE_SIZE", NULL) &&
+	    (!size || size > LINE_MEDIA_LIMIT)) {
+		media_error(error, "Invalid encrypted attachment size.");
+		return NULL;
+	}
+	enum line_media_object object = LINE_MEDIA_BODY;
+
+	if (preview)
+		object = LINE_MEDIA_VIDEO_POSTER;
+	else if (json_object_get_int(field(message, "15")) == LINE_MEDIA_VIDEO)
+		object = LINE_MEDIA_VIDEO_BODY;
 	gsize len;
 
 	g_autofree guint8 *key = g_base64_decode(encoded, &len);
@@ -610,14 +624,14 @@ static GBytes *download_sealed_object(Line *s, J *message, gboolean preview,
 		media_error(error,
 			    "The message has an invalid attachment key.");
 	else {
-		J *meta = field(message, "18");
 		GBytes *bytes = download_object(s, strfield(meta, "SID"),
 						strfield(meta, "OID"),
 						strfield(message, "4"), preview,
 						error);
 
 		if (bytes)
-			result = line_media_decrypt(bytes, key, error);
+			result = line_media_decrypt(bytes, key, object, size,
+						    error);
 	}
 	OPENSSL_cleanse(key, len);
 	return g_steal_pointer(&result);

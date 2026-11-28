@@ -17,6 +17,8 @@
  *     coalesce into fewer wakeups.
  */
 #include "liff_url.h"
+#include "security/liff_filter.h"
+#include "security/sandbox.h"
 #ifdef LINE_LIFF_GTK
 #include <webkit/webkit.h>
 #else
@@ -30,6 +32,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -52,7 +55,11 @@ static struct {
 	GHashTable *dialogs; /* dialog ID -> WebKitScriptDialog */
 	guint next_dialog;
 	int fd;
+	const char *account; /* SHA-256 profile name, or NULL */
 	gboolean liff, debug;
+	char *origin; /* Authorized endpoint for the current LIFF view. */
+	guint launch;
+	WebKitUserScript *fragment;
 	guint crashes, retry; /* memory kills of this page, pending reload */
 } b = { .fd = LINE_LIFF_FD };
 
@@ -85,14 +92,13 @@ static void send_packet(char kind, const char *a, const char *c)
 		;
 }
 
-/* The page's address without the tokens LINE put in its fragment. */
-static char *shareable_uri(void)
+/* A token-bearing LIFF fragment must never accompany a native handoff. */
+static void send_link(char kind, const char *uri)
 {
-	const char *uri = webkit_web_view_get_uri(b.view);
+	g_autofree char *clean = b.liff ? g_strndup(uri, strcspn(uri, "#")) :
+					  NULL;
 
-	if (!uri)
-		return NULL;
-	return b.liff ? g_strndup(uri, strcspn(uri, "#")) : g_strdup(uri);
+	send_packet(kind, clean ? clean : uri, NULL);
 }
 
 /* A cgroup of our own: systemd moves this process, WebKit's join it. */
@@ -168,6 +174,47 @@ static void tune_process(pid_t parent)
 	join_scope();
 }
 
+static gboolean control_peer(pid_t parent)
+{
+	struct ucred peer;
+	socklen_t size = sizeof(peer);
+	int type, domain;
+	socklen_t int_size = sizeof(int);
+
+	return !getsockopt(b.fd, SOL_SOCKET, SO_TYPE, &type, &int_size) &&
+	       type == SOCK_SEQPACKET &&
+	       !getsockopt(b.fd, SOL_SOCKET, SO_DOMAIN, &domain, &int_size) &&
+	       domain == AF_UNIX &&
+	       !getsockopt(b.fd, SOL_SOCKET, SO_PEERCRED, &peer, &size) &&
+	       size == sizeof(peer) && peer.pid == parent &&
+	       peer.uid == geteuid();
+}
+
+/* Set restrictions before GLib or WebKit create any threads or children. */
+static int confine_browser(void)
+{
+	const struct rlimit no_core = { 0, 0 };
+	const struct avernella_sandbox_opts opts = { .role = SANDBOX_ROLE_LIFF };
+	uint32_t active = 0;
+	int err;
+
+	if (prctl(PR_SET_DUMPABLE, 0, 0, 0, 0) < 0 ||
+	    setrlimit(RLIMIT_CORE, &no_core) < 0 ||
+	    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0)
+		return -errno;
+	err = line_liff_filter_apply();
+	if (err < 0)
+		return err;
+
+	err = avernella_landlock_apply(&opts, &active);
+	if (!g_strcmp0(g_getenv("LINE_DEBUG_SANDBOX"), "1"))
+		g_printerr(
+			"line-sandbox liff no-dump=1 no-new-privs=1 seccomp=1 landlock-net=%d landlock-signal=%d status=%d\n",
+			!!(active & AVSB_ACTIVE_LANDLOCK_NET),
+			!!(active & AVSB_ACTIVE_LANDLOCK_SCOPE), err);
+	return err;
+}
+
 static void resize(const char *size)
 {
 	int height = !strcmp(size, "compact") ? 480 :
@@ -188,20 +235,35 @@ static void resize(const char *size)
 #endif
 }
 
-static void open_page(gboolean liff, const char *size, const char *url)
+static void open_page(gboolean liff, const char *size, const char *url);
+
+/* Compare origins using the same URL parser as the WebView. */
+static char *http_origin(const char *uri, char **pattern)
 {
-	/* LINE_DEBUG_LIFF=1 also loads local test pages from 127.0.0.1. */
-	if (g_ascii_strncasecmp(url, "https://", 8) &&
-	    !(b.debug && line_liff_debug_url(url)))
-		return;
-	/* A page the client opens gets its own crash retry. */
-	g_clear_handle_id(&b.retry, g_source_remove);
-	b.crashes = 0;
-	b.liff = liff;
-	webkit_settings_set_user_agent(b.settings, liff ? LINE_LIFF_USER_AGENT :
-							  LINE_WEB_USER_AGENT);
-	resize(size);
-	webkit_web_view_load_uri(b.view, url);
+	if (!uri || (g_ascii_strncasecmp(uri, "https://", 8) &&
+		     !(b.debug && line_liff_debug_url(uri))))
+		return NULL;
+	g_autoptr(WebKitSecurityOrigin) origin =
+		webkit_security_origin_new_for_uri(uri);
+
+	const char *host = origin ? webkit_security_origin_get_host(origin) :
+				    NULL;
+
+	if (!host || !*host || strchr(host, '*'))
+		return NULL;
+	/* WebKit's host patterns omit the port; the script checks it too. */
+	if (pattern)
+		*pattern = g_strdup_printf(
+			"%s://%s/*",
+			webkit_security_origin_get_protocol(origin), host);
+	return webkit_security_origin_to_string(origin);
+}
+
+static gboolean app_origin(const char *uri)
+{
+	g_autofree char *origin = http_origin(uri, NULL);
+
+	return b.origin && !g_strcmp0(origin, b.origin);
 }
 
 static void answer_dialog(const char *id, const char *answer)
@@ -257,31 +319,56 @@ static gboolean on_packet(int fd, GIOCondition condition, gpointer data)
 	return G_SOURCE_CONTINUE;
 }
 
+static gboolean ignore_outside_app(WebKitPolicyDecision *decision)
+{
+	if (b.debug)
+		g_printerr("avernella-liff: outside origin blocked\n");
+	webkit_policy_decision_ignore(decision);
+	return TRUE;
+}
+
 static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 			  WebKitPolicyDecisionType type, gpointer data)
 {
 	(void)data;
-	if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE)
+	if (type == WEBKIT_POLICY_DECISION_TYPE_RESPONSE) {
+		WebKitResponsePolicyDecision *response =
+			WEBKIT_RESPONSE_POLICY_DECISION(decision);
+
+		/* Check the final document, including after HTTP redirects. */
+		if (b.liff &&
+		    webkit_response_policy_decision_is_main_frame_main_resource(
+			    response) &&
+		    !app_origin(webkit_uri_response_get_uri(
+			    webkit_response_policy_decision_get_response(
+				    response))))
+			return ignore_outside_app(decision);
 		return FALSE;
+	}
 	WebKitNavigationAction *action =
 		webkit_navigation_policy_decision_get_navigation_action(
 			WEBKIT_NAVIGATION_POLICY_DECISION(decision));
 	const char *uri = webkit_uri_request_get_uri(
 		webkit_navigation_action_get_request(action));
-	gboolean gesture = webkit_navigation_action_is_user_gesture(action);
+	gboolean gesture = webkit_navigation_action_is_user_gesture(action) &&
+			   !webkit_navigation_action_is_redirect(action);
 
 	if (!uri)
 		return FALSE;
 	/* The LIFF SDK closes its window with liff://close. */
 	if (!g_ascii_strncasecmp(uri, "liff://", 7)) {
-		if (b.liff && !g_ascii_strncasecmp(uri, "liff://close", 12))
+		if (b.liff && gesture &&
+		    !g_ascii_strcasecmp(uri, "liff://close"))
 			quit();
 		webkit_policy_decision_ignore(decision);
 		return TRUE;
 	}
 	/* Another LIFF app needs its own view from LINE: ask the client. */
 	if (line_liff_url(uri, NULL, NULL) || line_liff_line_scheme(uri)) {
-		send_packet('O', uri, NULL);
+		if (gesture &&
+		    webkit_navigation_action_get_navigation_type(action) ==
+			    WEBKIT_NAVIGATION_TYPE_LINK_CLICKED)
+			send_link('O', uri);
 		webkit_policy_decision_ignore(decision);
 		return TRUE;
 	}
@@ -290,6 +377,12 @@ static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 	 * the network can rewrite what runs beside the user's LINE identity.
 	 */
 	if (line_liff_web_url(uri, b.debug)) {
+		if (b.liff && !app_origin(uri)) {
+			/* A clicked outside link can leave without its fragment. */
+			if (gesture && !g_ascii_strncasecmp(uri, "https://", 8))
+				send_link('X', uri);
+			return ignore_outside_app(decision);
+		}
 		if (type != WEBKIT_POLICY_DECISION_TYPE_NEW_WINDOW_ACTION)
 			return FALSE;
 		/* One window, like LINE's: new windows replace the page. */
@@ -302,7 +395,7 @@ static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 	 * click only.
 	 */
 	if (gesture)
-		send_packet('X', uri, NULL);
+		send_link('X', uri);
 	webkit_policy_decision_ignore(decision);
 	return TRUE;
 }
@@ -398,10 +491,10 @@ static void on_key(WebKitUserContentManager *manager, JSCValue *value,
 	} else if (!g_strcmp0(key, "forward")) {
 		webkit_web_view_go_forward(b.view);
 	} else if (!g_strcmp0(key, "external")) {
-		g_autofree char *uri = shareable_uri();
+		const char *uri = webkit_web_view_get_uri(b.view);
 
 		if (uri && !g_ascii_strncasecmp(uri, "http", 4))
-			send_packet('X', uri, NULL);
+			send_link('X', uri);
 	} else if (!g_strcmp0(key, "zoom-in") || !g_strcmp0(key, "zoom-out") ||
 		   !g_strcmp0(key, "zoom-reset")) {
 		double zoom = webkit_web_view_get_zoom_level(b.view);
@@ -442,24 +535,36 @@ static const char *const shortcuts[] = {
  * client features through window._liff.postMessage(action, featureToken,
  * callbackId, json) and waits for a "liffEvent" with the answer.
  */
-static const char *const bridge[] = {
-	"(() => {",
-	" if (window._liff) return;",
-	" const native = webkit.messageHandlers.liff;",
-	" const post = (action, token, callback, json) => native.postMessage(",
-	"  [String(action), String(callback || ''), String(json || '')]);",
-	" Object.defineProperty(window, '_liff', { value: Object.freeze({",
-	"  features: Object.freeze([]), postMessage: post }) });",
-	"})();",
-	NULL,
-};
+static const char bridge[] =
+	"if (window._liff) return;"
+	"const post = (action, token, callback, json) => window.postMessage(\n"
+	"{avernellaLiff: [String(action), String(callback || ''), String(json || '')]},\n"
+	"location.origin);"
+	"Object.defineProperty(window, '_liff', { value: Object.freeze({"
+	"features: Object.freeze([]), postMessage: post }) });";
+
+/* Only the top document's own window can address this isolated world. */
+static const char relay[] =
+	"addEventListener('message', e => {"
+	"const m = e.data?.avernellaLiff;"
+	"if (!e.isTrusted || e.source !== window || e.origin !== origin ||\n"
+	"!Array.isArray(m) || m.length !== 3 ||\n"
+	"!m.every(v => typeof v === 'string')) return;"
+	"webkit.messageHandlers.liff.postMessage([launch, ...m]); });";
 
 /* LIFF addresses contain tokens. Log only WebKit's load state. */
 static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event,
 			    gpointer data)
 {
-	(void)view;
 	(void)data;
+	if (event == WEBKIT_LOAD_COMMITTED && b.fragment) {
+		webkit_user_content_manager_remove_script(
+			webkit_web_view_get_user_content_manager(view),
+			b.fragment);
+		g_clear_pointer(&b.fragment, webkit_user_script_unref);
+	}
+	if (!b.debug)
+		return;
 	switch (event) {
 	case WEBKIT_LOAD_STARTED:
 		g_printerr("avernella-liff: load started\n");
@@ -520,8 +625,8 @@ static gboolean bridge_open(JSCValue *value, const char *json)
 
 	if (!url || g_ascii_strncasecmp(url, "https://", 8))
 		return FALSE;
-	if (external && jsc_value_to_boolean(external))
-		send_packet('X', url, NULL);
+	if ((external && jsc_value_to_boolean(external)) || !app_origin(url))
+		send_link('X', url);
 	else
 		webkit_web_view_load_uri(b.view, url);
 	return TRUE;
@@ -534,12 +639,18 @@ static void on_bridge(WebKitUserContentManager *manager, JSCValue *value,
 	(void)data;
 	if (!b.liff || !jsc_value_is_array(value))
 		return;
-	g_autoptr(JSCValue) a =
+	g_autoptr(JSCValue) launch =
 		jsc_value_object_get_property_at_index(value, 0);
-	g_autoptr(JSCValue) c =
+
+	if (!jsc_value_is_number(launch) ||
+	    jsc_value_to_double(launch) != b.launch)
+		return;
+	g_autoptr(JSCValue) a =
 		jsc_value_object_get_property_at_index(value, 1);
-	g_autoptr(JSCValue) j =
+	g_autoptr(JSCValue) c =
 		jsc_value_object_get_property_at_index(value, 2);
+	g_autoptr(JSCValue) j =
+		jsc_value_object_get_property_at_index(value, 3);
 	g_autofree char *action = jsc_value_to_string(a);
 	g_autofree char *callback = jsc_value_to_string(c);
 	g_autofree char *json = jsc_value_to_string(j);
@@ -561,29 +672,97 @@ static void on_bridge(WebKitUserContentManager *manager, JSCValue *value,
 	bridge_reply(action, callback, done);
 }
 
-static void add_script(WebKitUserContentManager *content,
-		       const char *const *lines, const char *world)
+static WebKitUserScript *add_script(WebKitUserContentManager *content,
+				    const char *source, const char *world,
+				    const char *pattern)
 {
-	g_autofree char *source = g_strjoinv("\n", (char **)lines);
+	const char *const allow[] = { pattern, NULL };
+	WebKitUserScript *script;
 
-	g_autoptr(WebKitUserScript) script =
-		world ? webkit_user_script_new_for_world(
-				source, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-				WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-				world, NULL, NULL) :
-			webkit_user_script_new(
-				source, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-				WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-				NULL, NULL);
+	if (world)
+		script = webkit_user_script_new_for_world(
+			source, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+			WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, world,
+			pattern ? allow : NULL, NULL);
+	else
+		script = webkit_user_script_new(
+			source, WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+			WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+			pattern ? allow : NULL, NULL);
 
 	webkit_user_content_manager_add_script(content, script);
+	return script;
+}
+
+static void open_page(gboolean liff, const char *size, const char *url)
+{
+	g_autofree char *pattern = NULL;
+	g_autofree char *origin = http_origin(url, liff ? &pattern : NULL);
+	WebKitUserContentManager *content =
+		webkit_web_view_get_user_content_manager(b.view);
+
+	if (!origin)
+		return;
+	g_clear_handle_id(&b.retry, g_source_remove);
+	b.crashes = 0;
+	b.liff = liff;
+	b.launch++;
+	g_clear_pointer(&b.origin, g_free);
+	webkit_user_content_manager_remove_all_scripts(content);
+	g_clear_pointer(&b.fragment, webkit_user_script_unref);
+	g_autofree char *keys = g_strjoinv("\n", (char **)shortcuts);
+
+	webkit_user_script_unref(add_script(content, keys, WORLD, NULL));
+	g_autofree char *address = NULL;
+
+	if (liff) {
+		b.origin = g_steal_pointer(&origin);
+		g_autofree char *escaped =
+			g_uri_escape_string(b.origin, NULL, FALSE);
+		g_autofree char *guard = g_strdup_printf(
+			"(() => { const origin = decodeURIComponent('%s');"
+			"if (self.origin !== origin || location.origin !== origin) return;",
+			escaped);
+		g_autofree char *sdk =
+			g_strconcat(guard, bridge, "})();", NULL);
+		g_autofree char *native =
+			g_strdup_printf("%s const launch = %u; %s })();", guard,
+					b.launch, relay);
+		const char *hash = strchr(url, '#');
+
+		/*
+		 * Send WebKit a fragment-free request. Only the authorized
+		 * document receives the SDK fragment, before page scripts run.
+		 */
+		if (hash) {
+			g_autofree char *value =
+				g_uri_escape_string(hash, NULL, FALSE);
+			g_autofree char *seed = g_strdup_printf(
+				"%s if (!location.hash) history.replaceState(history.state,\n"
+				"'', location.href.split('#')[0] + decodeURIComponent('%s'));"
+				"})();",
+				guard, value);
+
+			b.fragment = add_script(content, seed, WORLD, pattern);
+			address = g_strndup(url, hash - url);
+		}
+		webkit_user_script_unref(
+			add_script(content, native, WORLD, pattern));
+		webkit_user_script_unref(
+			add_script(content, sdk, NULL, pattern));
+	}
+	webkit_settings_set_user_agent(b.settings, liff ? LINE_LIFF_USER_AGENT :
+							  LINE_WEB_USER_AGENT);
+	resize(size);
+	webkit_web_view_load_uri(b.view, address ? address : url);
 }
 
 static WebKitNetworkSession *network_session(void)
 {
-	/* Cookies and cache, carried over from kitatide or line-linux. */
-	g_autofree char *data = line_liff_storage_dir(g_get_user_data_dir());
-	g_autofree char *cache = line_liff_storage_dir(g_get_user_cache_dir());
+	g_autofree char *data =
+		line_liff_storage_dir(g_get_user_data_dir(), b.account);
+	g_autofree char *cache =
+		line_liff_storage_dir(g_get_user_cache_dir(), b.account);
 	WebKitMemoryPressureSettings *memory =
 		webkit_memory_pressure_settings_new();
 
@@ -593,7 +772,7 @@ static WebKitNetworkSession *network_session(void)
 	webkit_memory_pressure_settings_free(memory);
 	if (!data || !cache) {
 		/* Never store cookies where someone else could read them. */
-		g_printerr("avernella-liff: unsafe storage, nothing kept\n");
+		g_printerr("avernella-liff: using an ephemeral profile\n");
 		return webkit_network_session_new_ephemeral();
 	}
 	return webkit_network_session_new(data, cache);
@@ -622,13 +801,11 @@ static WebKitWebView *create_view(void)
 			 G_CALLBACK(on_key), NULL);
 	webkit_user_content_manager_register_script_message_handler(
 		content, "keys", WORLD);
-	add_script(content, shortcuts, WORLD);
-	/* The bridge lives in the page's world, where the LIFF SDK runs. */
+	/* The native endpoint is never visible in the page script world. */
 	g_signal_connect(content, "script-message-received::liff",
 			 G_CALLBACK(on_bridge), NULL);
 	webkit_user_content_manager_register_script_message_handler(
-		content, "liff", NULL);
-	add_script(content, bridge, NULL);
+		content, "liff", WORLD);
 	b.settings = webkit_settings_new_with_settings(
 		"user-agent", LINE_LIFF_USER_AGENT, "enable-developer-extras",
 		FALSE, "enable-page-cache", FALSE,
@@ -643,9 +820,8 @@ static WebKitWebView *create_view(void)
 #endif
 			     "user-content-manager", content, NULL);
 
-	if (b.debug)
-		g_signal_connect(view, "load-changed",
-				 G_CALLBACK(on_load_changed), NULL);
+	g_signal_connect(view, "load-changed", G_CALLBACK(on_load_changed),
+			 NULL);
 	g_signal_connect(view, "decide-policy", G_CALLBACK(on_decide), NULL);
 	g_signal_connect(view, "script-dialog", G_CALLBACK(on_dialog), NULL);
 	g_signal_connect(view, "permission-request", G_CALLBACK(on_permission),
@@ -659,18 +835,30 @@ static WebKitWebView *create_view(void)
 
 int main(int argc, char **argv)
 {
-	if (argc != 2 || fcntl(LINE_LIFF_FD, F_GETFD) < 0) {
+	if (argc != 2 && argc != 3) {
 		g_printerr("avernella-liff is started by avernella.\n");
 		return 2;
 	}
 	char *end;
+
+	errno = 0;
 	long parent = strtol(argv[1], &end, 10);
 
-	if (*end || parent <= 1)
+	if (errno || *end || parent <= 1 || (pid_t)parent != parent ||
+	    getppid() != parent || !control_peer((pid_t)parent))
 		return 2;
+	if (fcntl(b.fd, F_SETFD, FD_CLOEXEC) < 0)
+		return 1;
+	int err = confine_browser();
+
+	if (err < 0) {
+		g_printerr("avernella-liff: Linux isolation failed (%s).\n",
+			   g_strerror(-err));
+		return 1;
+	}
+	b.account = argc == 3 ? argv[2] : NULL;
 	tune_process((pid_t)parent);
 	b.debug = !g_strcmp0(g_getenv("LINE_DEBUG_LIFF"), "1");
-	fcntl(LINE_LIFF_FD, F_SETFD, FD_CLOEXEC);
 #ifdef LINE_LIFF_GTK
 	if (!gtk_init_check()) {
 		g_printerr(

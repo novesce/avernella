@@ -14,6 +14,7 @@
  *      supervisor crash respawn)
  */
 #include "security/ipc.h"
+#include "security/liff_filter.h"
 #include "security/sandbox.h"
 #include "security/vault.h"
 #include "state.h"
@@ -33,6 +34,7 @@
 #include <sys/eventfd.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -195,6 +197,80 @@ static void test_probe(void)
 		caps.has_mdwe, caps.has_seccomp);
 	g_assert_cmpint(caps.landlock_abi, >=, 1);
 	g_assert_true(caps.has_seccomp);
+}
+
+/* Check the browser filter separately from any WebKit runtime policies. */
+static void test_liff_seccomp(void)
+{
+	pid_t child = fork();
+	int status;
+
+	g_assert_cmpint(child, >=, 0);
+	if (!child) {
+		int pair[2];
+
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) ||
+		    line_liff_filter_apply() < 0)
+			_exit(1);
+		if (syscall(SYS_process_vm_readv, getpid(), NULL, 0UL, NULL,
+			    0UL, 0UL) != -1 ||
+		    errno != EPERM)
+			_exit(2);
+		if (syscall(SYS_io_uring_setup, 0, NULL) != -1 ||
+		    errno != ENOSYS)
+			_exit(3);
+		if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, pair))
+			_exit(4);
+		_exit(0);
+	}
+	g_assert_cmpint(waitpid(child, &status, 0), ==, child);
+	g_assert_true(WIFEXITED(status));
+	g_assert_cmpint(WEXITSTATUS(status), ==, 0);
+}
+
+static void test_liff_landlock(void)
+{
+	const struct avernella_sandbox_opts opts = { .role = SANDBOX_ROLE_LIFF };
+	struct avernella_sandbox_caps caps;
+	uint16_t port;
+	int status;
+
+	avernella_sandbox_probe(&caps);
+	if (caps.landlock_abi < 4) {
+		g_test_skip("Landlock ABI 4 is required");
+		return;
+	}
+	int listener = start_loopback_listener(&port);
+	pid_t child = fork();
+
+	g_assert_cmpint(child, >=, 0);
+	if (!child) {
+		uint32_t active = 0;
+		struct sockaddr_in local = {
+			.sin_family = AF_INET,
+			.sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+		};
+
+		close(listener);
+		if (prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) < 0 ||
+		    avernella_landlock_apply(&opts, &active) < 0 ||
+		    !(active & AVSB_ACTIVE_LANDLOCK_NET))
+			_exit(1);
+		int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+
+		if (fd < 0 ||
+		    bind(fd, (struct sockaddr *)&local, sizeof(local)) != -1 ||
+		    errno != EACCES)
+			_exit(2);
+		local.sin_port = htons(port);
+		if (connect(fd, (struct sockaddr *)&local, sizeof(local)) < 0)
+			_exit(3);
+		_exit(0);
+	}
+	g_assert_cmpint(waitpid(child, &status, 0), ==, child);
+	close(listener);
+	g_assert_true(WIFEXITED(status));
+	g_assert_cmpint(WEXITSTATUS(status), ==, 0);
 }
 
 static void test_net_worker_landlock_and_fd_hygiene(void)
@@ -394,18 +470,20 @@ static int attack_io_uring(int ctrl_fd, uint32_t active, void *userdata)
 	return 2;
 }
 
-static void assert_killed_by_sigsys(avernella_worker_fn attack)
+static void assert_killed_by_sigsys(avernella_worker_fn attack,
+				    enum avernella_sandbox_role role,
+				    void *userdata)
 {
 	struct avernella_sandbox_opts opts;
 	struct avernella_worker_proc proc;
 	int status = 0;
 
 	memset(&opts, 0, sizeof(opts));
-	opts.role = SANDBOX_ROLE_NET;
+	opts.role = role;
 	opts.keep_stderr = true;
 
-	g_assert_cmpint(avernella_spawn_worker(&opts, attack, NULL, &proc), ==,
-			0);
+	g_assert_cmpint(avernella_spawn_worker(&opts, attack, userdata, &proc),
+			==, 0);
 	g_assert_cmpint(waitpid(proc.pid, &status, 0), ==, proc.pid);
 	proc.pid = -1;
 	avernella_worker_close(&proc);
@@ -415,11 +493,48 @@ static void assert_killed_by_sigsys(avernella_worker_fn attack)
 
 static void test_seccomp_kills_attacks(void)
 {
-	assert_killed_by_sigsys(attack_rwx_mmap);
-	assert_killed_by_sigsys(attack_mprotect_exec);
-	assert_killed_by_sigsys(attack_execve_sh);
-	assert_killed_by_sigsys(attack_fork_raw);
-	assert_killed_by_sigsys(attack_io_uring);
+	assert_killed_by_sigsys(attack_rwx_mmap, SANDBOX_ROLE_NET, NULL);
+	assert_killed_by_sigsys(attack_mprotect_exec, SANDBOX_ROLE_NET, NULL);
+	assert_killed_by_sigsys(attack_execve_sh, SANDBOX_ROLE_NET, NULL);
+	assert_killed_by_sigsys(attack_fork_raw, SANDBOX_ROLE_NET, NULL);
+	assert_killed_by_sigsys(attack_io_uring, SANDBOX_ROLE_NET, NULL);
+}
+
+enum {
+	VAULT_PROBE_SOCKET,
+	VAULT_PROBE_SOCKETPAIR,
+	VAULT_PROBE_CONNECT,
+};
+
+static int vault_socket_probe(int ctrl_fd, uint32_t active, void *userdata)
+{
+	struct sockaddr addr = { .sa_family = AF_UNSPEC };
+	int pair[2];
+
+	(void)active;
+	switch (GPOINTER_TO_INT(userdata)) {
+	case VAULT_PROBE_SOCKET:
+		(void)socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+		break;
+	case VAULT_PROBE_SOCKETPAIR:
+		(void)socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0,
+				 pair);
+		break;
+	case VAULT_PROBE_CONNECT:
+		(void)connect(ctrl_fd, &addr, sizeof(addr));
+		break;
+	}
+	return 1;
+}
+
+static void test_vault_seccomp_no_new_peers(void)
+{
+	assert_killed_by_sigsys(vault_socket_probe, SANDBOX_ROLE_VAULT,
+				GINT_TO_POINTER(VAULT_PROBE_SOCKET));
+	assert_killed_by_sigsys(vault_socket_probe, SANDBOX_ROLE_VAULT,
+				GINT_TO_POINTER(VAULT_PROBE_SOCKETPAIR));
+	assert_killed_by_sigsys(vault_socket_probe, SANDBOX_ROLE_VAULT,
+				GINT_TO_POINTER(VAULT_PROBE_CONNECT));
 }
 
 static int media_worker_check(int ctrl_fd, uint32_t active, void *userdata)
@@ -1086,6 +1201,8 @@ int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, G_TEST_OPTION_ISOLATE_DIRS, NULL);
 	g_test_add_func("/security/probe", test_probe);
+	g_test_add_func("/security/liff-seccomp", test_liff_seccomp);
+	g_test_add_func("/security/liff-landlock", test_liff_landlock);
 	g_test_add_func("/security/net-worker-landlock-and-fd-hygiene",
 			test_net_worker_landlock_and_fd_hygiene);
 	g_test_add_func("/security/net-worker-empty-root-and-netns",
@@ -1100,6 +1217,8 @@ int main(int argc, char **argv)
 			test_ui_landlock_fresh_state_dir);
 	g_test_add_func("/security/vault-memfd-secret-and-ipc",
 			test_vault_memfd_secret_and_ipc);
+	g_test_add_func("/security/vault-seccomp-no-new-peers",
+			test_vault_seccomp_no_new_peers);
 	g_test_add_func("/security/vault-spawned-child-ecdh",
 			test_vault_spawned_child_ecdh);
 	g_test_add_func("/security/vault-reconnect", test_vault_reconnect);

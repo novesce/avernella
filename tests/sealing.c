@@ -238,6 +238,14 @@ static void test_incoming_compatibility(void)
 	no_key_id = FALSE;
 	g_assert_no_error(error);
 	g_assert_cmpstr(plain, ==, "Legacy message สวัสดี");
+
+	/* Media decoders require a content type authenticated by v2. */
+	json_object_object_add(legacy, "15", json_object_new_int(2));
+	g_assert_null(line_open_payload(&s, legacy, 2, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	json_object_object_add(legacy, "15", json_object_new_int(0));
+
 	json_object_array_put_idx(chunks, 2, raw64("AAAAAAAAAAAAAAAAAAAAAA=="));
 	g_assert_null(line_open_text(&s, legacy, &error));
 	g_assert_error(error, LINE_ERROR, 1);

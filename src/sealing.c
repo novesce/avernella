@@ -788,10 +788,12 @@ J *line_open_payload(Line *s, J *message, int type, GError **error)
 	const char *from = strfield(message, "1"), *to = strfield(message, "2");
 	gint32 version;
 
+	/* Only v2 authenticates the content type used by media decoders. */
 	if (!valid_mid(from, "u") || !valid_mid(to, "ucr") ||
 	    !valid_mid(s->mid, "u") ||
 	    (to[0] == 'u' && strcmp(from, s->mid) && strcmp(to, s->mid)) ||
 	    !message_version(message, &version) ||
+	    (version == 1 && type != 0) ||
 	    json_object_get_int(field(message, "15")) != type) {
 		fail(error,
 		     "This encrypted message requires an unsupported chat type or Letter Sealing version.");

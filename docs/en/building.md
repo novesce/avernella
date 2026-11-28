@@ -236,7 +236,7 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 - **A LINE app never finishes loading.** Run with `LINE_DEBUG_LIFF=1` and open it again. Check whether the load reached `committed` and `finished`, and whether the bridge reported an unsupported operation.
 - **A call has no video.** Run with `LINE_CALL_DEBUG=1`.
 - **Stepping through code.** Build with `make clean && make DEBUG=1`. The window is the `avernella` process. The worker is a child process named `avernella --worker`; attach to it separately with `gdb -p $(pgrep -f 'avernella --worker')`. Because the worker exits when its parent dies (`PR_SET_PDEATHSIG`), killing the window also ends the worker.
-- **Testing `avernella-liff` alone.** Start it with a `SOCK_SEQPACKET` socket on file descriptor 3 and the parent PID as its only argument, then send it `L\tfull\t<url>` datagrams. With `LINE_DEBUG_LIFF=1` it also loads pages from `http://127.0.0.1:<port>/`, so a local page that loads the real LIFF SDK can exercise the bridge.
+- **Testing `avernella-liff` alone.** Start it with a `SOCK_SEQPACKET` socket on file descriptor 3 and pass the parent PID as its first argument. Omitting the optional account digest selects an ephemeral profile. Send it `L\tfull\t<url>` datagrams. With `LINE_DEBUG_LIFF=1` it also loads pages from `http://127.0.0.1:<port>/`, so a local page that loads the real LIFF SDK can exercise the bridge.
 - **The session seems broken.** Sign out from the app. If you can't, close the app and remove `~/.local/state/avernella/session.json`. Then remove the linked device in LINE on your phone.
 
 ## Where your data is
@@ -246,6 +246,6 @@ None are needed for normal use. They exist for debugging, tuning and testing.
 | `$XDG_STATE_HOME/avernella/` (default `~/.local/state/avernella/`) | `session.json` (tokens, MID, Letter Sealing keys, request sequence) and `lists-<sha256 of your MID>.json` (folders, the selected folder view, pins, mutes, shortcuts, the notification and sound switches, reduced motion) |
 | `$XDG_CONFIG_HOME/avernella/` (default `~/.config/avernella/`) | `layout` (the theme choice) and the interface-language choice |
 | `$XDG_RUNTIME_DIR/avernella/` | Pictures pasted for sending, deleted after use |
-| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | The in-app browser's HTTP cache and cookies |
+| `~/.cache/avernella/liff-profiles/<account-hash>`, `~/.local/share/avernella/liff-profiles/<account-hash>` | The in-app browser's HTTP cache and cookies |
 
 The details of each file are in [Architecture](architecture.md#files-on-disk).

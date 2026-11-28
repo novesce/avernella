@@ -127,6 +127,41 @@ static void invalid_fields(void)
 	}
 }
 
+static void map_keys(void)
+{
+	/* String key with a list value; integer key with a string value. */
+	static const guint8 maps[] = { 0x1b, 1, 0x89, 1, 'a', 0x14, 2,
+				       0x1b, 1, 0x58, 5, 1,   'b',  0 };
+	static const guint8 list_key[] = { 0x1b, 1, 0x94, 0x14, 2, 4, 0 };
+	static const guint8 nul_key[] = { 0x1b, 1, 0x84, 2, 'a', 0, 2, 0 };
+	static const guint8 duplicate[] = { 0x1b, 2, 0x44, 2, 4, 2, 6, 0 };
+	/* Binary reply with a map whose single key is an empty struct. */
+	static const guint8 binary[] = { 0x80, 1, 0, 2, 0,  0, 0, 1,  'm',
+					 0,    0, 0, 0, 13, 0, 0, 12, 3,
+					 0,    0, 0, 1, 0,  7, 0 };
+	g_autoptr(GError) error = NULL;
+	g_autoptr(J) decoded = line_decode_struct(maps, sizeof(maps), &error);
+	int code = -1;
+
+	g_assert_no_error(error);
+	g_assert_cmpint(json_object_get_int(json_object_array_get_idx(
+				field(field(decoded, "1"), "a"), 0)),
+			==, 1);
+	g_assert_cmpstr(strfield(field(decoded, "2"), "-3"), ==, "b");
+	g_assert_null(line_decode_struct(list_key, sizeof(list_key), &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_null(line_decode_struct(nul_key, sizeof(nul_key), &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_null(line_decode_struct(duplicate, sizeof(duplicate), &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+	g_assert_null(
+		line_decode_auth("m", binary, sizeof(binary), &code, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+}
+
 int main(int argc, char **argv)
 {
 	g_test_init(&argc, &argv, NULL);
@@ -134,5 +169,6 @@ int main(int argc, char **argv)
 	g_test_add_func("/thrift/reply", replies);
 	g_test_add_func("/thrift/auth", auth);
 	g_test_add_func("/thrift/invalid-fields", invalid_fields);
+	g_test_add_func("/thrift/map-keys", map_keys);
 	return g_test_run();
 }

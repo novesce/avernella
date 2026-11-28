@@ -126,6 +126,54 @@ static void test_builds_launch_url(void)
 	"{\"1\":{\"1\":\"" LIFF_ID "\",\"2\":" context ",\"3\":" \
 	"\"ja_JP\"}}"
 
+static J *open_view(Line *s, const char *url, const char *chat, GError **error)
+{
+	g_autoptr(GHashTable) chats = g_hash_table_new(g_str_hash, g_str_equal);
+	g_autoptr(J) params = obj();
+
+	g_hash_table_add(chats, (gpointer)CHAT);
+	json_object_object_add(params, "url", json_object_new_string(url));
+	if (chat)
+		json_object_object_add(params, "chat",
+				       json_object_new_string(chat));
+	return line_liff_view(s, chats, params, error);
+}
+
+/* Unknown, former and malformed contexts are rejected before the RPC. */
+static void test_chat_authorization(void)
+{
+	g_autoptr(GHashTable) chats = g_hash_table_new(g_str_hash, g_str_equal);
+	g_autoptr(J) params = obj();
+	Line s = { 0 };
+	J *contexts[] = {
+		json_object_new_string(CHAT),
+		json_object_new_string(""),
+		json_object_new_int(1),
+		NULL,
+		json_object_new_string_len(CHAT "\0x", sizeof(CHAT) + 1),
+	};
+
+	json_object_object_add(params, "url",
+			       json_object_new_string("line://app/" LIFF_ID));
+	use(NULL, 0);
+	for (gsize i = 0; i < G_N_ELEMENTS(contexts); i++) {
+		g_autoptr(GError) error = NULL;
+
+		if (i)
+			g_hash_table_add(chats, (gpointer)CHAT);
+		json_object_object_add(params, "chat", contexts[i]);
+		g_assert_null(line_liff_view(&s, chats, params, &error));
+		g_assert_error(error, LINE_ERROR, 1);
+	}
+	g_hash_table_remove(chats, CHAT);
+	json_object_object_add(params, "chat", json_object_new_string(CHAT));
+	g_autoptr(GError) error = NULL;
+
+	g_assert_null(line_liff_view(&s, chats, params, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_assert_cmpuint(calls, ==, 0);
+}
+
 static void test_issues_view(void)
 {
 	static const struct rpc_step steps[] = {
@@ -141,7 +189,7 @@ static void test_issues_view(void)
 	Line s = { 0 };
 
 	use(steps, G_N_ELEMENTS(steps));
-	g_autoptr(J) view = line_liff_view(
+	g_autoptr(J) view = open_view(
 		&s, "https://liff.line.me/" LIFF_ID "/coupon", CHAT, &error);
 
 	g_assert_no_error(error);
@@ -174,131 +222,116 @@ static void test_opens_consent_page(void)
 	use(steps, G_N_ELEMENTS(steps));
 	g_autoptr(GError) error = NULL;
 	g_autoptr(J) consent =
-		line_liff_view(&s, "line://app/" LIFF_ID, NULL, &error);
+		open_view(&s, "line://app/" LIFF_ID, NULL, &error);
 
 	g_assert_no_error(error);
+	g_assert_true(json_object_get_boolean(field(consent, "web")));
 	g_assert_cmpstr(strfield(consent, "url"), ==,
 			"https://access.line.me/oauth2/v2.1/consent?x=1");
 	g_autoptr(J) unsafe =
-		line_liff_view(&s, "line://app/" LIFF_ID, NULL, &error);
+		open_view(&s, "line://app/" LIFF_ID, NULL, &error);
 
 	g_assert_null(unsafe);
 	g_assert_error(error, LINE_ERROR, 1);
 	g_clear_error(&error);
-	g_assert_null(line_liff_view(&s, "line://app/" LIFF_ID, NULL, &error));
+	g_assert_null(open_view(&s, "line://app/" LIFF_ID, NULL, &error));
 	g_assert_cmpstr(error->message, ==,
 			"This LINE app has ended its service.");
 	g_clear_error(&error);
-	g_assert_null(line_liff_view(&s, "line://app/" LIFF_ID, NULL, &error));
+	g_assert_null(open_view(&s, "line://app/" LIFF_ID, NULL, &error));
 	g_assert_error(error, LINE_ERROR, 1);
 	g_clear_error(&error);
-	g_assert_null(
-		line_liff_view(&s, "https://example.test/", NULL, &error));
+	g_assert_null(open_view(&s, "https://example.test/", NULL, &error));
 	g_assert_cmpuint(calls, ==, 4);
 }
 
-static char *make_store(const char *base, const char *name, const char *marker)
-{
-	g_autofree char *dir = g_build_filename(base, name, "liff", NULL);
-	g_autofree char *file = g_build_filename(dir, marker, NULL);
+#define ACCOUNT_A \
+	"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+#define ACCOUNT_B \
+	"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
-	g_assert_cmpint(g_mkdir_with_parents(dir, 0700), ==, 0);
-	g_assert_true(g_file_set_contents(file, "cookie", -1, NULL));
-	return g_steal_pointer(&dir);
-}
-
-/*
- * The browser's cookies and cache move into avernella/liff only when it has
- * none yet: kitatide first, then line-linux; existing data always stays.
- */
-static void test_storage_migration(void)
+static void test_storage_accounts(void)
 {
 	g_autofree char *base = g_dir_make_tmp("liff-store-XXXXXX", NULL);
-	g_autofree char *line_linux = make_store(base, "line-linux", "old");
-	g_autofree char *target = line_liff_storage_dir(base);
-	g_autofree char *moved = g_build_filename(target, "old", NULL);
+	g_autofree char *home = g_build_filename(base, "avernella", NULL);
+	g_autofree char *legacy = g_build_filename(home, "liff", NULL);
+	g_autofree char *shared = g_build_filename(legacy, "marker", NULL);
+	g_autofree char *profiles =
+		g_build_filename(home, "liff-profiles", NULL);
+	struct stat st;
 
-	g_assert_true(g_str_has_suffix(target, "/avernella/liff"));
-	g_assert_true(g_file_test(moved, G_FILE_TEST_IS_REGULAR));
-	g_assert_false(g_file_test(line_linux, G_FILE_TEST_EXISTS));
+	g_assert_cmpint(g_mkdir_with_parents(legacy, 0700), ==, 0);
+	g_assert_true(g_file_set_contents(shared, "old", 3, NULL));
+	g_assert_null(line_liff_storage_dir(base, NULL));
+	g_assert_null(line_liff_storage_dir(base, "../liff"));
+	g_assert_false(g_file_test(profiles, G_FILE_TEST_EXISTS));
+	g_autofree char *a = line_liff_storage_dir(base, ACCOUNT_A);
+	g_autofree char *b = line_liff_storage_dir(base, ACCOUNT_B);
+	g_autofree char *again = line_liff_storage_dir(base, ACCOUNT_A);
 
-	/* Avernella already has data: a later old directory is not merged. */
-	g_autofree char *kitatide = make_store(base, "kitatide", "newer");
-	g_autofree char *again = line_liff_storage_dir(base);
-	g_autofree char *kept = g_build_filename(kitatide, "newer", NULL);
+	g_assert_nonnull(a);
+	g_assert_nonnull(b);
+	g_assert_cmpstr(a, !=, b);
+	g_assert_cmpstr(again, ==, a);
+	g_autofree char *first = g_build_filename(a, "marker", NULL);
+	g_autofree char *second = g_build_filename(b, "marker", NULL);
 
-	g_assert_cmpstr(again, ==, target);
-	g_assert_true(g_file_test(kept, G_FILE_TEST_IS_REGULAR));
-	g_assert_true(g_file_test(moved, G_FILE_TEST_IS_REGULAR));
-
-	/* With both old directories present, kitatide (newer) wins. */
-	g_assert_cmpint(g_remove(moved), ==, 0);
-	g_assert_cmpint(g_rmdir(target), ==, 0);
-	g_autofree char *older = make_store(base, "line-linux", "old");
-	g_autofree char *third = line_liff_storage_dir(base);
-	g_autofree char *newer = g_build_filename(third, "newer", NULL);
-	g_autofree char *left = g_build_filename(older, "old", NULL);
-
-	g_assert_true(g_file_test(newer, G_FILE_TEST_IS_REGULAR));
-	g_assert_true(g_file_test(left, G_FILE_TEST_IS_REGULAR));
-	g_assert_cmpint(g_remove(newer), ==, 0);
-	g_assert_cmpint(g_rmdir(third), ==, 0);
-	g_assert_cmpint(g_remove(left), ==, 0);
-	g_assert_cmpint(g_rmdir(older), ==, 0);
-	g_autofree char *parent = g_path_get_dirname(older);
-	g_autofree char *home = g_path_get_dirname(third);
-
-	g_assert_cmpint(g_rmdir(parent), ==, 0);
+	g_assert_false(g_file_test(first, G_FILE_TEST_EXISTS));
+	g_assert_true(g_file_set_contents(first, "test", 4, NULL));
+	g_assert_false(g_file_test(second, G_FILE_TEST_EXISTS));
+	g_assert_true(g_file_test(shared, G_FILE_TEST_IS_REGULAR));
+	g_assert_cmpint(lstat(a, &st), ==, 0);
+	g_assert_cmpuint(st.st_mode & 0777, ==, 0700);
+	g_assert_cmpint(lstat(profiles, &st), ==, 0);
+	g_assert_cmpuint(st.st_mode & 0777, ==, 0700);
+	g_assert_cmpint(g_remove(first), ==, 0);
+	g_assert_cmpint(g_remove(shared), ==, 0);
+	g_assert_cmpint(g_rmdir(a), ==, 0);
+	g_assert_cmpint(g_rmdir(b), ==, 0);
+	g_assert_cmpint(g_rmdir(profiles), ==, 0);
+	g_assert_cmpint(g_rmdir(legacy), ==, 0);
 	g_assert_cmpint(g_rmdir(home), ==, 0);
 	g_assert_cmpint(g_rmdir(base), ==, 0);
 }
 
-/* An existing directory is used only when it is a private one of ours. */
 static void test_storage_validation(void)
 {
 	g_autofree char *base = g_dir_make_tmp("liff-store-XXXXXX", NULL);
 	g_autofree char *home = g_build_filename(base, "avernella", NULL);
-	g_autofree char *target = g_build_filename(home, "liff", NULL);
+	g_autofree char *root = g_build_filename(home, "liff-profiles", NULL);
+	g_autofree char *target = g_build_filename(root, ACCOUNT_A, NULL);
 	g_autofree char *elsewhere = g_build_filename(base, "elsewhere", NULL);
+	g_autofree char *made = line_liff_storage_dir(base, ACCOUNT_A);
 	struct stat st;
 
-	/* Created fresh, private. */
-	g_autofree char *made = line_liff_storage_dir(base);
-
 	g_assert_cmpstr(made, ==, target);
-	g_assert_cmpint(lstat(target, &st), ==, 0);
-	g_assert_true(S_ISDIR(st.st_mode));
-	g_assert_cmpuint(st.st_mode & 0777, ==, 0700);
-
-	/* An older, looser directory of ours is tightened, not replaced. */
 	g_assert_cmpint(chmod(target, 0755), ==, 0);
-	g_autofree char *loose = line_liff_storage_dir(base);
+	g_autofree char *loose = line_liff_storage_dir(base, ACCOUNT_A);
 
 	g_assert_cmpstr(loose, ==, target);
 	g_assert_cmpint(lstat(target, &st), ==, 0);
 	g_assert_cmpuint(st.st_mode & 0777, ==, 0700);
-
-	/* A symlink, even to a directory of ours, is refused. */
+	g_assert_cmpint(chmod(target, 0777), ==, 0);
+	g_assert_null(line_liff_storage_dir(base, ACCOUNT_A));
 	g_assert_cmpint(g_rmdir(target), ==, 0);
 	g_assert_cmpint(g_mkdir(elsewhere, 0700), ==, 0);
 	g_assert_cmpint(symlink(elsewhere, target), ==, 0);
-	g_assert_null(line_liff_storage_dir(base));
+	g_assert_null(line_liff_storage_dir(base, ACCOUNT_A));
 	g_assert_cmpint(g_remove(target), ==, 0);
-
-	/* So is a file in its place. */
 	g_assert_true(g_file_set_contents(target, "", 0, NULL));
-	g_assert_null(line_liff_storage_dir(base));
+	g_assert_null(line_liff_storage_dir(base, ACCOUNT_A));
 	g_assert_cmpint(g_remove(target), ==, 0);
-
-	/* And a parent other users could write to, or a symlinked one. */
+	g_assert_cmpint(g_rmdir(root), ==, 0);
+	g_assert_cmpint(symlink(elsewhere, root), ==, 0);
+	g_assert_null(line_liff_storage_dir(base, ACCOUNT_A));
+	g_assert_cmpint(g_remove(root), ==, 0);
 	g_assert_cmpint(chmod(home, 0777), ==, 0);
-	g_assert_null(line_liff_storage_dir(base));
-	g_assert_false(g_file_test(target, G_FILE_TEST_EXISTS));
+	g_assert_null(line_liff_storage_dir(base, ACCOUNT_A));
+	g_assert_false(g_file_test(root, G_FILE_TEST_EXISTS));
 	g_assert_cmpint(g_rmdir(home), ==, 0);
 	g_assert_cmpint(symlink(elsewhere, home), ==, 0);
-	g_assert_null(line_liff_storage_dir(base));
+	g_assert_null(line_liff_storage_dir(base, ACCOUNT_A));
 	g_assert_cmpint(g_remove(home), ==, 0);
-
 	g_assert_cmpint(g_rmdir(elsewhere), ==, 0);
 	g_assert_cmpint(g_rmdir(base), ==, 0);
 }
@@ -362,8 +395,9 @@ int main(int argc, char **argv)
 			test_recognizes_liff_urls);
 	g_test_add_func("/liff/builds-launch-url", test_builds_launch_url);
 	g_test_add_func("/liff/issues-view", test_issues_view);
+	g_test_add_func("/liff/chat-authorization", test_chat_authorization);
 	g_test_add_func("/liff/opens-consent-page", test_opens_consent_page);
-	g_test_add_func("/liff/storage-migration", test_storage_migration);
+	g_test_add_func("/liff/storage-accounts", test_storage_accounts);
 	g_test_add_func("/liff/storage-validation", test_storage_validation);
 	g_test_add_func("/liff/navigation-policy", test_navigation_policy);
 	return g_test_run();

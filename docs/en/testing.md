@@ -80,7 +80,9 @@ Each `tests/<name>.c` builds to `build/test-<name>` (with a few historical names
 | `test-stickers` | `stickers.c` | Catalog, entitlement, asset URLs, sending |
 | `test-emoji` | `emoji.c` | Catalog, pack index, manifests, asset policy |
 | `test-shared-content` | `shared_content.c` | Albums, notes, channel tokens (wrapped libcurl) |
-| `test-liff` | `liff.c` | `issueLiffView`, launch URLs, consent and fallback |
+| `test-liff` | `liff.c`, `liff_url.c` | View issuance, known-chat checks, consent, per-account private storage and unsafe directories |
+| `test-ui-liff` | `ui_liff.c` | Chat changes, account reset, stale replies and a fresh ordinary browser for consent |
+| `test-security-sandbox` | `security/` | Kernel enforcement of browser and Vault syscall limits, Landlock, descriptor handling and worker supervision |
 | `test-rich-message` | `rich_message.c` | Imagemap markup parsing |
 | `test-flex-asset` | `flex_asset.c` | Allowed hosts, public-address checks, redirects (wrapped libcurl) |
 | `test-talk-sync` | `talk_sync.c` | Cursor, paging, full and partial resync |

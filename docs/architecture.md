@@ -126,7 +126,7 @@ A reader thread in the UI sleeps in `recv` and posts an SDL event only when the 
 | `$XDG_STATE_HOME/avernella/` (same directory) | Per-account pins, folders, mutes, shortcuts and the Reduce Motion preference ([`chat_lists.c`](../src/chat_lists.c)) |
 | `$XDG_CONFIG_HOME/avernella/layout` and `language` (under `~/.config` by default) | Layout and interface language shared across local accounts. A fresh profile starts with the LINE layout and chooses its language from the desktop locale. |
 | `$XDG_RUNTIME_DIR/avernella/` | Pictures pasted for sending, deleted after use |
-| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | The in-app browser's HTTP cache and cookies |
+| `~/.cache/avernella/liff-profiles/<account-hash>`, `~/.local/share/avernella/liff-profiles/<account-hash>` | The in-app browser's HTTP cache and cookies |
 
 Messages, history and drafts stay in memory and are fetched again from LINE when needed. The session file holds keys in plain text, protected by file permissions; anyone who can read it can act as this linked device.
 

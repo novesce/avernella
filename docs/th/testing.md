@@ -66,7 +66,9 @@ python3 tests/group_media_apk.py --execute-presentation-codec "/path/to/LINE-26.
 | `test-stickers` | `stickers.c` | แค็ตตาล็อก สิทธิ์การเป็นเจ้าของ URL ของภาพ การส่ง |
 | `test-emoji` | `emoji.c` | แค็ตตาล็อก ดัชนีชุด manifest นโยบายการดึงภาพ |
 | `test-shared-content` | `shared_content.c` | อัลบั้ม โน้ต channel token (ห่อ libcurl) |
-| `test-liff` | `liff.c` | `issueLiffView` URL สำหรับเปิด หน้าขอความยินยอมและหน้าสำรอง |
+| `test-liff` | `liff.c`, `liff_url.c` | การขอเปิดแอป การตรวจห้องแชต หน้ายินยอม พื้นที่ส่วนตัวแยกตามบัญชี และการปฏิเสธไดเรกทอรีที่ไม่ปลอดภัย |
+| `test-ui-liff` | `ui_liff.c` | การสลับแชต การรีเซ็ตบัญชี การทิ้งคำตอบเก่า และการเปิดหน้ายินยอมในเบราว์เซอร์ธรรมดาตัวใหม่ |
+| `test-security-sandbox` | `security/` | การบังคับใช้ข้อจำกัด syscall ของเบราว์เซอร์และ Vault โดยเคอร์เนล รวมถึง Landlock การส่ง descriptor และการดูแลโปรเซสลูก |
 | `test-rich-message` | `rich_message.c` | การแยกวิเคราะห์ markup ของ imagemap |
 | `test-flex-asset` | `flex_asset.c` | โฮสต์ที่อนุญาต การตรวจที่อยู่สาธารณะ redirect (ห่อ libcurl) |
 | `test-talk-sync` | `talk_sync.c` | ตัวชี้ตำแหน่ง การแบ่งหน้า full และ partial resync |

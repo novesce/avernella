@@ -142,13 +142,28 @@ static J *exception_page(int code)
 		url = strfield(field(payload, "4"), "2");
 	if (!url || g_ascii_strncasecmp(url, "https://", 8))
 		return NULL;
-	return page(url, "full", NULL);
+	J *result = page(url, "full", NULL);
+
+	json_object_object_add(result, "web", json_object_new_boolean(TRUE));
+	return result;
 }
 
-J *line_liff_view(Line *s, const char *url, const char *chat, GError **error)
+J *line_liff_view(Line *s, GHashTable *chats, J *params, GError **error)
 {
 	g_autofree char *liff_id = NULL, *rest = NULL;
+	const char *url = strfield(params, "url");
+	const char *chat = strfield(params, "chat");
+	J *context_id = NULL;
 
+	if (json_object_object_get_ex(params, "chat", &context_id) &&
+	    (!chat || !*chat ||
+	     strlen(chat) != (gsize)json_object_get_string_len(context_id) ||
+	     !chats || !g_hash_table_contains(chats, chat))) {
+		g_set_error_literal(
+			error, LINE_ERROR, 1,
+			"Select a conversation from your chat list.");
+		return NULL;
+	}
 	if (!line_liff_url(url, &liff_id, &rest)) {
 		g_set_error_literal(error, LINE_ERROR, 1,
 				    "This is not a LINE app link.");

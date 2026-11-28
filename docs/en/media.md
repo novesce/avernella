@@ -32,7 +32,9 @@ Limits: 64 MiB per attachment (`LINE_MEDIA_LIMIT`), 2 MiB for a preview. Images 
    - for images, audio and files, over the whole ciphertext;
    - for videos, over the concatenated **SHA-256 digests of each 128 KiB chunk** of the ciphertext. The digest list is uploaded too, so a player can verify a video piece by piece.
 
-Decryption checks the tag in constant time, trying both forms, before decrypting.
+For a full video, the receiver checks the tag over the chunk digests. For an image, file, audio attachment or video poster, it checks the tag over the ciphertext. Letter Sealing v2 authenticates the message type used to choose the check. Legacy v1 supports text only. The receiver compares tags in constant time before decrypting and checks the original byte count when the message supplies `FILE_SIZE`.
+
+Video posters share the video's MAC key. A poster whose ciphertext is a multiple of 32 bytes could also be a list of SHA-256 digests. Avernella omits that thumbnail. The full video can still be opened.
 
 ### Sending an attachment
 
@@ -72,7 +74,7 @@ File cards show the attachment name and the size provided by LINE. Select **Save
 1. Open the sealed payload with `line_open_payload()` to get `keyMaterial` (exactly 44 base64 characters) and, for files, `fileName`.
 2. Check the metadata's `SID` matches the content type.
 3. `GET https://obs.line-apps.com/r/talk/<sid>/<oid>` with the OBS token and an `x-talk-meta` header: the base64 of `{"message": "<base64 of a Thrift Binary Message struct {4: message ID, 27: empty list}>"}` (`download_header()`). It tells OBS which message the request is for.
-4. Decrypt and verify (`line_media_decrypt()`).
+4. Verify the size and tag, then decrypt (`line_media_decrypt()`).
 
 Video posters come from `<sid>/<oid>/ud-preview` (falling back to `<oid>__ud-preview`), with a 6-second timeout. Legacy unencrypted media use `m/<message ID>` and `/preview`.
 

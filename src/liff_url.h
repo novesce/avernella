@@ -42,18 +42,11 @@ char *line_group_parse_ticket(const char *input);
  *                  "D\t<dialog>\t<a|c>\t<text>" alert or confirm.
  */
 /*
- * The in-app browser's storage directory under base (the user's data or
- * cache directory): base/avernella/liff. When it doesn't exist yet, an
- * earlier client's directory is moved there, newest first (kitatide, then
- * line-linux), so LINE apps keep their cookies and cache; otherwise it is
- * created. An existing Avernella directory is never replaced. Returns a
- * newly allocated path to a real directory that belongs to this user and
- * is private to them (0700, tightened if needed), inside base/avernella,
- * which no other user can write to. Returns NULL when that cannot be
- * guaranteed, such as for a symlink or another user's directory; the
- * browser then keeps nothing on disk.
+ * Private WebKit data or cache directory for one signed-in account.
+ * The account is a lowercase SHA-256 digest. Older shared profiles cannot
+ * be attributed to an account. NULL selects an ephemeral WebKit session.
  */
-char *line_liff_storage_dir(const char *base);
+char *line_liff_storage_dir(const char *base, const char *account);
 
 #define LINE_LIFF_FD 3
 #define LINE_LIFF_PACKET 16384

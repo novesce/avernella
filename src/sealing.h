@@ -16,8 +16,8 @@ J *line_seal_text(Line *s, const char *chat, const char *text, GError **error);
 char *line_open_text(Line *s, J *message, GError **error);
 
 /*
- * content_type participates in the authentication tag. The payload is borrowed
- * on seal and returned as an owned UTF-8 JSON object on open.
+ * v2 binds content_type in the authentication tag. Legacy v1 is text only.
+ * Payload is borrowed on seal and returned as an owned object on open.
  */
 J *line_seal_payload(Line *s, const char *chat, int content_type, J *payload,
 		     GError **error);

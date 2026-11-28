@@ -32,6 +32,8 @@ The worker starts the Vault supervisor before reading credentials and applying i
 
 Worker startup requires inherited file descriptors outside the IPC slots to be closed. On kernels with Landlock, the Vault can read, create, replace and remove regular files in Avernella's state directory. It opens the saved session there using the descriptor supplied by the worker.
 
+Vault seccomp limits communication to its inherited IPC socket by blocking socket creation and new connections.
+
 ## The UI process
 
 `main()` in [`main.c`](../../src/main.c) calls `line_ui()` in [`ui.c`](../../src/ui.c) unless the first argument is `--worker` or `--worker-password`. The UI process owns:
@@ -207,7 +209,7 @@ Avernella stores very little. Messages, history, the chat list and drafts are **
 | `$XDG_CONFIG_HOME/avernella/layout` (default `~/.config/avernella/`) | the UI, [`ui_theme.c`](../../src/ui_theme.c) | `avernella\n` to choose the Avernella theme. Anything else, or no file, means the default LINE theme. |
 | `$XDG_CONFIG_HOME/avernella/` | the UI, [`ui_lang.c`](../../src/ui_lang.c) | The interface-language choice |
 | `$XDG_RUNTIME_DIR/avernella/` | the UI, [`clipboard_paste.c`](../../src/clipboard_paste.c) | A picture pasted for sending, deleted after it is sent or the preview closes |
-| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | the browser helper | WebKit's HTTP cache and cookies for LINE apps |
+| `~/.cache/avernella/liff-profiles/<account-hash>`, `~/.local/share/avernella/liff-profiles/<account-hash>` | the browser helper | WebKit's HTTP cache and cookies for LINE apps |
 
 The rules every writer follows:
 
@@ -221,7 +223,7 @@ The rules every writer follows:
 Avernella was called *kitatide* before, and started from *line-linux*. Their files have the same format, so data moves over, but only when Avernella has none of its own:
 
 - **Session and chat preferences.** When `$XDG_STATE_HOME/avernella` doesn't exist, `migrate_store()` in `state.c` takes the newest earlier directory, `kitatide` and then `line-linux`, and renames it to `avernella` as a unit with `renameat2(RENAME_NOREPLACE)`, under its lock. A directory whose `session.json` this version can't read is skipped and left in place. If an `avernella` directory exists, even a signed-out one, nothing is moved.
-- **LINE-app browser data.** `line_liff_storage_dir()` in `liff_url.c` does the same for `liff/` under the cache and data directories, the first time the browser starts.
+- **LINE-app browser data.** `line_liff_storage_dir()` in `liff_url.c` opens a private cache and data directory for the signed-in account. A shared legacy directory has no account identifier, so existing users start with fresh LIFF cookies.
 
 ## Where everything lives
 

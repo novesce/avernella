@@ -610,33 +610,44 @@ int avernella_landlock_apply(const struct avernella_sandbox_opts *opts,
 	int ruleset = -1;
 	uint32_t active = 0;
 	int err = 0;
+	bool liff;
 
 	if (!opts)
 		return -EINVAL;
 	if (abi < 1)
 		return 0;
 
+	liff = opts->role == SANDBOX_ROLE_LIFF;
 	memset(&attr, 0, sizeof(attr));
 
-	attr.handled_access_fs = fs_mask_for_abi(abi);
-	active |= AVSB_ACTIVE_LANDLOCK_FS;
+	/* WebKit's bubblewrap launcher must construct its own mount tree. */
+	if (!liff) {
+		attr.handled_access_fs = fs_mask_for_abi(abi);
+		active |= AVSB_ACTIVE_LANDLOCK_FS;
+	}
 
 	/* TCP port containment (ABI 4+): deny all bind; allowlist connect. */
-	if (abi >= 4 && (opts->role == SANDBOX_ROLE_NET ||
+	if (abi >= 4 && (liff || opts->role == SANDBOX_ROLE_NET ||
 			 opts->role == SANDBOX_ROLE_MEDIA ||
 			 opts->role == SANDBOX_ROLE_VAULT)) {
-		attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP |
-					  LANDLOCK_ACCESS_NET_CONNECT_TCP;
+		attr.handled_access_net = LANDLOCK_ACCESS_NET_BIND_TCP;
+		if (!liff)
+			attr.handled_access_net |=
+				LANDLOCK_ACCESS_NET_CONNECT_TCP;
 		active |= AVSB_ACTIVE_LANDLOCK_NET;
 	}
 
 	/* IPC & signal scopes (ABI 6+): block abstract UNIX & cross-domain kill. */
-	if (abi >= 6) {
+	/* The Flatpak portal can launch WebKit peers outside our domain. */
+	if (abi >= 6 && (!liff || access("/.flatpak-info", F_OK) < 0)) {
 		attr.scoped = LANDLOCK_SCOPE_SIGNAL;
-		if (opts->role != SANDBOX_ROLE_UI)
+		if (!liff && opts->role != SANDBOX_ROLE_UI)
 			attr.scoped |= LANDLOCK_SCOPE_ABSTRACT_UNIX_SOCKET;
 		active |= AVSB_ACTIVE_LANDLOCK_SCOPE;
 	}
+
+	if (!active)
+		return 0;
 
 	ruleset = (int)syscall(SYS_landlock_create_ruleset, &attr, sizeof(attr),
 			       0);
@@ -818,9 +829,11 @@ int avernella_seccomp_apply(const struct avernella_sandbox_opts *opts)
 		SCMP_SYS(getpeername),
 		SCMP_SYS(getsockopt),
 		SCMP_SYS(setsockopt),
-		SCMP_SYS(socketpair),
-		/* Open/connect are bounded by empty root + Landlock ABI 1..11. */
+		/* File access is bounded by the filesystem sandbox. */
 		SCMP_SYS(openat),
+	};
+	static const int socket_peer_syscalls[] = {
+		SCMP_SYS(socketpair),
 		SCMP_SYS(connect),
 	};
 	static const int net_extra[] = {
@@ -905,13 +918,17 @@ int avernella_seccomp_apply(const struct avernella_sandbox_opts *opts)
 	if (rc < 0)
 		goto out;
 
-	/* Restrict socket() domains strictly by role. */
-	rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
-			      SCMP_A0(SCMP_CMP_EQ, AF_UNIX));
-	if (rc < 0)
-		goto out;
+	/* The Vault communicates through its inherited, connected socket. */
 	if (opts->role == SANDBOX_ROLE_NET ||
 	    opts->role == SANDBOX_ROLE_MEDIA) {
+		rc = allow_list(ctx, socket_peer_syscalls,
+				ARRAY_SIZE(socket_peer_syscalls));
+		if (rc < 0)
+			goto out;
+		rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
+				      SCMP_A0(SCMP_CMP_EQ, AF_UNIX));
+		if (rc < 0)
+			goto out;
 		rc = seccomp_rule_add(ctx, SCMP_ACT_ALLOW, SCMP_SYS(socket), 1,
 				      SCMP_A0(SCMP_CMP_EQ, AF_INET));
 		if (rc < 0)

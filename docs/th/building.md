@@ -236,7 +236,7 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 - **แอป LINE โหลดไม่เสร็จ** รันด้วย `LINE_DEBUG_LIFF=1` แล้วเปิดใหม่ ตรวจสอบว่าการโหลดถึง `committed` และ `finished` หรือยัง และมีคำสั่ง bridge ที่ขึ้นว่า `unsupported` หรือไม่
 - **โทรแล้วไม่มีภาพ** รันด้วย `LINE_CALL_DEBUG=1`
 - **ไล่โค้ดทีละขั้น** build ด้วย `make clean && make DEBUG=1` หน้าต่างคือโปรเซส `avernella` ส่วน worker เป็นโปรเซสลูกชื่อ `avernella --worker` ให้ attach แยกด้วย `gdb -p $(pgrep -f 'avernella --worker')` เนื่องจาก worker จะจบตามเมื่อโปรเซสแม่ตาย (`PR_SET_PDEATHSIG`) การปิดหน้าต่างจึงทำให้ worker จบด้วย
-- **ทดสอบ `avernella-liff` ตัวเดียว** เริ่มมันโดยให้ file descriptor 3 เป็นซ็อกเก็ต `SOCK_SEQPACKET` และส่ง PID ของโปรเซสแม่เป็นอาร์กิวเมนต์เดียว แล้วส่ง datagram `L\tfull\t<url>` ไปหา เมื่อตั้ง `LINE_DEBUG_LIFF=1` มันจะโหลดหน้าจาก `http://127.0.0.1:<port>/` ได้ด้วย หน้าทดสอบในเครื่องที่โหลด LIFF SDK ตัวจริงจึงใช้ทดสอบ bridge ได้
+- **ทดสอบ `avernella-liff` ตัวเดียว** เริ่มมันโดยให้ file descriptor 3 เป็นซ็อกเก็ต `SOCK_SEQPACKET` และส่ง PID ของโปรเซสแม่เป็นอาร์กิวเมนต์แรก ถ้าไม่ระบุแฮชบัญชี เบราว์เซอร์จะใช้โปรไฟล์ชั่วคราว แล้วส่ง datagram `L\tfull\t<url>` ไปหา เมื่อตั้ง `LINE_DEBUG_LIFF=1` มันจะโหลดหน้าจาก `http://127.0.0.1:<port>/` ได้ด้วย หน้าทดสอบในเครื่องที่โหลด LIFF SDK ตัวจริงจึงใช้ทดสอบ bridge ได้
 - **เซสชันดูเหมือนเสีย** ออกจากระบบจากในแอป ถ้าทำไม่ได้ ให้ปิดแอปแล้วลบ `~/.local/state/avernella/session.json` จากนั้นลบอุปกรณ์ที่เชื่อมไว้ใน LINE บนโทรศัพท์
 
 ## ข้อมูลของคุณอยู่ที่ไหน
@@ -246,6 +246,6 @@ make install PREFIX=$HOME/.local     # ติดตั้งเฉพาะผ�
 | `$XDG_STATE_HOME/avernella/` (ค่าเริ่มต้น `~/.local/state/avernella/`) | `session.json` (โทเค็น MID กุญแจ Letter Sealing ลำดับคำขอ) และ `lists-<sha256 ของ MID>.json` (โฟลเดอร์ โฟลเดอร์ที่เลือกอยู่ หมุด แชตที่ปิดเสียง ปุ่มลัด สวิตช์การแจ้งเตือนและเสียง โหมดลดการเคลื่อนไหว) |
 | `$XDG_CONFIG_HOME/avernella/` (ค่าเริ่มต้น `~/.config/avernella/`) | `layout` (ธีมที่เลือก) และภาษาของส่วนติดต่อที่เลือก |
 | `$XDG_RUNTIME_DIR/avernella/` | รูปที่วางเพื่อเตรียมส่ง ลบทิ้งหลังใช้ |
-| `~/.cache/avernella/liff`, `~/.local/share/avernella/liff` | แคช HTTP และคุกกี้ของเบราว์เซอร์ในแอป |
+| `~/.cache/avernella/liff-profiles/<account-hash>`, `~/.local/share/avernella/liff-profiles/<account-hash>` | แคช HTTP และคุกกี้ของเบราว์เซอร์ในแอป |
 
 รายละเอียดของแต่ละไฟล์อยู่ใน [สถาปัตยกรรม](architecture.md)

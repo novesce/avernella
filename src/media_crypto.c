@@ -81,18 +81,34 @@ static GBytes *hash_chunks(const guint8 *cipher, gsize len)
 }
 
 static gboolean authenticated(const guint8 *body, gsize len,
-			      const guint8 key[32])
+			      const guint8 key[32],
+			      enum line_media_object object)
 {
+	g_autoptr(GBytes) hashes = NULL;
+	const guint8 *input = body;
+	gsize n = len;
 	guint8 tag[HASH_SIZE];
 
-	hmac_sha256(key, body, len, tag);
-	if (CRYPTO_memcmp(tag, body + len, HASH_SIZE) == 0)
-		return TRUE;
-	g_autoptr(GBytes) hashes = hash_chunks(body, len);
-	gsize n;
-	const guint8 *digest = g_bytes_get_data(hashes, &n);
-
-	hmac_sha256(key, digest, n, tag);
+	switch (object) {
+	case LINE_MEDIA_VIDEO_BODY:
+		hashes = hash_chunks(body, len);
+		input = g_bytes_get_data(hashes, &n);
+		break;
+	case LINE_MEDIA_VIDEO_POSTER:
+		/*
+		 * Posters and video manifests share a MAC key. A manifest is
+		 * always a sequence of complete SHA-256 digests. The original
+		 * length in public message metadata cannot disambiguate it.
+		 */
+		if (!(len % HASH_SIZE))
+			return FALSE;
+		break;
+	case LINE_MEDIA_BODY:
+		break;
+	default:
+		return FALSE;
+	}
+	hmac_sha256(key, input, n, tag);
 	return CRYPTO_memcmp(tag, body + len, HASH_SIZE) == 0;
 }
 
@@ -133,12 +149,19 @@ GBytes *line_media_encrypt(GBytes *plain, const guint8 material[32],
 }
 
 GBytes *line_media_decrypt(GBytes *blob, const guint8 material[32],
+			   enum line_media_object object, guint64 original_size,
 			   GError **error)
 {
 	gsize len;
 	g_autofree guint8 *data = g_bytes_unref_to_data(blob, &len);
 
-	if (len <= HASH_SIZE || len > LINE_MEDIA_LIMIT + HASH_SIZE) {
+	gsize limit = object == LINE_MEDIA_VIDEO_POSTER ?
+			      LINE_MEDIA_PREVIEW_LIMIT :
+			      LINE_MEDIA_LIMIT;
+
+	if (len <= HASH_SIZE || len - HASH_SIZE > limit ||
+	    (object != LINE_MEDIA_VIDEO_POSTER && original_size &&
+	     len - HASH_SIZE != original_size)) {
 		g_set_error_literal(error, LINE_ERROR, 1,
 				    "Invalid encrypted attachment size.");
 		return NULL;
@@ -146,7 +169,7 @@ GBytes *line_media_decrypt(GBytes *blob, const guint8 material[32],
 	gsize n = len - HASH_SIZE;
 	struct media_keys keys;
 	gboolean ok = derive(material, &keys) &&
-		      authenticated(data, n, keys.hmac) &&
+		      authenticated(data, n, keys.hmac, object) &&
 		      aes_ctr(data, n, &keys);
 	OPENSSL_cleanse(&keys, sizeof(keys));
 	if (ok)

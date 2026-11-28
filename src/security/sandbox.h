@@ -26,6 +26,7 @@ enum avernella_sandbox_role {
 		2, /* PipeWire/Opus/VP8/SRTP worker: scoped HW/PW, 0 general FS */
 	SANDBOX_ROLE_UI =
 		3, /* SDL2/Vulkan UI: RO system assets, RW Avernella XDG only */
+	SANDBOX_ROLE_LIFF = 4, /* WebKit host: IPC and TCP bind restrictions */
 };
 
 struct avernella_sandbox_caps {

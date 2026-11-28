@@ -195,65 +195,52 @@ gboolean line_liff_web_url(const char *url, gboolean debug)
 
 #define DIR_FLAGS (O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)
 
-/* A real directory of ours that no other user can write to. */
-static gboolean own_dir(int fd)
+/* Inspect the opened inode before using it as a WebKit profile directory. */
+static int open_profile_dir(int parent, const char *name, gboolean private)
 {
 	struct stat st;
+	int fd;
 
-	return !fstat(fd, &st) && S_ISDIR(st.st_mode) &&
-	       st.st_uid == geteuid() && !(st.st_mode & 022);
+	if (mkdirat(parent, name, 0700) && errno != EEXIST)
+		return -1;
+	fd = openat(parent, name, DIR_FLAGS);
+	if (fd < 0)
+		return -1;
+	if (!fstat(fd, &st) && st.st_uid == geteuid() && !(st.st_mode & 022) &&
+	    (!private || (st.st_mode & 0777) == 0700 || !fchmod(fd, 0700)))
+		return fd;
+	close(fd);
+	return -1;
 }
 
-char *line_liff_storage_dir(const char *base)
+char *line_liff_storage_dir(const char *base, const char *account)
 {
-	g_autofree char *home = g_build_filename(base, "avernella", NULL);
-	static const char *const legacy[] = { "kitatide", "line-linux" };
-	g_autofree char *target = g_build_filename(home, "liff", NULL);
+	static const char profiles[] = "liff-profiles";
 	struct stat st;
+	int dir, home, root, profile;
 
-	if (g_mkdir_with_parents(home, 0700) < 0)
+	if (!base || !g_path_is_absolute(base) || !account ||
+	    strlen(account) != 64 || strspn(account, "0123456789abcdef") != 64)
 		return NULL;
-	/*
-	 * WebKit opens the path by name, so check the parent first: when it
-	 * is ours alone, no one else can swap the directory inside it.
-	 */
-	int dir = open(home, DIR_FLAGS);
-
+	if (g_mkdir_with_parents(base, 0700))
+		return NULL;
+	dir = open(base, DIR_FLAGS);
 	if (dir < 0)
 		return NULL;
-	if (!own_dir(dir)) {
-		close(dir);
-		return NULL;
-	}
-	if (fstatat(dir, "liff", &st, AT_SYMLINK_NOFOLLOW) && errno == ENOENT)
-		for (gsize i = 0; i < G_N_ELEMENTS(legacy); i++) {
-			g_autofree char *parent =
-				g_build_filename(base, legacy[i], NULL);
-			g_autofree char *source =
-				g_build_filename(parent, "liff", NULL);
-
-			if (lstat(source, &st) || !S_ISDIR(st.st_mode) ||
-			    st.st_uid != geteuid())
-				continue;
-			if (renameat2(AT_FDCWD, source, dir, "liff",
-				      RENAME_NOREPLACE) == 0) {
-				/* Drop the old parent only if it is empty. */
-				(void)rmdir(parent);
-				break;
-			}
-		}
-	if (mkdirat(dir, "liff", 0700) && errno != EEXIST) {
-		close(dir);
-		return NULL;
-	}
-	/* Never through a symlink, never someone else's; ours turns 0700. */
-	int fd = openat(dir, "liff", DIR_FLAGS);
-	gboolean ok = fd >= 0 && !fstat(fd, &st) && S_ISDIR(st.st_mode) &&
-		      st.st_uid == geteuid() &&
-		      (!(st.st_mode & 077) || !fchmod(fd, 0700));
-
-	if (fd >= 0)
-		close(fd);
+	home = -1;
+	if (!fstat(dir, &st) && st.st_uid == geteuid() && !(st.st_mode & 022))
+		home = open_profile_dir(dir, "avernella", FALSE);
 	close(dir);
-	return ok ? g_steal_pointer(&target) : NULL;
+	if (home < 0)
+		return NULL;
+	root = open_profile_dir(home, profiles, TRUE);
+	close(home);
+	if (root < 0)
+		return NULL;
+	profile = open_profile_dir(root, account, TRUE);
+	close(root);
+	if (profile < 0)
+		return NULL;
+	close(profile);
+	return g_build_filename(base, "avernella", profiles, account, NULL);
 }

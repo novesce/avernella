@@ -1422,6 +1422,9 @@ static void clear_password(void)
 
 static void reset_login(const char *message)
 {
+	ui_liff_close();
+	if (ui.connected)
+		g_clear_pointer(&pending_link, g_free);
 	stop_worker(FALSE);
 	ui_sound_stop_loop();
 	ui_media_reset();
@@ -2284,6 +2287,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 		ui.email_login = FALSE;
 		set_text(&ui.login_email, "");
 		wire.login_failures = 0;
+		ui_liff_close();
 		ui_media_login(result);
 		g_clear_pointer(&ui.qr, QRcode_free);
 		g_clear_pointer(&ui.pin, g_free);
@@ -2311,7 +2315,7 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 				g_autofree char *url =
 					g_steal_pointer(&pending_link);
 
-				ui_open_chat_link(url);
+				ui_open_chat_link(url, NULL);
 			}
 		}
 		if (wire.chats_again && ui.connected && !ui.logging_out) {
@@ -2471,7 +2475,6 @@ static void handle_reply(guint id, struct ui_request *saved, Json *result,
 			gboolean confirmed = json_object_get_boolean(
 				ui_field(result, "confirmed"));
 
-			ui_liff_close();
 			reset_login(
 				confirmed ?
 					_("Signed out.") :
@@ -3035,7 +3038,7 @@ static void click(int x, int y)
 		g_autofree char *text_link = ui_text_link_at(x, y);
 
 		if (text_link) {
-			ui_open_chat_link(text_link);
+			ui_open_chat_link(text_link, ui.selected);
 			return;
 		}
 		Rect card_anchor;
@@ -3365,7 +3368,7 @@ static void event(SDL_Event *e)
 		ui_present_window(ui.window);
 		if (url && *url) {
 			if (ui.connected && ui.chats)
-				ui_open_chat_link(url);
+				ui_open_chat_link(url, NULL);
 			else
 				set_string(&pending_link, url);
 		}

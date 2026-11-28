@@ -135,6 +135,7 @@ TESTS += build/test-monitor-picker build/test-screencast-cinnamon
 TESTS += build/test-qr-scan
 TESTS += build/test-password-login
 TESTS += build/test-profile-image build/test-rich-message build/test-clipboard-paste
+TESTS += build/test-ui-liff
 TESTS += build/test-liff build/test-chiptune build/test-denoise build/test-ui-scroll-scene build/test-ui-call-fullscreen
 TESTS += build/test-ui-theme build/test-ui-lang build/test-ui-sounds
 TESTS += build/test-udp-batch build/test-sandbox build/test-security-sandbox build/test-gpu-health
@@ -142,8 +143,8 @@ TESTS += build/test-call-net build/test-call-fec
 
 # The LIFF helpers share the same browser code and IPC.
 # LIFF_BROWSER=0 leaves both out.
-LIFF_WPE_PKGS = wpe-webkit-2.0 wpe-platform-wayland-2.0 gio-unix-2.0
-LIFF_GTK_PKGS = webkitgtk-6.0 gio-unix-2.0
+LIFF_WPE_PKGS = wpe-webkit-2.0 wpe-platform-wayland-2.0 gio-unix-2.0 libseccomp
+LIFF_GTK_PKGS = webkitgtk-6.0 gio-unix-2.0 libseccomp
 LIFF_BROWSER ?= 1
 ifneq ($(filter-out clean fuzz-clean format format-check checkpatch install uninstall,$(or $(MAKECMDGOALS),all)),)
 ifeq ($(LIFF_BROWSER),1)
@@ -195,10 +196,11 @@ avernella: $(OBJECTS)
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $(RO_SEGMENT) $(PACKED_RELOCS) $(STRIP_RELEASE) -o build/$@ $^ $(LDLIBS)
 	mv -f build/$@ $@
 
+LIFF_OBJECTS = build/liff_url.o build/security/liff_filter.o build/security/sandbox.o build/security/ipc.o
 avernella-liff: LIFF_PKGS = $(LIFF_WPE_PKGS)
-avernella-liff: build/liff_browser.o build/liff_url.o
+avernella-liff: build/liff_browser.o $(LIFF_OBJECTS)
 avernella-liff-gtk: LIFF_PKGS = $(LIFF_GTK_PKGS)
-avernella-liff-gtk: build/liff_browser_gtk.o build/liff_url.o
+avernella-liff-gtk: build/liff_browser_gtk.o $(LIFF_OBJECTS)
 avernella-liff avernella-liff-gtk:
 	$(CC) $(CFLAGS) $(LDFLAGS) $(LINK_FLAGS) $(RO_SEGMENT) $(PACKED_RELOCS) $(STRIP_RELEASE) -o build/$@ $^ $(shell pkg-config --libs $(LIFF_PKGS))
 	mv -f build/$@ $@
@@ -293,7 +295,7 @@ build/test-call-fec: tests/call_fec.c build/call_fec.o build/call_srtp.o
 build/test-pdtp: tests/pdtp.c build/call_pdtp.o build/call_srtp.o
 build/test-udp-batch: tests/udp_batch.c build/udp_batch.o
 build/test-sandbox: tests/sandbox.c build/sandbox.o build/security/sandbox.o build/security/ipc.o build/udp_batch.o
-build/test-security-sandbox: tests/test_sandbox.c build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/thrift.o
+build/test-security-sandbox: tests/test_sandbox.c build/security/liff_filter.o build/security/sandbox.o build/security/ipc.o build/security/vault.o build/sealing.o build/state.o build/thrift.o
 build/test-gpu-health: tests/gpu_health.c build/gpu_health.o
 build/test-call-video: tests/call_video.c build/call_video.o build/call_srtp.o build/call_schema.o build/call_wire.o build/screencast.o build/screencast_dma.o build/screencast_cinnamon.o build/monitor_picker.o build/camera_pixels.o build/tune.o
 build/test-call build/test-call-video: build/call_fec.o
@@ -425,6 +427,8 @@ build/test-ui-image-overlay: tests/ui_image_overlay.c build/ui_gpu.o
 build/test-ui-call-fullscreen: tests/ui_call_fullscreen.c build/ui_gpu.o
 build/test-ui-chat-refresh: private LDFLAGS += -Wl,--wrap=SDL_PollEvent
 build/test-ui-chat-refresh: tests/ui_chat_refresh.c build/ui_gpu.o build/tune.o
+build/test-ui-liff: private LDFLAGS += -Wl,--wrap=readlink
+build/test-ui-liff: tests/ui_liff.c build/ui_liff.o build/liff_url.o
 build/test-ui-worker-stop: private LDFLAGS += -Wl,--wrap=SDL_PollEvent,--wrap=waitpid
 build/test-ui-worker-stop: tests/ui_worker_stop.c build/ui_gpu.o build/tune.o
 build/test-monitor-picker: private LDFLAGS += -Wl,--wrap=SDL_WaitEvent

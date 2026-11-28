@@ -2381,8 +2381,7 @@ static J *dispatch(struct line_worker *w, const char *method, J *params,
 	if (!strcmp(method, "friendInvite"))
 		return line_friend_invite(s, error);
 	if (!strcmp(method, "liffView"))
-		return line_liff_view(s, strfield(params, "url"),
-				      strfield(params, "chat"), error);
+		return line_liff_view(s, w->chats, params, error);
 	if (!strcmp(method, "openFriend") || !strcmp(method, "renameFriend") ||
 	    !strcmp(method, "setFriendFavorite") ||
 	    !strcmp(method, "setFriendHidden") ||

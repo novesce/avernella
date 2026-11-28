@@ -300,11 +300,16 @@ static void crypto_vector(void)
 		g_bytes_new(input, sizeof(input)), material, NULL, &err);
 	g_assert_no_error(err);
 	g_assert_true(g_bytes_equal(encrypted, expected));
-	g_autoptr(GBytes) opened =
-		line_media_decrypt(g_bytes_ref(expected), material, &err);
+	g_autoptr(GBytes) opened = line_media_decrypt(g_bytes_ref(expected),
+						      material, LINE_MEDIA_BODY,
+						      sizeof(input), &err);
 	g_assert_no_error(err);
 	g_assert_cmpmem(g_bytes_get_data(opened, NULL),
 			g_bytes_get_size(opened), input, sizeof(input));
+	g_assert_null(line_media_decrypt(g_bytes_ref(expected), material,
+					 LINE_MEDIA_VIDEO_BODY, sizeof(input),
+					 &err));
+	g_assert_error(err, LINE_ERROR, 1);
 }
 
 static void chunk_vector(void)
@@ -331,14 +336,17 @@ static void chunk_vector(void)
 	const guint8 *raw = g_bytes_get_data(body, NULL);
 
 	g_assert_cmpmem(raw + length, 32, g_bytes_get_data(tag, NULL), 32);
-	g_autoptr(GBytes) read =
-		line_media_decrypt(g_bytes_ref(body), key, &error);
+	g_autoptr(GBytes) read = line_media_decrypt(
+		g_bytes_ref(body), key, LINE_MEDIA_VIDEO_BODY, length, &error);
 	g_assert_no_error(error);
 	g_assert_cmpuint(g_bytes_get_size(read), ==, length);
 	const guint8 *opened = g_bytes_get_data(read, NULL);
 
 	for (size_t i = 0; i < length; i++)
 		g_assert_cmpuint(opened[i], ==, (guint8)i);
+	g_assert_null(line_media_decrypt(g_bytes_ref(body), key,
+					 LINE_MEDIA_BODY, length, &error));
+	g_assert_error(error, LINE_ERROR, 1);
 }
 
 static void video_preview(Line *s)
@@ -362,6 +370,17 @@ static void video_preview(Line *s)
 	g_assert_no_error(error);
 	g_assert_true(g_bytes_equal(image, png));
 
+	/* A valid poster whose length overlaps a video MAC input is ambiguous. */
+	guint8 pixels[64] = { 0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n' };
+
+	g_bytes_unref(preview_blob);
+	preview_blob = line_media_encrypt(g_bytes_new(pixels, sizeof(pixels)),
+					  key, NULL, &error);
+	g_assert_no_error(error);
+	g_assert_null(line_download_video_preview(s, sent, &error));
+	g_assert_error(error, LINE_ERROR, 1);
+	g_clear_error(&error);
+
 	g_bytes_unref(preview_blob);
 	g_autoptr(GBytes) not_an_image = g_bytes_new_static("movie data", 10);
 	preview_blob = line_media_encrypt(g_bytes_ref(not_an_image), key, NULL,
@@ -375,7 +394,7 @@ static void video_preview(Line *s)
 	preview_blob = g_bytes_ref(png);
 	g_assert_null(line_download_video_preview(s, sent, &error));
 	g_assert_error(error, LINE_ERROR, 1);
-	g_assert_cmpint(preview_count, ==, 3);
+	g_assert_cmpint(preview_count, ==, 4);
 	g_assert_cmpint(download_count, ==, full_downloads);
 	g_clear_pointer(&preview_blob, g_bytes_unref);
 }
@@ -456,6 +475,27 @@ static void attachment_case(gconstpointer value)
 
 		g_assert_no_error(err);
 		g_assert_true(g_bytes_equal(legacy_envelope, read));
+		J *meta = field(sent, "18");
+
+		json_object_object_add(meta, "FILE_SIZE",
+				       json_object_new_string("42"));
+		g_assert_null(line_download_attachment(&s, sent, &err));
+		g_assert_error(err, LINE_ERROR, 1);
+		g_clear_error(&err);
+		int prior = download_count;
+
+		json_object_object_add(meta, "FILE_SIZE",
+				       json_object_new_null());
+		g_assert_null(line_download_attachment(&s, sent, &err));
+		g_assert_error(err, LINE_ERROR, 1);
+		g_assert_cmpint(download_count, ==, prior);
+		g_clear_error(&err);
+		json_object_object_del(meta, "FILE_SIZE");
+		g_autoptr(GBytes) no_size =
+			line_download_attachment(&s, sent, &err);
+
+		g_assert_no_error(err);
+		g_assert_true(g_bytes_equal(no_size, read));
 	}
 	if (type == LINE_MEDIA_FILE) {
 		g_assert_cmpuint(line_message_file_size(field(sent, "18")), ==,

@@ -347,7 +347,7 @@ Json *ui_row_at(int x, int y);
 const char *ui_flex_link_at(int x, int y);
 /* Newly allocated URL under (x, y) in a text message, or NULL. */
 char *ui_text_link_at(int x, int y);
-void ui_open_chat_link(const char *url);
+void ui_open_chat_link(const char *url, const char *chat);
 void ui_select_chat_id(const char *id);
 cairo_surface_t *ui_flex_image(const char *url);
 /* The picture at url could not be loaded or decoded. */

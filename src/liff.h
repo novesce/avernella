@@ -4,12 +4,12 @@
 #include "liff_url.h"
 
 /*
- * Ask LINE for a LIFF view of url, from chat (a chat MID, or NULL).
+ * Ask LINE for a view of params.url, optionally from a worker-known chat.
  * Returns {"url": page to load, "size": "full"|"tall"|"compact",
  * "title": app name} where url carries the tokens liff.init() reads, or,
- * when LINE first needs the user's consent, the consent page.
+ * when LINE requires a consent or fallback page, "web": true.
  */
-J *line_liff_view(Line *s, const char *url, const char *chat, GError **error);
+J *line_liff_view(Line *s, GHashTable *chats, J *params, GError **error);
 
 /*
  * The page LINE's client loads for a view: the endpoint with the LIFF

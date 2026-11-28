@@ -484,21 +484,30 @@ static J *read_value(struct thrift_reader *r, guint8 tag, int depth,
 			value_tag = types & 15;
 		}
 
-		if (n > MAX_VALUES || r->bad)
+		/* JSON object names can only represent scalar map keys. */
+		if (n > MAX_VALUES || r->bad ||
+		    (n && (key_tag < TRUE_T || key_tag > BINARY)))
 			break;
 
 		g_autoptr(J) map = obj();
 		for (guint64 i = 0; i < n; i++) {
 			g_autoptr(J) key =
 				read_value(r, key_tag, depth + 1, FALSE);
-			if (!key)
+			if (!key || r->bad)
+				return NULL;
+			const char *name = json_object_get_string(key);
+
+			if (!name ||
+			    (key_tag == BINARY &&
+			     memchr(name, 0,
+				    json_object_get_string_len(key))) ||
+			    json_object_object_get_ex(map, name, NULL))
 				return NULL;
 			J *v = read_value(r, value_tag, depth + 1, FALSE);
 
 			if (!v)
 				return NULL;
-			json_object_object_add(map, json_object_get_string(key),
-					       v);
+			json_object_object_add(map, name, v);
 		}
 		return g_steal_pointer(&map);
 	}

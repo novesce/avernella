@@ -122,7 +122,7 @@ gint64 type      = json_object_get_int64(field(message, "15"));
 
 `field()` returns `NULL` for anything missing or when the parent isn't an object, so chains such as `field(field(op, "20"), "18")` are safe.
 
-**Limits.** The decoder rejects nesting deeper than 48 levels, more than 300,000 values in total, duplicate field IDs, and trailing bytes after the struct. Untrusted replies can't exhaust memory or the stack.
+**Limits.** The decoder rejects nesting deeper than 48 levels, more than 300,000 values in total, duplicate field IDs, and trailing bytes after the struct. Map keys must be scalar. The decoder rejects duplicate keys and strings containing NUL as map keys before adding their values to a JSON object. Lists, structs and maps can still appear as values.
 
 ### Thrift Binary, for email login only
 

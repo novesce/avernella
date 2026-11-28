@@ -35,11 +35,11 @@ static struct {
 	int fd, pidfd;
 	GThread *reader;
 	Uint32 event;
-	guint generation;
+	guint generation, view_request;
 	unsigned int unavailable;
 	enum browser_backend backend;
 	char *pending;
-	gboolean ready;
+	gboolean ready, issued_view;
 } lb = { .fd = -1, .pidfd = -1 };
 
 struct reader {
@@ -146,7 +146,14 @@ static int spawn_browser(const char *path, int fd, int *pidfd)
 	char parent[24];
 
 	g_snprintf(parent, sizeof(parent), "%d", (int)getpid());
-	char *const args[] = { (char *)"avernella-liff", parent, NULL };
+	/* Keep the account ID itself out of the process argument list. */
+	g_autofree char *profile =
+		ui.connected && ui.self_id && *ui.self_id ?
+			g_compute_checksum_for_string(G_CHECKSUM_SHA256,
+						      ui.self_id, -1) :
+			NULL;
+	char *const args[] = { (char *)"avernella-liff", parent,
+			       profile ? profile : (char *)"-", NULL };
 	int err = posix_spawn_file_actions_init(&actions);
 
 	if (err)
@@ -243,7 +250,7 @@ static gboolean send_browser_packet(const char *packet)
 {
 	gsize n = strlen(packet);
 
-	if (n >= LINE_LIFF_PACKET)
+	if (n >= LINE_LIFF_PACKET || (packet[0] == 'R' && lb.fd < 0))
 		return FALSE;
 	for (int attempt = 0; attempt < 2; attempt++) {
 		if (!start_browser())
@@ -265,6 +272,8 @@ static gboolean send_browser_packet(const char *packet)
 		if (!lb.ready)
 			lb.unavailable |= lb.backend;
 		reap();
+		if (packet[0] == 'R')
+			break;
 	}
 	return FALSE;
 }
@@ -274,6 +283,16 @@ static gboolean send_browser(char kind, const char *a, const char *b)
 	g_autofree char *packet = g_strdup_printf("%c\t%s\t%s", kind, a, b);
 
 	return send_browser_packet(packet);
+}
+
+static gboolean load_page(char kind, const char *size, const char *url,
+			  gboolean issued)
+{
+	/* A LINE-issued view's history and sessionStorage are per view. */
+	if (issued || lb.issued_view)
+		reap();
+	lb.issued_view = issued;
+	return send_browser(kind, size, url);
 }
 
 static void open_outside(const char *url)
@@ -333,7 +352,7 @@ static char *chat_deep_link_id(const char *url)
 	return g_strndup(q, 33);
 }
 
-static gboolean route_line_link(const char *url)
+static gboolean route_line_link(const char *url, const char *chat)
 {
 	if (is_openchat_link(url)) {
 		ui_openchat_open_link(url);
@@ -366,22 +385,21 @@ static gboolean route_line_link(const char *url)
 
 		json_object_object_add(args, "url",
 				       json_object_new_string(url));
-		if (ui.selected)
-			json_object_object_add(
-				args, "chat",
-				json_object_new_string(ui.selected));
+		if (chat)
+			json_object_object_add(args, "chat",
+					       json_object_new_string(chat));
 		ui_status(_("Opening the LINE app…"));
-		ui_rpc("liffView", args, 0);
+		ui_rpc("liffView", args, ++lb.view_request);
 		return TRUE;
 	}
 	return FALSE;
 }
 
-void ui_liff_open_link(const char *url)
+static void open_in_browser(const char *url, const char *chat)
 {
 	if (!url || !*url)
 		return;
-	if (route_line_link(url))
+	if (route_line_link(url, chat))
 		return;
 	if (line_liff_line_scheme(url)) {
 		ui_status(_("Open this LINE link on your phone."));
@@ -389,15 +407,21 @@ void ui_liff_open_link(const char *url)
 	}
 	if (!line_flex_link_allowed(url))
 		return;
-	if (!send_browser('W', "web", url))
+	lb.view_request++;
+	if (!load_page('W', "web", url, FALSE))
 		open_outside(url);
 }
 
-void ui_open_chat_link(const char *url)
+void ui_liff_open_link(const char *url)
+{
+	open_in_browser(url, ui.selected);
+}
+
+void ui_open_chat_link(const char *url, const char *chat)
 {
 	if (!url || !*url)
 		return;
-	if (route_line_link(url))
+	if (route_line_link(url, chat))
 		return;
 	if (line_liff_line_scheme(url)) {
 		ui_status(_("Open this LINE link on your phone."));
@@ -411,22 +435,19 @@ void ui_open_chat_link(const char *url)
 gboolean ui_liff_reply(const char *action, guint tag, Json *result,
 		       const char *error)
 {
-	(void)tag;
 	if (strcmp(action, "liffView"))
 		return FALSE;
+	if (!ui.connected || ui.logging_out || tag != lb.view_request)
+		return TRUE;
 	if (error) {
 		ui_status(error);
 		return TRUE;
 	}
-	Json *url = NULL, *size = NULL;
+	const char *page = ui_string(result, "url", NULL);
+	const char *size = ui_string(result, "size", "full");
+	gboolean web = json_object_get_boolean(ui_field(result, "web"));
 
-	json_object_object_get_ex(result, "url", &url);
-	json_object_object_get_ex(result, "size", &size);
-	const char *page = json_object_get_string(url);
-
-	if (!page ||
-	    !send_browser('L', size ? json_object_get_string(size) : "full",
-			  page))
+	if (!page || !load_page(web ? 'W' : 'L', size, page, TRUE))
 		ui_status(_("Could not open the LINE app window."));
 	else
 		ui_status("");
@@ -483,9 +504,11 @@ gboolean ui_liff_event(const SDL_Event *e)
 
 		if (!lb.ready)
 			lb.unavailable |= lb.backend;
+		else
+			lb.view_request++;
 		reap();
 		if (pending && !send_browser_packet(pending)) {
-			if (pending[0] == 'W')
+			if (pending[0] == 'W' && !lb.issued_view)
 				open_outside(pending + sizeof("W\tweb\t") - 1);
 			else
 				ui_status(_(
@@ -500,7 +523,8 @@ gboolean ui_liff_event(const SDL_Event *e)
 		lb.ready = TRUE;
 		g_clear_pointer(&lb.pending, g_free);
 	} else if (n == 2 && !strcmp(part[0], "O"))
-		ui_liff_open_link(part[1]);
+		/* A browser link did not originate in the selected chat. */
+		open_in_browser(part[1], NULL);
 	else if (n == 2 && !strcmp(part[0], "X") && desktop_scheme(part[1]))
 		open_outside(part[1]);
 	else if (n == 4 && !strcmp(part[0], "D"))
@@ -510,5 +534,6 @@ gboolean ui_liff_event(const SDL_Event *e)
 
 void ui_liff_close(void)
 {
+	lb.view_request++;
 	reap();
 }
