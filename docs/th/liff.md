@@ -97,11 +97,12 @@ worker ตอบกลับเป็น `{url, size, title}`
 ### ทำให้หน้าเว็บมองว่าเป็น LINE
 
 - **User agent** หน้า LIFF ได้ `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Line/9.7.0 LIFF` (`LINE_LIFF_USER_AGENT`) `liff.isInClient()` เป็นจริงเมื่อ user agent ตรงกับ `Line/x.y.z LIFF` หน้าธรรมดาได้แบบเดียวกันแต่ไม่มี ` LIFF` (`LINE_WEB_USER_AGENT`)
-- **Native bridge** ถ้า user agent มีเวอร์ชัน LINE 9.5 ขึ้นไป `liff.init()` จะรอ `window._liff.features` ก่อนจะ resolve สคริปต์ที่ฉีดตอนเริ่มเอกสารนิยาม `window._liff = { features: [], postMessage }` แบบ freeze ไว้ `postMessage(action, featureToken, callbackId, json)` ไปถึงเบราว์เซอร์ผ่าน script message handler ของ WebKit
+- **ปุ่มลัด** ปุ่มลัดของเบราว์เซอร์ต้องมาจากเหตุการณ์คีย์บอร์ดที่เบราว์เซอร์รับรอง
+- **Native bridge** โปรแกรมเบราว์เซอร์รับคำขอ bridge ในโหมด LIFF ถ้า user agent มีเวอร์ชัน LINE 9.5 ขึ้นไป `liff.init()` จะรอ `window._liff.features` ก่อนจะ resolve สคริปต์ที่ฉีดตอนเริ่มเอกสารนิยาม `window._liff = { features: [], postMessage }` แบบ freeze ไว้ `postMessage(action, featureToken, callbackId, json)` ไปถึงเบราว์เซอร์ผ่าน script message handler ของ WebKit
   - `closeWindow` ปิดหน้าต่าง
   - `openWindow` โหลด `url` ของมัน หรือส่งให้เดสก์ท็อปเมื่อ `external` เป็นจริง
   - อย่างอื่น (สแกน QR ตัวเลือกการแชร์ และฟีเจอร์ที่มีเฉพาะบนโทรศัพท์) ตอบทันทีด้วย `liffEvent` ที่มี `detail` เป็น `{type, callbackId, error: {code: "FORBIDDEN"}}` การเรียกของ SDK จึงถูกปฏิเสธแทนที่จะค้าง
-- **การปิด** ไปที่ `liff://close` หรือเรียก `window.close()` จะปิดหน้าต่าง
+- **การปิด** ในโหมด LIFF การไปที่ `liff://close` จะปิดหน้าต่าง หน้าเว็บยังใช้ `window.close()` ตามพฤติกรรมมาตรฐานของ WebKit ได้
 - **ลิงก์ของ LINE** ในหน้า (`line_liff_url()` หรือ `line_liff_line_scheme()`) ถูกส่งกลับไปที่ UI เป็น `O` แต่ละลิงก์จึงได้ view ของตัวเองจาก LINE
 - **สิทธิ์** คำขอใช้กล้อง ไมโครโฟน ตำแหน่ง และการแจ้งเตือนถูกปฏิเสธ
 - **HTTPS เท่านั้น** การนำทางทุกครั้ง ไม่ว่าจะเป็นลิงก์ สคริปต์ หรือการ redirect จากเซิร์ฟเวอร์ ต้องอยู่บน `https://` หรือบนเอกสาร `about:`, `data:` และ `blob:` ที่หน้าเว็บสร้างเอง (`line_liff_web_url()`) ลิงก์ `http://` ธรรมดาที่ผู้ใช้คลิกจะเปิดในเบราว์เซอร์ของเดสก์ท็อปแทน และการย้ายไปยังลิงก์แบบนี้ในทางอื่นจะถูกทิ้ง ไม่มีใครบนเครือข่ายจึงแทนที่หน้าเว็บที่ถือโทเค็นของ LINE ได้

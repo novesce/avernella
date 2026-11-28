@@ -30,6 +30,8 @@ The split has one purpose: **the process that draws untrusted content never hold
 
 The worker starts the Vault supervisor before reading credentials and applying its sandbox. They communicate over anonymous Unix socket pairs. When the Vault disconnects, the supervisor starts a replacement, which restores Letter Sealing keys and the persisted request-sequence limit through the already-locked state directory descriptor. Safe local operations retry once after reconnecting. Requests already sent to LINE follow their existing retry rules.
 
+Worker startup requires inherited file descriptors outside the IPC slots to be closed. On kernels with Landlock, the Vault can read, create, replace and remove regular files in Avernella's state directory. It opens the saved session there using the descriptor supplied by the worker.
+
 ## The UI process
 
 `main()` in [`main.c`](../../src/main.c) calls `line_ui()` in [`ui.c`](../../src/ui.c) unless the first argument is `--worker` or `--worker-password`. The UI process owns:

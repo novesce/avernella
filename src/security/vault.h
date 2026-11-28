@@ -70,7 +70,8 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd);
 /* Runs the Vault IPC event loop until EOF or fatal error. */
 int avernella_vault_run(struct avernella_vault *vault, int client_fd);
 /* Start before processing credentials or starting any worker threads. */
-int avernella_vault_broker_start(struct avernella_worker_proc *broker);
+int avernella_vault_broker_start(struct avernella_worker_proc *broker,
+				 const char *state_dir);
 /* Returns a connected Vault socket, or -errno. */
 int avernella_vault_reconnect(int broker);
 int avernella_vault_disconnect(int broker);
@@ -83,11 +84,6 @@ J *avernella_vault_client_seal(int vault_fd, const char *chat, int content_type,
 J *avernella_vault_client_open(int vault_fd, J *message, int content_type,
 			       GError **error);
 gint32 avernella_vault_client_reserve_seq(int vault_fd, GError **error);
-gboolean avernella_vault_client_load_session(int vault_fd, const char *mid,
-					     const char *access,
-					     const char *refresh, J *keys,
-					     gint32 seq, int dirfd,
-					     GError **error);
 gboolean avernella_vault_client_ecdh(int vault_fd, gint32 key_id,
 				     const guint8 peer_pub[32],
 				     guint8 shared_out[32], GError **error);

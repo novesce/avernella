@@ -274,7 +274,7 @@ static gboolean on_decide(WebKitWebView *view, WebKitPolicyDecision *decision,
 		return FALSE;
 	/* The LIFF SDK closes its window with liff://close. */
 	if (!g_ascii_strncasecmp(uri, "liff://", 7)) {
-		if (!g_ascii_strncasecmp(uri, "liff://close", 12))
+		if (b.liff && !g_ascii_strncasecmp(uri, "liff://close", 12))
 			quit();
 		webkit_policy_decision_ignore(decision);
 		return TRUE;
@@ -419,6 +419,7 @@ static void on_key(WebKitUserContentManager *manager, JSCValue *value,
  */
 static const char *const shortcuts[] = {
 	"addEventListener('keydown', e => {",
+	" if (!e.isTrusted) return;",
 	" const c = e.ctrlKey || e.metaKey, k = e.key.toLowerCase();",
 	" const a = c && k === 'w' ? 'close'",
 	"  : (c && k === 'r') || k === 'f5' ? 'reload'",
@@ -531,7 +532,7 @@ static void on_bridge(WebKitUserContentManager *manager, JSCValue *value,
 {
 	(void)manager;
 	(void)data;
-	if (!jsc_value_is_array(value))
+	if (!b.liff || !jsc_value_is_array(value))
 		return;
 	g_autoptr(JSCValue) a =
 		jsc_value_object_get_property_at_index(value, 0);

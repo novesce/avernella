@@ -506,37 +506,6 @@ int avernella_vault_serve_once(struct avernella_vault *vault, int client_fd)
 		goto out;
 	}
 
-	if (hdr.op == IPC_OP_VAULT_LOAD_SESSION) {
-		const char *mid = strfield(req, "mid");
-		const char *access = strfield(req, "access");
-		const char *refresh = strfield(req, "refresh");
-		J *keys = field(req, "keys");
-		gint32 seq = json_object_get_int(field(req, "seq"));
-
-		if (nfds == 1 && recv_fd >= 0) {
-			if (vault->dirfd >= 0)
-				close(vault->dirfd);
-			vault->dirfd = recv_fd;
-			recv_fd = -1;
-		}
-		err = avernella_vault_load_secrets(
-			vault, mid, access, refresh,
-			keys && json_object_is_type(keys, json_type_object) ?
-				keys :
-				NULL,
-			seq);
-		if (err) {
-			err = reply_error(client_fd, hdr.req_id, err,
-					  "Failed to load session into Vault");
-			goto out;
-		}
-		out = obj();
-		json_object_object_add(out, "loaded",
-				       json_object_new_boolean(TRUE));
-		err = reply_json(client_fd, hdr.req_id, out);
-		goto out;
-	}
-
 	if (hdr.op == IPC_OP_VAULT_RESTORE) {
 		err = restore_session(vault, recv_fd, req, &error);
 		if (err) {
@@ -631,7 +600,6 @@ out:
 		json_object_put(out);
 	if (req) {
 		if (hdr.op == IPC_OP_VAULT_RESTORE ||
-		    hdr.op == IPC_OP_VAULT_LOAD_SESSION ||
 		    hdr.op == IPC_OP_VAULT_ROTATE_TOKEN) {
 			line_secret_json_wipe(field(req, "access"));
 			line_secret_json_wipe(field(req, "refresh"));
@@ -754,8 +722,7 @@ out:
 		free(rx_buf);
 	}
 	if (tx_str &&
-	    (op == IPC_OP_VAULT_RESTORE || op == IPC_OP_VAULT_LOAD_SESSION ||
-	     op == IPC_OP_VAULT_ROTATE_TOKEN)) {
+	    (op == IPC_OP_VAULT_RESTORE || op == IPC_OP_VAULT_ROTATE_TOKEN)) {
 		explicit_bzero((char *)tx_str, tx_len);
 		line_secret_json_wipe(field(req, "access"));
 		line_secret_json_wipe(field(req, "refresh"));
@@ -867,30 +834,6 @@ gint32 avernella_vault_client_reserve_seq(int vault_fd, GError **error)
 		return -1;
 	}
 	return (gint32)seq;
-}
-
-gboolean avernella_vault_client_load_session(int vault_fd, const char *mid,
-					     const char *access,
-					     const char *refresh, J *keys,
-					     gint32 seq, int dirfd,
-					     GError **error)
-{
-	g_autoptr(J) req = obj();
-
-	if (mid)
-		json_object_object_add(req, "mid", json_object_new_string(mid));
-	if (access)
-		json_object_object_add(req, "access",
-				       json_object_new_string(access));
-	if (refresh)
-		json_object_object_add(req, "refresh",
-				       json_object_new_string(refresh));
-	if (keys)
-		json_object_object_add(req, "keys", json_object_get(keys));
-	json_object_object_add(req, "seq", json_object_new_int(seq));
-	g_autoptr(J) rep = vault_rpc_fd(vault_fd, IPC_OP_VAULT_LOAD_SESSION,
-					req, dirfd, error);
-	return rep != NULL;
 }
 
 gboolean avernella_vault_client_ecdh(int vault_fd, gint32 key_id,
@@ -1033,11 +976,13 @@ static int set_socket_timeout(int fd)
 	return 0;
 }
 
-static void vault_broker_loop(int fd)
+static void vault_broker_loop(int fd, const char *state_dir)
 {
-	static const struct avernella_sandbox_opts opts = {
+	const struct avernella_sandbox_opts opts = {
 		.role = SANDBOX_ROLE_VAULT,
 		.keep_stderr = true,
+		.extra_rw_paths = &state_dir,
+		.n_extra_rw_paths = 1,
 	};
 	struct avernella_worker_proc vault = { .pid = -1,
 					       .pidfd = -1,
@@ -1090,7 +1035,8 @@ static void vault_broker_loop(int fd)
 	avernella_worker_close(&vault);
 }
 
-int avernella_vault_broker_start(struct avernella_worker_proc *broker)
+int avernella_vault_broker_start(struct avernella_worker_proc *broker,
+				 const char *state_dir)
 {
 	int pair[2];
 	int rc = avernella_ipc_socketpair(pair);
@@ -1124,7 +1070,7 @@ int avernella_vault_broker_start(struct avernella_worker_proc *broker)
 		close(STDOUT_FILENO);
 		if (avernella_close_extra_fds(fd) < 0)
 			_exit(1);
-		vault_broker_loop(fd);
+		vault_broker_loop(fd, state_dir);
 		_exit(0);
 	}
 	close(pair[1]);

@@ -203,21 +203,29 @@ int avernella_close_extra_fds(int max_keep_fd)
 					       (unsigned int)max_keep_fd + 1U;
 	DIR *dir;
 	struct dirent *ent;
-	int dir_fd;
+	int dir_fd, err;
 
 	if (syscall(SYS_close_range, first, ~0U, 0U) == 0)
 		return 0;
-	if (errno != ENOSYS && errno != EINVAL)
+	/* An outer sandbox may block close_range while exposing /proc. */
+	if (errno != ENOSYS && errno != EINVAL && errno != EPERM &&
+	    errno != EACCES)
 		return -errno;
 
 	dir = opendir("/proc/self/fd");
 	if (!dir)
 		return -errno;
 	dir_fd = dirfd(dir);
-	while ((ent = readdir(dir)) != NULL) {
+	for (;;) {
 		char *end = NULL;
 		long fd;
 
+		errno = 0;
+		ent = readdir(dir);
+		if (!ent) {
+			err = -errno;
+			break;
+		}
 		if (ent->d_name[0] == '.')
 			continue;
 		errno = 0;
@@ -228,5 +236,5 @@ int avernella_close_extra_fds(int max_keep_fd)
 			close((int)fd);
 	}
 	closedir(dir);
-	return 0;
+	return err;
 }

@@ -97,11 +97,12 @@ The tokens travel only over this socket, never in arguments or the environment, 
 ### Looking like LINE to the page
 
 - **User agent.** LIFF pages get `Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/605.1.15 (KHTML, like Gecko) Line/9.7.0 LIFF` (`LINE_LIFF_USER_AGENT`). `liff.isInClient()` is true when the user agent matches `Line/x.y.z LIFF`. Ordinary pages get the same without ` LIFF` (`LINE_WEB_USER_AGENT`).
-- **The native bridge.** With a LINE version of 9.5 or newer in the user agent, `liff.init()` waits for `window._liff.features` before it resolves. A script injected at document start defines `window._liff = { features: [], postMessage }`, frozen. `postMessage(action, featureToken, callbackId, json)` reaches the browser through a WebKit script message handler:
+- **Native shortcuts.** Browser shortcuts require trusted keyboard events.
+- **The native bridge.** The helper accepts bridge requests in LIFF mode. With a LINE version of 9.5 or newer in the user agent, `liff.init()` waits for `window._liff.features` before it resolves. A script injected at document start defines `window._liff = { features: [], postMessage }`, frozen. `postMessage(action, featureToken, callbackId, json)` reaches the browser through a WebKit script message handler:
   - `closeWindow` closes the window;
   - `openWindow` loads its `url`, or hands it to the desktop when `external` is true;
   - anything else (QR scanning, the share picker and other phone-only features) is answered at once with a `liffEvent` whose `detail` is `{type, callbackId, error: {code: "FORBIDDEN"}}`, so the SDK call rejects instead of hanging.
-- **Closing.** Navigating to `liff://close` or calling `window.close()` closes the window.
+- **Closing.** In LIFF mode, navigating to `liff://close` closes the window. Pages can also use WebKit's standard `window.close()` behavior.
 - **LINE links** inside the page (`line_liff_url()` or `line_liff_line_scheme()`) are sent back to the UI as `O`, so each gets its own view from LINE.
 - **Permissions.** Camera, microphone, location and notification requests are refused.
 - **HTTPS only.** Every navigation, whether a link, a script or a server redirect, must stay on `https://` or on the `about:`, `data:` and `blob:` documents that pages create (`line_liff_web_url()`). A plain `http://` link the user clicks goes to the desktop browser instead, and any other move to one is dropped, so nothing on the network can replace a page that holds LINE's tokens.

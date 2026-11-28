@@ -618,12 +618,8 @@ int avernella_landlock_apply(const struct avernella_sandbox_opts *opts,
 
 	memset(&attr, 0, sizeof(attr));
 
-	/* Filesystem containment for NET (0 rules), MEDIA (scoped), UI (scoped). */
-	if (opts->role == SANDBOX_ROLE_NET ||
-	    opts->role == SANDBOX_ROLE_MEDIA || opts->role == SANDBOX_ROLE_UI) {
-		attr.handled_access_fs = fs_mask_for_abi(abi);
-		active |= AVSB_ACTIVE_LANDLOCK_FS;
-	}
+	attr.handled_access_fs = fs_mask_for_abi(abi);
+	active |= AVSB_ACTIVE_LANDLOCK_FS;
 
 	/* TCP port containment (ABI 4+): deny all bind; allowlist connect. */
 	if (abi >= 4 && (opts->role == SANDBOX_ROLE_NET ||
@@ -666,6 +662,12 @@ int avernella_landlock_apply(const struct avernella_sandbox_opts *opts,
 	uint64_t rw = AVSB_FS_RW_BASE |
 		      (abi >= 2 ? LANDLOCK_ACCESS_FS_REFER : 0) |
 		      (abi >= 3 ? LANDLOCK_ACCESS_FS_TRUNCATE : 0);
+
+	if (opts->role == SANDBOX_ROLE_VAULT)
+		rw = LANDLOCK_ACCESS_FS_READ_FILE |
+		     LANDLOCK_ACCESS_FS_WRITE_FILE |
+		     LANDLOCK_ACCESS_FS_MAKE_REG |
+		     LANDLOCK_ACCESS_FS_REMOVE_FILE;
 
 	for (size_t i = 0; i < opts->n_extra_ro_paths; i++) {
 		err = add_path_rule(ruleset, opts->extra_ro_paths[i], ro,

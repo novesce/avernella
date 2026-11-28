@@ -897,16 +897,33 @@ static void test_ui_landlock_fresh_state_dir(void)
 	rmdir(fresh_root);
 }
 
+struct vault_child_fixture {
+	const char *outside;
+	J *keys;
+};
+
 static int sandboxed_vault_child(int ctrl_fd, uint32_t active, void *userdata)
 {
+	const struct vault_child_fixture *fixture = userdata;
 	struct avernella_vault vault;
+	int fd;
 	int rc;
 
-	(void)active;
-	(void)userdata;
+	if (!(active & AVSB_ACTIVE_LANDLOCK_FS))
+		return 1;
+	fd = open(fixture->outside, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		close(fd);
+		return 1;
+	}
+	if (errno != EACCES)
+		return 1;
 	if (avernella_vault_init(&vault, -1) < 0)
 		return 1;
-	rc = avernella_vault_run(&vault, ctrl_fd);
+	rc = avernella_vault_load_secrets(&vault, "u1234", "tok", "ref",
+					  fixture->keys, 1);
+	if (!rc)
+		rc = avernella_vault_run(&vault, ctrl_fd);
 	avernella_vault_destroy(&vault);
 	return rc < 0 ? 1 : 0;
 }
@@ -916,8 +933,16 @@ static void test_vault_spawned_child_ecdh(void)
 	struct avernella_sandbox_opts opts;
 	struct avernella_worker_proc proc;
 	g_autoptr(GError) err = NULL;
+	g_autofree char *outside = NULL;
 	guint8 priv[32], pub[32], got_pub[32], shared[32];
 	size_t priv_len = sizeof(priv), pub_len = sizeof(pub);
+
+	int fd = g_file_open_tmp("avernella-outside-vault-XXXXXX", &outside,
+				 &err);
+
+	g_assert_no_error(err);
+	g_assert_cmpint(fd, >=, 0);
+	close(fd);
 
 	EVP_PKEY *kp = EVP_PKEY_Q_keygen(NULL, NULL, "X25519");
 	g_assert_nonnull(kp);
@@ -937,13 +962,13 @@ static void test_vault_spawned_child_ecdh(void)
 	opts.role = SANDBOX_ROLE_VAULT;
 	opts.keep_stderr = true;
 
+	struct vault_child_fixture fixture = { .outside = outside,
+					       .keys = keys };
+
 	g_assert_cmpint(avernella_spawn_worker(&opts, sandboxed_vault_child,
-					       NULL, &proc),
+					       &fixture, &proc),
 			==, 0);
 	g_assert_cmpint(avernella_vault_client_ping(proc.ctrl_fd), ==, 0);
-	g_assert_true(avernella_vault_client_load_session(
-		proc.ctrl_fd, "u1234", "tok", "ref", keys, 1, -1, &err));
-	g_assert_no_error(err);
 	g_assert_true(avernella_vault_client_own_public(proc.ctrl_fd, 42,
 							got_pub, &err));
 	g_assert_no_error(err);
@@ -956,6 +981,7 @@ static void test_vault_spawned_child_ecdh(void)
 
 	json_object_put(keys);
 	avernella_worker_close(&proc);
+	g_assert_cmpint(unlink(outside), ==, 0);
 }
 
 static void test_vault_reconnect(void)
@@ -981,7 +1007,7 @@ static void test_vault_reconnect(void)
 	g_assert_cmpint(flock(dir, LOCK_EX | LOCK_NB), ==, 0);
 	g_assert_true(line_store_save(dir, &session, &error));
 	g_assert_no_error(error);
-	g_assert_cmpint(avernella_vault_broker_start(&broker), ==, 0);
+	g_assert_cmpint(avernella_vault_broker_start(&broker, root), ==, 0);
 	int fd = avernella_vault_reconnect(broker.ctrl_fd);
 
 	g_assert_cmpint(fd, >=, 0);

@@ -4212,9 +4212,15 @@ static int worker(int credentials_fd)
 		frame_fd = -1;
 	}
 	/* Strip any stray inherited FDs before spawning Vault & sandboxing. */
-	avernella_close_extra_fds(frame_fd >= 0	      ? frame_fd :
-				  credentials_fd >= 0 ? credentials_fd :
-							STDERR_FILENO);
+	int last_fd = MAX(frame_fd, MAX(credentials_fd, STDERR_FILENO));
+	int err = avernella_close_extra_fds(last_fd);
+
+	if (err < 0) {
+		g_printerr(
+			"Could not close inherited worker descriptors (%s).\n",
+			g_strerror(-err));
+		return 1;
+	}
 	/*
 	 * Spawn the isolated Key Vault broker BEFORE installing
 	 * the worker's Landlock/seccomp sandbox and before any thread starts.
@@ -4223,7 +4229,12 @@ static int worker(int credentials_fd)
 						.pidfd = -1,
 						.ctrl_fd = -1 };
 
-	(void)avernella_vault_broker_start(&broker);
+	{
+		g_autofree char *state_dir = g_build_filename(
+			g_get_user_state_dir(), LINE_STATE_DIR, NULL);
+
+		(void)avernella_vault_broker_start(&broker, state_dir);
+	}
 	/* Before any thread starts, so every later thread inherits it. */
 	line_sandbox_worker();
 	struct line_worker w = {
